@@ -4,17 +4,17 @@ from prefect import flow, task
 
 
 @task
-def raw_data_path(obsid):
+def nu_raw_data_path(obsid, **kwargs):
     return os.path.normpath(f"/FTP/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/")
 
 
 @task
-def base_output_path(obsid):
+def nu_base_output_path(obsid):
     return os.path.join(OUT_DATA_DIR, obsid)
 
 
 @task
-def pipeline_output_path(obsid):
+def nu_pipeline_output_path(obsid):
     return os.path.join(OUT_DATA_DIR, obsid + "/event_cl/")
 
 
@@ -33,7 +33,7 @@ def separate_sources(directories):
 
 
 @task
-def run_l2_pipeline(obsid):
+def nu_run_l2_pipeline(obsid):
     import heasoftpy as hsp
 
     pass
@@ -42,8 +42,8 @@ def run_l2_pipeline(obsid):
 @task
 def recover_spacecraft_science_data(obsid):
     print("Squeezing every photon from spacecraft science data")
-    datadir = raw_data_path(obsid)
-    ev_dir = pipeline_output_path(obsid)
+    datadir = nu_raw_data_path(obsid)
+    ev_dir = nu_pipeline_output_path(obsid)
     splitdir = split_path(obsid)
 
     hk_dir = os.path.join(datadir, "hk")
@@ -74,7 +74,7 @@ def recover_spacecraft_science_data(obsid):
 
 @task
 def join_source_data(obsid, directories, src_num=1):
-    outdir = base_output_path(obsid)
+    outdir = nu_base_output_path(obsid)
     outfiles = []
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"{obsid}{fpm}_src{src_num}.evt")
@@ -100,7 +100,7 @@ def join_source_data(obsid, directories, src_num=1):
 
 @flow
 def process_nustar_obsid(obsid, config, ra="NONE", dec="NONE"):
-    os.makedirs(os.path.join(base_output_path(obsid)), exist_ok=True)
+    os.makedirs(os.path.join(nu_base_output_path(obsid)), exist_ok=True)
     outdir = run_l2_pipeline(obsid)
     splitdir = recover_spacecraft_science_data(obsid)
     separate_sources([outdir, splitdir])
