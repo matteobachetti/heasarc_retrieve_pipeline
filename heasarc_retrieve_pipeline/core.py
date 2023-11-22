@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import glob
 import traceback
@@ -9,7 +10,7 @@ from .nicer import ni_raw_data_path
 from prefect import flow, task, get_run_logger
 
 
-def _download_pysmartdl(url, dest):
+def _download_pysmartdl(url: str, dest: str):
     from pySmartDL import SmartDL
 
     obj = SmartDL(url, dest)
@@ -17,15 +18,15 @@ def _download_pysmartdl(url, dest):
     return obj.get_dest()
 
 
-def download_cmd(url, dest):
+def download_cmd(url: str, dest: str):
     try:
-        return _download_pysmartdl(url, dest)
-    except Exception:
-        return None
+        return _download_pysmartdl(url, dest), None
+    except Exception as e:
+        return None, str(e)
 
 
 @task
-def get_remote_directory_listing(url):
+def get_remote_directory_listing(url: str):
     """Give the list of files in the remote directory."""
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
@@ -59,7 +60,14 @@ def get_remote_directory_listing(url):
 
 
 @task
-def download_node(node, base_url, outdir, cut_ndirs=0, test_str=".", test=False):
+def download_node(
+    node: str,
+    base_url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+):
     logger = get_run_logger()
     local_ver = os.path.join(outdir, *node.replace(base_url, "").split("/")[cut_ndirs:])
     if test_str is not None and test_str not in local_ver:
@@ -80,20 +88,29 @@ def download_node(node, base_url, outdir, cut_ndirs=0, test_str=".", test=False)
         return local_ver
 
     if not test:
-        fname = download_cmd(node, local_ver)
+        fname, exc_string = download_cmd(node, local_ver)
     else:
         logger.info(f"Faked download of {node} to {local_ver}")
         fname = local_ver
     if fname is None:
-        raise (Exception(f"Error downloading {node}"))
+        logger.warning(f"Error downloading {node}: {exc_string}")
     # print(node, local_ver)
     return local_ver
 
 
 @flow
 def recursive_download(
-    url, outdir, cut_ndirs=0, test_str=".", test=False, re_include=None, re_exclude=None
+    url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+    re_include: str = "",
+    re_exclude: str = "",
 ):
+    re_include = re.compile(re_include) if re_include != "" else None
+    re_exclude = re.compile(re_exclude) if re_exclude != "" else None
+
     logger = get_run_logger()
     logger.info("Getting remote directory listing...")
     listing = get_remote_directory_listing.fn(url)
@@ -103,6 +120,7 @@ def recursive_download(
 
     base_url = "/".join(url.rstrip("/").split("/")[:-1])
     local_vers = []
+    os.makedirs(outdir, exist_ok=True)
     for node in listing:
         if re_include is not None and not re_include.search(node):
             logger.info(f"Skipping {node} because not included in {re_include.pattern}")
@@ -111,7 +129,14 @@ def recursive_download(
             logger.info(f"Skipping {node} because excluded in {re_include.pattern}")
             continue
         local_vers.append(
-            download_node(node, base_url, outdir, cut_ndirs=cut_ndirs, test_str=test_str, test=test)
+            download_node(
+                node,
+                base_url,
+                outdir,
+                cut_ndirs=cut_ndirs,
+                test_str=test_str,
+                test=test,
+            )
         )
     return local_vers
 
@@ -133,7 +158,7 @@ MISSION_CONFIG = {
 
 
 @task
-def read_config(config_file):
+def read_config(config_file: str):
     import yaml
 
     with open(config_file, "r") as f:
@@ -142,16 +167,20 @@ def read_config(config_file):
 
 
 @task(log_prints=True)
-def retrieve_heasarc_table_by_position(ra_deg, dec_deg, mission="nustar", radius_deg=0.1):
+def retrieve_heasarc_table_by_position(
+    ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
+):
     import astropy.coordinates as coord
     import pyvo as vo
 
     tap_services = vo.regsearch(servicetype="table", keywords=["heasarc"])
+    tap_service = tap_services[0].service
 
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
-
+    if additional != "":
+        additional = f", {additional}"
     query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date {additional}
         FROM public.{table} as cat
         where
@@ -160,34 +189,38 @@ def retrieve_heasarc_table_by_position(ra_deg, dec_deg, mission="nustar", radius
         cat.{expo_name} > 0 order by cat.time
         """
 
-    print(query)
-    results = tap_services[0].search(query).to_table()
+    results = tap_service.search(query)
     return results
 
 
 @task
-def retrieve_heasarc_table_by_source_name(source, mission="nustar", radius_deg=0.1):
+def retrieve_heasarc_table_by_source_name(
+    source: str, mission: str = "nustar", radius_deg: float = 0.1
+):
     import astropy.coordinates as coord
 
     pos = coord.SkyCoord.from_name(f"{source}")
 
     return retrieve_heasarc_table_by_position.fn(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=0.1
+        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
 
 
 @flow
 def retrieve_heasarc_data_by_source_name(
-    source, outdir="out", mission="nustar", radius_deg=0.1, test=False
+    source: str,
+    outdir: str = "out",
+    mission: str = "nustar",
+    radius_deg: float = 0.1,
+    test: bool = False,
 ):
     import astropy.coordinates as coord
 
     logger = get_run_logger()
-    pos = coord.SkyCoord.from_name(f"{source}")
-
-    results = retrieve_heasarc_table_by_position.fn(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+    results = retrieve_heasarc_table_by_source_name.fn(
+        source, mission=mission, radius_deg=radius_deg
     )
+
     for row in results:
         logger.info(f"{row['obsid']}, {row['time']}")
     for obsid, time in zip(results["obsid"], results["time"]):
@@ -209,6 +242,7 @@ def retrieve_heasarc_data_by_source_name(
 )
 def test_retrieve_heasarc_table_by_source_name(mission):
     results = retrieve_heasarc_table_by_source_name.fn("M82 X-2", mission=mission)
+    results.to_table().sort("time")
     assert len(results) > 0
 
 
@@ -217,7 +251,9 @@ def test_retrieve_heasarc_table_by_source_name(mission):
     ["nustar", "nicer"],
 )
 def test_retrieve_heasarc_data_by_source_name(mission):
-    results = retrieve_heasarc_data_by_source_name("M82 X-2", mission=mission, test=True)
+    results = retrieve_heasarc_data_by_source_name(
+        "M82 X-2", mission=mission, test=True
+    )
     assert len(results) > 0
 
 
@@ -231,8 +267,8 @@ def test_recursive_download():
         cut_ndirs=0,
         test_str=".",
         test=False,
-        re_include=re.compile(r"[AB]0.*evt"),
-        re_exclude=re.compile(r"[AB]0[2-5]"),
+        re_include=r"[AB]0.*evt",
+        re_exclude=r"[AB]0[2-5]",
     )
     assert len(results) == 2
     shutil.rmtree("out_test")
