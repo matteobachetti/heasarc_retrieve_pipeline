@@ -146,9 +146,15 @@ def join_source_data(obsid, directories, src_num=1):
         files_to_join = []
         for d in directories:
             logger.info(f"Adding data from {d}")
-            files_to_join.extend(
-                glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*_src{src_num}.evt*"))
+            new_files = glob.glob(
+                os.path.join(d, f"nu{obsid}{fpm}0[16]*_src{src_num}.evt*")
             )
+            files_to_join.extend(new_files)
+            for nf in new_files:
+                if f"{fpm}01" in nf:
+                    logger.info(f"Copying {nf} to {outdir}")
+                    os.system(f"cp {nf} {outdir}/")
+
         logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
 
         hsp.ftmgtime(
@@ -183,8 +189,31 @@ def join_source_data(obsid, directories, src_num=1):
 
 
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def barycenter_data(outfiles):
-    pass
+def barycenter_data(obsid, ra, dec, src=1):
+    logger = get_run_logger()
+    outdir = nu_base_output_path.fn(obsid)
+    logger.info(f"Barycentering data in directory {outdir}")
+    pipe_outdir = nu_pipeline_output_path.fn(obsid)
+    for fpm in "A", "B":
+        infiles = glob.glob(
+            os.path.join(outdir, f"*{obsid}{fpm}01_cl_src{src}.evt*")
+        ) + glob.glob(os.path.join(outdir, f"*{obsid}{fpm}_src{src}.evt*"))
+        for infile in infiles:
+            logger.info(f"Barycentering {infile}")
+
+            outfile = infile.replace(".evt", "_bary.evt")
+            logger.info(f"Output file: {outfile}")
+
+            hsp.barycorr(
+                infile=infile,
+                outfile=outfile,
+                ra=ra,
+                dec=dec,
+                ephem="JPLEPH.430",
+                refframe="ICRS",
+                clobber="yes",
+                orbitfiles=os.path.join(pipe_outdir, f"nu{obsid}{fpm}.attorb"),
+            )
 
 
 @flow
@@ -194,4 +223,4 @@ def process_nustar_obsid(obsid, config, ra="NONE", dec="NONE"):
     splitdir = recover_spacecraft_science_data(obsid)
     separate_sources([outdir, splitdir])
     outfiles = join_source_data(obsid, [outdir, splitdir])
-    barycenter_data(outfiles)
+    barycenter_data(obsid, ra=48.962664, dec=+69.679298)

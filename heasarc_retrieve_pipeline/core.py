@@ -18,6 +18,15 @@ def _download_pysmartdl(url: str, dest: str):
     return obj.get_dest()
 
 
+def remote_data_url(mission, obsid, time):
+    url = (
+        "https://heasarc.gsfc.nasa.gov/"
+        + MISSION_CONFIG[mission]["path_func"](obsid, time=time)
+        + "/"
+    )
+    return url
+
+
 def download_cmd(url: str, dest: str):
     try:
         return _download_pysmartdl(url, dest), None
@@ -223,12 +232,9 @@ def retrieve_heasarc_data_by_source_name(
 
     for row in results:
         logger.info(f"{row['obsid']}, {row['time']}")
+
     for obsid, time in zip(results["obsid"], results["time"]):
-        url = (
-            "https://heasarc.gsfc.nasa.gov/"
-            + MISSION_CONFIG[mission]["path_func"](obsid, time=time)
-            + "/"
-        )
+        url = remote_data_url(mission, obsid, time)
         recursive_download(url, outdir, cut_ndirs=0, test_str=".", test=test)
         if test:
             break
