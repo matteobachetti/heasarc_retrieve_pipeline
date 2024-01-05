@@ -46,8 +46,31 @@ def separate_sources(directories):
             filter_sources_in_images(event_file)
 
 
+# @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+# def nu_run_l2_pipeline_on_single_fpm(obsid, fpm):
+#     logger = get_run_logger()
+#     nupipeline = hsp.HSPTask("nupipeline")
+#     logger.info(f"Running NuSTAR L2 pipeline on fpm {fpm}")
+#     datadir = nu_raw_data_path.fn(obsid)
+#     ev_dir = nu_pipeline_output_path.fn(obsid)
+#     os.makedirs(ev_dir, exist_ok=True)
+#     stem = "nu" + obsid
+#     nupipeline(
+#         indir=datadir,
+#         outdir=ev_dir,
+#         clobber="yes",
+#         steminputs=stem,
+#         instrument=fpm,
+#         noprompt=True,
+#         verbose=True,
+#     )
+#     return True
+
+
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
 def nu_run_l2_pipeline(obsid):
+    if not HAS_HEASOFT:
+        raise ImportError("heasoftpy not installed")
     logger = get_run_logger()
     nupipeline = hsp.HSPTask("nupipeline")
     logger.info("Running NuSTAR L2 pipeline")
@@ -65,6 +88,8 @@ def nu_run_l2_pipeline(obsid):
             noprompt=True,
             verbose=True,
         )
+
+    return ev_dir
 
 
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
@@ -107,20 +132,25 @@ def recover_spacecraft_science_data(obsid):
     return splitdir
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+# @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+@task
 def join_source_data(obsid, directories, src_num=1):
     logger = get_run_logger()
-    outdir = nu_base_output_path(obsid)
+    outdir = nu_base_output_path.fn(obsid)
     outfiles = []
     for fpm in "A", "B":
+        logger.info(f"Joining source data for fpm {fpm}")
         outfile = os.path.join(outdir, f"{obsid}{fpm}_src{src_num}.evt")
         outfile_gti = os.path.join(outdir, f"{obsid}{fpm}.gti")
         logger.info(outfile)
         files_to_join = []
         for d in directories:
+            logger.info(f"Adding data from {d}")
             files_to_join.extend(
                 glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*_src{src_num}.evt*"))
             )
+        logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
+
         hsp.ftmgtime(
             ingtis=",".join([f + "[GTI]" for f in files_to_join]),
             outgti=outfile_gti,
@@ -128,12 +158,33 @@ def join_source_data(obsid, directories, src_num=1):
         )
         hsp.ftsort(infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
 
+        logger.info(f"Changing extension name to GTI in {outfile_gti}")
+
+        hsp.fthedit(
+            infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
+        )
+        logger.info(f"Creating event file {outfile} from {files_to_join}")
+
         hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
+
+        logger.info(f"Sorting event file {outfile}")
+
         hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
-        hsp.fappend(infile=f"{outfile_gti}[GTI]", outfile=outfile)
+
+        logger.info(
+            f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
+        )
+
+        hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
 
         outfiles.append(outfile)
+
     return outfiles
+
+
+@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+def barycenter_data(outfiles):
+    pass
 
 
 @flow
@@ -142,4 +193,5 @@ def process_nustar_obsid(obsid, config, ra="NONE", dec="NONE"):
     outdir = nu_run_l2_pipeline(obsid)
     splitdir = recover_spacecraft_science_data(obsid)
     separate_sources([outdir, splitdir])
-    join_source_data(obsid, [outdir, splitdir])
+    outfiles = join_source_data(obsid, [outdir, splitdir])
+    barycenter_data(outfiles)

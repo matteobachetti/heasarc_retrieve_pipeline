@@ -18,11 +18,19 @@ def image_from_table(table, bins, gaussian_filter_sigma=1.0, correct_zeros=True)
 
 
 def filter_table(table, coord, region_size=30):
-    good = (table["X"] >= coord[0] - region_size) & (table["X"] <= coord[0] + region_size)
-    good = (table["Y"] >= coord[1] - region_size) & (table["Y"] <= coord[1] + region_size) & good
+    good = (table["X"] >= coord[0] - region_size) & (
+        table["X"] <= coord[0] + region_size
+    )
+    good = (
+        (table["Y"] >= coord[1] - region_size)
+        & (table["Y"] <= coord[1] + region_size)
+        & good
+    )
     table_filt = table[good]
 
-    circle_of_coords = (table_filt["X"] - coord[0]) ** 2 + (table_filt["Y"] - coord[1]) ** 2
+    circle_of_coords = (table_filt["X"] - coord[0]) ** 2 + (
+        table_filt["Y"] - coord[1]
+    ) ** 2
     good = circle_of_coords < region_size**2
     table_filt = table_filt[good]
     return table_filt
@@ -51,7 +59,12 @@ def filter_sources_in_images(eventfile, region_size=30):
     table = Table(copy.deepcopy(hdul[1].data))
 
     table["ENERGY"] = table["PI"] * 0.04 + 1.6
-    good = (table["ENERGY"] >= 3.0) & (table["ENERGY"] < 79.0) & (table["X"] > 0) & (table["Y"] > 0)
+    good = (
+        (table["ENERGY"] >= 3.0)
+        & (table["ENERGY"] < 79.0)
+        & (table["X"] > 0)
+        & (table["Y"] > 0)
+    )
     table = table[good]
     xmin = np.min(table["Y"])
     ymin = np.min(table["X"])
@@ -80,7 +93,7 @@ def filter_sources_in_images(eventfile, region_size=30):
     fig = plt.figure(eventfile + "0")
     plt.pcolormesh(xbins, ybins, np.log10(img), vmin=np.log10(np.median(img)))
     plt.plot(coordinates[:, 1], coordinates[:, 0], "r.")
-    plt.savefig(eventfile.replace(".evt", ".jpg"))
+    plt.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
     # plt.close(fig)
 
     region_fluxes = []
@@ -101,12 +114,17 @@ def filter_sources_in_images(eventfile, region_size=30):
             continue
 
         hdul[1].data = fits.BinTableHDU(table_filt).data
-        hdul.writeto(eventfile.replace(".evt", f"_src{i + 1}.evt"), overwrite=True)
+        hdul.writeto(
+            eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.evt"),
+            overwrite=True,
+        )
 
-        x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
+        x_filt, y_filt, img_filt = image_from_table(
+            table_filt, bins, gaussian_filter_sigma=0
+        )
         fig = plt.figure(eventfile + f"{i + 1}")
         plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
-        plt.savefig(eventfile.replace(".evt", f"_src{i + 1}.jpg"))
+        plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
         plt.close(fig)
 
     hdul.close()
