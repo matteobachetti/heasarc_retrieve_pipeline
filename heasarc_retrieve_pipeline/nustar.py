@@ -132,29 +132,36 @@ def recover_spacecraft_science_data(obsid):
     return splitdir
 
 
-# @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-@task
+@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
 def join_source_data(obsid, directories, src_num=1):
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid)
     outfiles = []
     for fpm in "A", "B":
-        logger.info(f"Joining source data for fpm {fpm}")
-        outfile = os.path.join(outdir, f"{obsid}{fpm}_src{src_num}.evt")
-        outfile_gti = os.path.join(outdir, f"{obsid}{fpm}.gti")
-        logger.info(outfile)
+        outfile = os.path.join(outdir, f"nu{obsid}{fpm}_src{src_num}.evt")
+        if os.path.exists(outfile):
+            os.unlink(outfile)
+        outfile_gti = os.path.join(outdir, f"nu{obsid}{fpm}.gti")
+        if os.path.exists(outfile_gti):
+            os.unlink(outfile_gti)
+        logger.info(f"Joining source data for fpm {fpm} into {outfile}")
         files_to_join = []
         for d in directories:
             logger.info(f"Adding data from {d}")
             new_files = glob.glob(
                 os.path.join(d, f"nu{obsid}{fpm}0[16]*_src{src_num}.evt*")
             )
-            files_to_join.extend(new_files)
+            to_be_removed = []
             for nf in new_files:
                 if f"{fpm}01" in nf:
                     logger.info(f"Copying {nf} to {outdir}")
                     os.system(f"cp {nf} {outdir}/")
-
+                elif f"{fpm}06" in nf and "chu" not in nf:
+                    logger.info(f"Discarding {nf}")
+                    to_be_removed.append(nf)
+            for nf in to_be_removed:
+                new_files.remove(nf)
+            files_to_join.extend(new_files)
         logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
 
         hsp.ftmgtime(
@@ -185,10 +192,14 @@ def join_source_data(obsid, directories, src_num=1):
 
         outfiles.append(outfile)
 
+        logger.info(f"Removing {outfile_gti}")
+
+        os.unlink(outfile_gti)
+
     return outfiles
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+@task
 def barycenter_data(obsid, ra, dec, src=1):
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid)
@@ -196,8 +207,8 @@ def barycenter_data(obsid, ra, dec, src=1):
     pipe_outdir = nu_pipeline_output_path.fn(obsid)
     for fpm in "A", "B":
         infiles = glob.glob(
-            os.path.join(outdir, f"*{obsid}{fpm}01_cl_src{src}.evt*")
-        ) + glob.glob(os.path.join(outdir, f"*{obsid}{fpm}_src{src}.evt*"))
+            os.path.join(outdir, f"nu{obsid}{fpm}01_cl_src{src}.evt*")
+        ) + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
         for infile in infiles:
             logger.info(f"Barycentering {infile}")
 
@@ -220,7 +231,7 @@ def barycenter_data(obsid, ra, dec, src=1):
 def process_nustar_obsid(obsid, config, ra="NONE", dec="NONE"):
     os.makedirs(os.path.join(nu_base_output_path(obsid)), exist_ok=True)
     outdir = nu_run_l2_pipeline(obsid)
-    splitdir = recover_spacecraft_science_data(obsid)
-    separate_sources([outdir, splitdir])
-    outfiles = join_source_data(obsid, [outdir, splitdir])
-    barycenter_data(obsid, ra=48.962664, dec=+69.679298)
+    splitdir = recover_spacecraft_science_data(obsid, wait_for=[nu_run_l2_pipeline])
+    separate_sources([outdir, splitdir], wait_for=[recover_spacecraft_science_data])
+    outfiles = join_source_data(obsid, [outdir, splitdir], wait_for=[separate_sources])
+    barycenter_data(obsid, ra=48.962664, dec=+69.679298, wait_for=[join_source_data])
