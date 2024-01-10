@@ -4,7 +4,7 @@ import sys
 import glob
 import traceback
 import pytest
-from .nustar import nu_raw_data_path
+from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nicer import ni_raw_data_path
 
 from prefect import flow, task, get_run_logger
@@ -68,7 +68,7 @@ def get_remote_directory_listing(url: str):
     return urls
 
 
-@task
+@task(task_run_name="download_{node.split('/')[-1])}")
 def download_node(
     node: str,
     base_url: str,
@@ -135,7 +135,7 @@ def recursive_download(
             logger.info(f"Skipping {node} because not included in {re_include.pattern}")
             continue
         if re_exclude is not None and re_exclude.search(node):
-            logger.info(f"Skipping {node} because excluded in {re_include.pattern}")
+            logger.info(f"Skipping {node} because excluded in {re_exclude.pattern}")
             continue
         local_vers.append(
             download_node(

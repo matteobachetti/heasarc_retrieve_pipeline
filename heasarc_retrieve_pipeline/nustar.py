@@ -11,32 +11,56 @@ try:
 except ImportError:
     HAS_HEASOFT = False
 
-OUT_DATA_DIR = "./"
+DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def nu_raw_data_path(obsid, **kwargs):
-    return obsid
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_local_raw_path_{obsid}",
+)
+def nu_local_raw_data_path(obsid, config, **kwargs):
+    return os.path.join(config["input_data_path"], obsid)
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_remote_raw_path_{obsid}",
+)
+def nu_heasarc_raw_data_path(obsid):
     return os.path.normpath(f"/FTP/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/")
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def nu_base_output_path(obsid):
-    return os.path.join(OUT_DATA_DIR, obsid)
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_base_output_{obsid}",
+)
+def nu_base_output_path(obsid, config):
+    return os.path.join(config["out_data_path"], obsid)
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_pipeline_output_{obsid}",
+)
+def nu_pipeline_output_path(obsid, config):
+    return os.path.join(config["out_data_path"], obsid + "/event_cl/")
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="split_path_{obsid}",
+)
+def split_path(obsid, config):
+    return os.path.join(config["out_data_path"], obsid + "/split/")
 
 
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def nu_pipeline_output_path(obsid):
-    return os.path.join(OUT_DATA_DIR, obsid + "/event_cl/")
-
-
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def split_path(obsid):
-    return os.path.join(OUT_DATA_DIR, obsid + "/split/")
-
-
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def separate_sources(directories):
+def separate_sources(directories, config):
     for d in directories:
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
@@ -46,59 +70,49 @@ def separate_sources(directories):
             filter_sources_in_images(event_file)
 
 
-# @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-# def nu_run_l2_pipeline_on_single_fpm(obsid, fpm):
-#     logger = get_run_logger()
-#     nupipeline = hsp.HSPTask("nupipeline")
-#     logger.info(f"Running NuSTAR L2 pipeline on fpm {fpm}")
-#     datadir = nu_raw_data_path.fn(obsid)
-#     ev_dir = nu_pipeline_output_path.fn(obsid)
-#     os.makedirs(ev_dir, exist_ok=True)
-#     stem = "nu" + obsid
-#     nupipeline(
-#         indir=datadir,
-#         outdir=ev_dir,
-#         clobber="yes",
-#         steminputs=stem,
-#         instrument=fpm,
-#         noprompt=True,
-#         verbose=True,
-#     )
-#     return True
-
-
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def nu_run_l2_pipeline(obsid):
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="l2_pipeline_obsid_{obsid}",
+)
+def nu_run_l2_pipeline(obsid, config):
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
     logger = get_run_logger()
     nupipeline = hsp.HSPTask("nupipeline")
     logger.info("Running NuSTAR L2 pipeline")
-    datadir = nu_raw_data_path.fn(obsid)
-    ev_dir = nu_pipeline_output_path.fn(obsid)
+    datadir = nu_local_raw_data_path.fn(obsid, config=config)
+    ev_dir = nu_pipeline_output_path.fn(obsid, config=config)
     os.makedirs(ev_dir, exist_ok=True)
     stem = "nu" + obsid
-    for instr in ["FPMA", "FPMB"]:
-        nupipeline(
-            indir=datadir,
-            outdir=ev_dir,
-            clobber="yes",
-            steminputs=stem,
-            instrument=instr,
-            noprompt=True,
-            verbose=True,
-        )
+    result = nupipeline(
+        indir=datadir,
+        outdir=ev_dir,
+        clobber="yes",
+        steminputs=stem,
+        instrument="ALL",
+        noprompt=True,
+        verbose=True,
+    )
+    print("return code:", result.returncode)
+    if result.returncode != 0:
+        logger.error(f"nupipeline failed: {result.stderr}")
+        raise RuntimeError("nupipeline failed")
 
     return ev_dir
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def recover_spacecraft_science_data(obsid):
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_recover_spacecraft_science_{obsid}",
+)
+def recover_spacecraft_science_data(obsid, config):
     logger = get_run_logger()
-    logger.info("Squeezing every photon from spacecraft science data")
-    datadir = nu_raw_data_path.fn(obsid)
-    ev_dir = nu_pipeline_output_path.fn(obsid)
-    splitdir = split_path.fn(obsid)
+    logger.info(f"Squeezing every photon from spacecraft science data in {obsid}")
+    datadir = nu_local_raw_data_path.fn(obsid, config)
+    ev_dir = nu_pipeline_output_path.fn(obsid, config)
+    splitdir = split_path.fn(obsid, config=config)
 
     hk_dir = os.path.join(datadir, "hk")
 
@@ -132,10 +146,14 @@ def recover_spacecraft_science_data(obsid):
     return splitdir
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def join_source_data(obsid, directories, src_num=1):
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_join_science_{obsid}_src{src_num}",
+)
+def join_source_data(obsid, directories, config, src_num=1):
     logger = get_run_logger()
-    outdir = nu_base_output_path.fn(obsid)
+    outdir = nu_base_output_path.fn(obsid, config=config)
     outfiles = []
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}_src{src_num}.evt")
@@ -199,39 +217,68 @@ def join_source_data(obsid, directories, src_num=1):
     return outfiles
 
 
-@task
-def barycenter_data(obsid, ra, dec, src=1):
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=90),
+    task_run_name="nu_barycenter_{infile}",
+)
+def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
     logger = get_run_logger()
-    outdir = nu_base_output_path.fn(obsid)
+    logger.info(f"Barycentering {infile}")
+
+    outfile = infile.replace(".evt", "_bary.evt")
+    logger.info(f"Output file: {outfile}")
+
+    hsp.barycorr(
+        infile=infile,
+        outfile=outfile,
+        ra=ra,
+        dec=dec,
+        ephem="JPLEPH.430",
+        refframe="ICRS",
+        clobber="yes",
+        orbitfiles=attorb,
+    )
+
+    return outfile
+
+
+@flow(flow_run_name="nu_barycenter_{obsid}")
+def barycenter_data(obsid, ra, dec, config, src=1):
+    logger = get_run_logger()
+    outdir = nu_base_output_path.fn(obsid, config=config)
     logger.info(f"Barycentering data in directory {outdir}")
-    pipe_outdir = nu_pipeline_output_path.fn(obsid)
+    pipe_outdir = nu_pipeline_output_path.fn(obsid, config=config)
     for fpm in "A", "B":
         infiles = glob.glob(
             os.path.join(outdir, f"nu{obsid}{fpm}01_cl_src{src}.evt*")
         ) + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
         for infile in infiles:
-            logger.info(f"Barycentering {infile}")
-
-            outfile = infile.replace(".evt", "_bary.evt")
-            logger.info(f"Output file: {outfile}")
-
-            hsp.barycorr(
-                infile=infile,
-                outfile=outfile,
+            barycenter_file(
+                infile,
+                os.path.join(pipe_outdir, f"nu{obsid}{fpm}.attorb"),
                 ra=ra,
                 dec=dec,
-                ephem="JPLEPH.430",
-                refframe="ICRS",
-                clobber="yes",
-                orbitfiles=os.path.join(pipe_outdir, f"nu{obsid}{fpm}.attorb"),
+                src=src,
             )
 
 
 @flow
-def process_nustar_obsid(obsid, config, ra="NONE", dec="NONE"):
-    os.makedirs(os.path.join(nu_base_output_path(obsid)), exist_ok=True)
-    outdir = nu_run_l2_pipeline(obsid)
-    splitdir = recover_spacecraft_science_data(obsid, wait_for=[nu_run_l2_pipeline])
-    separate_sources([outdir, splitdir], wait_for=[recover_spacecraft_science_data])
-    outfiles = join_source_data(obsid, [outdir, splitdir], wait_for=[separate_sources])
-    barycenter_data(obsid, ra=48.962664, dec=+69.679298, wait_for=[join_source_data])
+def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
+    config = DEFAULT_CONFIG if config is None else config
+    logger = get_run_logger()
+    logger.info(f"Processing NuSTAR observation {obsid}")
+    os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
+    outdir = nu_run_l2_pipeline(obsid, config=config)
+    splitdir = recover_spacecraft_science_data(
+        obsid, config, wait_for=[nu_run_l2_pipeline]
+    )
+    separate_sources(
+        [outdir, splitdir], config, wait_for=[recover_spacecraft_science_data]
+    )
+    outfiles = join_source_data(
+        obsid, [outdir, splitdir], config, wait_for=[separate_sources]
+    )
+    barycenter_data(
+        obsid, ra=48.962664, dec=+69.679298, config=config, wait_for=[join_source_data]
+    )
