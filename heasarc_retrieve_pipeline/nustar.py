@@ -47,7 +47,7 @@ def nu_base_output_path(obsid, config):
     task_run_name="nu_pipeline_output_{obsid}",
 )
 def nu_pipeline_output_path(obsid, config):
-    return os.path.join(config["out_data_path"], obsid + "/event_cl/")
+    return os.path.join(config["out_data_path"], obsid + "/event_pipe/")
 
 
 @task(
@@ -65,6 +65,9 @@ def separate_sources(directories, config):
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
+            if event_file.endswith(".gpg"):
+                continue
+            logger.info(f"Processing {event_file}")
             if os.path.exists(event_file.replace(".evt", "_src1.evt")):
                 continue
             filter_sources_in_images(event_file)
