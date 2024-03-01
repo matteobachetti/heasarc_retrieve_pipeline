@@ -68,7 +68,7 @@ def get_remote_directory_listing(url: str):
     return urls
 
 
-@task(task_run_name="download_{os.path.basename(node))}")
+@task(task_run_name="download_{node}")
 def download_node(
     node: str,
     base_url: str,
