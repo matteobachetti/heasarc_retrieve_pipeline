@@ -1,6 +1,8 @@
 Pipeline to automatically retrieve data from HEASARC
 ----------------------------------------------------
 
+This is an experiment of pipelines using Prefect. Not to be even marginally considered for production.
+
 License
 -------
 
