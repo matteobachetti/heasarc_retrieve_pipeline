@@ -28,7 +28,7 @@ def nu_local_raw_data_path(obsid, config, **kwargs):
     cache_expiration=timedelta(days=1000),
     task_run_name="nu_remote_raw_path_{obsid}",
 )
-def nu_heasarc_raw_data_path(obsid):
+def nu_heasarc_raw_data_path(obsid, **kwargs):
     return os.path.normpath(f"/FTP/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/")
 
 
@@ -231,7 +231,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
 
     outfile = infile.replace(".evt", "_bary.evt")
     logger.info(f"Output file: {outfile}")
-
+    print("bu")
     hsp.barycorr(
         infile=infile,
         outfile=outfile,
