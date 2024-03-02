@@ -247,11 +247,24 @@ def retrieve_heasarc_data_by_source_name(
     for obsid, time in zip(results["obsid"], results["time"]):
         os.chdir(cwd)
         url = remote_data_url(mission, obsid, time)
-        recursive_download(url, outdir, cut_ndirs=0, test_str=".", test=test)
+        recursive_download(
+            url,
+            outdir,
+            cut_ndirs=0,
+            test_str=".",
+            test=test,
+            wait_for=[remote_data_url],
+        )
         if test:
             break
         os.chdir(outdir)
-        process_nustar_obsid(obsid, config=None, ra=pos.ra.deg, dec=pos.dec.deg)
+        process_nustar_obsid(
+            obsid,
+            config=None,
+            ra=pos.ra.deg,
+            dec=pos.dec.deg,
+            wait_for=[recursive_download],
+        )
 
     return results
 
