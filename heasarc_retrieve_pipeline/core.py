@@ -214,6 +214,17 @@ def get_source_position(source: str):
     return pos
 
 
+@task
+def retrieve_heasarc_table_by_source_name(
+    source: str, mission: str = "nustar", radius_deg: float = 0.1
+):
+    pos = get_source_position(source)
+    results = retrieve_heasarc_table_by_position.fn(
+        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+    )
+    return results
+
+
 @flow
 def retrieve_heasarc_data_by_source_name(
     source: str,
