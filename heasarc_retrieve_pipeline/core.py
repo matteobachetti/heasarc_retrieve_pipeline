@@ -5,7 +5,8 @@ import glob
 import traceback
 import pytest
 from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
-from .nicer import ni_raw_data_path
+from .nustar import process_nustar_obsid
+from .nicer import ni_raw_data_path, process_nicer_obsid
 
 from prefect import flow, task, get_run_logger
 
@@ -156,12 +157,14 @@ MISSION_CONFIG = {
         "path_func": nu_raw_data_path,
         "expo_column": "exposure_a",
         "additional": "solar_activity",
+        "obsid_processing": process_nustar_obsid,
     },
     "nicer": {
         "table": "nicermastr",
         "path_func": ni_raw_data_path,
         "expo_column": "exposure",
         "additional": "",
+        "obsid_processing": process_nicer_obsid,
     },
 }
 
@@ -203,16 +206,12 @@ def retrieve_heasarc_table_by_position(
 
 
 @task
-def retrieve_heasarc_table_by_source_name(
-    source: str, mission: str = "nustar", radius_deg: float = 0.1
-):
+def get_source_position(source: str):
     import astropy.coordinates as coord
 
     pos = coord.SkyCoord.from_name(f"{source}")
 
-    return retrieve_heasarc_table_by_position.fn(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
-    )
+    return pos
 
 
 @flow
@@ -223,11 +222,12 @@ def retrieve_heasarc_data_by_source_name(
     radius_deg: float = 0.1,
     test: bool = False,
 ):
-    import astropy.coordinates as coord
 
     logger = get_run_logger()
-    results = retrieve_heasarc_table_by_source_name.fn(
-        source, mission=mission, radius_deg=radius_deg
+    pos = get_source_position(source)
+
+    results = retrieve_heasarc_table_by_position.fn(
+        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
 
     for row in results:
@@ -238,18 +238,9 @@ def retrieve_heasarc_data_by_source_name(
         recursive_download(url, outdir, cut_ndirs=0, test_str=".", test=test)
         if test:
             break
+        process_nustar_obsid(obsid, config=None, ra=pos.ra.deg, dec=pos.dec.deg)
+
     return results
-
-
-# test that the retrieval works
-@pytest.mark.parametrize(
-    "mission",
-    ["nustar", "nicer"],
-)
-def test_retrieve_heasarc_table_by_source_name(mission):
-    results = retrieve_heasarc_table_by_source_name.fn("M82 X-2", mission=mission)
-    results.to_table().sort("time")
-    assert len(results) > 0
 
 
 @pytest.mark.parametrize(
