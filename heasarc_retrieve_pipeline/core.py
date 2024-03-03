@@ -264,6 +264,7 @@ def retrieve_heasarc_data_by_source_name(
             ra=pos.ra.deg,
             dec=pos.dec.deg,
             wait_for=[recursive_download],
+            return_result=True,
         )
 
     return results

@@ -65,6 +65,11 @@ def filter_sources_in_images(eventfile, region_size=30):
         & (table["X"] > 0)
         & (table["Y"] > 0)
     )
+
+    if np.count_nonzero(good) < 20:
+        hdul.close()
+        return
+
     table = table[good]
     xmin = np.min(table["Y"])
     ymin = np.min(table["X"])
