@@ -53,6 +53,15 @@ def nu_pipeline_output_path(obsid, config):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
+    task_run_name="nu_pipeline_output_{obsid}",
+)
+def nu_pipeline_done_file(obsid, config):
+    return os.path.join(nu_pipeline_output_path.fn(obsid, config), "PIPELINE_DONE.TXT")
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
     task_run_name="split_path_{obsid}",
 )
 def split_path(obsid, config):
@@ -81,6 +90,11 @@ def separate_sources(directories, config):
 def nu_run_l2_pipeline(obsid, config):
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
+    pipe_done_file = nu_pipeline_done_file.fn(obsid, config=config)
+    if os.path.exists(pipe_done_file):
+        logger = get_run_logger()
+        logger.info(f"Data for {obsid} already preprocessed")
+        return
     logger = get_run_logger()
     nupipeline = hsp.HSPTask("nupipeline")
     logger.info("Running NuSTAR L2 pipeline")
@@ -102,6 +116,8 @@ def nu_run_l2_pipeline(obsid, config):
         logger.error(f"nupipeline failed: {result.stderr}")
         raise RuntimeError("nupipeline failed")
 
+    open(pipe_done_file, "a").close()
+
     return ev_dir
 
 
@@ -116,13 +132,13 @@ def recover_spacecraft_science_data(obsid, config):
     datadir = nu_local_raw_data_path.fn(obsid, config)
     ev_dir = nu_pipeline_output_path.fn(obsid, config)
     splitdir = split_path.fn(obsid, config=config)
-
+    recover_done_file = os.path.join(splitdir, "RECOVER_DONE.TXT")
     hk_dir = os.path.join(datadir, "hk")
 
     evfiles_06 = glob.glob(os.path.join(ev_dir, "*[AB]06_cl.evt*"))
 
-    if os.path.exists(splitdir):
-        logger.info("Output directory exists. Assuming processing done")
+    if os.path.exists(recover_done_file):
+        logger.info("Processing done")
         return splitdir
 
     for evfile in evfiles_06:
@@ -145,7 +161,7 @@ def recover_spacecraft_science_data(obsid, config):
             outdir=splitdir,
             clobber="yes",
         )
-
+    open(recover_done_file, "a").close()
     return splitdir
 
 
@@ -272,22 +288,20 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")
     os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
-    outdir = nu_base_output_path.fn(obsid, config=config)
+    basedir = nu_base_output_path.fn(obsid, config=config)
+    # splitdir = split_path.fn(obsid, config=config)
+    pipedir = nu_pipeline_output_path.fn(obsid, config=config)
 
-    if os.path.exists(outdir):
-        if len(glob.glob(os.path.join(outdir, f"nu{obsid}*bary.evt*"))) > 0:
-            logger.info(f"Data for {obsid} already processed")
-            return
+    nu_run_l2_pipeline(obsid, config=config)
 
-    outdir = nu_run_l2_pipeline(obsid, config=config)
     splitdir = recover_spacecraft_science_data(
         obsid, config, wait_for=[nu_run_l2_pipeline]
     )
     separate_sources(
-        [outdir, splitdir], config, wait_for=[recover_spacecraft_science_data]
+        [pipedir, splitdir], config, wait_for=[recover_spacecraft_science_data]
     )
     outfiles = join_source_data(
-        obsid, [outdir, splitdir], config, wait_for=[separate_sources]
+        obsid, [pipedir, splitdir], config, wait_for=[separate_sources]
     )
     barycenter_data(
         obsid, ra=48.962664, dec=+69.679298, config=config, wait_for=[join_source_data]
