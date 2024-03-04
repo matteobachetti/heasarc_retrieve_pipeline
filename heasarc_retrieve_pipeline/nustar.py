@@ -272,6 +272,13 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")
     os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
+    outdir = nu_base_output_path.fn(obsid, config=config)
+
+    if os.path.exists(outdir):
+        if len(glob.glob(os.path.join(outdir, f"nu{obsid}*bary.evt*"))) > 0:
+            logger.info(f"Data for {obsid} already processed")
+            return
+
     outdir = nu_run_l2_pipeline(obsid, config=config)
     splitdir = recover_spacecraft_science_data(
         obsid, config, wait_for=[nu_run_l2_pipeline]
