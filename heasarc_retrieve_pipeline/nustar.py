@@ -290,9 +290,12 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     logger.info(f"Barycentering data in directory {outdir}")
     pipe_outdir = nu_pipeline_output_path.fn(obsid, config=config)
     for fpm in "A", "B":
-        infiles = glob.glob(
-            os.path.join(outdir, f"nu{obsid}{fpm}01_cl_src{src}.evt*")
-        ) + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
+        infiles = (
+            glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl_src{src}.evt*"))
+            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
+            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl_back.evt*"))
+            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_back.evt*"))
+        )
         for infile in infiles:
             barycenter_file(
                 infile,
