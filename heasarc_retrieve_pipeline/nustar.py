@@ -1,4 +1,6 @@
 import os
+import re
+
 import glob
 from datetime import timedelta
 from prefect import flow, task, get_run_logger
@@ -12,6 +14,8 @@ except ImportError:
     HAS_HEASOFT = False
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
+
+valid_re = re.compile(r"nu[0-9]{11}[AB]0[16].*")
 
 
 @task(
@@ -69,17 +73,30 @@ def split_path(obsid, config):
 
 
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
+    logger = get_run_logger()
+    if event_file.endswith(".gpg"):
+        return None
+    if not valid_re.search(event_file):
+        return None
+    logger.info(f"Processing {event_file}")
+    # if os.path.exists(event_file.replace(".evt", "_back.evt")):
+    #     logger.info("Older processing exists")
+    #     return None
+    return filter_sources_in_images(
+        event_file, region_size=region_size, back_region_size=back_region_size
+    )
+
+
+@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
 def separate_sources(directories, config):
     for d in directories:
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
-            if event_file.endswith(".gpg"):
-                continue
-            logger.info(f"Processing {event_file}")
-            if os.path.exists(event_file.replace(".evt", "_src1.evt")):
-                continue
-            filter_sources_in_images(event_file)
+            separate_sources_in_event_file.fn(
+                event_file, region_size=30, back_region_size=55
+            )
 
 
 @task(
@@ -174,8 +191,14 @@ def join_source_data(obsid, directories, config, src_num=1):
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
     outfiles = []
+
+    if src_num > 0:
+        label = f"_src{src_num}"
+    else:
+        label = "_back"
+
     for fpm in "A", "B":
-        outfile = os.path.join(outdir, f"nu{obsid}{fpm}_src{src_num}.evt")
+        outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
         if os.path.exists(outfile):
             os.unlink(outfile)
         outfile_gti = os.path.join(outdir, f"nu{obsid}{fpm}.gti")
@@ -185,9 +208,7 @@ def join_source_data(obsid, directories, config, src_num=1):
         files_to_join = []
         for d in directories:
             logger.info(f"Adding data from {d}")
-            new_files = glob.glob(
-                os.path.join(d, f"nu{obsid}{fpm}0[16]*_src{src_num}.evt*")
-            )
+            new_files = glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*{label}.evt*"))
             to_be_removed = []
             for nf in new_files:
                 if f"{fpm}01" in nf:
@@ -300,8 +321,9 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
     separate_sources(
         [pipedir, splitdir], config, wait_for=[recover_spacecraft_science_data]
     )
-    outfiles = join_source_data(
-        obsid, [pipedir, splitdir], config, wait_for=[separate_sources]
+    join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
+    join_source_data(
+        obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
     )
     barycenter_data(
         obsid, ra=48.962664, dec=+69.679298, config=config, wait_for=[join_source_data]

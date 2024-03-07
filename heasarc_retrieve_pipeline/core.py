@@ -121,6 +121,10 @@ def recursive_download(
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
+    # rec_down_file = os.path.join(outdir, "DOWNLOAD_DONE.txt")
+    # if os.path.exists(rec_down_file):
+    #     logger.info(f"Download already done for {url}")
+    #     return
     logger = get_run_logger()
     logger.info("Getting remote directory listing...")
     listing = get_remote_directory_listing.fn(url)
@@ -148,6 +152,7 @@ def recursive_download(
                 test=test,
             )
         )
+    # open(rec_down_file, "a").close()
     return local_vers
 
 

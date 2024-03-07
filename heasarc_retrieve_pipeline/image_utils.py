@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 import numpy as np
 import copy
 from astropy.table import Table
@@ -17,22 +18,40 @@ def image_from_table(table, bins, gaussian_filter_sigma=1.0, correct_zeros=True)
     return xbins, ybins, img.T
 
 
-def filter_table(table, coord, region_size=30):
-    good = (table["X"] >= coord[0] - region_size) & (
-        table["X"] <= coord[0] + region_size
-    )
-    good = (
-        (table["Y"] >= coord[1] - region_size)
-        & (table["Y"] <= coord[1] + region_size)
-        & good
-    )
-    table_filt = table[good]
+def valid_table(table):
+    return table[(table["X"] > 0) | (table["Y"] > 0)]
 
-    circle_of_coords = (table_filt["X"] - coord[0]) ** 2 + (
-        table_filt["Y"] - coord[1]
-    ) ** 2
-    good = circle_of_coords < region_size**2
-    table_filt = table_filt[good]
+
+def mask_around_region(table, coord, region_size=30):
+
+    # Note the casting to standard int. Otherwise, it will
+    # overflow and give negative numbers
+    circle_of_coords = (
+        np.array(table["X"] - coord[0]).astype(int) ** 2
+        + np.array(table["Y"] - coord[1]).astype(int) ** 2
+    )
+    return circle_of_coords < region_size**2
+
+
+def filter_table(table, coord, region_size=30):
+    table = valid_table(table)
+    table = table[mask_around_region(table, coord, region_size)]
+
+    return table
+
+
+def filter_table_outside_regions(table, coord_list, region_size=100):
+    if len(np.shape(coord_list)) < 2:
+        coord_list = np.array([coord_list])
+    if not isinstance(region_size, Iterable):
+        region_size = np.ones(len(coord_list)) * region_size
+    bad = (table["X"] < 0) | (table["Y"] < 0)
+
+    for i, coord in enumerate(coord_list):
+        bad = bad | mask_around_region(table, coord, region_size[i])
+
+    table_filt = table[~bad]
+
     return table_filt
 
 
@@ -53,7 +72,7 @@ def get_random_fluxes_in_img(table, region_size=30, n_rand=100):
     return fluxes
 
 
-def filter_sources_in_images(eventfile, region_size=30):
+def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     hdul = fits.open(eventfile)
 
     table = Table(copy.deepcopy(hdul[1].data))
@@ -132,4 +151,21 @@ def filter_sources_in_images(eventfile, region_size=30):
         plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
         plt.close(fig)
 
+    table_filt = filter_table_outside_regions(
+        table, coordinates, region_size=back_region_size
+    )
+
+    hdul[1].data = fits.BinTableHDU(table_filt).data
+    hdul.writeto(
+        eventfile.replace(".gz", "").replace(".evt", f"_back.evt"),
+        overwrite=True,
+    )
+    x_filt, y_filt, img_filt = image_from_table(
+        table_filt, bins, gaussian_filter_sigma=0
+    )
+    fig = plt.figure(eventfile + f"_back")
+    plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
+    plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
+    plt.close(fig)
     hdul.close()
+    return True
