@@ -328,6 +328,4 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
     join_source_data(
         obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
     )
-    barycenter_data(
-        obsid, ra=48.962664, dec=+69.679298, config=config, wait_for=[join_source_data]
-    )
+    barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])

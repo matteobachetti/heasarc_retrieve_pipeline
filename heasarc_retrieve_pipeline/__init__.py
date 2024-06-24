@@ -3,4 +3,4 @@
 from .version import __version__
 import matplotlib
 
-matplotlib.use("Agg")
+# matplotlib.use("Agg")
