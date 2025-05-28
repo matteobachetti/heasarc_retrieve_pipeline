@@ -8,14 +8,24 @@ authors = [
   { name = "Matteo Bachetti", email = "matteo@matteobachetti.it" },
 ]
 dependencies = [
-
+  "matplotlib",
+  "astropy<7.0",
+  "numpy",
+  "pyvo",
+  "pytest",
+  "prefect",
+  "pysmartdl",
+  "scikit-image",
+  "scipy",
+  "statsmodels",
+  "beautifulsoup4",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
 test = [
     "pytest",
-    "pytest-doctestplus",
+    "pytest-astropy",
 ]
 docs = [
     "sphinx",
