@@ -3,6 +3,9 @@ import glob
 from prefect import flow, task
 
 
+OUT_DATA_DIR = "./"
+
+
 @task
 def process_nicer_obsid(obsid, config=None, ra="NONE", dec="NONE"):
     raise NotImplementedError("process_nicer_obsid is not yet implemented.")
@@ -15,9 +18,7 @@ def ni_raw_data_path(obsid, time):
     mjd = Time(time.data, format="mjd")
     mjd_dt = mjd.to_datetime()
 
-    return os.path.normpath(
-        f"/FTP/nicer/data/obs/{mjd_dt.year}_{mjd_dt.month:02d}//{obsid}/"
-    )
+    return os.path.normpath(f"/FTP/nicer/data/obs/{mjd_dt.year}_{mjd_dt.month:02d}//{obsid}/")
 
 
 @task
