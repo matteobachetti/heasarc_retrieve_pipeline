@@ -26,6 +26,7 @@ dynamic = ["version"]
 test = [
     "pytest",
     "pytest-astropy",
+    "tox",
 ]
 docs = [
     "sphinx",
