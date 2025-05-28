@@ -16,7 +16,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10"]
+        include:
+        # python-version: ["3.8", "3.9", "3.10"]
+        - python-version: "3.8"
+          toxenv: "py38-test"
+        - python-version: "3.10"
+          toxenv: "py310-test"
+        - python-version: "3.12"
+          toxenv: "py310-test"
+
 
     steps:
     - uses: actions/checkout@v3
@@ -37,4 +45,4 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        pytest
+        tox -e ${{ matrix.toxenv }}
