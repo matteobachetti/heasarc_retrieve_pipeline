@@ -57,7 +57,7 @@ include-package-data = true
 [tool.setuptools.packages.find]
 
 [tool.setuptools_scm]
-write_to = "heasarc_retrieve_pipeline/version.py"
+write_to = "heasarc_retrieve_pipeline/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = [
