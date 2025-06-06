@@ -1,9 +1,13 @@
 import os
 import re
+import shutil
 import sys
 import glob
 import traceback
 import pytest
+from astropy.table import hstack
+from astroquery.heasarc import Heasarc
+
 from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nustar import process_nustar_obsid
 from .nicer import ni_raw_data_path, process_nicer_obsid
@@ -118,6 +122,11 @@ def recursive_download(
     re_include: str = "",
     re_exclude: str = "",
 ):
+    if not url.startswith("http"):
+        outpath = os.path.join(outdir, url.split("/")[-1])
+        shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
+        return os.walk(outpath)
+
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
@@ -187,18 +196,20 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
-    import astropy.coordinates as coord
-    import pyvo as vo
+    # import astropy.coordinates as coord
+    # import pyvo as vo
 
-    tap_services = vo.regsearch(servicetype="table", keywords=["heasarc"])
-    tap_service = tap_services[0].service
+    # from astropy.coordinates import SkyCoord
+
+    # tap_services = vo.regsearch(servicetype="table", keywords=["heasarc"])
+    # tap_service = tap_services[0].service
 
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
     if additional != "":
         additional = f", {additional}"
-    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date {additional}
+    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
         FROM public.{table} as cat
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
@@ -206,7 +217,9 @@ def retrieve_heasarc_table_by_position(
         cat.{expo_name} > 0 order by cat.time
         """
 
-    results = tap_service.search(query)
+    # results = tap_service.search(query)
+    results = Heasarc.query_tap(query).to_table()
+
     return results
 
 
@@ -230,8 +243,8 @@ def retrieve_heasarc_table_by_source_name(
     return results
 
 
-@flow
-def retrieve_heasarc_data_by_source_name(
+@task
+def retrieve_heasarc_data_by_source_name_old(
     source: str,
     outdir: str = "out",
     mission: str = "nustar",
@@ -252,6 +265,68 @@ def retrieve_heasarc_data_by_source_name(
     for obsid, time in zip(results["obsid"], results["time"]):
         os.chdir(cwd)
         url = remote_data_url(mission, obsid, time)
+        recursive_download(
+            url,
+            outdir,
+            cut_ndirs=0,
+            test_str=".",
+            test=test,
+            wait_for=[remote_data_url],
+        )
+        if test:
+            break
+        os.chdir(outdir)
+        process_nustar_obsid(
+            obsid,
+            config=None,
+            ra=pos.ra.deg,
+            dec=pos.dec.deg,
+            wait_for=[recursive_download],
+            return_state=True,
+        )
+
+    return results
+
+
+@flow
+def retrieve_heasarc_data_by_source_name(
+    source: str,
+    outdir: str = "out",
+    mission: str = "nustar",
+    radius_deg: float = 0.1,
+    test: bool = False,
+):
+
+    logger = get_run_logger()
+    pos = get_source_position(source)
+
+    results = retrieve_heasarc_table_by_position.fn(
+        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+    )
+    try:
+        links = Heasarc.locate_data(results)
+    except Exception as e:
+        logger.error(f"Error using astroquery to locate data: {str(e)}")
+        return retrieve_heasarc_data_by_source_name_old.fn(
+            source=source,
+            outdir=outdir,
+            mission=mission,
+            radius_deg=radius_deg,
+            test=test,
+        )
+    results = hstack([results, links])
+    for row in results:
+        logger.info(f"{row['obsid']}, {row['time']}")
+    cwd = os.getcwd()
+    for obsid, time, sci_dir, remote_url in zip(
+        results["obsid"], results["time"], results["sciserver"], results["access_url"]
+    ):
+        os.chdir(cwd)
+        if "SCISERVER_USER_ID" in os.environ:
+
+            url = sci_dir
+        else:
+            url = remote_url
         recursive_download(
             url,
             outdir,
