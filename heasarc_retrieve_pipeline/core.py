@@ -122,6 +122,7 @@ def recursive_download(
     re_include: str = "",
     re_exclude: str = "",
 ):
+
     if not url.startswith("http"):
         outpath = os.path.join(outdir, url.split("/")[-1])
         shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
@@ -304,6 +305,7 @@ def retrieve_heasarc_data_by_source_name(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
     try:
+        Heasarc._lastcatalog_name = MISSION_CONFIG[mission]["table"]
         links = Heasarc.locate_data(results)
     except Exception as e:
         logger.error(f"Error using astroquery to locate data: {str(e)}")
@@ -323,7 +325,6 @@ def retrieve_heasarc_data_by_source_name(
     ):
         os.chdir(cwd)
         if "SCISERVER_USER_ID" in os.environ:
-
             url = sci_dir
         else:
             url = remote_url
