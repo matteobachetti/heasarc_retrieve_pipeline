@@ -305,7 +305,8 @@ def retrieve_heasarc_data_by_source_name(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
     try:
-        Heasarc._lastcatalog_name = MISSION_CONFIG[mission]["table"]
+        # Work around for astroquery bug
+        Heasarc._last_catalog_name = MISSION_CONFIG[mission]["table"]
         links = Heasarc.locate_data(results)
     except Exception as e:
         logger.error(f"Error using astroquery to locate data: {str(e)}")
