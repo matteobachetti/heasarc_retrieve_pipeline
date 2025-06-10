@@ -124,8 +124,12 @@ def recursive_download(
 ):
 
     if not url.startswith("http"):
-        outpath = os.path.join(outdir, url.split("/")[-1])
+        outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
+        logger = get_run_logger()
+        logger.info(f"Copied local directory {url} to {outpath}")
+
         shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
+
         return os.walk(outpath)
 
     re_include = re.compile(re_include) if re_include != "" else None
