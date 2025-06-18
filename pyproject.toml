@@ -19,6 +19,7 @@ dependencies = [
   "scipy",
   "statsmodels",
   "beautifulsoup4",
+  "boto3", 
 ]
 dynamic = ["version"]
 
