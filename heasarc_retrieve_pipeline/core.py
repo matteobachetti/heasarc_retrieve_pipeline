@@ -201,13 +201,6 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
-    # import astropy.coordinates as coord
-    # import pyvo as vo
-
-    # from astropy.coordinates import SkyCoord
-
-    # tap_services = vo.regsearch(servicetype="table", keywords=["heasarc"])
-    # tap_service = tap_services[0].service
 
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]

@@ -11,7 +11,7 @@ dependencies = [
   "matplotlib",
   "astropy<7.0",
   "numpy",
-  "pyvo",
+  "astroquery",
   "pytest",
   "prefect",
   "pysmartdl",
