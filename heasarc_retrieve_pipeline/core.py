@@ -293,6 +293,8 @@ def retrieve_heasarc_data_by_source_name(
     mission: str = "nustar",
     radius_deg: float = 0.1,
     test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
 ):
 
     logger = get_run_logger()
@@ -318,14 +320,24 @@ def retrieve_heasarc_data_by_source_name(
     for row in results:
         logger.info(f"{row['obsid']}, {row['time']}")
     cwd = os.getcwd()
-    for obsid, time, sci_dir, remote_url in zip(
-        results["obsid"], results["time"], results["sciserver"], results["access_url"]
+    for obsid, time, sci_dir, remote_url, s3_url in zip(
+        results["obsid"],
+        results["time"],
+        results["sciserver"],
+        results["access_url"],
+        results["aws"],
     ):
         os.chdir(cwd)
-        if "SCISERVER_USER_ID" in os.environ:
+        if force_s3:
+            url = s3_url
+        elif force_heasarc:
+            url = remote_url
+        elif "SCISERVER_USER_ID" in os.environ:
             url = sci_dir
         else:
-            url = remote_url
+            # Defaults to S3
+            url = s3_url
+
         recursive_download(
             url,
             outdir,
