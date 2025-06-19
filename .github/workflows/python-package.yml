@@ -18,9 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Py3.8"
-            python: "3.8"
-            toxenv: "py38-test"
+          - name: "Py3.9"
+            python: "3.9"
+            toxenv: "py39-test"
             os: ubuntu-latest
           - name: "Py3.10"
             python: "3.10"
