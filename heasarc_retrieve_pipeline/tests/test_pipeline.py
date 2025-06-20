@@ -46,22 +46,22 @@ def test_retrieve_heasarc_data_by_obsid_nicer(host):
 
 
 @pytest.mark.remote_data
-@pytest.mark.parametrize("host", ["heasarc", "aws"])
+@pytest.mark.parametrize("host", ["aws", "heasarc"])
 def test_recursive_download(host):
     import shutil
     import re
 
     if host == "aws":
-        path = "s3://nasa-heasarc/"
+        path = "s3://nasa-heasarc"
     else:
-        path = "https://heasarc.gsfc.nasa.gov/FTP/"
+        path = "https://heasarc.gsfc.nasa.gov/FTP"
 
     results = recursive_download(
         f"{path}/nustar/data/obs/00/8/80002092003/",
         "out_test",
         cut_ndirs=0,
-        test_str=".",
         test=False,
+        test_str=".",
         re_include=r"[AB]0.*evt",
         re_exclude=r"[AB]0[2-5]",
     )

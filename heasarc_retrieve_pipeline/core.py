@@ -168,6 +168,7 @@ def recursive_download_s3(
             continue
         if os.path.exists(dest):
             logger.info(f"{dest} already exists, skipping download.")
+            local_vers.append(dest)
             continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
