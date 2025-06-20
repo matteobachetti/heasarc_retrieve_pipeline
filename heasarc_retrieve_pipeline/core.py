@@ -5,8 +5,10 @@ import sys
 import glob
 import traceback
 import pytest
-from astropy.table import hstack
+import warnings
+from astropy.table import hstack, Table
 from astroquery.heasarc import Heasarc
+from astropy.coordinates import SkyCoord
 
 from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nustar import process_nustar_obsid
@@ -108,7 +110,7 @@ def download_node(
         fname = local_ver
     if fname is None:
         logger.warning(f"Error downloading {node}: {exc_string}")
-    # print(node, local_ver)
+
     return local_ver
 
 
@@ -125,9 +127,7 @@ def recursive_download_s3(
     import boto3
     from urllib.parse import urlparse
 
-    # raise NotImplementedError(
-    #     "S3 download is not implemented yet. Please use the HEASARC API or a direct URL."
-    # )
+    warnings.warn("S3 download is not working yet. Please use the HEASARC API or a direct URL.")
     logger = get_run_logger()
     logger.info("Recursively downloading from S3...")
 
@@ -301,11 +301,31 @@ def retrieve_heasarc_table_by_position(
     return results
 
 
+def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
+    """
+    Retrieve the observation information for a given obsid from the HEASARC table.
+    """
+    expo_name = MISSION_CONFIG[mission]["expo_column"]
+    additional = MISSION_CONFIG[mission]["additional"]
+    table = MISSION_CONFIG[mission]["table"]
+    if additional != "":
+        additional = f", {additional}"
+    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
+        FROM public.{table} as cat
+        where
+        cat.obsid='{obsid}'
+        and
+        cat.{expo_name} > 0 order by cat.time
+        """
+
+    results = Heasarc.query_tap(query).to_table()
+    return results
+
+
 @task
 def get_source_position(source: str):
-    import astropy.coordinates as coord
 
-    pos = coord.SkyCoord.from_name(f"{source}")
+    pos = SkyCoord.from_name(f"{source}")
 
     return pos
 
@@ -366,6 +386,59 @@ def retrieve_heasarc_data_by_source_name_old(
     return results
 
 
+@task
+def retrieve_and_process_data(
+    result_table: Table,
+    source_position: SkyCoord = None,
+    mission: str = "nustar",
+    outdir: str = "out",
+    test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
+):
+
+    cwd = os.getcwd()
+    processing = MISSION_CONFIG[mission]["obsid_processing"]
+    if force_s3:
+        host = "aws"
+    elif force_heasarc:
+        host = "heasarc"
+    elif "SCISERVER_USER_ID" in os.environ:
+        host = "sciserver"
+    else:
+        # Defaults to AWS
+        host = "aws"
+
+    links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
+
+    for i, row in enumerate(result_table):
+        obsid = row["obsid"]
+        if source_position is not None:
+            ra = source_position.ra.deg
+            dec = source_position.dec.deg
+        else:
+            ra = row["ra"]
+            dec = row["dec"]
+
+        os.chdir(cwd)
+
+        if test:
+            break
+
+        Heasarc.download_data(links[i], host=host, location=outdir)
+
+        os.chdir(outdir)
+
+        processing(
+            obsid,
+            config=None,
+            ra=ra,
+            dec=dec,
+            wait_for=[recursive_download],
+            return_state=True,
+        )
+
+
 @flow
 def retrieve_heasarc_data_by_source_name(
     source: str,
@@ -384,9 +457,7 @@ def retrieve_heasarc_data_by_source_name(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
     try:
-        # Work around for astroquery bug
-        Heasarc._last_catalog_name = MISSION_CONFIG[mission]["table"]
-        links = Heasarc.locate_data(results)
+        links = Heasarc.locate_data(results, catalog_name=MISSION_CONFIG[mission]["table"])
     except Exception as e:
         logger.error(f"Error using astroquery to locate data: {str(e)}")
         return retrieve_heasarc_data_by_source_name_old.fn(
@@ -396,46 +467,39 @@ def retrieve_heasarc_data_by_source_name(
             radius_deg=radius_deg,
             test=test,
         )
-    results = hstack([results, links])
-    for row in results:
-        logger.info(f"{row['obsid']}, {row['time']}")
-    cwd = os.getcwd()
-    for obsid, time, sci_dir, remote_url, s3_url in zip(
-        results["obsid"],
-        results["time"],
-        results["sciserver"],
-        results["access_url"],
-        results["aws"],
-    ):
-        os.chdir(cwd)
-        if force_s3:
-            url = s3_url
-        elif force_heasarc:
-            url = remote_url
-        elif "SCISERVER_USER_ID" in os.environ:
-            url = sci_dir
-        else:
-            # Defaults to heasarc
-            url = remote_url
-
-        recursive_download(
-            url,
-            outdir,
-            cut_ndirs=0,
-            test_str=".",
-            test=test,
-            wait_for=[remote_data_url],
-        )
-        if test:
-            break
-        os.chdir(outdir)
-        process_nustar_obsid(
-            obsid,
-            config=None,
-            ra=pos.ra.deg,
-            dec=pos.dec.deg,
-            wait_for=[recursive_download],
-            return_state=True,
-        )
+    results = retrieve_and_process_data(
+        result_table=results,
+        source_position=pos,
+        mission=mission,
+        outdir=outdir,
+        test=test,
+        force_heasarc=force_heasarc,
+        force_s3=force_s3,
+    )
 
     return results
+
+
+@flow
+def retrieve_heasarc_data_by_obsid(
+    obsid: str,
+    outdir: str = "out",
+    mission: str = "nustar",
+    test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
+):
+
+    logger = get_run_logger()
+
+    results = retrieve_info_for_obsid(obsid, mission=mission)
+
+    results = retrieve_and_process_data(
+        result_table=results,
+        source_position=None,
+        mission=mission,
+        outdir=outdir,
+        test=test,
+        force_heasarc=force_heasarc,
+        force_s3=force_s3,
+    )
