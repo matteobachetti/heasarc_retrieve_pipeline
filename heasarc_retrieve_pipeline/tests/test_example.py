@@ -6,23 +6,42 @@ from heasarc_retrieve_pipeline.core import (
 )
 
 
+def kwargs_from_host(host):
+    """
+    Helper function to return kwargs based on the host.
+    """
+    if host == "aws":
+        return {"force_s3": True}
+    elif host == "heasarc":
+        return {"force_heasarc": True}
+
+
 @pytest.mark.remote_data
-@pytest.mark.parametrize(
-    "mission",
-    ["nustar", "nicer"],
-)
-def test_retrieve_heasarc_data_by_source_name(mission):
-    results = retrieve_heasarc_data_by_source_name("M82 X-2", mission=mission, test=True)
+@pytest.mark.parametrize("mission", ["nustar", "nicer"])
+@pytest.mark.parametrize("host", ["heasarc", "aws"])
+def test_retrieve_heasarc_data_by_source_name(mission, host):
+
+    results = retrieve_heasarc_data_by_source_name(
+        "M82 X-2", mission=mission, test=True, **kwargs_from_host(host)
+    )
     assert len(results) > 0
 
 
 @pytest.mark.remote_data
-@pytest.mark.parametrize(
-    "mission",
-    ["nustar", "nicer"],
-)
-def test_retrieve_heasarc_data_by_obsid(mission):
-    results = retrieve_heasarc_data_by_obsid("80002092003", mission=mission, test=True)
+@pytest.mark.parametrize("host", ["heasarc", "aws"])
+def test_retrieve_heasarc_data_by_obsid_nustar(host):
+    results = retrieve_heasarc_data_by_obsid(
+        "90101005001", mission="nustar", test=True, **kwargs_from_host(host)
+    )
+    assert len(results) > 0
+
+
+@pytest.mark.remote_data
+@pytest.mark.parametrize("host", ["heasarc", "aws"])
+def test_retrieve_heasarc_data_by_obsid_nicer(host):
+    results = retrieve_heasarc_data_by_obsid(
+        "1104010106", mission="nicer", test=True, **kwargs_from_host(host)
+    )
     assert len(results) > 0
 
 
@@ -32,7 +51,7 @@ def test_recursive_download():
     import re
 
     results = recursive_download(
-        "https://heasarc.gsfc.nasa.gov/FTP/nustar/data/obs/00/8/80002092003/",
+        "https://heasarc.gsfc.nasa.gov/FTP/nustar/data/obs/00/8/90101005001/",
         "out_test",
         cut_ndirs=0,
         test_str=".",
