@@ -128,6 +128,7 @@ def recursive_download_s3(
     import botocore
     from urllib.parse import urlparse
 
+    os.makedirs(outdir, exist_ok=True)
     logger = get_run_logger()
     logger.info("Recursively downloading from S3...")
 
@@ -152,6 +153,7 @@ def recursive_download_s3(
     local_vers = []
     for obj in content:
         key = obj["Key"]
+
         if re_include is not None and not re_include.search(key):
             logger.info(f"Skipping {key} because not included in {re_include.pattern}")
             continue
@@ -167,8 +169,7 @@ def recursive_download_s3(
         if os.path.exists(dest):
             logger.info(f"{dest} already exists, skipping download.")
             continue
-        if dest.endswith("/"):
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
 
         if not test:
