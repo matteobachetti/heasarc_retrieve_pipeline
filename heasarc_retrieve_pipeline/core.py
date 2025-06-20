@@ -125,48 +125,57 @@ def recursive_download_s3(
     re_exclude: str = "",
 ):
     import boto3
+    import botocore
     from urllib.parse import urlparse
 
-    warnings.warn("S3 download is not working yet. Please use the HEASARC API or a direct URL.")
     logger = get_run_logger()
     logger.info("Recursively downloading from S3...")
 
     # Parse S3 URL
     parsed = urlparse(url)
     bucket_name = parsed.netloc
-    prefix = parsed.path.lstrip("/")
 
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    operation_parameters = {"Bucket": bucket_name, "Prefix": prefix}
+    # Adapted from astroquery.heasarc
+    logger.info("Enabling anonymous cloud data access ...")
+    config = botocore.client.Config(signature_version=botocore.UNSIGNED)
+    s3_resource = boto3.resource("s3", config=config)
+
+    s3_client = s3_resource.meta.client
+
+    path = url.replace(f"s3://{bucket_name}/", "")
+    response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=path)
 
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
+    content = response.get("Contents", [])
     local_vers = []
-    for page in paginator.paginate(**operation_parameters):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue  # skip directories
-            if re_include is not None and not re_include.search(key):
-                logger.info(f"Skipping {key} because not included in {re_include.pattern}")
-                continue
-            if re_exclude is not None and re_exclude.search(key):
-                logger.info(f"Skipping {key} because excluded in {re_exclude.pattern}")
-                continue
-            rel_path = key.split("/")[cut_ndirs:]
-            local_path = os.path.join(outdir, *rel_path)
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            if os.path.exists(local_path):
-                logger.info(f"{local_path} exists")
-                continue
-            logger.info(f"Downloading s3://{bucket_name}/{key} to {local_path}")
-            if not test:
-                s3.download_file(bucket_name, key, local_path)
-            else:
-                logger.info(f"Faked download of s3://{bucket_name}/{key} to {local_path}")
-            local_vers.append(local_path)
+    for obj in content:
+        key = obj["Key"]
+        if re_include is not None and not re_include.search(key):
+            logger.info(f"Skipping {key} because not included in {re_include.pattern}")
+            continue
+        if re_exclude is not None and re_exclude.search(key):
+            logger.info(f"Skipping {key} because excluded in {re_exclude.pattern}")
+            continue
+
+        path2 = "/".join(path.strip("/").split("/")[:-1])
+        dest = os.path.join(outdir, key[len(path2) + 1 :])
+        if test_str is not None and test_str not in dest:
+            logger.debug(f"Ignoring {key}")
+            continue
+        if os.path.exists(dest):
+            logger.info(f"{dest} already exists, skipping download.")
+            continue
+        if dest.endswith("/"):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
+
+        if not test:
+            s3_client.download_file(bucket_name, key, dest)
+        else:
+            logger.info(f"Faked download of s3://{bucket_name}/{key} to {dest}")
+        local_vers.append(dest)
     return local_vers
 
 
