@@ -11,7 +11,7 @@ dependencies = [
   "matplotlib",
   "astropy<7.0",
   "numpy",
-  "astroquery",
+  "git+https://github.com/astropy/astroquery.git",
   "pytest",
   "prefect",
   "pysmartdl",
@@ -19,6 +19,7 @@ dependencies = [
   "scipy",
   "statsmodels",
   "beautifulsoup4",
+  "boto3",
 ]
 dynamic = ["version"]
 
