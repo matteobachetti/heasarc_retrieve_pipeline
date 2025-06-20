@@ -41,7 +41,7 @@ def download_cmd(url: str, dest: str):
         return None, str(e)
 
 
-@task
+@task(task_run_name="get_remote_directory_listing_{url}")
 def get_remote_directory_listing(url: str):
     """Give the list of files in the remote directory."""
     from urllib.request import Request, urlopen
@@ -114,7 +114,7 @@ def download_node(
     return local_ver
 
 
-@task
+@task(task_run_name="recursive_download_s3_{url}")
 def recursive_download_s3(
     url: str,
     outdir: str,
@@ -179,7 +179,7 @@ def recursive_download_s3(
     return local_vers
 
 
-@flow
+@flow(task_run_name="recursive_download_https_{url}")
 def recursive_download_https(
     url: str,
     outdir: str,
@@ -227,7 +227,7 @@ def recursive_download_https(
     return local_vers
 
 
-@task
+@task(task_run_name="copy_local_directory_{url}")
 def copy_local_directory(url: str, outdir: str):
     """Copy a local directory to the output directory."""
     outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
@@ -239,7 +239,7 @@ def copy_local_directory(url: str, outdir: str):
     return os.walk(outpath)
 
 
-@flow
+@flow(task_run_name="recursive_download_{url}")
 def recursive_download(
     url: str,
     outdir: str,
@@ -254,8 +254,10 @@ def recursive_download(
         return recursive_download_https(
             url, outdir, cut_ndirs, test_str, test, re_include, re_exclude
         )
+
     if url.startswith("s3://"):
         return recursive_download_s3(url, outdir, cut_ndirs, test_str, test, re_include, re_exclude)
+
     return copy_local_directory(url, outdir)  # For local directories, we just copy them directly
 
 
@@ -277,7 +279,7 @@ MISSION_CONFIG = {
 }
 
 
-@task
+@task(task_run_name="read_config_{config_file}")
 def read_config(config_file: str):
     import yaml
 
@@ -291,6 +293,10 @@ def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
 
+    logger = get_run_logger()
+    logger.info(
+        f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
+    )
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
@@ -301,7 +307,7 @@ def retrieve_heasarc_table_by_position(
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
         and
-        cat.{expo_name} > 0 order by cat.time
+        cat.{expo_name} >= 0 order by cat.time
         """
 
     # results = tap_service.search(query)
@@ -310,6 +316,7 @@ def retrieve_heasarc_table_by_position(
     return results
 
 
+@task(task_run_name="retrieve_info_for_obsid_{obsid}")
 def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     """
     Retrieve the observation information for a given obsid from the HEASARC table.
@@ -328,6 +335,7 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
         """
 
     results = Heasarc.query_tap(query).to_table()
+
     return results
 
 
@@ -395,7 +403,7 @@ def retrieve_heasarc_data_by_source_name_old(
     return results
 
 
-@task
+@flow
 def retrieve_and_process_data(
     result_table: Table,
     source_position: SkyCoord = None,
@@ -408,17 +416,16 @@ def retrieve_and_process_data(
 
     cwd = os.getcwd()
     processing = MISSION_CONFIG[mission]["obsid_processing"]
+    links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
     if force_s3:
-        host = "aws"
+        link_col_name = "aws"
     elif force_heasarc:
-        host = "heasarc"
+        link_col_name = "access_url"
     elif "SCISERVER_USER_ID" in os.environ:
-        host = "sciserver"
+        link_col_name = "sciserver"
     else:
         # Defaults to AWS
-        host = "aws"
-
-    links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
+        link_col_name = "aws"
 
     for i, row in enumerate(result_table):
         obsid = row["obsid"]
@@ -431,10 +438,10 @@ def retrieve_and_process_data(
 
         os.chdir(cwd)
 
+        recursive_download(links[i][link_col_name], outdir, test_str=".", test=test)
         if test:
             break
-
-        Heasarc.download_data(links[i], host=host, location=outdir)
+        # Heasarc.download_data(links[i], host=host, location=outdir)
 
         os.chdir(outdir)
 
@@ -511,4 +518,5 @@ def retrieve_heasarc_data_by_obsid(
         test=test,
         force_heasarc=force_heasarc,
         force_s3=force_s3,
+        wait_for=[retrieve_info_for_obsid],
     )
