@@ -170,7 +170,7 @@ def recursive_download_s3(
     return local_vers
 
 
-@task
+@flow
 def recursive_download_https(
     url: str,
     outdir: str,
@@ -218,6 +218,7 @@ def recursive_download_https(
     return local_vers
 
 
+@task
 def copy_local_directory(url: str, outdir: str):
     """Copy a local directory to the output directory."""
     outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
