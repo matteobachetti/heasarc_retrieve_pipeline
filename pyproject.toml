@@ -11,7 +11,7 @@ dependencies = [
   "matplotlib",
   "astropy<7.0",
   "numpy",
-  "git+https://github.com/astropy/astroquery.git",
+  "astroquery",
   "pytest",
   "prefect",
   "pysmartdl",
