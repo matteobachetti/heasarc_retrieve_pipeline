@@ -179,7 +179,7 @@ def recursive_download_s3(
     return local_vers
 
 
-@flow(task_run_name="recursive_download_https_{url}")
+@flow(flow_run_name="recursive_download_https_{url}")
 def recursive_download_https(
     url: str,
     outdir: str,
@@ -239,7 +239,7 @@ def copy_local_directory(url: str, outdir: str):
     return os.walk(outpath)
 
 
-@flow(task_run_name="recursive_download_{url}")
+@flow(flow_run_name="recursive_download_{url}")
 def recursive_download(
     url: str,
     outdir: str,
