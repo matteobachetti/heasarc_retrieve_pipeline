@@ -455,6 +455,7 @@ def retrieve_and_process_data(
             wait_for=[recursive_download],
             return_state=True,
         )
+    return result_table
 
 
 @flow
@@ -522,3 +523,4 @@ def retrieve_heasarc_data_by_obsid(
         force_s3=force_s3,
         wait_for=[retrieve_info_for_obsid],
     )
+    return results
