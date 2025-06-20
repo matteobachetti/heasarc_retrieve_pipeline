@@ -112,8 +112,8 @@ def download_node(
     return local_ver
 
 
-@flow
-def recursive_download(
+@task
+def recursive_download_s3(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
@@ -122,16 +122,64 @@ def recursive_download(
     re_include: str = "",
     re_exclude: str = "",
 ):
+    import boto3
+    from urllib.parse import urlparse
 
-    if not url.startswith("http"):
-        outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
-        logger = get_run_logger()
-        logger.info(f"Copying local directory {url} to {outpath}")
+    # raise NotImplementedError(
+    #     "S3 download is not implemented yet. Please use the HEASARC API or a direct URL."
+    # )
+    logger = get_run_logger()
+    logger.info("Recursively downloading from S3...")
 
-        shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
+    # Parse S3 URL
+    parsed = urlparse(url)
+    bucket_name = parsed.netloc
+    prefix = parsed.path.lstrip("/")
 
-        return os.walk(outpath)
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    operation_parameters = {"Bucket": bucket_name, "Prefix": prefix}
 
+    re_include = re.compile(re_include) if re_include != "" else None
+    re_exclude = re.compile(re_exclude) if re_exclude != "" else None
+
+    local_vers = []
+    for page in paginator.paginate(**operation_parameters):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue  # skip directories
+            if re_include is not None and not re_include.search(key):
+                logger.info(f"Skipping {key} because not included in {re_include.pattern}")
+                continue
+            if re_exclude is not None and re_exclude.search(key):
+                logger.info(f"Skipping {key} because excluded in {re_exclude.pattern}")
+                continue
+            rel_path = key.split("/")[cut_ndirs:]
+            local_path = os.path.join(outdir, *rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            if os.path.exists(local_path):
+                logger.info(f"{local_path} exists")
+                continue
+            logger.info(f"Downloading s3://{bucket_name}/{key} to {local_path}")
+            if not test:
+                s3.download_file(bucket_name, key, local_path)
+            else:
+                logger.info(f"Faked download of s3://{bucket_name}/{key} to {local_path}")
+            local_vers.append(local_path)
+    return local_vers
+
+
+@task
+def recursive_download_https(
+    url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+    re_include: str = "",
+    re_exclude: str = "",
+):
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
@@ -168,6 +216,37 @@ def recursive_download(
         )
     # open(rec_down_file, "a").close()
     return local_vers
+
+
+def copy_local_directory(url: str, outdir: str):
+    """Copy a local directory to the output directory."""
+    outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
+    logger = get_run_logger()
+    logger.info(f"Copying local directory {url} to {outpath}")
+
+    shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
+
+    return os.walk(outpath)
+
+
+@flow
+def recursive_download(
+    url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+    re_include: str = "",
+    re_exclude: str = "",
+):
+
+    if url.startswith("http"):
+        return recursive_download_https(
+            url, outdir, cut_ndirs, test_str, test, re_include, re_exclude
+        )
+    if url.startswith("s3://"):
+        return recursive_download_s3(url, outdir, cut_ndirs, test_str, test, re_include, re_exclude)
+    return copy_local_directory(url, outdir)  # For local directories, we just copy them directly
 
 
 MISSION_CONFIG = {
@@ -335,8 +414,8 @@ def retrieve_heasarc_data_by_source_name(
         elif "SCISERVER_USER_ID" in os.environ:
             url = sci_dir
         else:
-            # Defaults to S3
-            url = s3_url
+            # Defaults to heasarc
+            url = remote_url
 
         recursive_download(
             url,
