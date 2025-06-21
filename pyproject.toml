@@ -2,7 +2,7 @@
 name = "heasarc_retrieve_pipeline"
 description = "Pipeline to automatically retrieve data from HEASARC"
 readme = "README.rst"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { file = "licenses/LICENSE.rst", content-type = "text/plain" }
 authors = [
   { name = "Matteo Bachetti", email = "matteo@matteobachetti.it" },
@@ -11,7 +11,7 @@ dependencies = [
   "matplotlib",
   "astropy<7.0",
   "numpy",
-  "pyvo",
+  "astroquery",
   "pytest",
   "prefect",
   "pysmartdl",
@@ -19,6 +19,7 @@ dependencies = [
   "scipy",
   "statsmodels",
   "beautifulsoup4",
+  "boto3",
 ]
 dynamic = ["version"]
 

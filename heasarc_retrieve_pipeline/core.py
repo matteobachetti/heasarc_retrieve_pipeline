@@ -1,9 +1,16 @@
 import os
 import re
+import shutil
 import sys
 import glob
 import traceback
 import pytest
+import warnings
+import typing
+from astropy.table import hstack, Table
+from astroquery.heasarc import Heasarc
+from astropy.coordinates import SkyCoord
+
 from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nustar import process_nustar_obsid
 from .nicer import ni_raw_data_path, process_nicer_obsid
@@ -35,7 +42,7 @@ def download_cmd(url: str, dest: str):
         return None, str(e)
 
 
-@task
+@task(task_run_name="get_remote_directory_listing_{url}")
 def get_remote_directory_listing(url: str):
     """Give the list of files in the remote directory."""
     from urllib.request import Request, urlopen
@@ -104,12 +111,79 @@ def download_node(
         fname = local_ver
     if fname is None:
         logger.warning(f"Error downloading {node}: {exc_string}")
-    # print(node, local_ver)
+
     return local_ver
 
 
-@flow
-def recursive_download(
+@task(task_run_name="recursive_download_s3_{url}")
+def recursive_download_s3(
+    url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+    re_include: str = "",
+    re_exclude: str = "",
+):
+    import boto3
+    import botocore
+    from urllib.parse import urlparse
+
+    os.makedirs(outdir, exist_ok=True)
+    logger = get_run_logger()
+    logger.info("Recursively downloading from S3...")
+
+    # Parse S3 URL
+    parsed = urlparse(url)
+    bucket_name = parsed.netloc
+
+    # Adapted from astroquery.heasarc
+    logger.info("Enabling anonymous cloud data access ...")
+    config = botocore.client.Config(signature_version=botocore.UNSIGNED)
+    s3_resource = boto3.resource("s3", config=config)
+
+    s3_client = s3_resource.meta.client
+
+    path = url.replace(f"s3://{bucket_name}/", "")
+    response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=path)
+
+    re_include = re.compile(re_include) if re_include != "" else None
+    re_exclude = re.compile(re_exclude) if re_exclude != "" else None
+
+    content = response.get("Contents", [])
+    local_vers = []
+    for obj in content:
+        key = obj["Key"]
+
+        if re_include is not None and not re_include.search(key):
+            logger.info(f"Skipping {key} because not included in {re_include.pattern}")
+            continue
+        if re_exclude is not None and re_exclude.search(key):
+            logger.info(f"Skipping {key} because excluded in {re_exclude.pattern}")
+            continue
+
+        path2 = "/".join(path.strip("/").split("/")[:-1])
+        dest = os.path.join(outdir, key[len(path2) + 1 :])
+        if test_str is not None and test_str not in dest:
+            logger.debug(f"Ignoring {key}")
+            continue
+        if os.path.exists(dest):
+            logger.info(f"{dest} already exists, skipping download.")
+            local_vers.append(dest)
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
+
+        if not test:
+            s3_client.download_file(bucket_name, key, dest)
+        else:
+            logger.info(f"Faked download of s3://{bucket_name}/{key} to {dest}")
+        local_vers.append(dest)
+    return local_vers
+
+
+@flow(flow_run_name="recursive_download_https_{url}")
+def recursive_download_https(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
@@ -156,6 +230,40 @@ def recursive_download(
     return local_vers
 
 
+@task(task_run_name="copy_local_directory_{url}")
+def copy_local_directory(url: str, outdir: str):
+    """Copy a local directory to the output directory."""
+    outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
+    logger = get_run_logger()
+    logger.info(f"Copying local directory {url} to {outpath}")
+
+    shutil.copytree(url.rstrip("/"), outpath, dirs_exist_ok=True)
+
+    return os.walk(outpath)
+
+
+@flow(flow_run_name="recursive_download_{url}")
+def recursive_download(
+    url: str,
+    outdir: str,
+    cut_ndirs: int = 0,
+    test_str: str = ".",
+    test: bool = False,
+    re_include: str = "",
+    re_exclude: str = "",
+):
+
+    if url.startswith("http"):
+        return recursive_download_https(
+            url, outdir, cut_ndirs, test_str, test, re_include, re_exclude
+        )
+
+    if url.startswith("s3://"):
+        return recursive_download_s3(url, outdir, cut_ndirs, test_str, test, re_include, re_exclude)
+
+    return copy_local_directory(url, outdir)  # For local directories, we just copy them directly
+
+
 MISSION_CONFIG = {
     "nustar": {
         "table": "numaster",
@@ -174,7 +282,7 @@ MISSION_CONFIG = {
 }
 
 
-@task
+@task(task_run_name="read_config_{config_file}")
 def read_config(config_file: str):
     import yaml
 
@@ -187,34 +295,57 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
-    import astropy.coordinates as coord
-    import pyvo as vo
 
-    tap_services = vo.regsearch(servicetype="table", keywords=["heasarc"])
-    tap_service = tap_services[0].service
-
+    logger = get_run_logger()
+    logger.info(
+        f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
+    )
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
     if additional != "":
         additional = f", {additional}"
-    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date {additional}
+    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
         FROM public.{table} as cat
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
         and
+        cat.{expo_name} >= 0 order by cat.time
+        """
+
+    # results = tap_service.search(query)
+    results = Heasarc.query_tap(query).to_table()
+
+    return results
+
+
+@task(task_run_name="retrieve_info_for_obsid_{obsid}")
+def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
+    """
+    Retrieve the observation information for a given obsid from the HEASARC table.
+    """
+    expo_name = MISSION_CONFIG[mission]["expo_column"]
+    additional = MISSION_CONFIG[mission]["additional"]
+    table = MISSION_CONFIG[mission]["table"]
+    if additional != "":
+        additional = f", {additional}"
+    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
+        FROM public.{table} as cat
+        where
+        cat.obsid='{obsid}'
+        and
         cat.{expo_name} > 0 order by cat.time
         """
 
-    results = tap_service.search(query)
+    results = Heasarc.query_tap(query).to_table()
+
     return results
 
 
 @task
 def get_source_position(source: str):
-    import astropy.coordinates as coord
 
-    pos = coord.SkyCoord.from_name(f"{source}")
+    pos = SkyCoord.from_name(f"{source}")
 
     return pos
 
@@ -230,8 +361,8 @@ def retrieve_heasarc_table_by_source_name(
     return results
 
 
-@flow
-def retrieve_heasarc_data_by_source_name(
+@task
+def retrieve_heasarc_data_by_source_name_old(
     source: str,
     outdir: str = "out",
     mission: str = "nustar",
@@ -272,4 +403,125 @@ def retrieve_heasarc_data_by_source_name(
             return_state=True,
         )
 
+    return results
+
+
+@flow
+def retrieve_and_process_data(
+    result_table: Table,
+    source_position: typing.Union[SkyCoord, None] = None,
+    mission: str = "nustar",
+    outdir: str = "out",
+    test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
+):
+
+    cwd = os.getcwd()
+    processing = MISSION_CONFIG[mission]["obsid_processing"]
+    links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
+    if force_s3:
+        link_col_name = "aws"
+    elif force_heasarc:
+        link_col_name = "access_url"
+    elif "SCISERVER_USER_ID" in os.environ:
+        link_col_name = "sciserver"
+    else:
+        # Defaults to AWS
+        link_col_name = "aws"
+
+    for i, row in enumerate(result_table):
+        obsid = row["obsid"]
+        if source_position is not None:
+            ra = source_position.ra.deg
+            dec = source_position.dec.deg
+        else:
+            ra = row["ra"]
+            dec = row["dec"]
+
+        os.chdir(cwd)
+
+        recursive_download(links[i][link_col_name], outdir, test_str=".", test=test)
+        if test:
+            break
+        # Heasarc.download_data(links[i], host=host, location=outdir)
+
+        os.chdir(outdir)
+
+        processing(
+            obsid,
+            config=None,
+            ra=ra,
+            dec=dec,
+            wait_for=[recursive_download],
+            return_state=True,
+        )
+    return result_table
+
+
+@flow
+def retrieve_heasarc_data_by_source_name(
+    source: str,
+    outdir: str = "out",
+    mission: str = "nustar",
+    radius_deg: float = 0.1,
+    test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
+):
+
+    logger = get_run_logger()
+    pos = get_source_position(source)
+
+    results = retrieve_heasarc_table_by_position.fn(
+        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+    )
+    try:
+        links = Heasarc.locate_data(results, catalog_name=MISSION_CONFIG[mission]["table"])
+    except Exception as e:
+        logger.error(f"Error using astroquery to locate data: {str(e)}")
+        return retrieve_heasarc_data_by_source_name_old.fn(
+            source=source,
+            outdir=outdir,
+            mission=mission,
+            radius_deg=radius_deg,
+            test=test,
+        )
+    results = retrieve_and_process_data(
+        result_table=results,
+        source_position=pos,
+        mission=mission,
+        outdir=outdir,
+        test=test,
+        force_heasarc=force_heasarc,
+        force_s3=force_s3,
+    )
+
+    return results
+
+
+@flow
+def retrieve_heasarc_data_by_obsid(
+    obsid: str,
+    outdir: str = "out",
+    mission: str = "nustar",
+    test: bool = False,
+    force_heasarc: bool = False,
+    force_s3: bool = False,
+):
+
+    logger = get_run_logger()
+
+    results = retrieve_info_for_obsid(obsid, mission=mission)
+
+    results = retrieve_and_process_data(
+        result_table=results,
+        source_position=None,
+        mission=mission,
+        outdir=outdir,
+        test=test,
+        force_heasarc=force_heasarc,
+        force_s3=force_s3,
+        wait_for=[retrieve_info_for_obsid],
+    )
     return results
