@@ -6,6 +6,7 @@ import glob
 import traceback
 import pytest
 import warnings
+import typing
 from astropy.table import hstack, Table
 from astroquery.heasarc import Heasarc
 from astropy.coordinates import SkyCoord
@@ -408,7 +409,7 @@ def retrieve_heasarc_data_by_source_name_old(
 @flow
 def retrieve_and_process_data(
     result_table: Table,
-    source_position: SkyCoord = None,
+    source_position: typing.Union[SkyCoord, None] = None,
     mission: str = "nustar",
     outdir: str = "out",
     test: bool = False,
