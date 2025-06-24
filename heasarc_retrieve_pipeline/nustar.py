@@ -94,9 +94,7 @@ def separate_sources(directories, config):
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
-            separate_sources_in_event_file.fn(
-                event_file, region_size=30, back_region_size=55
-            )
+            separate_sources_in_event_file.fn(event_file, region_size=30, back_region_size=55)
 
 
 @task(
@@ -161,9 +159,7 @@ def recover_spacecraft_science_data(obsid, config):
     for evfile in evfiles_06:
         evfile_base = os.path.split(evfile)[1]
         chu123hkfile = [
-            f
-            for f in glob.glob(os.path.join(hk_dir, f"nu{obsid}_chu123.fits*"))
-            if "gpg" not in f
+            f for f in glob.glob(os.path.join(hk_dir, f"nu{obsid}_chu123.fits*")) if "gpg" not in f
         ][0]
         hkfile = [
             f
@@ -231,9 +227,7 @@ def join_source_data(obsid, directories, config, src_num=1):
 
         logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
-        hsp.fthedit(
-            infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
-        )
+        hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
         logger.info(f"Creating event file {outfile} from {files_to_join}")
 
         hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
@@ -242,9 +236,7 @@ def join_source_data(obsid, directories, config, src_num=1):
 
         hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
 
-        logger.info(
-            f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
-        )
+        logger.info(f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}")
 
         hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
 
@@ -295,6 +287,7 @@ def barycenter_data(obsid, ra, dec, config, src=1):
             + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
             + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl_back.evt*"))
             + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_back.evt*"))
+            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl.evt*"))
         )
         for infile in infiles:
             barycenter_file(
@@ -318,14 +311,8 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE"):
 
     nu_run_l2_pipeline(obsid, config=config)
 
-    splitdir = recover_spacecraft_science_data(
-        obsid, config, wait_for=[nu_run_l2_pipeline]
-    )
-    separate_sources(
-        [pipedir, splitdir], config, wait_for=[recover_spacecraft_science_data]
-    )
+    splitdir = recover_spacecraft_science_data(obsid, config, wait_for=[nu_run_l2_pipeline])
+    separate_sources([pipedir, splitdir], config, wait_for=[recover_spacecraft_science_data])
     join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
-    join_source_data(
-        obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
-    )
+    join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
