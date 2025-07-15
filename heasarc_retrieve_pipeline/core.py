@@ -316,6 +316,7 @@ def retrieve_heasarc_table_by_position(
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
+    source_name_col = MISSION_CONFIG[mission]["name_column"]
     date_column = "start_date" if mission == "rxte" else "public_date"
     if additional != "":
         additional = f", {additional}"
