@@ -308,19 +308,25 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
-
     logger = get_run_logger()
     logger.info(
         f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
     )
+
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
     source_name_col = MISSION_CONFIG[mission]["name_column"]
-    date_column = "start_date" if mission == "rxte" else "public_date"
-    if additional != "":
-        additional = f", {additional}"
-    query = f"""SELECT {source_name_col} as source_name, obsid, time, {expo_name}, ra, dec, {date_column}, __row {additional}
+
+    select_columns = f"{source_name_col} as source_name, obsid, time, {expo_name}, ra, dec, __row"
+
+    if mission != "rxte":
+        select_columns += ", public_date"
+
+    if additional:
+        select_columns += f", {additional}"
+
+    query = f"""SELECT {select_columns}
         FROM public.{table} as cat
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
@@ -328,7 +334,6 @@ def retrieve_heasarc_table_by_position(
         cat.{expo_name} >= 0 order by cat.time
         """
 
-    # results = tap_service.search(query)
     results = Heasarc.query_tap(query).to_table()
 
     return results
@@ -396,7 +401,7 @@ def retrieve_heasarc_data_by_source_name_old(
         logger.info(f"{row['obsid']}, {row['time']}")
     cwd = os.getcwd()
     for obsid, time, cycle, prnb in zip(
-        results["obsid"], results["time"], result["cycle"], result["prnb"]
+        results["obsid"], results["time"], results["cycle"], results["prnb"]
     ):
         os.chdir(cwd)
         url = remote_data_url(mission, obsid, time, cycle, prnb)

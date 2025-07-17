@@ -37,26 +37,26 @@ def rxte_base_output_path(config, obsid):
 @task(name="setup_workspace_rxte")
 def setup_workspace(raw_data_dir: str, obsid: str):
     logger = get_run_logger()
-
     l2_dir = os.path.join(raw_data_dir, "l2_files")
     os.makedirs(l2_dir, exist_ok=True)
     paths = {"l2_dir": l2_dir, "raw_data_dir": raw_data_dir, "obsid": obsid}
 
-    # finding the main evt file which is in the pca folder
-    logger.info("Searching for PCA event file.")
+    logger.info("Searching for PCA Event Mode file (e.g., GX*.evt.gz)...")
     event_patterns = ["FS*.evt.gz", "GX*.evt.gz"]
     event_gz_files = []
     for pattern in event_patterns:
         if found_files := glob.glob(os.path.join(raw_data_dir, "**", pattern), recursive=True):
             event_gz_files = found_files
-            logger.info(
-                f"Found event file with pattern '{pattern}': {os.path.basename(event_gz_files[0])}"
-            )
+            logger.info(f"Found event file: {os.path.basename(event_gz_files[0])}")
             break
-    if not event_gz_files:
-        raise FileNotFoundError(f"PCA Event file not found in {os.path.join(raw_data_dir, 'pca')}")
 
-    # Unzip the evt file
+    if not event_gz_files:
+        logger.warning(
+            f"Could not find Event Mode file for OBSID {obsid}. This script can only process Event Mode data.\n"
+        )
+        return None
+    # ---
+
     unzipped_event_path = event_gz_files[0][:-3]
     with gzip.open(event_gz_files[0], "rb") as f_in, open(unzipped_event_path, "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
@@ -167,14 +167,20 @@ def apply_gti_with_astropy(paths: dict, gti_file: str) -> str | None:
 
 @flow
 def process_rxte_obsid(obsid: str, config={}, flags=None, ra: float = None, dec: float = None):
+    DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
     current_config = DEFAULT_CONFIG if config is None else config
     logger = get_run_logger()
-    logger.info(f"Processing Nicer observation {obsid}")
+    logger.info(f"Processing RXTE observation {obsid}")
     raw_data_dir = rxte_base_output_path.fn(config=current_config, obsid=obsid)
     os.makedirs(raw_data_dir, exist_ok=True)
 
     paths = setup_workspace(raw_data_dir, obsid)
-    maketime_expr = flags.get("maketime_expr", "(ELV>10)&&(OFFSET<0.02)&&(NUM_PCU_ON>0)")
+
+    if paths is None:
+        logger.info(f"Pipeline for OBSID {obsid} stopped as no usable data was found.")
+        return
+
+    maketime_expr = "(ELV>10)&&(OFFSET<0.02)&&(NUM_PCU_ON>0)"
     gti_file = create_gti_with_astropy(paths, maketime_expr)
     cleaned_event_file = apply_gti_with_astropy(paths, gti_file)
 
