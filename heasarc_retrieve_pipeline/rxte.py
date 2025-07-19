@@ -42,12 +42,12 @@ def setup_workspace(raw_data_dir: str, obsid: str):
     paths = {"l2_dir": l2_dir, "raw_data_dir": raw_data_dir, "obsid": obsid}
 
     logger.info("Searching for PCA Event Mode file (e.g., GX*.evt.gz)...")
-    event_patterns = ["FS*.evt.gz", "GX*.evt.gz"]
+    event_patterns = ["GX*.evt.gz", "SE*.evt.gz", "FS*.evt.gz"]
     event_gz_files = []
     for pattern in event_patterns:
         if found_files := glob.glob(os.path.join(raw_data_dir, "**", pattern), recursive=True):
             event_gz_files = found_files
-            logger.info(f"Found event file: {os.path.basename(event_gz_files[0])}")
+            logger.info(f"Found best available event file: {os.path.basename(event_gz_files[0])}")
             break
 
     if not event_gz_files:
@@ -55,7 +55,6 @@ def setup_workspace(raw_data_dir: str, obsid: str):
             f"Could not find Event Mode file for OBSID {obsid}. This script can only process Event Mode data.\n"
         )
         return None
-    # ---
 
     unzipped_event_path = event_gz_files[0][:-3]
     with gzip.open(event_gz_files[0], "rb") as f_in, open(unzipped_event_path, "wb") as f_out:
@@ -66,7 +65,7 @@ def setup_workspace(raw_data_dir: str, obsid: str):
 
 
 @task(name="create_gti_rxte")
-def create_gti_with_astropy(paths: dict, maketime_expr: str) -> str:
+def create_gti_with_astropy(paths: dict) -> str:
     # Make a "keep" list of all the good parts.
     logger = get_run_logger()
     raw_data_dir = paths["raw_data_dir"]
@@ -90,7 +89,6 @@ def create_gti_with_astropy(paths: dict, maketime_expr: str) -> str:
         data_table = Table(hdul[1].data)
         time_res = hdul[1].header.get("TIMEDEL", 16.0)
 
-    logger.info(f"Applying filter expression: {maketime_expr}")
     mask = (
         (data_table["ELV"] > 10)  # Pointing away from Earth
         & (data_table["OFFSET"] < 0.02)  # Pointing steadily & still
@@ -180,8 +178,7 @@ def process_rxte_obsid(obsid: str, config={}, flags=None, ra: float = None, dec:
         logger.info(f"Pipeline for OBSID {obsid} stopped as no usable data was found.")
         return
 
-    maketime_expr = "(ELV>10)&&(OFFSET<0.02)&&(NUM_PCU_ON>0)"
-    gti_file = create_gti_with_astropy(paths, maketime_expr)
+    gti_file = create_gti_with_astropy(paths)
     cleaned_event_file = apply_gti_with_astropy(paths, gti_file)
 
     logger.info("RXTE processing pipeline complete.")

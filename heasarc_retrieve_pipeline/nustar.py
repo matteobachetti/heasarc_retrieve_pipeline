@@ -6,6 +6,7 @@ from datetime import timedelta
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
+from .barycenter import barycenter_file
 
 try:
     HAS_HEASOFT = True
@@ -249,32 +250,6 @@ def join_source_data(obsid, directories, config, src_num=1):
     return outfiles
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=90),
-    task_run_name="nu_barycenter_{infile}",
-)
-def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
-    logger = get_run_logger()
-    logger.info(f"Barycentering {infile}")
-
-    outfile = infile.replace(".evt", "_bary.evt")
-    logger.info(f"Output file: {outfile}")
-    print("bu")
-    hsp.barycorr(
-        infile=infile,
-        outfile=outfile,
-        ra=ra,
-        dec=dec,
-        ephem="JPLEPH.430",
-        refframe="ICRS",
-        clobber="yes",
-        orbitfiles=attorb,
-    )
-
-    return outfile
-
-
 @flow(flow_run_name="nu_barycenter_{obsid}")
 def barycenter_data(obsid, ra, dec, config, src=1):
     logger = get_run_logger()
@@ -295,7 +270,7 @@ def barycenter_data(obsid, ra, dec, config, src=1):
                 os.path.join(pipe_outdir, f"nu{obsid}{fpm}.attorb"),
                 ra=ra,
                 dec=dec,
-                src=src,
+                # src=src,
             )
 
 

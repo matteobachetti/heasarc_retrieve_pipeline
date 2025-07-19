@@ -12,6 +12,8 @@ from prefect.tasks import task_input_hash
 import subprocess
 import os
 
+from .barycenter import barycenter_file
+
 try:
     HAS_HEASOFT = True
     import heasoftpy as hsp
@@ -122,36 +124,6 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
         f.write(f"Completed on {Time.now().iso}")
 
     return ev_dir
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=90),
-    task_run_name="ni_barycenter_{infile}",
-)
-def barycenter_file(infile: str, attorb: str, ra: float, dec: float):
-    logger = get_run_logger()
-    logger.info(f"Barycentering {infile}")
-
-    outfile = infile.replace(".evt", "_bary.evt")
-    logger.info(f"Output file: {outfile}")
-
-    hsp.barycorr(
-        infile=infile,
-        outfile=outfile,
-        ra=ra,
-        dec=dec,
-        ephem="JPLEPH.430",
-        refframe="ICRS",
-        clobber="yes",
-        orbitfiles=attorb,
-        chatter=5,
-    )
-
-    if not os.path.exists(outfile):
-        raise FileNotFoundError(f"Barycentered output file not created: {outfile}")
-
-    return outfile
 
 
 @flow(flow_run_name="ni_barycenter_{obsid}")
