@@ -31,7 +31,6 @@ jobs:
             toxenv: "py314-test"
             os: ubuntu-latest
 
-
     steps:
     - uses: actions/checkout@v3
     - name: Set up Python ${{ matrix.python }}
