@@ -2,7 +2,7 @@
 name = "heasarc_retrieve_pipeline"
 description = "Pipeline to automatically retrieve data from HEASARC"
 readme = "README.rst"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { file = "licenses/LICENSE.rst", content-type = "text/plain" }
 authors = [
   { name = "Matteo Bachetti", email = "matteo@matteobachetti.it" },

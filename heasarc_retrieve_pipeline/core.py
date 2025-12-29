@@ -11,9 +11,12 @@ from astropy.table import hstack, Table
 from astroquery.heasarc import Heasarc
 from astropy.coordinates import SkyCoord
 
+
 from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nustar import process_nustar_obsid
 from .nicer import ni_raw_data_path, process_nicer_obsid
+from .rxte import rxte_heasarc_raw_data_path as rxte_raw_data_path
+from .rxte import process_rxte_obsid
 
 from prefect import flow, task, get_run_logger
 
@@ -26,10 +29,10 @@ def _download_pysmartdl(url: str, dest: str):
     return obj.get_dest()
 
 
-def remote_data_url(mission, obsid, time):
+def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
     url = (
         "https://heasarc.gsfc.nasa.gov/"
-        + MISSION_CONFIG[mission]["path_func"](obsid, time=time)
+        + MISSION_CONFIG[mission]["path_func"](obsid, time, cycle, prnb)
         + "/"
     )
     return url
@@ -271,6 +274,7 @@ MISSION_CONFIG = {
         "expo_column": "exposure_a",
         "additional": "solar_activity",
         "obsid_processing": process_nustar_obsid,
+        "name_column": "name",
     },
     "nicer": {
         "table": "nicermastr",
@@ -278,6 +282,15 @@ MISSION_CONFIG = {
         "expo_column": "exposure",
         "additional": "",
         "obsid_processing": process_nicer_obsid,
+        "name_column": "name",
+    },
+    "rxte": {
+        "table": "xtemaster",
+        "path_func": rxte_raw_data_path,
+        "expo_column": "exposure",
+        "additional": "cycle, prnb",
+        "obsid_processing": process_rxte_obsid,
+        "name_column": "target_name",
     },
 }
 
@@ -295,17 +308,25 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
-
     logger = get_run_logger()
     logger.info(
         f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
     )
+
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
-    if additional != "":
-        additional = f", {additional}"
-    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
+    source_name_col = MISSION_CONFIG[mission]["name_column"]
+
+    select_columns = f"{source_name_col} as source_name, obsid, time, {expo_name}, ra, dec, __row"
+
+    if mission != "rxte":
+        select_columns += ", public_date"
+
+    if additional:
+        select_columns += f", {additional}"
+
+    query = f"""SELECT {select_columns}
         FROM public.{table} as cat
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
@@ -313,7 +334,6 @@ def retrieve_heasarc_table_by_position(
         cat.{expo_name} >= 0 order by cat.time
         """
 
-    # results = tap_service.search(query)
     results = Heasarc.query_tap(query).to_table()
 
     return results
@@ -327,18 +347,18 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
+    name_column = MISSION_CONFIG[mission]["name_column"]
     if additional != "":
         additional = f", {additional}"
-    query = f"""SELECT name, cycle, obsid, time, {expo_name}, ra, dec, public_date, __row {additional}
+    query = f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
         FROM public.{table} as cat
         where
         cat.obsid='{obsid}'
         and
-        cat.{expo_name} > 0 order by cat.time
+        cat.{expo_name} >= 0 order by cat.time
         """
 
     results = Heasarc.query_tap(query).to_table()
-
     return results
 
 
@@ -380,9 +400,11 @@ def retrieve_heasarc_data_by_source_name_old(
     for row in results:
         logger.info(f"{row['obsid']}, {row['time']}")
     cwd = os.getcwd()
-    for obsid, time in zip(results["obsid"], results["time"]):
+    for obsid, time, cycle, prnb in zip(
+        results["obsid"], results["time"], results["cycle"], results["prnb"]
+    ):
         os.chdir(cwd)
-        url = remote_data_url(mission, obsid, time)
+        url = remote_data_url(mission, obsid, time, cycle, prnb)
         recursive_download(
             url,
             outdir,
@@ -413,6 +435,7 @@ def retrieve_and_process_data(
     mission: str = "nustar",
     outdir: str = "out",
     test: bool = False,
+    flags={},
     force_heasarc: bool = False,
     force_s3: bool = False,
 ):
@@ -440,7 +463,6 @@ def retrieve_and_process_data(
             dec = row["dec"]
 
         os.chdir(cwd)
-
         recursive_download(links[i][link_col_name], outdir, test_str=".", test=test)
         if test:
             break
@@ -453,6 +475,7 @@ def retrieve_and_process_data(
             config=None,
             ra=ra,
             dec=dec,
+            flags=flags,
             wait_for=[recursive_download],
             return_state=True,
         )
@@ -506,6 +529,7 @@ def retrieve_heasarc_data_by_obsid(
     outdir: str = "out",
     mission: str = "nustar",
     test: bool = False,
+    flags: dict = {},
     force_heasarc: bool = False,
     force_s3: bool = False,
 ):
@@ -513,6 +537,9 @@ def retrieve_heasarc_data_by_obsid(
     logger = get_run_logger()
 
     results = retrieve_info_for_obsid(obsid, mission=mission)
+    if not results:
+        logger.warning(f"No observations found for OBSID {obsid} in HEASARC query.")
+        return None
 
     results = retrieve_and_process_data(
         result_table=results,
@@ -520,6 +547,7 @@ def retrieve_heasarc_data_by_obsid(
         mission=mission,
         outdir=outdir,
         test=test,
+        flags=flags,
         force_heasarc=force_heasarc,
         force_s3=force_s3,
         wait_for=[retrieve_info_for_obsid],
