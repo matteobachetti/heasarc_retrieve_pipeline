@@ -26,6 +26,10 @@ jobs:
             python: "3.12"
             toxenv: "py312-test"
             os: ubuntu-latest
+          - name: "Py3.14"
+            python: "3.14"
+            toxenv: "py314-test"
+            os: ubuntu-latest
 
 
     steps:
@@ -47,4 +51,4 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
-        tox -e ${{ matrix.toxenv }}
+        CONDA_EXE=mamba tox -e ${{ matrix.toxenv }}
