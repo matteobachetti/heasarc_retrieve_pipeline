@@ -57,5 +57,8 @@ jobs:
       env:
         # make tox-conda use micromamba for environment creation
         CONDA_EXE: micromamba
+        # tox creates the env directory (and log subdir) before micromamba;
+        # allow micromamba to create into that existing, non-empty prefix
+        MAMBA_ALLOW_EXISTING_PREFIX: "true"
       run: |
         tox -e ${{ matrix.toxenv }}
