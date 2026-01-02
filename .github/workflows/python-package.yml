@@ -48,7 +48,6 @@ jobs:
           pytest
           pytest-astropy
           flake8
-          # heasoft
 
     - name: Install package into micromamba env
       shell: bash -leo pipefail {0}
