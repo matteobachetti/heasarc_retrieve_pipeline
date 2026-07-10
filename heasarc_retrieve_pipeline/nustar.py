@@ -101,12 +101,14 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
 
 
 @task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
-def separate_sources(directories, config):
+def separate_sources(directories, config, region_size=30, back_region_size=55):
     for d in directories:
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
-            separate_sources_in_event_file.fn(event_file, region_size=30, back_region_size=55)
+            separate_sources_in_event_file.fn(
+                event_file, region_size=region_size, back_region_size=back_region_size
+            )
 
 
 @task(
@@ -214,7 +216,7 @@ def join_source_data(obsid, directories, config, src_num=1):
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
         if os.path.exists(outfile):
             os.unlink(outfile)
-        outfile_gti = os.path.join(outdir, f"nu{obsid}{fpm}.gti")
+        outfile_gti = os.path.join(outdir, f"nu{obsid}{fpm}_{np.random.randint(1000000)}.gti")
         if os.path.exists(outfile_gti):
             os.unlink(outfile_gti)
         logger.info(f"Joining source data for fpm {fpm} into {outfile}")
@@ -277,7 +279,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
 
     outfile = infile.replace(".evt", "_bary.evt")
     logger.info(f"Output file: {outfile}")
-    print("bu")
+
     hsp.barycorr(
         infile=infile,
         outfile=outfile,
@@ -488,7 +490,18 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     nu_run_l2_pipeline(obsid, config=config, flags=flags)
 
     splitdir = recover_spacecraft_science_data(obsid, config, wait_for=[nu_run_l2_pipeline])
-    separate_sources([pipedir, splitdir], config, wait_for=[recover_spacecraft_science_data])
+
+    ra, dec, region_size = get_best_source_regions(obsid, config, wait_for=[nu_run_l2_pipeline])
+
+    calculate_spectra(obsid, config, wait_for=[get_best_source_regions])
+
+    separate_sources(
+        [pipedir, splitdir],
+        config,
+        wait_for=[recover_spacecraft_science_data],
+        region_size=region_size,
+        back_region_size=region_size + 25,
+    )
     join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
     join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
