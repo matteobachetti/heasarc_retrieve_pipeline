@@ -316,6 +316,110 @@ def barycenter_data(obsid, ra, dec, config, src=1):
             )
 
 
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_best_source_reg_{infile}",
+)
+def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None):
+    from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
+    from nustar_gen.wrappers import make_image
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+
+    indir, fname = os.path.split(infile)
+    if rootname is None:
+        rootname = splitext_improved(fname)[0]
+
+    src_out = os.path.join(indir, rootname + "_src.reg")
+    bkg_out = os.path.join(indir, rootname + "_bkg.reg")
+
+    full_range = make_image(infile, elow=elow, ehigh=ehigh, clobber=True)
+    if pair is None:
+        pair = [elow, ehigh]
+    coordinates = find_source(full_range, show_image=False, filt_range=3)
+    # Get the WCS header and convert the pixel coordinates into an RA/Dec object
+    hdu = fits.open(full_range, uint=True)[0]
+    wcs = WCS(hdu.header)
+
+    # The "flip" is necessary to go to [X, Y] ordering from native [Y, X] ordering, which wcs seems to require
+    world = wcs.all_pix2world(np.flip(coordinates), 0)
+    ra = world[0][0]
+    dec = world[0][1]
+    target = SkyCoord(ra, dec, unit="deg", frame="fk5")
+    obj_j2000 = SkyCoord(hdu.header["RA_OBJ"], hdu.header["DEC_OBJ"], unit="deg", frame="fk5")
+
+    # How far are we from the J2000 coordinates? If <15 arcsec, all is okay
+    sep = target.separation(obj_j2000)
+    # Now the radial image parts.
+
+    # Make the radial image for the full energy range (or whatever is the best SNR)
+    full_range = make_image(infile, elow=3, ehigh=80, clobber=True)
+    rind, rad_profile, radial_err, psf_profile = make_radial_profile(
+        full_range, show_image=False, coordinates=coordinates
+    )
+    coordinates = find_source(full_range, show_image=False)
+
+    test_file = make_image(infile, elow=pair[0], ehigh=pair[1], clobber=True)
+    rind, rad_profile, radial_err, psf_profile = make_radial_profile(
+        test_file, show_image=False, coordinates=coordinates
+    )
+    rlimit = optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False)
+    print("Radius of peak SNR for {} to {} keV: {}".format(pair[0], pair[1], rlimit))
+
+    icrs = target.icrs
+
+    src_reg = rf"""icrs
+circle({icrs.ra.deg}, {icrs.dec.deg}, {rlimit}")
+"""
+    bkg_reg = rf"""icrs
+-circle({icrs.ra.deg}, {icrs.dec.deg}, {max(rlimit, 100)}")
+circle({icrs.ra.deg}, {icrs.dec.deg}, {max(rlimit * 2, 250)}")
+"""
+
+    with open(src_out, "w") as fobj:
+        print(src_reg, file=fobj)
+    with open(bkg_out, "w") as fobj:
+        print(bkg_reg, file=fobj)
+
+    return icrs.ra.deg, icrs.dec.deg, rlimit, src_out, bkg_out
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_best_source_regs_{obsid}",
+)
+def get_best_source_regions(obsid, config):
+    indir = nu_pipeline_output_path.fn(obsid, config=config)
+    outdir = nu_pipeline_output_path.fn(obsid, config=config)
+    os.makedirs(outdir, exist_ok=True)
+    mean_ra = 0
+    mean_dec = 0
+    mean_rlimit = 0
+    count = 0
+    for fpm in "A", "B":
+        infiles = glob.glob(os.path.join(indir, f"nu{obsid}{fpm}01_cl.evt*"))
+        for infile in infiles:
+            if infile.endswith(".gpg"):
+                continue
+            rootname = splitext_improved(infile)[0]
+            src_reg = os.path.join(outdir, rootname + "_src.reg")
+            bkg_reg = os.path.join(outdir, rootname + "_bkg.reg")
+            if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
+                ra, dec, rlimit, src_out, bkg_out = get_best_source_region(infile)
+                mean_ra += ra
+                mean_dec += dec
+                mean_rlimit += rlimit
+                count += 1
+
+    mean_ra /= count if count > 0 else 1
+    mean_dec /= count if count > 0 else 1
+    mean_rlimit /= count if count > 0 else 1
+
+    return mean_ra, mean_dec, mean_rlimit
+
 
 @task(
     cache_key_fn=task_input_hash,
