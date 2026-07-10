@@ -3,10 +3,12 @@ import re
 
 import glob
 from datetime import timedelta
+import numpy as np
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
 from .barycenter import barycenter_file
+from .utils import splitext_improved
 
 try:
     HAS_HEASOFT = True
@@ -53,6 +55,15 @@ def nu_base_output_path(obsid, config):
 )
 def nu_pipeline_output_path(obsid, config):
     return os.path.join(config["out_data_path"], obsid + "/event_pipe/")
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_product_output_{obsid}",
+)
+def nu_product_output_path(obsid, config):
+    return os.path.join(config["out_data_path"], obsid + "/products/")
 
 
 @task(
@@ -303,6 +314,61 @@ def barycenter_data(obsid, ra, dec, config, src=1):
                 dec=dec,
                 src=src,
             )
+
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="nu_best_source_reg_{obsid}",
+)
+def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
+    logger = get_run_logger()
+    indir = nu_pipeline_output_path.fn(obsid, config=config)
+    outdir = nu_product_output_path.fn(obsid, config=config)
+    os.makedirs(outdir, exist_ok=True)
+    logger.info(f"Calculating spectra in directory {outdir}")
+    for fpm in "A", "B":
+        infiles = glob.glob(os.path.join(indir, f"nu{obsid}{fpm}01_cl.evt*"))
+        for infile in infiles:
+            if infile.endswith(".gpg"):
+                continue
+            _, fname = os.path.split(infile)
+            rootname = splitext_improved(fname)[0]
+            if src_reg is None:
+                src_reg = os.path.join(indir, rootname + "_src.reg")
+            if bkg_reg is None:
+                bkg_reg = os.path.join(indir, rootname + "_bkg.reg")
+            if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
+                logger.warning(f"Source or background region file missing for {infile}")
+                continue
+            break
+
+        logger.info(f"Calculating spectrum for {infile}")
+
+        params = dict(
+            indir=indir,
+            instrument=f"FPM{fpm}",
+            steminputs="nu" + obsid,
+            stemout="nu" + obsid + f"{fpm}01",
+            srcregionfile=src_reg,
+            bkgregionfile=bkg_reg,
+            outdir=outdir,
+            clobber="yes",
+            runmkarf="yes",
+            extended="no",
+            runmkrmf="yes",
+            rungrppha="yes",
+            grpmincounts=20,
+            grppibadlow=35,
+            grppibadhigh=1909,
+            grpphafile=os.path.join(outdir, f"nu{obsid}{fpm}01_grp.pha"),
+        )
+        command = "nuproducts "
+        for key, val in params.items():
+            command += f"{key}={val} "
+        print(command)
+        hsp.nuproducts(params, noprompt=True, clobber=True, verbose=True)
 
 
 @flow
