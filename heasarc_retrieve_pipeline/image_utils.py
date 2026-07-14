@@ -75,15 +75,10 @@ def get_random_fluxes_in_img(table, region_size=30, n_rand=100):
 def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     hdul = fits.open(eventfile)
 
-    table = Table(copy.deepcopy(hdul[1].data))
+    table = copy.deepcopy(hdul[1].data)
 
-    table["ENERGY"] = table["PI"] * 0.04 + 1.6
-    good = (
-        (table["ENERGY"] >= 3.0)
-        & (table["ENERGY"] < 79.0)
-        & (table["X"] > 0)
-        & (table["Y"] > 0)
-    )
+    energy = table["PI"] * 0.04 + 1.6
+    good = (energy >= 3.0) & (energy < 79.0) & (table["X"] > 0) & (table["Y"] > 0)
 
     if np.count_nonzero(good) < 20:
         hdul.close()
@@ -109,13 +104,16 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     median = np.median(fluxes)
     std = mad(fluxes)
 
-    coordinates = peak_local_max(img, min_distance=20)
+    coordinates = peak_local_max(img, min_distance=20, threshold_abs=0.5 * np.max(img))
 
-    coordinates[:, 1] = coordinates[:, 1] * dx + xmin
-    coordinates[:, 0] = coordinates[:, 0] * dy + ymin
+    # The first pixel in a FITS image is defined to range from 0.5 to 1.5,
+    # with the center of the pixel at coordinate 1.0
+
+    coordinates[:, 1] = coordinates[:, 1] * dx + dx + xmin
+    coordinates[:, 0] = coordinates[:, 0] * dy + dy + ymin
 
     fig = plt.figure(eventfile + "0")
-    plt.pcolormesh(xbins, ybins, np.log10(img), vmin=np.log10(np.median(img)))
+    plt.pcolormesh(xbins, ybins, img, vmin=np.median(img))
     plt.plot(coordinates[:, 1], coordinates[:, 0], "r.")
     plt.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
     # plt.close(fig)
@@ -138,31 +136,27 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
             continue
 
         hdul[1].data = fits.BinTableHDU(table_filt).data
+        # hdul[1].header = header
         hdul.writeto(
             eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.evt"),
             overwrite=True,
         )
 
-        x_filt, y_filt, img_filt = image_from_table(
-            table_filt, bins, gaussian_filter_sigma=0
-        )
+        x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
         fig = plt.figure(eventfile + f"{i + 1}")
         plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
         plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
         plt.close(fig)
 
-    table_filt = filter_table_outside_regions(
-        table, coordinates, region_size=back_region_size
-    )
+    table_filt = filter_table_outside_regions(table, coordinates, region_size=back_region_size)
 
     hdul[1].data = fits.BinTableHDU(table_filt).data
+    # hdul[1].header = header
     hdul.writeto(
         eventfile.replace(".gz", "").replace(".evt", f"_back.evt"),
         overwrite=True,
     )
-    x_filt, y_filt, img_filt = image_from_table(
-        table_filt, bins, gaussian_filter_sigma=0
-    )
+    x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
     fig = plt.figure(eventfile + f"_back")
     plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
     plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
