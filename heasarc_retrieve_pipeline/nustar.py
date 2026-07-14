@@ -16,7 +16,7 @@ try:
 except ImportError:
     HAS_HEASOFT = False
 
-DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
+DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./", max_radius=80)
 
 valid_re = re.compile(r"nu[0-9]{11}[AB]0[16].*")
 
@@ -323,13 +323,15 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     cache_expiration=timedelta(days=1000),
     task_run_name="nu_best_source_reg_{infile}",
 )
-def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None):
+def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, config=None):
     from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
     from nustar_gen.wrappers import make_image
     from astropy.io import fits
     from astropy.wcs import WCS
     from astropy.coordinates import SkyCoord
 
+    if config is None:
+        config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
     if rootname is None:
         rootname = splitext_improved(fname)[0]
@@ -367,7 +369,10 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None):
     rind, rad_profile, radial_err, psf_profile = make_radial_profile(
         test_file, show_image=False, coordinates=coordinates
     )
-    rlimit = optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False)
+    rlimit = max(
+        optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False),
+        config.get("max_radius", 80),
+    )
     print("Radius of peak SNR for {} to {} keV: {}".format(pair[0], pair[1], rlimit))
 
     icrs = target.icrs
