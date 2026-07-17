@@ -84,7 +84,11 @@ def split_path(obsid, config):
     return os.path.join(config["out_data_path"], obsid + "/split/")
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="separate_sources_in_event_file_{obsid}_{event_file}_region_{region_size}_back_{back_region_size}",
+)
 def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
     logger = get_run_logger()
     if event_file.endswith(".gpg"):
@@ -100,7 +104,11 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
     )
 
 
-@task(cache_key_fn=task_input_hash, cache_expiration=timedelta(days=1000))
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="separate_sources_{directories}_region_{region_size}_back_{back_region_size}",
+)
 def separate_sources(directories, config, region_size=30, back_region_size=55):
     for d in directories:
         logger = get_run_logger()
@@ -112,8 +120,6 @@ def separate_sources(directories, config, region_size=30, back_region_size=55):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="l2_pipeline_obsid_{obsid}",
 )
 def nu_run_l2_pipeline(obsid, config, flags=None):
@@ -156,8 +162,6 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_recover_spacecraft_science_{obsid}",
 )
 def recover_spacecraft_science_data(obsid, config):
@@ -271,7 +275,7 @@ def join_source_data(obsid, directories, config, src_num=1):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=90),
-    task_run_name="nu_barycenter_{infile}",
+    task_run_name="nu_barycenter_{infile}_ra{ra}_dec{dec}_src{src}",
 )
 def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
     logger = get_run_logger()
@@ -294,7 +298,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
     return outfile
 
 
-@flow(flow_run_name="nu_barycenter_{obsid}")
+@flow(flow_run_name="nu_barycenter_{obsid}_src{src}_ra{ra}_dec{dec}")
 def barycenter_data(obsid, ra, dec, config, src=1):
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
@@ -321,7 +325,7 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="nu_best_source_reg_{infile}",
+    task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
 def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, config=None):
     from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
@@ -431,7 +435,7 @@ def get_best_source_regions(obsid, config):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="nu_best_source_reg_{obsid}",
+    task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
 def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
     logger = get_run_logger()
