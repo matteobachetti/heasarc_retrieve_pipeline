@@ -323,8 +323,6 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
 def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, config=None):
