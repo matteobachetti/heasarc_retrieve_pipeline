@@ -364,8 +364,8 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, c
         logger = get_run_logger()
         logger.info(f"Source and background region files already exist for {infile}")
         return (
-            region_src.ra.deg,
-            region_src.dec.deg,
+            region_src.center.ra.deg,
+            region_src.center.dec.deg,
             region_src.radius.to(u.arcsec).value,
             src_out,
             bkg_out,
