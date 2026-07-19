@@ -85,8 +85,6 @@ def split_path(obsid, config):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="separate_sources_in_event_file_{obsid}_{event_file}_region_{region_size}_back_{back_region_size}",
 )
 def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
@@ -110,13 +108,21 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
     task_run_name="separate_sources_{directories}_region_{region_size}_back_{back_region_size}",
 )
 def separate_sources(directories, config, region_size=30, back_region_size=55):
+
     for d in directories:
+        separate_done_file = os.path.join(d, "SEPARATE_DONE.TXT")
+        if os.path.exists(separate_done_file):
+            logger = get_run_logger()
+            logger.info(f"Source separation already done in {d}")
+            continue
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
             separate_sources_in_event_file.fn(
                 event_file, region_size=region_size, back_region_size=back_region_size
             )
+        with open(separate_done_file, "w") as f:
+            f.write("")
 
 
 @task(
@@ -202,11 +208,10 @@ def recover_spacecraft_science_data(obsid, config):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_join_science_{obsid}_src{src_num}",
 )
 def join_source_data(obsid, directories, config, src_num=1):
+
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
     outfiles = []
@@ -215,6 +220,14 @@ def join_source_data(obsid, directories, config, src_num=1):
         label = f"_src{src_num}"
     else:
         label = "_back"
+
+    join_done_file = os.path.join(
+        nu_base_output_path.fn(obsid, config=config), f"JOIN_DONE_SRC{src_num}.TXT"
+    )
+    if os.path.exists(join_done_file):
+        logger = get_run_logger()
+        logger.info(f"Source data for {obsid} already joined")
+        return glob.glob(os.path.join(outdir, f"nu{obsid}*{label}.evt"))
 
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
@@ -269,12 +282,11 @@ def join_source_data(obsid, directories, config, src_num=1):
 
         os.unlink(outfile_gti)
 
+    open(join_done_file, "a").close()
     return outfiles
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=90),
     task_run_name="nu_barycenter_{infile}_ra{ra}_dec{dec}_src{src}",
 )
 def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
@@ -283,6 +295,10 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
 
     outfile = infile.replace(".evt", "_bary.evt")
     logger.info(f"Output file: {outfile}")
+
+    if os.path.exists(outfile):
+        logger.info(f"Output file {outfile} already exists, skipping")
+        return outfile
 
     hsp.barycorr(
         infile=infile,
@@ -340,6 +356,20 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, c
 
     src_out = os.path.join(indir, rootname + "_src.reg")
     bkg_out = os.path.join(indir, rootname + "_bkg.reg")
+    if os.path.exists(src_out) and os.path.exists(bkg_out):
+        from regions import Regions
+        import astropy.units as u
+
+        region_src = Regions.read(src_out, format="ds9")[0]
+        logger = get_run_logger()
+        logger.info(f"Source and background region files already exist for {infile}")
+        return (
+            region_src.ra.deg,
+            region_src.dec.deg,
+            region_src.radius.to(u.arcsec).value,
+            src_out,
+            bkg_out,
+        )
 
     full_range = make_image(infile, elow=elow, ehigh=ehigh, clobber=True)
     if pair is None:
@@ -396,8 +426,6 @@ circle({icrs.ra.deg}, {icrs.dec.deg}, {max(rlimit * 2, 250)}")
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_best_source_regs_{obsid}",
 )
 def get_best_source_regions(obsid, config):
@@ -431,8 +459,6 @@ def get_best_source_regions(obsid, config):
 
 
 @task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
 def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
