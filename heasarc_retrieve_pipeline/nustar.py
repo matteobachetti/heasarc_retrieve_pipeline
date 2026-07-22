@@ -209,7 +209,7 @@ def recover_spacecraft_science_data(obsid, config):
 
 @task()
 def merge_event_files(files_to_join, outfile):
-    outdir, fname = os.path.split(outfile)[0]
+    outdir, fname = os.path.split(outfile)
     root = splitext_improved(fname)[0]
 
     outfile_gti = os.path.join(outdir, f"{root}_{np.random.randint(1000000)}.gti")
