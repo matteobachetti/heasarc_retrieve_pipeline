@@ -207,7 +207,7 @@ def recover_spacecraft_science_data(obsid, config):
     return splitdir
 
 
-@task()
+@task(task_run_name="nu_merge_event_files_{files_to_join}_into_{outfile}")
 def merge_event_files(files_to_join, outfile):
     outdir, fname = os.path.split(outfile)
     root = splitext_improved(fname)[0]
