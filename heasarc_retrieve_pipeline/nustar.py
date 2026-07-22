@@ -207,6 +207,45 @@ def recover_spacecraft_science_data(obsid, config):
     return splitdir
 
 
+@task()
+def merge_event_files(files_to_join, outfile):
+    outdir, fname = os.path.split(outfile)[0]
+    root = splitext_improved(fname)[0]
+
+    outfile_gti = os.path.join(outdir, f"{root}_{np.random.randint(1000000)}.gti")
+    if os.path.exists(outfile_gti):
+        os.unlink(outfile_gti)
+    logger = get_run_logger()
+
+    logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
+
+    hsp.ftmgtime(
+        ingtis=",".join([f + "[GTI]" for f in files_to_join]),
+        outgti=outfile_gti,
+        merge="OR",
+    )
+    hsp.ftsort(infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
+
+    logger.info(f"Changing extension name to GTI in {outfile_gti}")
+
+    hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
+    logger.info(f"Creating event file {outfile} from {files_to_join}")
+
+    hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
+
+    logger.info(f"Sorting event file {outfile}")
+
+    hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
+
+    logger.info(f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}")
+
+    hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
+
+    logger.info(f"Removing {outfile_gti}")
+
+    os.unlink(outfile_gti)
+
+
 @task(
     task_run_name="nu_join_science_{obsid}_src{src_num}",
 )
@@ -233,9 +272,7 @@ def join_source_data(obsid, directories, config, src_num=1):
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
         if os.path.exists(outfile):
             os.unlink(outfile)
-        outfile_gti = os.path.join(outdir, f"nu{obsid}{fpm}_{np.random.randint(1000000)}.gti")
-        if os.path.exists(outfile_gti):
-            os.unlink(outfile_gti)
+
         logger.info(f"Joining source data for fpm {fpm} into {outfile}")
         files_to_join = []
         for d in directories:
@@ -252,35 +289,13 @@ def join_source_data(obsid, directories, config, src_num=1):
             for nf in to_be_removed:
                 new_files.remove(nf)
             files_to_join.extend(new_files)
-        logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
-
-        hsp.ftmgtime(
-            ingtis=",".join([f + "[GTI]" for f in files_to_join]),
-            outgti=outfile_gti,
-            merge="OR",
-        )
-        hsp.ftsort(infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
-
-        logger.info(f"Changing extension name to GTI in {outfile_gti}")
-
-        hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
-        logger.info(f"Creating event file {outfile} from {files_to_join}")
-
-        hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
-
-        logger.info(f"Sorting event file {outfile}")
-
-        hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
-
-        logger.info(f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}")
-
-        hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
-
+        merge_event_files(files_to_join, outfile)
         outfiles.append(outfile)
 
-        logger.info(f"Removing {outfile_gti}")
-
-        os.unlink(outfile_gti)
+    for a_file in glob.glob(os.path.join(outdir, f"nu{obsid}A{label}.evt")):
+        b_file = a_file.replace("A", "B")
+        outfile = os.path.join(outdir, f"nu{obsid}{label}.evt")
+        merge_event_files([a_file, b_file], outfile)
 
     open(join_done_file, "a").close()
     return outfiles
@@ -320,22 +335,16 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     outdir = nu_base_output_path.fn(obsid, config=config)
     logger.info(f"Barycentering data in directory {outdir}")
     pipe_outdir = nu_pipeline_output_path.fn(obsid, config=config)
-    for fpm in "A", "B":
-        infiles = (
-            glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl_src{src}.evt*"))
-            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_src{src}.evt*"))
-            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl_back.evt*"))
-            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}_back.evt*"))
-            + glob.glob(os.path.join(outdir, f"nu{obsid}{fpm}01_cl.evt*"))
+
+    infiles = glob.glob(os.path.join(outdir, f"nu{obsid}*.evt*"))
+    for infile in infiles:
+        barycenter_file(
+            infile,
+            os.path.join(pipe_outdir, f"nu{obsid}A.attorb"),
+            ra=ra,
+            dec=dec,
+            src=src,
         )
-        for infile in infiles:
-            barycenter_file(
-                infile,
-                os.path.join(pipe_outdir, f"nu{obsid}{fpm}.attorb"),
-                ra=ra,
-                dec=dec,
-                src=src,
-            )
 
 
 @task(
@@ -535,6 +544,7 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         region_size=region_size,
         back_region_size=region_size + 25,
     )
+
     join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
     join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
