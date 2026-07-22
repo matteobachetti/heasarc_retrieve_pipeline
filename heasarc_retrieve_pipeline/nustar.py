@@ -519,6 +519,9 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 
     infiles = glob.glob(os.path.join(outdir, f"nu{obsid}*.evt*"))
     for infile in infiles:
+        if "bary" in infile:
+            continue
+
         barycenter_file(
             infile,
             os.path.join(pipe_outdir, f"nu{obsid}A.attorb"),
@@ -531,7 +534,7 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 @task(
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
-def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, config=None):
+def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=None, config=None):
     from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
     from nustar_gen.wrappers import make_image
     from astropy.io import fits
@@ -541,11 +544,11 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, rootname=None, c
     if config is None:
         config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
-    if rootname is None:
-        rootname = splitext_improved(fname)[0]
+    if out_rootname is None:
+        out_rootname = rootname(fname)
 
-    src_out = os.path.join(indir, rootname + "_src.reg")
-    bkg_out = os.path.join(indir, rootname + "_bkg.reg")
+    src_out = os.path.join(indir, out_rootname + "_src.reg")
+    bkg_out = os.path.join(indir, out_rootname + "_bkg.reg")
     if os.path.exists(src_out) and os.path.exists(bkg_out):
         from regions import Regions
         import astropy.units as u
@@ -631,9 +634,9 @@ def get_best_source_regions(obsid, config):
         for infile in infiles:
             if infile.endswith(".gpg"):
                 continue
-            rootname = splitext_improved(infile)[0]
-            src_reg = os.path.join(outdir, rootname + "_src.reg")
-            bkg_reg = os.path.join(outdir, rootname + "_bkg.reg")
+            root_name = rootname(infile)
+            src_reg = os.path.join(outdir, root_name + "_src.reg")
+            bkg_reg = os.path.join(outdir, root_name + "_bkg.reg")
             if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
                 ra, dec, rlimit, src_out, bkg_out = get_best_source_region(infile)
                 mean_ra += ra
@@ -667,14 +670,24 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
             if infile.endswith(".gpg"):
                 continue
             _, fname = os.path.split(infile)
-            rootname = splitext_improved(fname)[0]
+            root_name = rootname(fname)
             if src_reg is None:
-                src_reg = os.path.join(indir, rootname + "_src.reg")
+                src_reg = os.path.join(indir, root_name + "_src.reg")
             if bkg_reg is None:
-                bkg_reg = os.path.join(indir, rootname + "_bkg.reg")
+                bkg_reg = os.path.join(indir, root_name + "_bkg.reg")
+
+            outfile_gti_goes = get_goes_gtis(infile)
+            outfile_gti_temp = os.path.join(indir, root_name + "_noflares.gti")
+
+            merge_gtis([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+
             if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
                 logger.warning(f"Source or background region file missing for {infile}")
                 continue
+
+            if not os.path.exists(outfile_gti_temp):
+                logger.warning(f"Temporary GTI file missing for {infile}")
+
             break
 
         logger.info(f"Calculating spectrum for {infile}")
@@ -695,6 +708,7 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
             grpmincounts=20,
             grppibadlow=35,
             grppibadhigh=1909,
+            usrgtifile=outfile_gti_temp,
             grpphafile=os.path.join(outdir, f"nu{obsid}{fpm}01_grp.pha"),
         )
         command = "nuproducts "
@@ -722,8 +736,6 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
 
     ra, dec, region_size = get_best_source_regions(obsid, config, wait_for=[nu_run_l2_pipeline])
 
-    calculate_spectra(obsid, config, wait_for=[get_best_source_regions])
-
     separate_sources(
         [pipedir, splitdir],
         config,
@@ -732,6 +744,11 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         back_region_size=region_size + 25,
     )
 
-    join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
+    files = join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
+    for fname in files:
+        filter_from_solar_flares(fname, wait_for=[join_source_data])
+
     join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
+
+    calculate_spectra(obsid, config, wait_for=[get_best_source_regions])
