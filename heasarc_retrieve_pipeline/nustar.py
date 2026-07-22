@@ -265,12 +265,8 @@ def recover_spacecraft_science_data(obsid, config):
     return splitdir
 
 
-@task(task_run_name="nu_merge_event_files_{files_to_join}_into_{outfile}")
-def merge_event_files(files_to_join, outfile):
-    outdir, fname = os.path.split(outfile)
-    root = splitext_improved(fname)[0]
-
-    outfile_gti = os.path.join(outdir, f"{root}_{np.random.randint(1000000)}.gti")
+@task(task_run_name="nu_merge_gtis_{files_to_join}_into_{outfile_gti}_gti_{gti_operation}")
+def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
     if os.path.exists(outfile_gti):
         os.unlink(outfile_gti)
     logger = get_run_logger()
@@ -280,13 +276,27 @@ def merge_event_files(files_to_join, outfile):
     hsp.ftmgtime(
         ingtis=",".join([f + "[GTI]" for f in files_to_join]),
         outgti=outfile_gti,
-        merge="OR",
+        merge=gti_operation,
+        chatter=5,
     )
+
     hsp.ftsort(infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
 
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
     hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
+
+
+@task(task_run_name="nu_merge_event_files_{files_to_join}_into_{outfile}_gti_{gti_operation}")
+def merge_event_files(files_to_join, outfile, gti_operation="OR"):
+    outdir, fname = os.path.split(outfile)
+    root = splitext_improved(fname)[0]
+    logger = get_run_logger()
+
+    outfile_gti = os.path.join(outdir, f"{root}_{np.random.randint(1000000)}.gti")
+
+    merge_gtis(files_to_join, outfile_gti, gti_operation=gti_operation)
+
     logger.info(f"Creating event file {outfile} from {files_to_join}")
 
     hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
@@ -352,11 +362,124 @@ def join_source_data(obsid, directories, config, src_num=1):
     for a_file in glob.glob(os.path.join(outdir, f"nu{obsid}A{label}.evt")):
         b_file = a_file.replace("A", "B")
         outfile = os.path.join(outdir, f"nu{obsid}{label}.evt")
-        merge_event_files([a_file, b_file], outfile)
+        merge_event_files([a_file, b_file], outfile, gti_operation="AND")
         outfiles.append(outfile)
 
     open(join_done_file, "a").close()
     return outfiles
+
+
+@task(task_run_name="goes_lightcurve_{event_file}_mincat_{minimum_class}")
+def get_goes_gtis(event_file, minimum_class="C5.0"):
+    from sunpy import timeseries as ts
+    from sunpy.net import Fido
+    from sunpy.net import attrs as a
+    from sunpy.time import parse_time
+    from astropy.io.fits import getheader, getdata
+    from nustar_gen import info, utils
+
+    outfile_gti = goes_gti_file_name(event_file)
+
+    if os.path.exists(outfile_gti):
+        logger = get_run_logger()
+        logger.info(f"GOES GTI file {outfile_gti} already exists, skipping")
+        return outfile_gti
+
+    # categories = ["A", "B", "C", "M", "X"]
+
+    min_cat = minimum_class[0]
+    min_num = float(minimum_class[1:])
+
+    logger = get_run_logger()
+    logger.info(f"Creating GOES light curve and GTIs for {event_file}")
+
+    ns = info.NuSTAR()
+    hdr = getheader(event_file, ext=1)
+    tstart = hdr["TSTART"]
+    tstop = hdr["TSTOP"]
+    datestart = ns.met_to_time(tstart)
+    dateend = ns.met_to_time(tstop)
+    mjdref = hdr["MJDREFI"] + hdr["MJDREFF"]
+
+    result = Fido.search(
+        a.Time(datestart.fits, dateend.fits), a.Resolution("avg1m"), a.Instrument("XRS")
+    )
+    satellites = result["xrs"]["SatelliteNumber"].data
+    sat_id = np.unique(satellites).max()
+    result3 = Fido.search(
+        a.Time(datestart.fits, dateend.fits),
+        a.Instrument.xrs & a.goes.SatelliteNumber(sat_id) & a.Resolution("avg1m")
+        | a.hek.FL & (a.hek.FRM.Name == "SWPC"),
+    )
+    files = Fido.fetch(result3, progress=False)
+    goes_all = ts.TimeSeries(files, concatenate=True)
+    goes = goes_all.truncate(datestart.iso, dateend.iso)
+
+    hek_results = result3["hek"]
+    flares_hek = hek_results
+
+    # goes.to_table().write(root + "_goes.fits", overwrite=True)
+
+    gtis = []
+    previous_gti_start = tstart
+    for flare_hek in flares_hek:
+        flare_class = flare_hek["fl_goescls"]
+        print(flare_class)
+        category = flare_class[0]
+        number = float(flare_class[1:])
+        if category < min_cat:
+            continue
+        if category == min_cat and number < min_num:
+            continue
+
+        flare_start = (parse_time(flare_hek["event_starttime"]).mjd - mjdref) * 86400
+        flare_end = (parse_time(flare_hek["event_endtime"]).mjd - mjdref) * 86400
+        if flare_start >= tstop or flare_end <= tstart:
+            continue
+
+        gtis.append({"START": previous_gti_start, "STOP": flare_start})
+        previous_gti_start = flare_end
+
+    gtis.append({"START": previous_gti_start, "STOP": tstop})
+    print(gtis)
+
+    utils.make_usr_gti(gtis, overwrite=True, outfile=outfile_gti)
+    logger.info(f"Changing extension name to GTI in {outfile_gti}")
+
+    hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
+
+    if not os.path.exists(outfile_gti):
+        raise RuntimeError(f"Failed to create GTI file {outfile_gti}")
+
+    return outfile_gti
+
+
+@flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
+def filter_from_solar_flares(event_file, minimum_class="C5.0"):
+    from astropy.io import fits
+    from astropy.table import Table
+
+    root = rootname(event_file)
+    outfile_gti_temp = root + "_tmp.gti"
+    outfile_filtered = flare_filtered_event_file_name(event_file)
+
+    if os.path.exists(outfile_filtered):
+        logger = get_run_logger()
+        logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
+        return outfile_filtered
+
+    outfile_gti_goes = get_goes_gtis(event_file, minimum_class=minimum_class)
+
+    merge_gtis([event_file, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+
+    with fits.open(event_file) as hdul, fits.open(outfile_gti_temp) as gti_hdul:
+        hdul[2].data = gti_hdul[1].data
+
+        hdul.writeto(outfile_filtered, overwrite=True)
+
+    os.unlink(outfile_gti_temp)
+
+    return outfile_filtered
 
 
 @task(
