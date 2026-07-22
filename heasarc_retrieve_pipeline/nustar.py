@@ -474,6 +474,10 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
     logger = get_run_logger()
     indir = nu_pipeline_output_path.fn(obsid, config=config)
     outdir = nu_product_output_path.fn(obsid, config=config)
+    product_done_file = os.path.join(outdir, "PRODUCTS_DONE.TXT")
+    if os.path.exists(product_done_file):
+        logger.info(f"Spectra for {obsid} already calculated")
+        return
     os.makedirs(outdir, exist_ok=True)
     logger.info(f"Calculating spectra in directory {outdir}")
     for fpm in "A", "B":
@@ -517,6 +521,8 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
             command += f"{key}={val} "
         print(command)
         hsp.nuproducts(params, noprompt=True, clobber=True, verbose=True)
+
+    open(product_done_file, "w").close()
 
 
 @flow
