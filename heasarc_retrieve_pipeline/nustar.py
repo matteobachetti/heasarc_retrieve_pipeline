@@ -253,7 +253,6 @@ def join_source_data(obsid, directories, config, src_num=1):
 
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
-    outfiles = []
 
     if src_num > 0:
         label = f"_src{src_num}"
@@ -290,12 +289,13 @@ def join_source_data(obsid, directories, config, src_num=1):
                 new_files.remove(nf)
             files_to_join.extend(new_files)
         merge_event_files(files_to_join, outfile)
-        outfiles.append(outfile)
 
+    outfiles = []
     for a_file in glob.glob(os.path.join(outdir, f"nu{obsid}A{label}.evt")):
         b_file = a_file.replace("A", "B")
         outfile = os.path.join(outdir, f"nu{obsid}{label}.evt")
         merge_event_files([a_file, b_file], outfile)
+        outfiles.append(outfile)
 
     open(join_done_file, "a").close()
     return outfiles
