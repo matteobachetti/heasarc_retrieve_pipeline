@@ -85,6 +85,64 @@ def split_path(obsid, config):
 
 
 @task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="splitext_{infile}",
+)
+def splitext(infile):
+    return splitext_improved(infile)
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="rootname_{infile}",
+)
+def rootname(infile):
+    return splitext(infile)[0]
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="barycentered_file_name_{infile}",
+)
+def barycentered_file_name(infile):
+    root, ext = splitext(infile)
+    return root + "_bary" + ext
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="goes_lc_file_name_{event_file}",
+)
+def goes_lc_file_name(event_file):
+    root = rootname(event_file)
+    return root + "_goes.fits"
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="goes_gti_file_name_{event_file}",
+)
+def goes_gti_file_name(event_file):
+    root = rootname(event_file)
+    return root + "_goes.gti"
+
+
+@task(
+    cache_key_fn=task_input_hash,
+    cache_expiration=timedelta(days=1000),
+    task_run_name="flare_filtered_event_file_name_{event_file}",
+)
+def flare_filtered_event_file_name(event_file):
+    root = rootname(event_file)
+    return root + "_noflares.evt"
+
+
+@task(
     task_run_name="separate_sources_in_event_file_{obsid}_{event_file}_region_{region_size}_back_{back_region_size}",
 )
 def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
