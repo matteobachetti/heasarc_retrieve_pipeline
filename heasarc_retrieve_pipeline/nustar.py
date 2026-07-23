@@ -541,6 +541,7 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     from astropy.wcs import WCS
     from astropy.coordinates import SkyCoord
 
+    logger = get_run_logger()
     if config is None:
         config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
