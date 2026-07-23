@@ -680,10 +680,10 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
             if bkg_reg is None:
                 bkg_reg = os.path.join(indir, root_name + "_bkg.reg")
 
-            outfile_gti_goes = get_goes_gtis(infile)
+            outfile_gti_goes = get_goes_gtis.fn(infile)
             outfile_gti_temp = os.path.join(indir, root_name + "_noflares.gti")
 
-            merge_gtis([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+            merge_gtis.fn([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
 
             if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
                 logger.warning(f"Source or background region file missing for {infile}")
@@ -758,4 +758,4 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
 
-    calculate_spectra(obsid, config, wait_for=[get_best_source_regions])
+    calculate_spectra(obsid, config, wait_for=[get_best_source_regions, filter_from_solar_flares])
