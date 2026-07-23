@@ -594,11 +594,15 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     rind, rad_profile, radial_err, psf_profile = make_radial_profile(
         test_file, show_image=False, coordinates=coordinates
     )
-    rlimit = max(
-        optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False),
-        config.get("max_radius", 80),
-    )
+    rlimit = optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False)
+
+    max_radius = config.get("max_radius", 80)
     print("Radius of peak SNR for {} to {} keV: {}".format(pair[0], pair[1], rlimit))
+    if rlimit > max_radius:
+        logger.warning(
+            f"Calculated source region radius {rlimit} exceeds maximum allowed {max_radius}, using maximum"
+        )
+        rlimit = max_radius
 
     icrs = target.icrs
 
