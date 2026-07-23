@@ -740,6 +740,9 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
 
     ra, dec, region_size = get_best_source_regions(obsid, config, wait_for=[nu_run_l2_pipeline])
 
+    region_size = region_size / 2.45
+    # TODO: ACCROCCHIO! Conversione da arcosecondo a pixel
+
     separate_sources(
         [pipedir, splitdir],
         config,
