@@ -42,7 +42,7 @@ from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
 from .barycenter import barycenter_file
-from .utils import splitext_improved
+from .utils import get_logger, splitext_improved
 
 try:
     HAS_HEASOFT = True
@@ -1171,18 +1171,12 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     because the aperture stray-light background varies across the detector. See issue 4 and
     the science caveats in ``docs/known_issues.rst``.
     """
-    from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
-    from nustar_gen.wrappers import make_image
-    from astropy.io import fits
-    from astropy.wcs import WCS
-    from astropy.coordinates import SkyCoord
-
-    logger = get_run_logger()
+    logger = get_logger()
     if config is None:
         config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
     if out_rootname is None:
-        out_rootname = rootname(fname)
+        out_rootname = rootname.fn(fname)
 
     src_out = os.path.join(indir, out_rootname + "_src.reg")
     bkg_out = os.path.join(indir, out_rootname + "_bkg.reg")
@@ -1191,7 +1185,6 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
         import astropy.units as u
 
         region_src = Regions.read(src_out, format="ds9")[0]
-        logger = get_run_logger()
         logger.info(f"Source and background region files already exist for {infile}")
         return (
             region_src.center.ra.deg,
@@ -1200,6 +1193,14 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
             src_out,
             bkg_out,
         )
+
+    # nustar_gen is only needed when a region has to be measured, not when one is read
+    # back, so import it here rather than at the top of the function.
+    from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
+    from nustar_gen.wrappers import make_image
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
 
     full_range = make_image(infile, elow=elow, ehigh=ehigh, clobber=True)
     if pair is None:
@@ -1285,38 +1286,30 @@ def get_best_source_regions(obsid, config):
 
     Notes
     -----
-    Files whose region files already exist are skipped without being counted, so if every
-    region file exists this returns ``(0.0, 0.0, 0.0)`` -- which
-    :func:`process_nustar_obsid` would then use as a sky position. See issue 4 in
-    ``docs/known_issues.rst``.
+    Files whose region files already exist still contribute: :func:`get_best_source_region`
+    reads the position and radius back out of them. ``(0.0, 0.0, 0.0)`` is returned only
+    when there is no cleaned event file at all.
     """
-    indir = nu_pipeline_output_path.fn(obsid, config=config)
+    logger = get_logger()
     outdir = nu_pipeline_output_path.fn(obsid, config=config)
     os.makedirs(outdir, exist_ok=True)
-    mean_ra = 0
-    mean_dec = 0
-    mean_rlimit = 0
+
+    mean_ra = mean_dec = mean_rlimit = 0.0
     count = 0
-    for fpm in "A", "B":
-        infiles = glob.glob(os.path.join(indir, f"nu{obsid}{fpm}01_cl.evt*"))
-        for infile in infiles:
-            if infile.endswith(".gpg"):
-                continue
-            root_name = rootname(infile)
-            src_reg = os.path.join(outdir, root_name + "_src.reg")
-            bkg_reg = os.path.join(outdir, root_name + "_bkg.reg")
-            if not os.path.exists(src_reg) or not os.path.exists(bkg_reg):
-                ra, dec, rlimit, src_out, bkg_out = get_best_source_region(infile)
-                mean_ra += ra
-                mean_dec += dec
-                mean_rlimit += rlimit
-                count += 1
+    for _, infile in spectral_input_files(obsid, config):
+        # get_best_source_region returns early when the region files already exist,
+        # reading the position and radius back out of them, so every file counts.
+        ra, dec, rlimit, _, _ = get_best_source_region.fn(infile, config=config)
+        mean_ra += ra
+        mean_dec += dec
+        mean_rlimit += rlimit
+        count += 1
 
-    mean_ra /= count if count > 0 else 1
-    mean_dec /= count if count > 0 else 1
-    mean_rlimit /= count if count > 0 else 1
+    if count == 0:
+        logger.warning(f"No cleaned event file to locate a source in for {obsid}")
+        return 0.0, 0.0, 0.0
 
-    return mean_ra, mean_dec, mean_rlimit
+    return mean_ra / count, mean_dec / count, mean_rlimit / count
 
 
 @task(

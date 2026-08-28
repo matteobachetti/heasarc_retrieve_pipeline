@@ -6,9 +6,16 @@ file-selection helpers that decide which event files the pipeline works on.
 
 import os
 
-import pytest
+# These tests call Prefect tasks through ``.fn``, outside any flow run. Prefect's API log
+# handler warns about that on every call; it has nothing to report to.
+os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
 
-from heasarc_retrieve_pipeline.nustar import spectral_input_files
+import pytest  # noqa: E402
+
+from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
+    get_best_source_regions,
+    spectral_input_files,
+)
 
 
 OBSID = "80002092008"
@@ -98,3 +105,37 @@ def test_observation_without_mode_01_data(tmp_path):
 def test_empty_observation_yields_nothing(tmp_path):
     config = make_obsid_tree(tmp_path)
     assert list(spectral_input_files(OBSID, config)) == []
+
+
+def write_region_files(directory, root, ra, dec, radius_arcsec):
+    """Write the pair of ds9 region files ``get_best_source_region`` produces."""
+    with open(os.path.join(directory, root + "_src.reg"), "w") as fobj:
+        print(f'icrs\ncircle({ra}, {dec}, {radius_arcsec}")', file=fobj)
+    with open(os.path.join(directory, root + "_bkg.reg"), "w") as fobj:
+        print(f'icrs\n-circle({ra}, {dec}, 100")\ncircle({ra}, {dec}, 250")', file=fobj)
+
+
+def test_existing_regions_are_read_back_on_a_rerun(tmp_path):
+    """A rerun must return the positions it already measured, not ``(0, 0, 0)``.
+
+    ``process_nustar_obsid`` feeds this straight into barycentring, so returning zeros
+    would barycentre the data to RA=0, Dec=0.
+    """
+    pytest.importorskip("regions")
+    config = make_obsid_tree(
+        tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+    )
+    pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+    write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
+    write_region_files(pipedir, f"nu{OBSID}B01_cl", 149.10, 69.70, 40.0)
+
+    ra, dec, rlimit = get_best_source_regions.fn(OBSID, config)
+
+    assert ra == pytest.approx(149.0, abs=1e-6)
+    assert dec == pytest.approx(69.68, abs=1e-6)
+    assert rlimit == pytest.approx(35.0, abs=1e-3)
+
+
+def test_no_event_files_gives_no_position(tmp_path):
+    config = make_obsid_tree(tmp_path)
+    assert get_best_source_regions.fn(OBSID, config) == (0.0, 0.0, 0.0)

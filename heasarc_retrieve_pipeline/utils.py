@@ -2,10 +2,32 @@
 Small helpers shared across the package.
 """
 
+import logging
 import os
-import numpy as np
 
-__all__ = ["splitext_improved"]
+import numpy as np
+from prefect import get_run_logger
+
+__all__ = ["get_logger", "splitext_improved"]
+
+
+def get_logger():
+    """
+    Prefect's run logger inside a flow or task run, a plain one outside.
+
+    ``prefect.get_run_logger`` raises when there is no active run, which makes any task
+    that logs impossible to call through ``.fn`` from a test. Falling back to a standard
+    library logger keeps the tasks unit-testable offline.
+
+    Returns
+    -------
+    logging.Logger or logging.LoggerAdapter
+        A logger that is safe to use in either context.
+    """
+    try:
+        return get_run_logger()
+    except Exception:
+        return logging.getLogger("heasarc_retrieve_pipeline")
 
 
 def splitext_improved(path):

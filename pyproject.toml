@@ -12,6 +12,7 @@ dependencies = [
   "astropy",
   "numpy",
   "astroquery",
+  "regions",
   "pyvo",
   "pytest",
   "prefect",
