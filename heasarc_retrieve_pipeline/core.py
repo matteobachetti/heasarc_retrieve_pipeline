@@ -1,3 +1,22 @@
+"""
+Mission-agnostic entry points: query HEASARC, download, and dispatch to processing.
+
+This module holds the parts of the pipeline that do not depend on which mission the
+data come from:
+
+* the ADQL queries against the HEASARC master catalogues
+  (``numaster``, ``nicermastr``, ``xtemaster``);
+* the three download transports -- HTTPS directory scraping, anonymous S3, and a plain
+  local copy for SciServer, all dispatched by :func:`recursive_download`;
+* the ``MISSION_CONFIG`` dispatch table, which maps a mission name to its catalogue,
+  its column names, its archive path builder and its processing flow;
+* the two top-level flows, :func:`retrieve_heasarc_data_by_source_name` and
+  :func:`retrieve_heasarc_data_by_obsid`.
+
+See ``docs/technical_details.rst`` for a description of the whole pipeline, and
+``docs/known_issues.rst`` for its currently known defects.
+"""
+
 import os
 import re
 import shutil
@@ -22,6 +41,24 @@ from prefect import flow, task, get_run_logger
 
 
 def _download_pysmartdl(url: str, dest: str):
+    """
+    Download a single URL with pySmartDL.
+
+    pySmartDL splits the file into chunks and fetches them in parallel, which is
+    noticeably faster than urllib against the HEASARC archive.
+
+    Parameters
+    ----------
+    url : str
+        Full URL of the file to download.
+    dest : str
+        Local destination path.
+
+    Returns
+    -------
+    str
+        The path pySmartDL actually wrote to.
+    """
     from pySmartDL import SmartDL
 
     obj = SmartDL(url, dest)
@@ -30,6 +67,38 @@ def _download_pysmartdl(url: str, dest: str):
 
 
 def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
+    """
+    Build the public HTTPS URL of an observation's directory in the HEASARC archive.
+
+    This is the legacy way of locating data, from before ``astroquery`` gained the
+    ``locate_data`` datalink interface. It is only used by
+    :func:`retrieve_heasarc_data_by_source_name_old`.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of ``MISSION_CONFIG``.
+    obsid : str
+        Observation identifier.
+    time : float
+        Observation start time (MJD). Needed by NICER, whose archive is laid out by
+        year and month.
+    cycle : int, optional
+        Proposal cycle. Needed by RXTE (``AO<cycle>``).
+    prnb : int, optional
+        Proposal number. Needed by RXTE (``P<prnb>``).
+
+    Returns
+    -------
+    str
+        URL of the observation directory, with a trailing slash.
+
+    Notes
+    -----
+    This function does not currently work: it calls the per-mission ``path_func``
+    with four positional arguments, and none of the path builders accepts that
+    signature. See issue 2 in ``docs/known_issues.rst``.
+    """
     url = (
         "https://heasarc.gsfc.nasa.gov/"
         + MISSION_CONFIG[mission]["path_func"](obsid, time, cycle, prnb)
@@ -39,6 +108,23 @@ def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
 
 
 def download_cmd(url: str, dest: str):
+    """
+    Download one file, converting any exception into a return value.
+
+    Parameters
+    ----------
+    url : str
+        Full URL of the file to download.
+    dest : str
+        Local destination path.
+
+    Returns
+    -------
+    fname : str or None
+        The path that was written, or ``None`` if the download failed.
+    error : str or None
+        The string form of the exception, or ``None`` on success.
+    """
     try:
         return _download_pysmartdl(url, dest), None
     except Exception as e:
@@ -47,7 +133,31 @@ def download_cmd(url: str, dest: str):
 
 @task(task_run_name="get_remote_directory_listing_{url}")
 def get_remote_directory_listing(url: str):
-    """Give the list of files in the remote directory."""
+    """
+    List every file below a remote directory, recursively.
+
+    Scrapes the Apache-generated HTML index of ``url`` with BeautifulSoup, descends
+    into every subdirectory, and returns a flat list of URLs. Directory URLs keep
+    their trailing slash, which is how :func:`download_node` later tells directories
+    from files.
+
+    Parameters
+    ----------
+    url : str
+        URL of the directory to list. Spaces are percent-encoded.
+
+    Returns
+    -------
+    list of str or None
+        All URLs found below ``url``, directories included, or ``None`` if the
+        request returned an HTTP error.
+
+    Notes
+    -----
+    The listing is built from the *text* of each ``<a>`` element rather than its
+    ``href``, so the index's own column-sort links and its "Parent Directory" link
+    end up in the result. See issue 10 in ``docs/known_issues.rst``.
+    """
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
 
@@ -88,6 +198,43 @@ def download_node(
     test_str: str = ".",
     test: bool = False,
 ):
+    """
+    Download one node (file or directory) of a remote listing to its local mirror.
+
+    The local path is obtained by stripping ``base_url`` from ``node`` and joining
+    the remainder onto ``outdir``, so that the archive's directory structure is
+    reproduced locally.
+
+    Parameters
+    ----------
+    node : str
+        URL of the file or directory. A trailing slash marks a directory.
+    base_url : str
+        Prefix to strip from ``node`` before building the local path. Usually the
+        parent of the observation directory, so that the OBSID becomes the top
+        local directory.
+    outdir : str
+        Local root directory of the download.
+    cut_ndirs : int, optional
+        Number of leading path components to drop from the remote path.
+    test_str : str, optional
+        Substring that must appear in the local path for the node to be fetched.
+        The default ``"."`` effectively means "only names containing a dot". Pass
+        ``None`` to disable the check.
+    test : bool, optional
+        If True, log what would happen but transfer nothing.
+
+    Returns
+    -------
+    str or None
+        The local path, or ``None`` if the node was skipped or already present.
+
+    Notes
+    -----
+    A failed download is logged as a warning but the local path is still returned,
+    so callers cannot tell success from failure. See issue 11 in
+    ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     local_ver = os.path.join(outdir, *node.replace(base_url, "").split("/")[cut_ndirs:])
     if test_str is not None and test_str not in local_ver:
@@ -128,6 +275,41 @@ def recursive_download_s3(
     re_include: str = "",
     re_exclude: str = "",
 ):
+    """
+    Mirror an observation directory from the public ``nasa-heasarc`` S3 bucket.
+
+    Reads the bucket anonymously (unsigned requests), so no AWS credentials are
+    needed. The local layout matches the other transports: files land under
+    ``<outdir>/<OBSID>/...``.
+
+    Parameters
+    ----------
+    url : str
+        ``s3://<bucket>/<key prefix>`` pointing at the observation directory.
+    outdir : str
+        Local root directory of the download.
+    cut_ndirs : int, optional
+        Accepted for signature compatibility with the HTTPS transport; unused here.
+    test_str : str, optional
+        Substring that must appear in the local path for the key to be fetched.
+    test : bool, optional
+        If True, log what would happen but transfer nothing.
+    re_include : str, optional
+        Regular expression; only keys matching it are downloaded. Empty means "all".
+    re_exclude : str, optional
+        Regular expression; keys matching it are skipped. Empty means "none".
+
+    Returns
+    -------
+    list of str
+        Local paths of the files downloaded or already present.
+
+    Notes
+    -----
+    ``list_objects_v2`` is called once and returns at most 1000 keys, so
+    observations with more files than that are silently truncated. See issue 9 in
+    ``docs/known_issues.rst``.
+    """
     import boto3
     import botocore
     from urllib.parse import urlparse
@@ -195,6 +377,45 @@ def recursive_download_https(
     re_include: str = "",
     re_exclude: str = "",
 ):
+    """
+    Mirror an observation directory from the HEASARC HTTPS archive.
+
+    Gets the recursive listing with :func:`get_remote_directory_listing`, applies the
+    include/exclude regular expressions to the remote URLs, and fetches what is left
+    with :func:`download_node`.
+
+    Parameters
+    ----------
+    url : str
+        ``https://heasarc.gsfc.nasa.gov/FTP/...`` URL of the observation directory.
+    outdir : str
+        Local root directory of the download.
+    cut_ndirs : int, optional
+        Number of leading path components to drop from each remote path.
+    test_str : str, optional
+        Substring that must appear in the local path for a node to be fetched.
+    test : bool, optional
+        If True, log what would happen but transfer nothing.
+    re_include : str, optional
+        Regular expression; only URLs matching it are downloaded. Empty means "all".
+    re_exclude : str, optional
+        Regular expression; URLs matching it are skipped. Empty means "none".
+
+    Returns
+    -------
+    list or bool
+        Local paths (with ``None`` for skipped nodes), or ``False`` if the remote
+        directory was empty or unreachable.
+
+    Examples
+    --------
+    Fetch only the NuSTAR mode 01 and 06 event files of an observation, skipping the
+    calibration modes 02 to 05::
+
+        recursive_download_https(url, "out",
+                                 re_include=r"[AB]0.*evt",
+                                 re_exclude=r"[AB]0[2-5]")
+    """
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
@@ -235,7 +456,25 @@ def recursive_download_https(
 
 @task(task_run_name="copy_local_directory_{url}")
 def copy_local_directory(url: str, outdir: str):
-    """Copy a local directory to the output directory."""
+    """
+    Copy an already-local archive directory into the output directory.
+
+    This is the SciServer transport: there, the HEASARC archive is mounted under
+    ``/FTP`` and "downloading" is a directory copy.
+
+    Parameters
+    ----------
+    url : str
+        Path of the source directory. Its basename (normally the OBSID) becomes the
+        name of the copy.
+    outdir : str
+        Local root directory of the download.
+
+    Returns
+    -------
+    generator
+        ``os.walk`` over the newly created copy.
+    """
     outpath = os.path.join(outdir, url.rstrip("/").split("/")[-1])
     logger = get_run_logger()
     logger.info(f"Copying local directory {url} to {outpath}")
@@ -256,6 +495,38 @@ def recursive_download(
     re_exclude: str = "",
 ):
 
+    """
+    Fetch an observation directory, choosing the transport from the URL scheme.
+
+    ``http...`` is scraped over HTTPS, ``s3://`` is read from the public S3 mirror,
+    and anything else is treated as a local path and copied. All three produce the
+    same local layout, ``<outdir>/<OBSID>/...``.
+
+    Parameters
+    ----------
+    url : str
+        Location of the observation directory: an HTTPS URL, an ``s3://`` URL, or a
+        local path.
+    outdir : str
+        Local root directory of the download.
+    cut_ndirs : int, optional
+        Number of leading path components to drop from each remote path.
+    test_str : str, optional
+        Substring that must appear in the local path for a file to be fetched.
+    test : bool, optional
+        If True, log what would happen but transfer nothing.
+    re_include : str, optional
+        Regular expression; only paths matching it are downloaded. Empty means "all".
+    re_exclude : str, optional
+        Regular expression; paths matching it are skipped. Empty means "none".
+
+    Returns
+    -------
+    list, generator or bool
+        Whatever the chosen transport returns: a list of local paths for HTTPS and
+        S3, an ``os.walk`` generator for the local copy, or ``False`` if an HTTPS
+        listing came back empty.
+    """
     if url.startswith("http"):
         return recursive_download_https(
             url, outdir, cut_ndirs, test_str, test, re_include, re_exclude
@@ -297,6 +568,24 @@ MISSION_CONFIG = {
 
 @task(task_run_name="read_config_{config_file}")
 def read_config(config_file: str):
+    """
+    Read a YAML configuration file.
+
+    Parameters
+    ----------
+    config_file : str
+        Path of the YAML file.
+
+    Returns
+    -------
+    dict
+        The parsed configuration.
+
+    Notes
+    -----
+    Unused, and currently broken: ``yaml.load`` requires an explicit ``Loader``
+    argument from PyYAML 6 onwards. See issue 24 in ``docs/known_issues.rst``.
+    """
     import yaml
 
     with open(config_file, "r") as f:
@@ -308,6 +597,40 @@ def read_config(config_file: str):
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
 ):
+    """
+    Cone-search a mission's master catalogue around a sky position.
+
+    Builds and runs an ADQL query against the mission's HEASARC master catalogue,
+    selecting every observation whose *pointing* falls within ``radius_deg`` of the
+    given position and whose exposure is non-negative (planned-but-not-executed
+    observations carry a null or negative exposure).
+
+    Parameters
+    ----------
+    ra_deg : float
+        Right ascension of the search centre, ICRS degrees.
+    dec_deg : float
+        Declination of the search centre, ICRS degrees.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``: ``"nustar"``, ``"nicer"`` or
+        ``"rxte"``.
+    radius_deg : float, optional
+        Search radius in degrees. The default, 0.1 deg (6 arcmin), is conservative
+        for an imaging instrument: NuSTAR's field of view is 12x12 arcmin, so a
+        source can be well inside the field of an observation pointed further away
+        than this.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per observation, ordered by time, with columns ``source_name``,
+        ``obsid``, ``time``, the mission's exposure column, ``ra``, ``dec`` and
+        ``__row``; plus ``public_date`` for NuSTAR and NICER (``xtemaster`` has no
+        such column) and the mission's extra columns.
+
+        ``__row`` is astroquery's internal row identifier and must be preserved: it
+        is what ``Heasarc.locate_data`` needs in order to find the files.
+    """
     logger = get_run_logger()
     logger.info(
         f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
@@ -342,7 +665,26 @@ def retrieve_heasarc_table_by_position(
 @task(task_run_name="retrieve_info_for_obsid_{obsid}")
 def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     """
-    Retrieve the observation information for a given obsid from the HEASARC table.
+    Look up a single observation in a mission's master catalogue.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier, matched exactly.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+
+    Returns
+    -------
+    astropy.table.Table
+        Zero or one row, with the mission's name, ``cycle``, ``obsid``, ``time``,
+        exposure, ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
+
+    Notes
+    -----
+    Unlike :func:`retrieve_heasarc_table_by_position`, this does not alias the
+    mission's name column to ``source_name``, so the two functions return tables
+    with slightly different schemas.
     """
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
@@ -365,6 +707,19 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
 @task
 def get_source_position(source: str):
 
+    """
+    Resolve a source name to coordinates through SIMBAD/NED.
+
+    Parameters
+    ----------
+    source : str
+        Source name, as understood by ``SkyCoord.from_name``.
+
+    Returns
+    -------
+    astropy.coordinates.SkyCoord
+        The resolved position.
+    """
     pos = SkyCoord.from_name(f"{source}")
 
     return pos
@@ -374,6 +729,26 @@ def get_source_position(source: str):
 def retrieve_heasarc_table_by_source_name(
     source: str, mission: str = "nustar", radius_deg: float = 0.1
 ):
+    """
+    Cone-search a mission's master catalogue around a named source.
+
+    Convenience wrapper: resolves the name with :func:`get_source_position` and
+    hands the result to :func:`retrieve_heasarc_table_by_position`.
+
+    Parameters
+    ----------
+    source : str
+        Source name, as understood by ``SkyCoord.from_name``.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+    radius_deg : float, optional
+        Search radius in degrees.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per matching observation.
+    """
     pos = get_source_position.fn(source)
     results = retrieve_heasarc_table_by_position.fn(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
@@ -390,6 +765,39 @@ def retrieve_heasarc_data_by_source_name_old(
     test: bool = False,
 ):
 
+    """
+    Legacy retrieve-and-process path, using hand-built archive URLs.
+
+    Predates ``astroquery``'s ``locate_data`` datalink interface: instead of asking
+    HEASARC where the files are, it builds the archive path itself from the OBSID
+    with :func:`remote_data_url`. Kept as a fallback for
+    :func:`retrieve_heasarc_data_by_source_name`.
+
+    Parameters
+    ----------
+    source : str
+        Source name, as understood by ``SkyCoord.from_name``.
+    outdir : str, optional
+        Directory to download into and process in.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+    radius_deg : float, optional
+        Cone-search radius in degrees.
+    test : bool, optional
+        If True, fake the downloads and stop after the first observation.
+
+    Returns
+    -------
+    astropy.table.Table
+        The catalogue rows that were processed.
+
+    Notes
+    -----
+    This function cannot run as written: the archive path builders reject the
+    argument list it passes them, it reads ``cycle`` and ``prnb`` columns that are
+    only selected for RXTE, and it hardcodes the NuSTAR processing flow regardless
+    of ``mission``. See issue 2 in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     pos = get_source_position(source)
 
@@ -440,6 +848,54 @@ def retrieve_and_process_data(
     force_s3: bool = False,
 ):
 
+    """
+    Download and reduce every observation in a catalogue table.
+
+    For each row: work out where the files live, mirror them into ``outdir``, then
+    run the mission's processing flow on the resulting directory.
+
+    The mirror is chosen in this order: ``force_s3`` and ``force_heasarc`` win if
+    set; otherwise, if ``SCISERVER_USER_ID`` is in the environment the local
+    SciServer paths are used; otherwise AWS S3.
+
+    The processing flow is run with the working directory changed to ``outdir``,
+    which is why the mission modules' ``DEFAULT_CONFIG`` uses ``"./"`` for both
+    input and output paths.
+
+    Parameters
+    ----------
+    result_table : astropy.table.Table
+        Catalogue rows, as returned by :func:`retrieve_heasarc_table_by_position` or
+        :func:`retrieve_info_for_obsid`. Must still contain the ``__row`` column.
+    source_position : astropy.coordinates.SkyCoord or None, optional
+        Position to use for barycentring. If ``None``, each observation's own
+        pointing (``ra``, ``dec``) is used instead.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+    outdir : str, optional
+        Directory to download into and process in.
+    test : bool, optional
+        If True, fake the downloads and stop after the first observation, without
+        processing anything.
+    flags : dict, optional
+        Extra parameters forwarded to the mission's Level-2 pipeline task
+        (``nupipeline``, ``nicerl2``).
+    force_heasarc : bool, optional
+        Download over HTTPS from HEASARC, whatever the environment suggests.
+    force_s3 : bool, optional
+        Download from the public AWS S3 mirror, whatever the environment suggests.
+
+    Returns
+    -------
+    astropy.table.Table
+        The input table, unchanged.
+
+    Notes
+    -----
+    The link table is indexed positionally (``links[i]``), which assumes the
+    datalink service returns exactly one row per input row in the same order. It
+    does not. See issue 1 in ``docs/known_issues.rst``.
+    """
     cwd = os.getcwd()
     processing = MISSION_CONFIG[mission]["obsid_processing"]
     links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
@@ -493,6 +949,42 @@ def retrieve_heasarc_data_by_source_name(
     force_s3: bool = False,
 ):
 
+    """
+    Download and reduce every observation of a named source.
+
+    Top-level entry point. Resolves the name, cone-searches the mission's master
+    catalogue, and hands the results to :func:`retrieve_and_process_data`. Falls
+    back to :func:`retrieve_heasarc_data_by_source_name_old` if locating the data
+    through ``astroquery`` raises.
+
+    Parameters
+    ----------
+    source : str
+        Source name, as understood by ``SkyCoord.from_name``.
+    outdir : str, optional
+        Directory to download into and process in.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+    radius_deg : float, optional
+        Cone-search radius in degrees, applied to the observation pointing.
+    test : bool, optional
+        If True, fake the downloads and stop after the first observation.
+    force_heasarc : bool, optional
+        Download over HTTPS from HEASARC.
+    force_s3 : bool, optional
+        Download from the public AWS S3 mirror.
+
+    Returns
+    -------
+    astropy.table.Table
+        The catalogue rows that were processed.
+
+    Notes
+    -----
+    Unlike :func:`retrieve_heasarc_data_by_obsid`, this flow has no ``flags``
+    argument, so Level-2 pipeline parameters cannot be customised when working by
+    source name.
+    """
     logger = get_run_logger()
     pos = get_source_position(source)
 
@@ -534,6 +1026,37 @@ def retrieve_heasarc_data_by_obsid(
     force_s3: bool = False,
 ):
 
+    """
+    Download and reduce a single observation, by OBSID.
+
+    Top-level entry point. Looks the OBSID up in the mission's master catalogue and
+    hands the single-row result to :func:`retrieve_and_process_data`. Since no
+    source position is given, the observation is barycentred at its own pointing
+    coordinates (for NuSTAR, at the position measured from the image).
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    outdir : str, optional
+        Directory to download into and process in.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+    test : bool, optional
+        If True, fake the download and skip processing.
+    flags : dict, optional
+        Extra parameters forwarded to the mission's Level-2 pipeline task.
+    force_heasarc : bool, optional
+        Download over HTTPS from HEASARC.
+    force_s3 : bool, optional
+        Download from the public AWS S3 mirror.
+
+    Returns
+    -------
+    astropy.table.Table or None
+        The catalogue row that was processed, or ``None`` if the OBSID is not in the
+        catalogue.
+    """
     logger = get_run_logger()
 
     results = retrieve_info_for_obsid(obsid, mission=mission)
