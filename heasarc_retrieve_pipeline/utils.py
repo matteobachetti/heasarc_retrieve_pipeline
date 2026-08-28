@@ -1,3 +1,7 @@
+"""
+Small helpers shared across the package.
+"""
+
 import os
 import numpy as np
 
@@ -6,6 +10,25 @@ __all__ = ["splitext_improved"]
 
 def splitext_improved(path):
     """
+    Split a path into root and extension, keeping compression suffixes attached.
+
+    ``os.path.splitext`` treats ``a.evt.gz`` as ``("a.evt", ".gz")``, which is the wrong
+    split for the archive's file names: almost every FITS file in a HEASARC observation is
+    gzipped, and the useful root is ``a``. This version recognises ``.gz``, ``.Z``, ``.zip``
+    and ``.bz2`` and folds them into the extension.
+
+    Parameters
+    ----------
+    path : str
+        File path, with or without directories.
+
+    Returns
+    -------
+    root : str
+        The path with its extension removed, directories preserved.
+    ext : str
+        The extension, including the compression suffix if there was one.
+
     Examples
     --------
     >>> assert np.all(splitext_improved("a.tar.gz") ==  ('a', '.tar.gz'))
