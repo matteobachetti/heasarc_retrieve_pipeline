@@ -1,4 +1,5 @@
 import os
+import numpy as np
 
 __all__ = ["splitext_improved"]
 
