@@ -33,6 +33,17 @@ table** for every query.
 ``retrieve_and_process_data`` (``core.py:466``) then evaluates ``links[i][link_col_name]``
 and raises ``IndexError`` on the first observation.
 
+This is not hypothetical. Running the existing test suite against the live services
+today gives::
+
+    8 failed, 3 passed
+
+All eight failures are
+``IndexError: index 0 out of range for table with length 0``. The three that pass are
+``test_recursive_download`` (both hosts), which bypasses ``locate_data`` and builds the
+archive URL by hand, and the ``splitext_improved`` doctest. In other words, every test
+that exercises a top-level flow is currently red.
+
 The ``try``/``except`` fallback in ``retrieve_heasarc_data_by_source_name``
 (``core.py:500``) does not help, for two reasons: ``locate_data`` does not raise, it
 returns an empty table; and the fallback itself is broken (issue 2).
@@ -436,7 +447,25 @@ machine with a display can try to open a window.
 * ``nustar.py:734``: unused local ``basedir``.
 * ``image_from_table`` takes a ``correct_zeros`` argument that is never used.
 
-33. ``tox.ini`` cannot run
+33. The documentation does not build with a current Sphinx
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``docs/conf.py:57`` uses the pre-Sphinx-5 form of the intersphinx configuration::
+
+    intersphinx_mapping = {'https://docs.python.org/': None}
+
+Sphinx 5 and later require a named mapping, and reject this one outright::
+
+    sphinx.errors.ConfigError: Invalid `intersphinx_mapping` configuration (1 error).
+
+So ``sphinx-build -W docs docs/_build`` -- exactly what the ``build-docs`` tox
+environment runs -- fails before reading a single page. The fix is one line::
+
+    intersphinx_mapping = {'python': ('https://docs.python.org/3', None)}
+
+With that change the documentation builds clean under ``-W`` (warnings as errors).
+
+34. ``tox.ini`` cannot run
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * ``env_list`` includes ``py{38,39,...}`` while ``pyproject.toml`` sets
@@ -507,6 +536,9 @@ Four test functions, all ``@pytest.mark.remote_data``. Three fake the download
 (``test=True``) and never reach any processing code; one downloads two real files. So:
 
 * with no network, the suite collects **zero** runnable tests;
+* the ``remote_data`` marker only skips anything if ``pytest-remotedata`` (part of
+  ``pytest-astropy``) is installed. Without it the marker is inert and a plain
+  ``pytest`` run hits the network regardless, while emitting an unknown-marker warning;
 * the CI workflow always passes ``--remote-data``, so a HEASARC or AWS outage turns the
   build red for reasons unrelated to the code;
 * ``heasoftpy`` is never installed in CI, so no processing code is executed anywhere, ever;
