@@ -28,6 +28,7 @@ import warnings
 import typing
 from astropy.table import hstack, Table
 from astroquery.heasarc import Heasarc
+import pyvo
 from astropy.coordinates import SkyCoord
 
 
@@ -836,6 +837,70 @@ def retrieve_heasarc_data_by_source_name_old(
     return results
 
 
+def locate_data(result_table, catalog_name):
+    """Local stand-in for :meth:`astroquery.heasarc.Heasarc.locate_data`.
+
+    ``Heasarc.locate_data`` keeps only the datalink rows whose ``content_type``
+    is ``directory``, but the HEASARC datalink service now labels the
+    observation-directory row ``text/html``, so it returns an empty table for
+    every query (astroquery issue #3652). This is a verbatim copy of the
+    astroquery method with the row selection replaced by a test on the access
+    URL -- which is how ``sciserver`` and ``aws`` are derived a few lines below
+    anyway. Rows that carry an ``error_message`` are kept, as astroquery keeps
+    them: they mark observations with no public data products, typically ones
+    still in their proprietary period.
+
+    Delete this function and restore the ``Heasarc.locate_data`` call once
+    astroquery #3652 is fixed.
+
+    Parameters
+    ----------
+    result_table : :class:`astropy.table.Table`
+        Output of a catalogue query, including the ``__row`` column.
+    catalog_name : str
+        Name of the HEASARC catalogue the rows came from, e.g. ``numaster``.
+
+    Returns
+    -------
+    :class:`astropy.table.Table`
+        Same columns as ``Heasarc.locate_data``: ``ID``, ``access_url``,
+        ``sciserver``, ``aws``, ``content_length``, ``error_message``. For rows
+        with an error message the three URL columns are empty strings.
+    """
+    query = pyvo.dal.adhoc.DatalinkQuery(
+        baseurl=f"{Heasarc.VO_URL}/datalink/{catalog_name}",
+        id=result_table["__row"],
+        session=Heasarc._session,
+    )
+    dl_result = pyvo.dal.DALResults(
+        query.execute_votable(post=True), url=query.queryurl, session=query._session
+    ).to_table()
+
+    # Include rows that point at a data directory and those that report errors
+    # (usually meaning there are no public data products).
+    dl_result = dl_result[
+        [
+            "/FTP/" in url or err != ""
+            for url, err in zip(dl_result["access_url"], dl_result["error_message"])
+        ]
+    ]
+    dl_result = dl_result[["ID", "access_url", "content_length", "error_message"]]
+
+    # Add sciserver and s3 columns
+    newcol = [
+        f"/FTP/{row.split('FTP/')[1]}".replace("//", "/") if "FTP" in row else ""
+        for row in dl_result["access_url"]
+    ]
+    dl_result.add_column(newcol, name="sciserver", index=2)
+    newcol = [
+        f"s3://{Heasarc.S3_BUCKET}/{row[5:]}" if row != "" else ""
+        for row in dl_result["sciserver"]
+    ]
+    dl_result.add_column(newcol, name="aws", index=3)
+
+    return dl_result
+
+
 @flow
 def retrieve_and_process_data(
     result_table: Table,
@@ -892,13 +957,22 @@ def retrieve_and_process_data(
 
     Notes
     -----
-    The link table is indexed positionally (``links[i]``), which assumes the
-    datalink service returns exactly one row per input row in the same order. It
-    does not. See issue 1 in ``docs/known_issues.rst``.
+    Links are matched to catalogue rows through the datalink ``ID``, not by
+    position: the datalink service does not return one usable row per input row.
+    Observations with no public data products -- typically ones still in their
+    proprietary period -- are logged and skipped.
     """
     cwd = os.getcwd()
     processing = MISSION_CONFIG[mission]["obsid_processing"]
-    links = Heasarc.locate_data(result_table, catalog_name=MISSION_CONFIG[mission]["table"])
+    logger = get_run_logger()
+    links = locate_data(result_table, MISSION_CONFIG[mission]["table"])
+    # Restore this once astroquery #3652 is fixed, and delete ``locate_data`` above:
+    # links = Heasarc.locate_data(
+    #     result_table, catalog_name=MISSION_CONFIG[mission]["table"]
+    # )
+    # Match links to catalogue rows by identity, not by position: observations
+    # with no public data products do come back, but not in a downloadable form.
+    link_by_row = {str(i).split("?")[-1]: row for i, row in zip(links["ID"], links)}
     if force_s3:
         link_col_name = "aws"
     elif force_heasarc:
@@ -909,7 +983,7 @@ def retrieve_and_process_data(
         # Defaults to AWS
         link_col_name = "aws"
 
-    for i, row in enumerate(result_table):
+    for row in result_table:
         obsid = row["obsid"]
         if source_position is not None:
             ra = source_position.ra.deg
@@ -918,11 +992,19 @@ def retrieve_and_process_data(
             ra = row["ra"]
             dec = row["dec"]
 
+        link = link_by_row.get(row["__row"])
+        if link is None or not link[link_col_name]:
+            logger.info(
+                f"No public data products for OBSID {obsid} "
+                "(still in its proprietary period?), skipping"
+            )
+            continue
+
         os.chdir(cwd)
-        recursive_download(links[i][link_col_name], outdir, test_str=".", test=test)
+        recursive_download(link[link_col_name], outdir, test_str=".", test=test)
         if test:
             break
-        # Heasarc.download_data(links[i], host=host, location=outdir)
+        # Heasarc.download_data(link, host=host, location=outdir)
 
         os.chdir(outdir)
 

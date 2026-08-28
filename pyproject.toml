@@ -12,6 +12,7 @@ dependencies = [
   "astropy",
   "numpy",
   "astroquery",
+  "pyvo",
   "pytest",
   "prefect",
   "pysmartdl",

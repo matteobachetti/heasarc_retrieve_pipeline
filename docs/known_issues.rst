@@ -19,8 +19,12 @@ Blocking
 
 .. _issue_locate_data:
 
-1. ``Heasarc.locate_data`` currently returns nothing, and the code cannot survive it
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. ``Heasarc.locate_data`` returns nothing -- WORKED AROUND
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*Reported upstream as* `astroquery #3652
+<https://github.com/astropy/astroquery/issues/3652>`_ *and worked around locally; the
+description below is kept because the workaround is temporary.*
 
 *Verified live against the HEASARC service with astroquery 0.4.11.*
 
@@ -48,12 +52,21 @@ The ``try``/``except`` fallback in ``retrieve_heasarc_data_by_source_name``
 (``core.py:500``) does not help, for two reasons: ``locate_data`` does not raise, it
 returns an empty table; and the fallback itself is broken (issue 2).
 
-Suggested fix: stop relying on the ``content_type`` label. Fetch the datalink table and
-select the row whose ``access_url`` contains ``/FTP/``, or upgrade astroquery once
-upstream has adapted. Either way, ``retrieve_and_process_data`` should check
-``len(links) == len(result_table)`` and match rows by ``__row``/``ID`` rather than by
-position -- the datalink service returns several rows per input row, in no guaranteed
-order, so positional indexing was never safe.
+**Workaround in place.** ``core.locate_data`` is a copy of the astroquery method with
+the row selection replaced by a test on the access URL (``'/FTP/' in access_url``, which
+is how the ``sciserver`` and ``aws`` columns are derived anyway). It returns the same
+columns as the original, and the ``Heasarc.locate_data`` call it replaces is kept
+commented out at the call site: when astroquery #3652 is fixed, uncomment that line and
+delete the local function.
+
+The same change fixed the row matching. Links are now keyed on the datalink ``ID``
+instead of being indexed positionally against the catalogue table. Positional indexing
+was never safe, and it fails in ordinary use: observations still inside their
+proprietary period are returned by the catalogue query but have no downloadable
+products, so every observation after the first such gap was being downloaded under the
+wrong OBSID. Those observations are now logged and skipped.
+
+With the workaround, the full test suite passes: ``11 passed``.
 
 2. The legacy fallback path cannot run
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
