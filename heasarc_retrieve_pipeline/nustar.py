@@ -38,6 +38,8 @@ import re
 import glob
 from datetime import timedelta
 import numpy as np
+import astropy.units as u
+from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
@@ -283,8 +285,13 @@ def spectral_input_files(obsid, config):
     """
     Event files to extract spectra from, with the module each one belongs to.
 
-    Only mode 01, the normal science mode, is considered: mode 06 needs its aspect
-    reconstructing first and is handled separately.
+    Two kinds of file qualify. Mode 01, the normal science mode, comes from the
+    ``nupipeline`` output directory. Mode 06, "spacecraft science", comes from the ``split``
+    directory as the per-CHU files written by ``nusplitsc`` -- the unsplit mode-06 file is
+    deliberately not included, because its aspect solution has not been reconstructed yet.
+
+    Mode 01 is yielded first for each module, because it defines the reference position the
+    mode-06 detections are checked against.
 
     Parameters
     ----------
@@ -301,9 +308,47 @@ def spectral_input_files(obsid, config):
         Path of the cleaned event file.
     """
     pipedir = nu_pipeline_output_path.fn(obsid, config=config)
+    splitdir = split_path.fn(obsid, config=config)
     for fpm in "A", "B":
         for infile in _cl_event_files(pipedir, f"nu{obsid}{fpm}01_cl.evt*"):
             yield fpm, infile
+        for infile in _cl_event_files(splitdir, f"nu{obsid}{fpm}06_chu*_cl.evt*"):
+            yield fpm, infile
+
+
+def position_is_consistent(position, reference, max_offset):
+    """
+    Whether a detected source position is close enough to where it was expected.
+
+    Each CHU1/CHU2/CHU3 combination recovered by ``nusplitsc`` carries its own aspect
+    reconstruction, scattered by about 2 arcmin according to the ``nusplitsc``
+    documentation. A detection further from the mode-01 position than that is not the same
+    object, and extracting a spectrum there would silently produce the wrong source.
+
+    Parameters
+    ----------
+    position : :class:`astropy.coordinates.SkyCoord`
+        Detected source position.
+    reference : :class:`astropy.coordinates.SkyCoord` or None
+        Position the source is expected near. ``None`` means no constraint -- the case for
+        mode-01 data, which is what defines the reference in the first place.
+    max_offset : :class:`astropy.units.Quantity`
+        Largest acceptable separation, as an angle.
+
+    Returns
+    -------
+    bool
+        ``True`` if the position is acceptable.
+
+    Notes
+    -----
+    This takes a single reference position because the pipeline currently extracts one
+    source, the brightest. Supporting several means passing the list of reference positions
+    and matching each detected peak to its nearest one; the comparison itself is unchanged.
+    """
+    if reference is None:
+        return True
+    return position.separation(reference) <= max_offset
 
 
 @task(
@@ -1123,7 +1168,16 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 @task(
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
-def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=None, config=None):
+def get_best_source_region(
+    infile,
+    pair=None,
+    elow=3,
+    ehigh=80,
+    out_rootname=None,
+    config=None,
+    reference=None,
+    max_offset=None,
+):
     """
     Find the source and choose the extraction radius that maximises its signal-to-noise.
 
@@ -1152,7 +1206,13 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     out_rootname : str, optional
         Root name for the region files. Defaults to the event file's root.
     config : dict, optional
-        Pipeline configuration; only ``max_radius`` is read.
+        Pipeline configuration; ``max_radius`` and ``max_source_offset_arcmin`` are read.
+    reference : :class:`astropy.coordinates.SkyCoord`, optional
+        Position the source is expected near. Used for mode-06 data, whose per-CHU aspect
+        solutions each carry their own offset; ``None`` imposes no constraint.
+    max_offset : :class:`astropy.units.Quantity`, optional
+        Largest acceptable separation from ``reference``. Defaults to
+        ``config["max_source_offset_arcmin"]`` arcmin, or 3 arcmin.
 
     Returns
     -------
@@ -1163,13 +1223,16 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     src_out, bkg_out : str
         Paths of the source and background region files.
 
+    Returns ``None``, writing no region files, if the detected source is further than
+    ``max_offset`` from ``reference``.
+
     Notes
     -----
-    The separation between the detected position and the header's ``RA_OBJ``/``DEC_OBJ`` is
-    computed but never checked, so a detection that locked onto the wrong object is not
-    caught; and a concentric annulus is not the recommended NuSTAR background prescription,
-    because the aperture stray-light background varies across the detector. See issue 4 and
-    the science caveats in ``docs/known_issues.rst``.
+    A detection that locks onto the wrong object is caught only when ``reference`` is
+    given; without one, the brightest peak in the field is taken on trust. A concentric
+    annulus is also not the recommended NuSTAR background prescription, because the
+    aperture stray-light background varies across the detector. See the science caveats in
+    ``docs/known_issues.rst``.
     """
     logger = get_logger()
     if config is None:
@@ -1200,7 +1263,6 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     from nustar_gen.wrappers import make_image
     from astropy.io import fits
     from astropy.wcs import WCS
-    from astropy.coordinates import SkyCoord
 
     full_range = make_image(infile, elow=elow, ehigh=ehigh, clobber=True)
     if pair is None:
@@ -1215,10 +1277,17 @@ def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=Non
     ra = world[0][0]
     dec = world[0][1]
     target = SkyCoord(ra, dec, unit="deg", frame="fk5")
-    obj_j2000 = SkyCoord(hdu.header["RA_OBJ"], hdu.header["DEC_OBJ"], unit="deg", frame="fk5")
 
-    # How far are we from the J2000 coordinates? If <15 arcsec, all is okay
-    sep = target.separation(obj_j2000)
+    if max_offset is None:
+        max_offset = config.get("max_source_offset_arcmin", 3) * u.arcmin
+    if not position_is_consistent(target, reference, max_offset):
+        logger.warning(
+            f"Source found in {infile} is "
+            f"{target.separation(reference).to(u.arcmin):.2f} from the expected position, "
+            f"more than {max_offset}. Writing no region file for it."
+        )
+        return None
+
     # Now the radial image parts.
 
     # Make the radial image for the full energy range (or whatever is the best SNR)
@@ -1299,7 +1368,10 @@ def get_best_source_regions(obsid, config):
     for _, infile in spectral_input_files(obsid, config):
         # get_best_source_region returns early when the region files already exist,
         # reading the position and radius back out of them, so every file counts.
-        ra, dec, rlimit, _, _ = get_best_source_region.fn(infile, config=config)
+        result = get_best_source_region.fn(infile, config=config)
+        if result is None:
+            continue
+        ra, dec, rlimit, _, _ = result
         mean_ra += ra
         mean_dec += dec
         mean_rlimit += rlimit
@@ -1315,7 +1387,7 @@ def get_best_source_regions(obsid, config):
 @task(
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
-def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
+def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=None):
     """
     Extract calibrated spectra with HEASOFT ``nuproducts``.
 
@@ -1343,7 +1415,11 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
     config : dict
         Must contain ``out_data_path``.
     src_reg, bkg_reg : str, optional
-        Region files to use. If ``None``, they are looked up next to each event file.
+        Region files to use. If ``None``, they are looked up next to each event file and
+        measured if they are not there.
+    ra, dec : float, optional
+        Mode-01 source position, in degrees. Mode-06 detections are required to fall within
+        ``config["max_source_offset_arcmin"]`` of it.
 
     Notes
     -----
@@ -1362,19 +1438,35 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
     os.makedirs(outdir, exist_ok=True)
     logger.info(f"Calculating spectra in directory {outdir}")
 
+    reference = None
+    if ra not in (None, "NONE") and dec not in (None, "NONE"):
+        reference = SkyCoord(float(ra), float(dec), unit="deg")
+    max_offset = config.get("max_source_offset_arcmin", 3) * u.arcmin
+
     problems = 0
     for fpm, infile in spectral_input_files(obsid, config):
         root_name = rootname.fn(os.path.basename(infile))
         stem = root_name[: -len("_cl")] if root_name.endswith("_cl") else root_name
         filedir = os.path.dirname(infile)
+        is_mode_06 = f"{fpm}06" in os.path.basename(infile)
 
         # Region files are per input file. Anything passed in by the caller wins, but it
         # must not be allowed to leak from one module to the next.
         this_src = src_reg or os.path.join(filedir, root_name + "_src.reg")
         this_bkg = bkg_reg or os.path.join(filedir, root_name + "_bkg.reg")
         if not os.path.exists(this_src) or not os.path.exists(this_bkg):
-            logger.warning(f"Source or background region file missing for {infile}, skipping")
-            problems += 1
+            # Every CHU combination has its own aspect solution, so it needs its own
+            # region; the mode-01 position is the reference it has to agree with.
+            get_best_source_region.fn(
+                infile,
+                config=config,
+                reference=reference if is_mode_06 else None,
+                max_offset=max_offset,
+            )
+        if not os.path.exists(this_src) or not os.path.exists(this_bkg):
+            # Determinate: either no source was found or it was too far from the mode-01
+            # position. Rerunning would decide the same, so this is a clean skip.
+            logger.warning(f"No usable extraction region for {infile}, skipping")
             continue
 
         outfile_gti_goes = get_goes_gtis.fn(infile)
@@ -1479,4 +1571,10 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
 
-    calculate_spectra(obsid, config, wait_for=[get_best_source_regions, filter_from_solar_flares])
+    calculate_spectra(
+        obsid,
+        config,
+        ra=ra,
+        dec=dec,
+        wait_for=[get_best_source_regions, filter_from_solar_flares],
+    )

@@ -496,10 +496,26 @@ field is not the intended target it silently barycentres to the wrong source.
 Spectral products
 ~~~~~~~~~~~~~~~~~
 
-``calculate_spectra`` (``nustar.py:662``) calls HEASOFT ``nuproducts`` once per FPM, with:
+``calculate_spectra`` calls HEASOFT ``nuproducts`` once per event file. Which files those
+are is decided by ``spectral_input_files``: the mode-01 cleaned file from ``event_pipe`` for
+each module, followed by every per-CHU mode-06 file from ``split``. Mode 01 comes first
+because it defines the reference position (see below). The unsplit mode-06 file is not
+included -- its aspect solution has not been reconstructed.
 
+``infile``
+    The event file, passed explicitly. Left at its default, ``nuproducts`` uses "the 01
+    event file from the input directory", which is why mode-06 data was previously invisible
+    to this step.
+``indir``
+    Always the ``event_pipe`` directory, even for a mode-06 file in ``split``: ``attfile``,
+    ``hkfile``, ``mastaspectfile``, ``optaxisfile`` and ``det1reffile`` all default to "the
+    file from the input directory", and those auxiliary files live there.
+``stemout``
+    The input file's own root, so each CHU combination gets its own output names instead of
+    colliding on ``nu<OBSID><FPM>01``.
 ``srcregionfile`` / ``bkgregionfile``
-    The DS9 regions written by ``get_best_source_region``.
+    The DS9 regions written by ``get_best_source_region``, measured per input file and
+    measured on demand if they are not already there.
 ``runmkarf="yes"``, ``runmkrmf="yes"``
     Generate the ancillary response (effective area, including the PSF correction for the
     chosen extraction radius and the vignetting for the source's off-axis angle) and the
@@ -518,6 +534,33 @@ Spectral products
 
 These products, unlike everything above, are calibrated and suitable for spectral fitting
 in XSPEC.
+
+Mode-06 spectra and the reference position
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each CHU1/CHU2/CHU3 combination produced by ``nusplitsc`` carries its own aspect
+reconstruction, and the ``nusplitsc`` documentation puts the scatter between them at about
+2 arcmin. Against an extraction radius capped at 80 arcsec, that is far more than the
+aperture, so the mode-01 region cannot simply be reused: each CHU file needs its own
+region, measured in its own sky frame. This is why ``calculate_spectra`` measures regions
+per input file rather than once per module.
+
+An independent detection per file is also a way to pick up the wrong object, so the mode-06
+detections are constrained. ``position_is_consistent`` requires the source found in a CHU
+file to lie within ``config["max_source_offset_arcmin"]`` -- 3 arcmin by default, chosen
+against the documented 2 arcmin scatter -- of the mode-01 position that
+``get_best_source_regions`` measured and ``process_nustar_obsid`` passes down. A file that
+fails the check gets no region file and no spectrum, and says so in the log. Mode-01 files
+themselves are unconstrained: they are what defines the reference.
+
+The check takes a single reference position because the pipeline extracts one source, the
+brightest. Extending it to several means passing the list of mode-01 positions and matching
+each detected peak to its nearest one; the comparison itself does not change.
+
+The resulting spectra are one set per CHU combination per module. They are **not** to be
+combined by merging their event files -- the merged event files this pipeline produces are
+timing-only precisely because they mix aspect solutions and exposures. Combine them at the
+spectrum level with ``addascaspec``, or load them as separate datasets and fit them jointly.
 
 
 NICER

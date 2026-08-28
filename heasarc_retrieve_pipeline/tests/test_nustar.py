@@ -12,8 +12,12 @@ os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
 
 import pytest  # noqa: E402
 
+from astropy.coordinates import SkyCoord  # noqa: E402
+import astropy.units as u  # noqa: E402
+
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     get_best_source_regions,
+    position_is_consistent,
     spectral_input_files,
 )
 
@@ -21,10 +25,10 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
 OBSID = "80002092008"
 
 
-def make_obsid_tree(base, pipe_files=(), split_files=()):
+def make_obsid_tree(base, pipe_files=(), split_files=(), obsid=OBSID):
     """Create an empty ``event_pipe``/``split`` tree and return a matching config."""
-    pipedir = os.path.join(base, OBSID, "event_pipe")
-    splitdir = os.path.join(base, OBSID, "split")
+    pipedir = os.path.join(base, obsid, "event_pipe")
+    splitdir = os.path.join(base, obsid, "split")
     os.makedirs(pipedir, exist_ok=True)
     os.makedirs(splitdir, exist_ok=True)
     for d, names in ((pipedir, pipe_files), (splitdir, split_files)):
@@ -98,8 +102,10 @@ def test_observation_without_mode_01_data(tmp_path):
     config = make_obsid_tree(
         tmp_path,
         pipe_files=["nu80002092003A03_cl.evt", "nu80002092003A06_cl.evt"],
+        obsid="80002092003",
     )
-    assert list(spectral_input_files("80002092003", config)) == []
+    found = [f for _, f in spectral_input_files("80002092003", config)]
+    assert not [f for f in found if "01_cl.evt" in f]
 
 
 def test_empty_observation_yields_nothing(tmp_path):
@@ -139,3 +145,65 @@ def test_existing_regions_are_read_back_on_a_rerun(tmp_path):
 def test_no_event_files_gives_no_position(tmp_path):
     config = make_obsid_tree(tmp_path)
     assert get_best_source_regions.fn(OBSID, config) == (0.0, 0.0, 0.0)
+
+
+def test_mode_06_chu_files_are_found(full_observation):
+    found = [os.path.basename(f) for _, f in spectral_input_files(OBSID, full_observation)]
+    assert f"nu{OBSID}A06_chu1_N_cl.evt" in found
+    assert f"nu{OBSID}A06_chu12_N_cl.evt" in found
+    assert f"nu{OBSID}B06_chu1_N_cl.evt" in found
+
+
+def test_strict_split_files_are_found_too(tmp_path):
+    """``nusplitsc splitmode=STRICT`` names its output ``_S_`` rather than ``_N_``."""
+    config = make_obsid_tree(tmp_path, split_files=[f"nu{OBSID}A06_chu2_S_cl.evt"])
+    found = [os.path.basename(f) for _, f in spectral_input_files(OBSID, config)]
+    assert found == [f"nu{OBSID}A06_chu2_S_cl.evt"]
+
+
+def test_mode_01_comes_before_mode_06(full_observation):
+    """Mode 01 defines the reference position, so it must be processed first."""
+    per_fpm = {}
+    for fpm, infile in spectral_input_files(OBSID, full_observation):
+        per_fpm.setdefault(fpm, []).append(os.path.basename(infile))
+    for fpm, files in per_fpm.items():
+        modes = ["01" if f"{fpm}01" in f else "06" for f in files]
+        assert modes == sorted(modes)
+
+
+def test_observation_without_mode_01_still_yields_chu_files(tmp_path):
+    """80002092003 has no mode-01 data, but its recovered mode-06 data is usable."""
+    config = make_obsid_tree(
+        tmp_path,
+        pipe_files=["nu80002092003A06_cl.evt"],
+        split_files=["nu80002092003A06_chu3_N_cl.evt"],
+        obsid="80002092003",
+    )
+    found = [os.path.basename(f) for _, f in spectral_input_files("80002092003", config)]
+    assert found == ["nu80002092003A06_chu3_N_cl.evt"]
+
+
+class TestPositionIsConsistent:
+    """The mode-06 region must never be far from the mode-01 one.
+
+    Each CHU combination has its own aspect reconstruction, scattered by about 2 arcmin
+    (nusplitsc documentation), so a detection further away than that is a different object.
+    """
+
+    reference = SkyCoord(148.95, 69.68, unit="deg")
+
+    def test_nearby_position_is_accepted(self):
+        nearby = self.reference.directional_offset_by(0 * u.deg, 1 * u.arcmin)
+        assert position_is_consistent(nearby, self.reference, 3 * u.arcmin)
+
+    def test_distant_position_is_rejected(self):
+        far = self.reference.directional_offset_by(0 * u.deg, 5 * u.arcmin)
+        assert not position_is_consistent(far, self.reference, 3 * u.arcmin)
+
+    def test_position_just_inside_the_limit_is_accepted(self):
+        edge = self.reference.directional_offset_by(90 * u.deg, 2.9 * u.arcmin)
+        assert position_is_consistent(edge, self.reference, 3 * u.arcmin)
+
+    def test_without_a_reference_everything_is_accepted(self):
+        anywhere = SkyCoord(12.3, -45.6, unit="deg")
+        assert position_is_consistent(anywhere, None, 3 * u.arcmin)

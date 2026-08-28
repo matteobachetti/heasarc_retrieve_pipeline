@@ -90,8 +90,8 @@ Suggested fix: delete it. The archive-path builders it depends on duplicate what
 datalink service provides, and keeping a fallback that has never been exercised is worse
 than having none.
 
-3. ``calculate_spectra`` runs ``nuproducts`` outside its own loop
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3. ``calculate_spectra`` runs ``nuproducts`` outside its own loop -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``nustar.py:662``. The structure is::
 
@@ -115,11 +115,18 @@ Consequences:
   reused for FPMB. For the region files this is harmless (they are in sky coordinates), for
   the GTI file it is not: FPMB gets FPMA's flare-free GTI.
 
-Suggested fix: put the ``nuproducts`` call inside the loop, drop the ``break``, and reset
-``src_reg``/``bkg_reg`` per file.
+**Fixed.** The glob and the inner loop were replaced by ``spectral_input_files``, which
+yields ``(module, file)`` pairs, so the body runs once per file with nothing leaking between
+iterations. ``src_reg``/``bkg_reg`` are no longer reassigned, the "file missing" branches
+now really skip, and ``PRODUCTS_DONE.TXT`` is written only when nothing went wrong -- an
+observation with no usable files is a clean outcome and is marked done, a missing region or
+GTI file is not.
 
-4. ``get_best_source_regions`` can return ``(0, 0, 0)``, barycentring to RA=0, Dec=0
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The same restructuring made it possible to extract spectra from mode-06 data as well; see
+the NuSTAR section of ``technical_details.rst``.
+
+4. ``get_best_source_regions`` returns ``(0, 0, 0)`` on a rerun -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``nustar.py:629``. The function accumulates ``mean_ra``/``mean_dec``/``mean_rlimit`` only
 for files whose region files do **not** already exist. If every region file exists,
@@ -137,9 +144,14 @@ This is currently masked by a second bug in the same function:
 that never exists. Two bugs cancelling is not a fix -- correcting the path bug alone would
 activate the RA=0 bug.
 
-Suggested fix: read the existing region files back with ``regions.Regions.read`` (the
-single-file function ``get_best_source_region`` already does exactly this) instead of
-skipping them, and use the basename consistently when constructing region paths.
+**Fixed.** ``get_best_source_region`` is now called for every file and its result always
+counted; it already returns early, reading the position and radius back out of the existing
+region files with ``regions.Regions.read``. The existence check that carried the path bug is
+gone entirely, so the two bugs are removed rather than left cancelling. Its ``nustar_gen``
+import moved below that early return, since reading a region back needs neither
+``nustar_gen`` nor an image, and ``regions`` is now declared in ``pyproject.toml``.
+
+Pinned by ``test_existing_regions_are_read_back_on_a_rerun``, which runs offline.
 
 
 Correctness
