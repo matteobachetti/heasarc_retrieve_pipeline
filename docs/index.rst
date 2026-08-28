@@ -7,6 +7,8 @@ This is the documentation for heasarc_retrieve_pipeline.
    :maxdepth: 2
    :caption: Contents:
 
+   technical_details
+   known_issues
 
 
 Indices and tables
