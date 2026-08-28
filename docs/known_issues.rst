@@ -316,17 +316,22 @@ Also, ``merge_gtis``, ``merge_event_files`` and ``separate_sources`` interpolate
 Packaging and hygiene
 ---------------------
 
-21. A ``TOKEN`` file sits untracked in the repository root
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+21. A ``TOKEN`` file sat untracked in the repository root -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A 94-byte ``TOKEN`` file is present in the working tree, is not tracked, and is **not in**
-``.gitignore``. A single ``git add -A`` commits a credential. Add it to ``.gitignore`` now,
-and rotate the token if there is any doubt about its history.
+A 94-byte ``TOKEN`` file was present in the working tree, untracked and **not in**
+``.gitignore``, one ``git add -A`` away from committing a credential.
 
-``.gitignore`` currently covers only ``__pycache__``, ``*.pyc``, ``*.jpg``, ``*.log`` and
-``version.py``. It should also cover ``out/``, ``test_dload/``, ``*.egg-info/``,
-``heasarc_retrieve_pipeline/_version.py`` (the setuptools-scm target; the current entry
-says ``version.py``), ``.hypothesis/``, ``.pytest_cache/``, ``.tox/`` and ``.DS_Store``.
+``.gitignore`` has been rewritten to cover it, along with the other artefacts that were
+accumulating untracked: ``out/``, ``out_test/``, ``test_dload/``, ``*.egg-info/``,
+``build/``, ``dist/``, ``docs/_build/``, ``heasarc_retrieve_pipeline/_version.py`` (the
+real setuptools-scm target -- the previous entry said ``version.py``, which matches
+nothing), ``.pytest_cache/``, ``.hypothesis/``, ``.tox/``, coverage output and
+``.DS_Store``.
+
+Ignoring the file does not undo any exposure it may already have had. Check
+``git log --all -- TOKEN`` (currently empty, so it was never committed on any branch)
+and rotate the token if there is any doubt about where else it has been.
 
 22. Undeclared dependencies
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -447,10 +452,10 @@ machine with a display can try to open a window.
 * ``nustar.py:734``: unused local ``basedir``.
 * ``image_from_table`` takes a ``correct_zeros`` argument that is never used.
 
-33. The documentation does not build with a current Sphinx
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+33. The documentation did not build with a current Sphinx -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``docs/conf.py:57`` uses the pre-Sphinx-5 form of the intersphinx configuration::
+``docs/conf.py`` used the pre-Sphinx-5 form of the intersphinx configuration::
 
     intersphinx_mapping = {'https://docs.python.org/': None}
 
@@ -459,11 +464,11 @@ Sphinx 5 and later require a named mapping, and reject this one outright::
     sphinx.errors.ConfigError: Invalid `intersphinx_mapping` configuration (1 error).
 
 So ``sphinx-build -W docs docs/_build`` -- exactly what the ``build-docs`` tox
-environment runs -- fails before reading a single page. The fix is one line::
+environment runs -- failed before reading a single page. It is now::
 
     intersphinx_mapping = {'python': ('https://docs.python.org/3', None)}
 
-With that change the documentation builds clean under ``-W`` (warnings as errors).
+and the documentation builds clean under ``-W`` (warnings as errors).
 
 34. ``tox.ini`` cannot run
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
