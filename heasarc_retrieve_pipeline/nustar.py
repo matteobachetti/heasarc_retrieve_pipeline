@@ -1,3 +1,37 @@
+"""
+NuSTAR reduction: Level-2 pipeline, source separation, merging, flare filtering, spectra.
+
+The entry point is :func:`process_nustar_obsid`, which runs, in order:
+
+1. :func:`nu_run_l2_pipeline` -- HEASOFT ``nupipeline``;
+2. :func:`recover_spacecraft_science_data` -- ``nusplitsc`` on the mode-06 files, to
+   recover the exposure taken while the optics-bench star tracker was unavailable;
+3. :func:`get_best_source_regions` -- SNR-optimised extraction regions via ``nustar_gen``;
+4. :func:`separate_sources` -- image-based splitting of the field into per-source and
+   background event files;
+5. :func:`join_source_data` -- merging of the event files and their GTIs;
+6. :func:`filter_from_solar_flares` -- GOES/HEK solar-flare exclusion;
+7. :func:`barycenter_data` -- HEASOFT ``barycorr``;
+8. :func:`calculate_spectra` -- HEASOFT ``nuproducts``.
+
+Only observing modes 01 (normal science) and 06 (spacecraft science) are considered;
+``valid_re`` encodes that choice.
+
+Output layout, relative to ``config["out_data_path"]``::
+
+    <OBSID>/               merged event files, *_bary.evt, sentinel files
+    <OBSID>/event_pipe/    nupipeline output and region files
+    <OBSID>/split/         nusplitsc output (mode-06 sub-observations)
+    <OBSID>/products/      nuproducts spectra, ARFs and RMFs
+
+Everything past step 1 needs a working HEASOFT with ``heasoftpy``; steps 3 and 6 also
+need ``nustar_gen``, ``sunpy`` and ``regions``, which are not currently declared as
+dependencies.
+
+See ``docs/technical_details.rst`` for the scientific rationale behind each step, and
+``docs/known_issues.rst`` for known defects.
+"""
+
 import os
 import re
 
@@ -27,6 +61,21 @@ valid_re = re.compile(r"nu[0-9]{11}[AB]0[16].*")
     task_run_name="nu_local_raw_path_{obsid}",
 )
 def nu_local_raw_data_path(obsid, config, **kwargs):
+    """
+    Directory holding the raw (Level-1) data of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str
+        ``<input_data_path>/<OBSID>``.
+    """
     return os.path.join(config["input_data_path"], obsid)
 
 
@@ -36,6 +85,22 @@ def nu_local_raw_data_path(obsid, config, **kwargs):
     task_run_name="nu_remote_raw_path_{obsid}",
 )
 def nu_heasarc_raw_data_path(obsid, **kwargs):
+    """
+    Path of an observation in the HEASARC archive.
+
+    NuSTAR observations are filed by the third and fourth digits of the OBSID, then by its
+    first digit; for example ``90101005001`` lives under ``.../obs/01/9/90101005001/``.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    str
+        ``/FTP/nustar/data/obs/<obsid[1:3]>/<obsid[0]>/<OBSID>``.
+    """
     return os.path.normpath(f"/FTP/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/")
 
 
@@ -45,6 +110,21 @@ def nu_heasarc_raw_data_path(obsid, **kwargs):
     task_run_name="nu_base_output_{obsid}",
 )
 def nu_base_output_path(obsid, config):
+    """
+    Top-level output directory of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>``, where the merged and barycentred event files go.
+    """
     return os.path.join(config["out_data_path"], obsid)
 
 
@@ -54,6 +134,21 @@ def nu_base_output_path(obsid, config):
     task_run_name="nu_pipeline_output_{obsid}",
 )
 def nu_pipeline_output_path(obsid, config):
+    """
+    Directory for the ``nupipeline`` output of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_pipe/``.
+    """
     return os.path.join(config["out_data_path"], obsid + "/event_pipe/")
 
 
@@ -63,6 +158,21 @@ def nu_pipeline_output_path(obsid, config):
     task_run_name="nu_product_output_{obsid}",
 )
 def nu_product_output_path(obsid, config):
+    """
+    Directory for the ``nuproducts`` output of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/products/``, where spectra, ARFs and RMFs go.
+    """
     return os.path.join(config["out_data_path"], obsid + "/products/")
 
 
@@ -72,6 +182,25 @@ def nu_product_output_path(obsid, config):
     task_run_name="nu_pipeline_output_{obsid}",
 )
 def nu_pipeline_done_file(obsid, config):
+    """
+    Path of the sentinel file marking a finished ``nupipeline`` run.
+
+    The pipeline uses sentinel files rather than Prefect's cache for idempotency. Note that
+    a sentinel records only *that* the step ran, not with which parameters, so changing
+    ``flags`` will not trigger a re-run.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_pipe/PIPELINE_DONE.TXT``.
+    """
     return os.path.join(nu_pipeline_output_path.fn(obsid, config), "PIPELINE_DONE.TXT")
 
 
@@ -81,6 +210,21 @@ def nu_pipeline_done_file(obsid, config):
     task_run_name="split_path_{obsid}",
 )
 def split_path(obsid, config):
+    """
+    Directory for the ``nusplitsc`` output of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/split/``.
+    """
     return os.path.join(config["out_data_path"], obsid + "/split/")
 
 
@@ -90,6 +234,23 @@ def split_path(obsid, config):
     task_run_name="splitext_{infile}",
 )
 def splitext(infile):
+    """
+    Split a path into root and extension, treating ``.evt.gz`` as one extension.
+
+    Thin wrapper around :func:`heasarc_retrieve_pipeline.utils.splitext_improved`.
+
+    Parameters
+    ----------
+    infile : str
+        File path.
+
+    Returns
+    -------
+    root : str
+        The path without its extension.
+    ext : str
+        The extension, including any compression suffix.
+    """
     return splitext_improved(infile)
 
 
@@ -99,6 +260,19 @@ def splitext(infile):
     task_run_name="rootname_{infile}",
 )
 def rootname(infile):
+    """
+    Return a path with its extension removed.
+
+    Parameters
+    ----------
+    infile : str
+        File path.
+
+    Returns
+    -------
+    str
+        ``infile`` without its (possibly compound) extension.
+    """
     return splitext(infile)[0]
 
 
@@ -108,6 +282,27 @@ def rootname(infile):
     task_run_name="barycentered_file_name_{infile}",
 )
 def barycentered_file_name(infile):
+    """
+    Name of the barycentred version of an event file.
+
+    Inserts ``_bary`` before the extension, so that ``x.evt.gz`` becomes
+    ``x_bary.evt.gz`` rather than being mangled by a naive string replacement.
+
+    Parameters
+    ----------
+    infile : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        The barycentred file name.
+
+    Notes
+    -----
+    Currently unused: :func:`barycenter_file` builds the output name with
+    ``str.replace`` instead. See issue 13 in ``docs/known_issues.rst``.
+    """
     root, ext = splitext(infile)
     return root + "_bary" + ext
 
@@ -118,6 +313,23 @@ def barycentered_file_name(infile):
     task_run_name="goes_lc_file_name_{event_file}",
 )
 def goes_lc_file_name(event_file):
+    """
+    Name of the GOES light-curve file associated with an event file.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        ``<root>_goes.fits``.
+
+    Notes
+    -----
+    Unused: :func:`get_goes_gtis` downloads the GOES light curve but never writes it.
+    """
     root = rootname(event_file)
     return root + "_goes.fits"
 
@@ -128,6 +340,19 @@ def goes_lc_file_name(event_file):
     task_run_name="goes_gti_file_name_{event_file}",
 )
 def goes_gti_file_name(event_file):
+    """
+    Name of the solar-flare GTI file associated with an event file.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        ``<root>_goes.gti``.
+    """
     root = rootname(event_file)
     return root + "_goes.gti"
 
@@ -138,6 +363,19 @@ def goes_gti_file_name(event_file):
     task_run_name="flare_filtered_event_file_name_{event_file}",
 )
 def flare_filtered_event_file_name(event_file):
+    """
+    Name of the flare-filtered version of an event file.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        ``<root>_noflares.evt``.
+    """
     root = rootname(event_file)
     return root + "_noflares.evt"
 
@@ -146,6 +384,29 @@ def flare_filtered_event_file_name(event_file):
     task_run_name="separate_sources_in_event_file_{obsid}_{event_file}_region_{region_size}_back_{back_region_size}",
 )
 def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
+    """
+    Split one cleaned event file into per-source and background event files.
+
+    Skips encrypted (``.gpg``) files and anything that is not a mode 01 or mode 06 NuSTAR
+    event file, then delegates to
+    :func:`heasarc_retrieve_pipeline.image_utils.filter_sources_in_images`.
+
+    Parameters
+    ----------
+    event_file : str
+        Path of a cleaned event file.
+    region_size : float, optional
+        Radius of the source extraction circles, in sky pixels (1 pixel = 2.45 arcsec).
+    back_region_size : float, optional
+        Radius, in sky pixels, of the region excluded around every detected peak when
+        building the background file.
+
+    Returns
+    -------
+    bool or None
+        ``True`` if files were written, ``None`` if the input was skipped or contained too
+        few events.
+    """
     logger = get_run_logger()
     if event_file.endswith(".gpg"):
         return None
@@ -167,6 +428,24 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
 )
 def separate_sources(directories, config, region_size=30, back_region_size=55):
 
+    """
+    Run the image-based source separation over every cleaned event file in some directories.
+
+    Writes a ``SEPARATE_DONE.TXT`` sentinel in each directory and skips directories that
+    already have one.
+
+    Parameters
+    ----------
+    directories : list of str
+        Directories to scan for ``nu*_cl.evt*`` files -- normally the ``event_pipe`` and
+        ``split`` directories of one observation.
+    config : dict
+        Pipeline configuration. Currently unused by this step.
+    region_size : float, optional
+        Source extraction radius in sky pixels.
+    back_region_size : float, optional
+        Background exclusion radius in sky pixels.
+    """
     for d in directories:
         separate_done_file = os.path.join(d, "SEPARATE_DONE.TXT")
         if os.path.exists(separate_done_file):
@@ -187,6 +466,37 @@ def separate_sources(directories, config, region_size=30, back_region_size=55):
     task_run_name="l2_pipeline_obsid_{obsid}",
 )
 def nu_run_l2_pipeline(obsid, config, flags=None):
+    """
+    Run the HEASOFT ``nupipeline`` Level-2 pipeline on one observation.
+
+    ``nupipeline`` performs the standard NuSTAR screening: calibration, coordinate
+    transformation, and the good-time selection on SAA passage, source occultation and
+    attitude quality. It is run for both focal-plane modules (``instrument="ALL"``).
+
+    Returns immediately if the ``PIPELINE_DONE.TXT`` sentinel already exists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path`` and ``out_data_path``.
+    flags : dict, optional
+        Extra ``nupipeline`` parameters, merged over the defaults. This is how
+        non-standard screening (for example a different SAA mode) is requested.
+
+    Returns
+    -------
+    str or None
+        The ``event_pipe`` directory, or ``None`` if the step was already done.
+
+    Raises
+    ------
+    ImportError
+        If ``heasoftpy`` is not available.
+    RuntimeError
+        If ``nupipeline`` exits with a non-zero return code.
+    """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
     pipe_done_file = nu_pipeline_done_file.fn(obsid, config=config)
@@ -229,6 +539,34 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
     task_run_name="nu_recover_spacecraft_science_{obsid}",
 )
 def recover_spacecraft_science_data(obsid, config):
+    """
+    Recover the mode-06 "spacecraft science" exposure with ``nusplitsc``.
+
+    NuSTAR's normal aspect solution comes from CHU4, the star tracker on the optics bench.
+    When CHU4 is blinded -- typically by the Sun or the Moon -- the data are recorded in
+    observing mode 06 and the aspect must be reconstructed from the spacecraft's own star
+    trackers CHU1, CHU2 and CHU3. Standard Level-2 products drop these intervals.
+
+    ``nusplitsc`` splits each mode-06 cleaned event file by which combination of star
+    trackers was active, since each combination carries its own systematic astrometric
+    offset and they must be treated as separate sub-observations. The result typically adds
+    of order 10-20 per cent more exposure, at the cost of degraded pointing accuracy.
+
+    Writes a ``RECOVER_DONE.TXT`` sentinel in the split directory and returns early if it
+    already exists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path`` and ``out_data_path``.
+
+    Returns
+    -------
+    str
+        The ``split`` directory.
+    """
     logger = get_run_logger()
     logger.info(f"Squeezing every photon from spacecraft science data in {obsid}")
     datadir = nu_local_raw_data_path.fn(obsid, config)
@@ -267,6 +605,24 @@ def recover_spacecraft_science_data(obsid, config):
 
 @task(task_run_name="nu_merge_gtis_{files_to_join}_into_{outfile_gti}_gti_{gti_operation}")
 def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
+    """
+    Merge the GTI extensions of several event files into one GTI file.
+
+    Runs HEASOFT ``ftmgtime`` to combine the intervals, ``ftsort`` to order them by
+    ``START``, and ``fthedit`` to name the resulting extension ``GTI``.
+
+    Parameters
+    ----------
+    files_to_join : list of str
+        Files whose ``[GTI]`` extensions are to be combined.
+    outfile_gti : str
+        Output GTI file. Deleted first if it exists.
+    gti_operation : {"OR", "AND"}, optional
+        ``"OR"`` takes the union of the intervals -- correct when combining disjoint
+        stretches of the same instrument. ``"AND"`` takes the intersection -- correct when
+        combining simultaneous data from two instruments, so that the effective area is
+        constant across the result.
+    """
     if os.path.exists(outfile_gti):
         os.unlink(outfile_gti)
     logger = get_run_logger()
@@ -289,6 +645,28 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
 
 @task(task_run_name="nu_merge_event_files_{files_to_join}_into_{outfile}_gti_{gti_operation}")
 def merge_event_files(files_to_join, outfile, gti_operation="OR"):
+    """
+    Merge several event files, and their GTIs, into a single event file.
+
+    The GTIs are combined first with :func:`merge_gtis`, then ``ftmerge`` concatenates the
+    event tables, ``ftsort`` orders them by ``TIME``, and ``fappend`` attaches the merged
+    GTI extension. Doing it with HEASOFT rather than by hand is what keeps the GTI
+    bookkeeping correct.
+
+    Parameters
+    ----------
+    files_to_join : list of str
+        Event files to merge.
+    outfile : str
+        Output event file.
+    gti_operation : {"OR", "AND"}, optional
+        How to combine the GTIs; see :func:`merge_gtis`.
+
+    Notes
+    -----
+    The temporary GTI file is named with ``np.random.randint``, which makes the task's
+    inputs non-deterministic. See issue 19 in ``docs/known_issues.rst``.
+    """
     outdir, fname = os.path.split(outfile)
     root = splitext_improved(fname)[0]
     logger = get_run_logger()
@@ -319,6 +697,50 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
 )
 def join_source_data(obsid, directories, config, src_num=1):
 
+    """
+    Merge the per-source (or background) event files of one observation.
+
+    Two stages:
+
+    1. For each focal-plane module, merge the files produced by the source separation in
+       all the given directories -- the ``nupipeline`` output and the ``nusplitsc``
+       sub-observations -- with a logical **OR** of their GTIs, since these are disjoint
+       stretches of the same telescope. Mode-01 files are also copied to the output
+       directory as-is; the unsplit mode-06 files are discarded in favour of their
+       CHU-resolved counterparts.
+    2. Merge the FPMA and FPMB results into a single file, this time with a logical
+       **AND** of the GTIs: an interval counts only if both telescopes were observing, so
+       that the combined light curve has a constant effective area.
+
+    The combined A+B file roughly doubles the counting statistics and is meant for timing
+    analysis. It is not usable for spectroscopy, since two telescopes with different
+    responses now share one event list.
+
+    Writes a ``JOIN_DONE_SRC<n>.TXT`` sentinel and returns early if it exists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    directories : list of str
+        Directories to collect event files from.
+    config : dict
+        Must contain ``out_data_path``.
+    src_num : int, optional
+        Which product to merge: a positive number selects ``_src<n>`` files, 0 selects the
+        ``_back`` files.
+
+    Returns
+    -------
+    list of str
+        The combined FPMA+FPMB event files.
+
+    Notes
+    -----
+    The early return takes a different code path and returns a wider set of files than the
+    normal one; and FPMB file names are derived by replacing every ``A`` in the FPMA path.
+    See issue 6 in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
 
@@ -371,6 +793,44 @@ def join_source_data(obsid, directories, config, src_num=1):
 
 @task(task_run_name="goes_lightcurve_{event_file}_mincat_{minimum_class}")
 def get_goes_gtis(event_file, minimum_class="C5.0"):
+    """
+    Build good time intervals that exclude solar flares.
+
+    NuSTAR observes from low Earth orbit with an open detector aperture, and large solar
+    flares raise its background substantially. This task looks up the flares that occurred
+    during an observation and produces the complementary GTIs.
+
+    The steps are: convert the observation's ``TSTART``/``TSTOP`` from NuSTAR
+    mission-elapsed time to civil time; ask ``sunpy``'s ``Fido`` for the GOES XRS data of
+    that interval, picking the highest-numbered (most recent) satellite that covers it;
+    retrieve the HEK flare catalogue entries flagged by SWPC; and cut out every catalogued
+    flare at or above ``minimum_class``. Good intervals run from ``TSTART`` to the first
+    flare, between consecutive flares, and from the last flare to ``TSTOP``.
+
+    Flare classes are compared by letter and number separately. The GOES scale runs
+    A, B, C, M, X, which is alphabetical, so comparing the letters as characters gives the
+    correct ordering.
+
+    Returns the existing file unchanged if it is already present.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file whose time range defines the search interval.
+    minimum_class : str, optional
+        Smallest flare class to exclude, e.g. ``"C5.0"``.
+
+    Returns
+    -------
+    str
+        Path of the GTI file, ``<root>_goes.gti``.
+
+    Notes
+    -----
+    The GOES X-ray light curve is downloaded but not used: the filtering runs entirely off
+    the HEK flare catalogue. A flare overlapping ``TSTART`` also produces a
+    negative-length interval. See issue 12 in ``docs/known_issues.rst``.
+    """
     from sunpy import timeseries as ts
     from sunpy.net import Fido
     from sunpy.net import attrs as a
@@ -456,6 +916,31 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
 def filter_from_solar_flares(event_file, minimum_class="C5.0"):
+    """
+    Write a copy of an event file whose GTIs exclude solar flares.
+
+    Combines the event file's own GTIs with the flare-free intervals from
+    :func:`get_goes_gtis` using a logical AND, and writes the result as
+    ``<root>_noflares.evt``.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file to filter.
+    minimum_class : str, optional
+        Smallest flare class to exclude.
+
+    Returns
+    -------
+    str
+        Path of the filtered file.
+
+    Notes
+    -----
+    Only the GTI extension is replaced: the event table is copied unchanged and the
+    exposure keywords are not recomputed, so tools that ignore GTIs or read rates from the
+    header will be wrong. See issue 5 in ``docs/known_issues.rst``.
+    """
     from astropy.io import fits
     from astropy.table import Table
 
@@ -486,6 +971,39 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     task_run_name="nu_barycenter_{infile}_ra{ra}_dec{dec}_src{src}",
 )
 def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
+    """
+    Barycentre one event file with HEASOFT ``barycorr``.
+
+    Converts photon arrival times from the spacecraft frame to the solar system
+    barycentre, removing the up to ~500 s light-travel-time modulation caused by the
+    Earth's and the satellite's motion. This is a prerequisite for any coherent timing
+    analysis, and it is **position-dependent**: an error in the assumed RA/Dec translates
+    directly into a timing error.
+
+    Uses the JPL DE430 ephemeris in the ICRS frame.
+
+    Parameters
+    ----------
+    infile : str
+        Event file to barycentre.
+    attorb : str
+        Attitude/orbit file, as produced by ``nupipeline`` (``nu<OBSID><FPM>.attorb``).
+    ra, dec : float, optional
+        Source position in degrees. Accuracy here directly sets the timing accuracy.
+    src : int, optional
+        Source number; recorded in the task run name only.
+
+    Returns
+    -------
+    str
+        Path of the barycentred file.
+
+    Notes
+    -----
+    This shadows the guarded implementation in
+    :mod:`heasarc_retrieve_pipeline.barycenter`, which is imported at the top of this
+    module and then never used. See issue 14 in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     logger.info(f"Barycentering {infile}")
 
@@ -512,6 +1030,25 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
 
 @flow(flow_run_name="nu_barycenter_{obsid}_src{src}_ra{ra}_dec{dec}")
 def barycenter_data(obsid, ra, dec, config, src=1):
+    """
+    Barycentre every event file of an observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    ra, dec : float
+        Source position in degrees.
+    config : dict
+        Must contain ``out_data_path``.
+    src : int, optional
+        Source number, passed through to :func:`barycenter_file`.
+
+    Notes
+    -----
+    FPMA's attitude/orbit file is used for every file, including the FPMB and combined
+    ones. See issue 13 in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
     logger.info(f"Barycentering data in directory {outdir}")
@@ -535,6 +1072,53 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
 def get_best_source_region(infile, pair=None, elow=3, ehigh=80, out_rootname=None, config=None):
+    """
+    Find the source and choose the extraction radius that maximises its signal-to-noise.
+
+    Delegates to ``nustar_gen``: make a sky image in the requested band, locate the
+    brightest source, convert its pixel position to RA/Dec through the image WCS, build the
+    radial profile together with the expected PSF profile, and pick the radius that
+    maximises the SNR. The radius is capped at ``config["max_radius"]`` (default 80
+    arcsec).
+
+    Two DS9 region files are written next to the event file: a circle of the optimised
+    radius at the source position, and a concentric background annulus of inner radius
+    ``max(r, 100)`` arcsec and outer radius ``max(2r, 250)`` arcsec.
+
+    If both region files already exist, they are read back and their parameters returned
+    without recomputing.
+
+    Parameters
+    ----------
+    infile : str
+        Cleaned event file.
+    pair : list of float, optional
+        ``[elow, ehigh]`` band, in keV, in which the SNR is optimised. Defaults to
+        ``[elow, ehigh]``.
+    elow, ehigh : float, optional
+        Band, in keV, used to build the image in which the source is located.
+    out_rootname : str, optional
+        Root name for the region files. Defaults to the event file's root.
+    config : dict, optional
+        Pipeline configuration; only ``max_radius`` is read.
+
+    Returns
+    -------
+    ra, dec : float
+        Source position in ICRS degrees.
+    rlimit : float
+        Extraction radius in arcsec.
+    src_out, bkg_out : str
+        Paths of the source and background region files.
+
+    Notes
+    -----
+    The separation between the detected position and the header's ``RA_OBJ``/``DEC_OBJ`` is
+    computed but never checked, so a detection that locked onto the wrong object is not
+    caught; and a concentric annulus is not the recommended NuSTAR background prescription,
+    because the aperture stray-light background varies across the detector. See issue 4 and
+    the science caveats in ``docs/known_issues.rst``.
+    """
     from nustar_gen.radial_profile import find_source, make_radial_profile, optimize_radius_snr
     from nustar_gen.wrappers import make_image
     from astropy.io import fits
@@ -627,6 +1211,33 @@ circle({icrs.ra.deg}, {icrs.dec.deg}, {max(rlimit * 2, 250)}")
     task_run_name="nu_best_source_regs_{obsid}",
 )
 def get_best_source_regions(obsid, config):
+    """
+    Build extraction regions for both focal-plane modules and average their parameters.
+
+    Runs :func:`get_best_source_region` on each mode-01 cleaned event file that does not
+    already have region files, and returns the mean of the resulting positions and radii.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    mean_ra, mean_dec : float
+        Mean detected source position, in degrees.
+    mean_rlimit : float
+        Mean extraction radius, in arcsec.
+
+    Notes
+    -----
+    Files whose region files already exist are skipped without being counted, so if every
+    region file exists this returns ``(0.0, 0.0, 0.0)`` -- which
+    :func:`process_nustar_obsid` would then use as a sky position. See issue 4 in
+    ``docs/known_issues.rst``.
+    """
     indir = nu_pipeline_output_path.fn(obsid, config=config)
     outdir = nu_pipeline_output_path.fn(obsid, config=config)
     os.makedirs(outdir, exist_ok=True)
@@ -660,6 +1271,41 @@ def get_best_source_regions(obsid, config):
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
 def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
+    """
+    Extract calibrated spectra with HEASOFT ``nuproducts``.
+
+    Runs once per focal-plane module, using the region files from
+    :func:`get_best_source_region` and the flare-free GTIs from :func:`get_goes_gtis`.
+    Unlike the event files produced by the image-based separation, these products are
+    properly calibrated and suitable for fitting in XSPEC:
+
+    * ``runmkarf``/``runmkrmf`` generate the ancillary response -- effective area including
+      the PSF correction for the chosen extraction radius and the vignetting for the
+      source's off-axis angle -- and the redistribution matrix;
+    * ``extended="no"`` treats the source as a point source, which is what makes the PSF
+      correction valid;
+    * ``grpmincounts=20`` groups the spectrum to at least 20 counts per bin, the usual
+      minimum for chi-squared fitting to be approximately valid;
+    * ``grppibadlow=35`` and ``grppibadhigh=1909`` mark channels outside 3.0-78.0 keV as
+      bad, via ``E = 0.04 * PI + 1.6``.
+
+    Writes a ``PRODUCTS_DONE.TXT`` sentinel and returns early if it exists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    src_reg, bkg_reg : str, optional
+        Region files to use. If ``None``, they are looked up next to each event file.
+
+    Notes
+    -----
+    The ``nuproducts`` call sits outside the loop over event files and uses a leaked loop
+    variable, so it can raise ``NameError`` or silently reduce FPMB with FPMA's data. See
+    issue 3 in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     indir = nu_pipeline_output_path.fn(obsid, config=config)
     outdir = nu_product_output_path.fn(obsid, config=config)
@@ -727,6 +1373,32 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None):
 
 @flow
 def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
+    """
+    Reduce one NuSTAR observation end to end.
+
+    Runs the eight steps listed in the module docstring, from ``nupipeline`` to
+    ``nuproducts``.
+
+    Note that the ``ra``/``dec`` arguments are **overridden** by the position measured from
+    the image by :func:`get_best_source_regions`. When the detection is correct this is
+    better than the catalogue pointing; when the brightest object in the field is not the
+    intended target, the data are barycentred to the wrong source.
+
+    The SNR-optimised radius comes back in arcsec and is divided by 2.45, the NuSTAR sky
+    pixel scale in arcsec per pixel, before being handed to the image-based separation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict, optional
+        Pipeline configuration. Defaults to ``DEFAULT_CONFIG``, which puts everything under
+        the current working directory.
+    ra, dec : float or str, optional
+        Source position in degrees. Overridden as described above.
+    flags : dict, optional
+        Extra ``nupipeline`` parameters.
+    """
     config = DEFAULT_CONFIG if config is None else config
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")

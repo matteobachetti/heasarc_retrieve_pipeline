@@ -1,3 +1,26 @@
+"""
+NICER reduction: the ``nicerl2`` Level-2 pipeline, then barycentring.
+
+NICER is a collimated instrument with a field of view of roughly 3 arcmin and no
+imaging capability, so there is no equivalent of the NuSTAR source-separation step:
+everything inside the field of view ends up in the same event file.
+
+The entry point is :func:`process_nicer_obsid`, which runs :func:`ni_run_l2_pipeline`
+and then :func:`barycenter_data`.
+
+``nicerl2`` performs the standard NICER screening -- calibration, merging of the seven
+Measurement/Power Units, and good-time selection on orbital day/night, undershoot and
+overshoot rates and pointing offset -- and produces the single cleaned file
+``ni<OBSID>_0mpu7_cl.evt`` ("0mpu7" meaning all seven MPUs, i.e. all 52 active
+detectors combined).
+
+No spectral extraction is performed. NICER's background cannot be measured from the
+data themselves, since there is no off-source region; it requires one of the community
+background models, none of which is invoked here.
+
+See ``docs/technical_details.rst`` for more detail.
+"""
+
 import re
 
 from astropy.time import Time
@@ -30,6 +53,24 @@ valid_re = re.compile(r"ni[0-9]{11}")
 
 @task
 def ni_raw_data_path(obsid, time, **kwargs):
+    """
+    Path of an observation in the HEASARC NICER archive.
+
+    NICER observations are filed by the year and month of the observation, which is why
+    this path builder needs the observation time and the others do not.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    time : astropy.table.Column or float
+        Observation start time, MJD.
+
+    Returns
+    -------
+    str
+        ``/FTP/nicer/data/obs/<YYYY>_<MM>/<OBSID>``.
+    """
     from astropy.time import Time
 
     mjd = Time(time.data, format="mjd")
@@ -44,11 +85,42 @@ def ni_raw_data_path(obsid, time, **kwargs):
     task_run_name="ni_base_output_{obsid}",
 )
 def ni_base_output_path(config, obsid):
+    """
+    Top-level output directory of an observation.
+
+    Parameters
+    ----------
+    config : dict
+        Must contain ``out_data_path``.
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>``. This is also where the downloaded raw data live, and
+        what is passed to ``nicerl2`` as ``indir``.
+    """
     return os.path.join(config["out_data_path"], obsid)
 
 
 @task
 def ni_pipeline_output_path(config, obsid):
+    """
+    Directory for the ``nicerl2`` output of an observation.
+
+    Parameters
+    ----------
+    config : dict
+        Must contain ``out_data_path``.
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/l2files/``.
+    """
     return os.path.join(config["out_data_path"], obsid + "/l2files/")
 
 
@@ -58,6 +130,21 @@ def ni_pipeline_output_path(config, obsid):
     task_run_name="ni_pipeline_done_file_{obsid}",
 )
 def ni_pipeline_done_file(obsid, config):
+    """
+    Path of the sentinel file marking a finished ``nicerl2`` run.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/l2files/PIPELINE_DONE.TXT``.
+    """
     return os.path.join(ni_pipeline_output_path.fn(obsid, config), "PIPELINE_DONE.TXT")
 
 
@@ -68,6 +155,41 @@ def ni_pipeline_done_file(obsid, config):
 )
 def ni_run_l2_pipeline(obsid, config, flags=None):
 
+    """
+    Run the ``nicerl2`` Level-2 pipeline on one observation.
+
+    ``nicerl2`` is invoked as an external command through ``subprocess`` rather than
+    through ``heasoftpy``, with stdout and stderr captured to ``nicerl2_process_<OBSID>.log``
+    and ``.err`` in the output directory. ``heasoftpy`` is still required to be importable,
+    as a proxy for "HEASOFT is set up at all".
+
+    Returns immediately if the ``PIPELINE_DONE.TXT`` sentinel already exists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    flags : dict, optional
+        Extra ``nicerl2`` parameters, merged over the defaults (``clobber``, ``chatter``).
+        This is how non-standard screening -- a relaxed undershoot or overshoot cut, for
+        instance -- is requested.
+
+    Returns
+    -------
+    str
+        The ``l2files`` directory.
+
+    Raises
+    ------
+    ImportError
+        If ``heasoftpy`` is not available.
+    FileNotFoundError
+        If the ``nicerl2`` command is not on ``PATH``.
+    RuntimeError
+        If ``nicerl2`` exits with a non-zero return code.
+    """
     logger = get_run_logger()
     if not HAS_HEASOFT:
         logger.error("heasoftpy not installed, cannot run NICER L2 pipeline.")
@@ -128,6 +250,39 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
 
 @flow(flow_run_name="ni_barycenter_{obsid}")
 def barycenter_data(obsid: str, ra: float, dec: float, config: dict):
+    """
+    Barycentre the cleaned event file of a NICER observation.
+
+    Uses the shared implementation in :mod:`heasarc_retrieve_pipeline.barycenter`, with the
+    orbit file from the observation's ``auxil`` directory. See
+    :func:`heasarc_retrieve_pipeline.barycenter.barycenter_file` for what barycentring does
+    and why the source position matters.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    ra, dec : float
+        Source position in degrees.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        Path of the barycentred event file.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the cleaned event file or the orbit file is missing.
+
+    Notes
+    -----
+    Both file names are hardcoded, uncompressed for the event file and gzipped for the
+    orbit file. A ``nicerl2`` run that leaves its output compressed differently will not be
+    found.
+    """
     logger = get_run_logger()
     outdir = ni_base_output_path.fn(config=config, obsid=obsid)
     logger.info(f"Barycentering NICER data in directory {outdir}")
@@ -149,6 +304,23 @@ def barycenter_data(obsid: str, ra: float, dec: float, config: dict):
 
 @flow
 def process_nicer_obsid(obsid: str, config={}, ra="NONE", dec="NONE", flags=None):
+    """
+    Reduce one NICER observation end to end: ``nicerl2``, then barycentring.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict, optional
+        Pipeline configuration. Must contain ``out_data_path``; note that the default is
+        an empty dict rather than ``None``, so the fallback to ``DEFAULT_CONFIG`` never
+        fires and calling this without a config raises ``KeyError`` (issue 27 in
+        ``docs/known_issues.rst``).
+    ra, dec : float or str, optional
+        Source position in degrees, used for barycentring.
+    flags : dict, optional
+        Extra ``nicerl2`` parameters.
+    """
     current_config = DEFAULT_CONFIG if config is None else config
     logger = get_run_logger()
     logger.info(f"Processing Nicer observation {obsid}")
