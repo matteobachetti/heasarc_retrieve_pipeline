@@ -96,7 +96,7 @@ def splitext_improved(path):
     return os.path.join(dir, froot), ext
 
 
-def merge_intervals(intervals):
+def merge_intervals(intervals, tolerance=0.0):
     """
     Sort a set of intervals and merge the ones that overlap or touch.
 
@@ -108,6 +108,12 @@ def merge_intervals(intervals):
     ----------
     intervals : iterable of (float, float)
         Can also be an ``(N, 2)`` array. Any order.
+    tolerance : float, optional
+        Intervals separated by less than this are merged as well. Use it when the interval
+        edges carry numerical noise -- sample times that jitter by a fraction of a
+        microsecond, say -- and a gap that small cannot mean anything. Keep it far below
+        the shortest gap that would be real. Zero, the default, merges only intervals that
+        genuinely overlap or touch.
 
     Returns
     -------
@@ -118,6 +124,8 @@ def merge_intervals(intervals):
     --------
     >>> merge_intervals([[20, 30], [0, 10], [5, 15]]).tolist()
     [[0.0, 15.0], [20.0, 30.0]]
+    >>> merge_intervals([[0, 10], [10.5, 20]], tolerance=1).tolist()
+    [[0.0, 20.0]]
     """
     intervals = np.asarray(intervals, dtype=float).reshape(-1, 2)
 
@@ -126,7 +134,7 @@ def merge_intervals(intervals):
     for start, stop in intervals[order]:
         if stop <= start:
             continue
-        if merged and start <= merged[-1][1]:
+        if merged and start <= merged[-1][1] + tolerance:
             merged[-1][1] = max(merged[-1][1], stop)
         else:
             merged.append([start, stop])
@@ -158,7 +166,8 @@ def intervals_above_threshold(times, values, threshold, cadence=None):
     threshold : float
         Samples at or above this count as bad.
     cadence : float, optional
-        Width of one sample. Defaults to the median spacing of ``times``.
+        Width of one sample. Defaults to the median spacing of ``times``. Gaps narrower
+        than a thousandth of it are treated as sample-time jitter and merged over.
 
     Returns
     -------
@@ -181,7 +190,12 @@ def intervals_above_threshold(times, values, threshold, cadence=None):
         cadence = float(np.median(np.diff(times))) if times.size > 1 else 0.0
 
     hot = times[np.isfinite(values) & (values >= threshold)]
-    return merge_intervals(np.column_stack([hot - cadence / 2, hot + cadence / 2]))
+    # Sample times jitter: the real GOES 1-minute series wanders by around a microsecond
+    # about its own cadence. Without a tolerance, consecutive bright samples come back as
+    # separate intervals divided by slivers of "good" time a few tens of nanoseconds long.
+    return merge_intervals(
+        np.column_stack([hot - cadence / 2, hot + cadence / 2]), tolerance=cadence / 1000
+    )
 
 
 def intersect_intervals(first, second):

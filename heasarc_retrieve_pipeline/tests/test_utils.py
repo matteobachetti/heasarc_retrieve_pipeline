@@ -396,6 +396,18 @@ class TestMergeIntervals:
     def test_nothing_in_nothing_out(self):
         assert len(merge_intervals([])) == 0
 
+    def test_a_tolerance_bridges_a_gap_too_small_to_be_real(self):
+        assert np.allclose(merge_intervals([[0, 10], [10.5, 20]], tolerance=1.0), [[0, 20]])
+
+    def test_the_tolerance_does_not_bridge_a_real_gap(self):
+        assert np.allclose(
+            merge_intervals([[0, 10], [11, 20]], tolerance=0.5), [[0, 10], [11, 20]]
+        )
+
+    def test_without_a_tolerance_the_smallest_gap_still_separates(self):
+        merged = merge_intervals([[0, 10], [10 + 1e-9, 20]])
+        assert len(merged) == 2
+
 
 class TestIntervalsAboveThreshold:
     """Turning a sampled light curve into the intervals where it is too bright.
@@ -411,6 +423,30 @@ class TestIntervalsAboveThreshold:
         assert np.allclose(
             intervals_above_threshold(times, values, 5e-6), [[30.0, 90.0]]
         )
+
+    def test_jittery_sample_times_do_not_split_one_bright_stretch(self):
+        """Real GOES timestamps are not exactly one cadence apart.
+
+        Measured on the GOES-15 1-minute series covering 80002092008, the spacing varies
+        by about 600 ns around 60 s. Taken literally, ``t + cadence/2`` of one sample falls
+        a few tens of nanoseconds short of ``t - cadence/2`` of the next, and a single
+        bright stretch comes back as several intervals separated by slivers of "good" time
+        far shorter than any instrument can use.
+        """
+        spacing = 60.0 + 6e-7 * np.array([1, -1] * 10)
+        times = 129813203.8 + np.cumsum(spacing)
+        values = np.full(20, 1e-5)
+
+        intervals = intervals_above_threshold(times, values, 5e-6)
+
+        assert len(intervals) == 1
+
+    def test_a_real_gap_between_bright_stretches_is_kept(self):
+        """The jitter tolerance must not swallow a genuine quiet minute."""
+        times = np.arange(6) * 60.0
+        values = np.array([1e-5, 1e-5, 1e-7, 1e-7, 1e-5, 1e-5])
+
+        assert len(intervals_above_threshold(times, values, 5e-6)) == 2
 
     def test_consecutive_hot_samples_merge_into_one_interval(self):
         times = np.array([0.0, 60.0, 120.0, 180.0])
