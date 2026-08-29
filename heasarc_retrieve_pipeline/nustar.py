@@ -460,9 +460,10 @@ def goes_lc_file_name(event_file):
     str
         ``<root>_goes.fits``.
 
-    Notes
-    -----
-    Unused: :func:`get_goes_gtis` downloads the GOES light curve but never writes it.
+    The file :func:`get_goes_gtis` writes there has a ``TIME`` column in the mission
+    elapsed time of the event file -- not the GOES time scale -- so that the solar X-ray
+    flux can be plotted directly against the event times. See
+    :func:`plot_flare_filtering`.
     """
     root = rootname(event_file)
     return root + "_goes.fits"
@@ -961,16 +962,18 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     str
         Path of the GTI file, ``<root>_goes.gti``.
 
-    Notes
-    -----
-    The GOES X-ray light curve is downloaded but not used for the filtering itself, which
-    runs entirely off the HEK flare catalogue.
+    The GOES X-ray light curve is not used for the filtering itself, which runs entirely
+    off the HEK flare catalogue. It is written to :func:`goes_lc_file_name` all the same,
+    on the event file's own time scale, so that :func:`plot_flare_filtering` can show what
+    the Sun was doing without downloading anything a second time.
     """
     from sunpy import timeseries as ts
     from sunpy.net import Fido
     from sunpy.net import attrs as a
     from sunpy.time import parse_time
     from astropy.io.fits import getheader, getdata
+    from astropy.table import Table
+    from astropy.time import Time
     from nustar_gen import info, utils
 
     outfile_gti = goes_gti_file_name(event_file)
@@ -1013,7 +1016,15 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     hek_results = result3["hek"]
     flares_hek = hek_results
 
-    # goes.to_table().write(root + "_goes.fits", overwrite=True)
+    outfile_lc = goes_lc_file_name(event_file)
+    goes_table = goes.to_table()
+    time_column = next(col for col in goes_table.itercols() if isinstance(col, Time))
+    lightcurve = {"TIME": (time_column.mjd - mjdref) * 86400}
+    for channel in "xrsa", "xrsb":
+        if channel in goes_table.colnames:
+            lightcurve[channel.upper()] = np.asarray(goes_table[channel], dtype=float)
+    logger.info(f"Writing the GOES X-ray light curve to {outfile_lc}")
+    Table(lightcurve).write(outfile_lc, overwrite=True)
 
     flares = []
     for flare_hek in flares_hek:
