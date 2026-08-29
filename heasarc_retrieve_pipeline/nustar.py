@@ -958,6 +958,10 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     A, B, C, M, X, which is alphabetical, so comparing the letters as characters gives the
     correct ordering.
 
+    The time range searched is the wider of the header's ``TSTART``/``TSTOP`` and the
+    event file's own GTI extent. On a merged file those disagree, and the GTI is the
+    honest one.
+
     Returns the existing file unchanged if it is already present.
 
     Parameters
@@ -981,9 +985,9 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     from sunpy.net import Fido
     from sunpy.net import attrs as a
     from sunpy.time import parse_time
+    from astropy.io import fits
     from astropy.io.fits import getheader, getdata
     from astropy.table import Table
-    from astropy.time import Time
     from nustar_gen import info, utils
 
     outfile_gti = goes_gti_file_name(event_file)
@@ -1003,8 +1007,16 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 
     ns = info.NuSTAR()
     hdr = getheader(event_file, ext=1)
-    tstart = hdr["TSTART"]
-    tstop = hdr["TSTOP"]
+    with fits.open(event_file) as hdul:
+        file_gti = read_gti(hdul)
+
+    # TSTART/TSTOP are not trustworthy on a merged file: ftmerge copies them from its
+    # first input, so they can be narrower than the merged GTI (issue 35 in
+    # known_issues.rst). Since this GTI is later ANDed with the event file's own, a
+    # narrow range would silently delete good time at the edges of the observation --
+    # 791 s of the 80002092008 background product. Take whichever bound is wider.
+    tstart = min(hdr["TSTART"], file_gti[:, 0].min()) if len(file_gti) else hdr["TSTART"]
+    tstop = max(hdr["TSTOP"], file_gti[:, 1].max()) if len(file_gti) else hdr["TSTOP"]
     datestart = ns.met_to_time(tstart)
     dateend = ns.met_to_time(tstop)
     mjdref = hdr["MJDREFI"] + hdr["MJDREFF"]
@@ -1028,12 +1040,20 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 
     outfile_lc = goes_lc_file_name(event_file)
     goes_table = goes.to_table()
-    time_column = next(col for col in goes_table.itercols() if isinstance(col, Time))
-    lightcurve = {"TIME": (time_column.mjd - mjdref) * 86400}
+    # sunpy names the time column after the source file's own index -- "date" for XRS --
+    # and gives it as datetime64, so take the times from the TimeSeries itself instead.
+    lightcurve = {"TIME": (goes.time.mjd - mjdref) * 86400}
     for channel in "xrsa", "xrsb":
         if channel in goes_table.colnames:
-            lightcurve[channel.upper()] = np.asarray(goes_table[channel], dtype=float)
-    logger.info(f"Writing the GOES X-ray light curve to {outfile_lc}")
+            # The flux columns are masked where the satellite reported bad data. NaN is
+            # what matplotlib skips, and what FITS can hold.
+            lightcurve[channel.upper()] = np.ma.filled(
+                np.ma.asarray(goes_table[channel], dtype=float), np.nan
+            )
+    logger.info(
+        f"Writing the GOES X-ray light curve ({len(lightcurve['TIME'])} points) "
+        f"to {outfile_lc}"
+    )
     Table(lightcurve).write(outfile_lc, overwrite=True)
 
     flares = []

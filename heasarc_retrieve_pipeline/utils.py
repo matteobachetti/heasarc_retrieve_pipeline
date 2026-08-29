@@ -293,7 +293,16 @@ def apply_gti(hdul, gti):
     * events outside the new intervals are dropped from the event table;
     * the new intervals replace the GTI extension;
     * ``ONTIME`` becomes the exact total of the new intervals;
-    * ``LIVETIME`` and ``EXPOSURE`` are scaled by the ``ONTIME`` ratio.
+    * ``LIVETIME`` and ``EXPOSURE`` are scaled by the ratio of the new GTI total to the
+      old one.
+
+    Note where that ratio comes from: the **file's own GTI**, not its ``ONTIME`` keyword.
+    ``ONTIME`` is by definition the GTI total, but the two disagree in practice --
+    HEASOFT's ``ftmerge`` copies the keyword from the first input instead of recomputing
+    it, so a merged NuSTAR file can claim ``ONTIME = 36058 s`` over a GTI totalling
+    58889 s. Trusting the keyword there would scale ``LIVETIME`` by 1.58 and make the
+    filtered file claim *more* live time than the unfiltered one. The GTI is the authority,
+    because it is what the events were selected on.
 
     The extensions are located by ``EXTNAME`` (``EVENTS``, and ``GTI`` or ``STDGTI``),
     falling back to indices 1 and 2. Times are compared on the ``TIME + TIMEZERO`` scale,
@@ -337,9 +346,7 @@ def apply_gti(hdul, gti):
     gti_timezero = float(gti_hdu.header.get("TIMEZERO", 0.0))
 
     old_gti = read_gti(hdul)
-    ontime_before = float(
-        events.header.get("ONTIME", np.sum(old_gti[:, 1] - old_gti[:, 0]))
-    )
+    ontime_before = float(np.sum(old_gti[:, 1] - old_gti[:, 0]))
     livetime_before = float(events.header.get("LIVETIME", ontime_before))
     exposure_before = float(events.header.get("EXPOSURE", livetime_before))
 

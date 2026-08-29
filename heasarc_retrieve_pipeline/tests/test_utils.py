@@ -341,3 +341,31 @@ class TestReadGti:
     def test_timezero_is_added(self):
         hdul = make_event_file(times=[], gti=[[0, 10]], timezero=1000.0)
         assert np.allclose(read_gti(hdul), [[1000, 1010]])
+
+
+class TestApplyGtiWithAStaleHeader:
+    """The scaling must come from the GTI, not from a keyword that disagrees with it.
+
+    HEASOFT's ``ftmerge`` copies ONTIME from the first input rather than recomputing it,
+    so the merged NuSTAR products carry an ONTIME far smaller than their own GTI total.
+    Scaling on the keyword made the filtered file claim more live time than the
+    unfiltered one.
+    """
+
+    def test_the_ratio_comes_from_the_gti_not_from_ontime(self):
+        # As on the real nu80002092008_src1.evt: ONTIME says 36058 s over a 58889 s GTI.
+        hdul = make_event_file(
+            times=[15.0], gti=[[0, 58889]], ontime=36058.0, livetime=33646.0
+        )
+        apply_gti(hdul, [[0, 56851]])
+
+        expected = 33646.0 * 56851 / 58889
+        assert hdul["EVENTS"].header["LIVETIME"] == pytest.approx(expected)
+        assert hdul["EVENTS"].header["LIVETIME"] < 33646.0, "filtering cannot add live time"
+        assert hdul["EVENTS"].header["ONTIME"] == pytest.approx(56851.0)
+
+    def test_ontime_before_is_reported_from_the_gti_too(self):
+        hdul = make_event_file(times=[], gti=[[0, 100]], ontime=50.0)
+        stats = apply_gti(hdul, [[0, 100]])
+
+        assert stats["ontime_before"] == pytest.approx(100.0)
