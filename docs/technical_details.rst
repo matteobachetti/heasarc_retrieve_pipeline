@@ -447,9 +447,10 @@ exclude flare intervals:
 2. ``sunpy``'s ``Fido`` queries the GOES XRS instrument for that interval, choosing the
    highest-numbered (i.e. most recent) GOES satellite that covers it.
 3. The same query retrieves the **HEK flare catalogue** entries flagged by SWPC.
-4. Every catalogued flare at or above ``minimum_class`` (default ``"C5.0"``) is collected
-   and handed to ``utils.good_intervals``, which returns the complement of those flares
-   inside ``[TSTART, TSTOP]``.
+4. Every catalogued flare at or above ``minimum_class`` (default ``"C5.0"``) is collected,
+   together with every stretch where the measured 1--8 A flux reaches ``flux_class``
+   (default ``"C5.0"`` as well). The union of the two is handed to ``utils.good_intervals``,
+   which returns its complement inside ``[TSTART, TSTOP]``.
 5. ``nustar_gen.utils.make_usr_gti`` writes the intervals as a GTI file.
 
 Flare classes are compared by splitting the class string into its letter and its number
@@ -465,12 +466,43 @@ properties a GTI list is expected to have -- positive length, sorted, disjoint. 
 and its tests are offline; 80002092008's single flare falls well inside the observation, so
 no real observation in hand would have exercised any of those cases.
 
-The filtering itself uses only the HEK *catalogue* of flare start/end times, not the GOES
-light curve. A threshold on the measured GOES flux would be a more direct proxy for the
-background actually seen by NuSTAR, and remains a possible improvement. The light curve is
-written all the same, to ``<root>_goes.fits``, with its ``TIME`` column converted to the
-event file's mission elapsed time; that is what the diagnostic below plots against, at no
-extra network cost.
+**Why both criteria.** The HEK catalogue gives the times of *solar* flares, which are not
+the times NuSTAR's background is contaminated. Its end time is when the flare ended on the
+Sun; NuSTAR's background is still elevated after that, as the diagnostic figure showed on
+the very first observation it was run against. Rises that never got catalogued, or that sit
+just under the class cut, are not listed at all. The measured flux catches those. It has
+its own blind spot -- the GOES series is sampled once a minute and carries NaN gaps, which
+contribute nothing to a threshold -- and the catalogue covers those, so the two are used
+together rather than one instead of the other. ``utils.intervals_above_threshold`` turns the
+sampled flux into intervals, each hot sample covering half a cadence either side of itself;
+``utils.merge_intervals`` merges the result with the catalogued flares.
+
+Those sample times need one small allowance. GOES timestamps are not exactly one cadence
+apart -- over 80002092008 the 1-minute series wanders by about 600 ns -- so taken literally,
+one bright sample's interval can end a microsecond before the next one's begins, and a
+single bright stretch comes back as several intervals divided by slivers of good time a few
+tens of nanoseconds wide. ``merge_intervals`` therefore takes a ``tolerance``, and
+``intervals_above_threshold`` passes a thousandth of the cadence: three orders of magnitude
+above the jitter, three below any gap that could mean anything. Without it the flux cut on
+that observation produced six intervals where there are physically two.
+
+The light curve is written to ``<root>_goes.fits``, with its ``TIME`` column converted to
+the event file's mission elapsed time, so the diagnostic below plots against the same data
+the cut was made on, at no extra network cost.
+
+**The hazard of a flux threshold, and what the code does about it.** The Sun's quiescent
+1--8 A flux is not a fixed number: it rises and falls with the eleven-year cycle. Near solar
+maximum it sits well inside class C. In February 2014, when 80002092008 was taken, it was
+around 1.5e-6 W/m2 -- mid-C1. A threshold set below that excludes the entire observation
+except the sampling gaps: ``flux_class="C1.0"`` on that observation removes 54013 of 58889 s
+of good time, and what survives is only where the flux is NaN. The default ``"C5.0"`` sits
+above the quiescent level for any epoch, but a user lowering it has no warning from the
+physics that they have crossed the line. So ``get_goes_gtis`` measures the damage before
+writing anything: if the cut would remove more than half of the file's existing good time,
+it logs a prominent warning naming the percentage. It still writes the GTI. A genuinely
+flare-dominated observation really can lose most of its exposure, and nothing the code can
+inspect distinguishes that from a threshold set too low -- only the person analysing the
+observation can. Passing ``flux_class=None`` falls back to the catalogue alone.
 
 ``filter_from_solar_flares`` then ANDs the flare GTIs with the event file's existing GTIs
 and writes ``*_noflares.evt`` through ``utils.apply_gti``, which does the whole job: events
@@ -532,8 +564,9 @@ same convention ``image_utils`` already uses for its image cut-outs. Three panel
 time axis:
 
 1. the GOES X-ray flux in the 1--8 A and 0.5--4 A channels, on a log scale, with the
-   A/B/C/M/X class thresholds drawn as horizontal lines and the ``minimum_class`` cut marked
-   on top of them, so the cut is visible where it acts;
+   A/B/C/M/X class thresholds drawn as horizontal lines and the ``flux_class`` cut marked on
+   top of them, so both cuts are visible where they act -- the flux threshold as the line the
+   1--8 A curve crosses, the catalogue cut as the shading it produces;
 2. the event file's 3--10 keV light curve, the band solar stray light lands in, with the
    light curve before filtering in grey and the one after in colour;
 3. the same in 10--79 keV. This is the control: solar flares do not produce hard X-rays at
@@ -613,21 +646,62 @@ filtering costs 1.7% of the live time (33646 -> 33063 s) and 1830 of 63936 backg
 and a brightest bin seven times the median. Other backgrounds, sub-threshold flares and
 Earth-limb effects are untouched by this work.
 
-Two things the diagnostic figure shows that the numbers do not, both visible on
-``nu80002092008_back_flares.jpg``:
+Two things the diagnostic figure showed that the numbers did not, both visible on
+``nu80002092008_back_flares.jpg`` as the catalogue-only cut left it:
 
-* **The excluded window ends too early.** The 3--10 keV background peaks at 4.6 c/s, more
-  than ten times its 0.35 c/s baseline, inside the shaded window -- but it is still at
+* **The excluded window ended too early.** The 3--10 keV background peaks at 4.6 c/s, more
+  than ten times its 0.35 c/s baseline, inside the shaded window -- but it was still at
   2.5, 2.0 and 1.5 c/s in the three bins *after* it. The HEK catalogue's flare end time is
   when the *solar* flare ended, not when NuSTAR's background recovered from it.
-* **A second rise at the end of the observation is not excluded at all.** The GOES 1--8 A
-  flux climbs back above the C5.0 cut in the last few hundred seconds, and the NuSTAR
+* **A second rise at the end of the observation was not excluded at all.** The GOES 1--8 A
+  flux climbs back above the C5.0 level in the last few hundred seconds, and the NuSTAR
   background rises with it to about 1 c/s, with nothing shaded.
 
-Both point the same way, and it is the improvement already noted for issue 12: a threshold
-on the measured GOES flux would track NuSTAR's actual background better than the catalogue
-of flare start and end times does. The diagnostic exists to make exactly this kind of thing
-visible, and it did so on its first run against real data.
+Both point the same way, and it is what the flux criterion above was added for. The
+diagnostic exists to make exactly this kind of thing visible, and it did so on its first run
+against real data. Adding the flux cut to the catalogue cut, same observation, same band and
+binning, background region:
+
+.. list-table::
+   :header-rows: 1
+
+   * - criterion
+     - chi2/dof
+     - fractional rms
+     - max / median
+     - good time removed
+   * - none
+     - 5.17
+     - 0.703
+     - 13.20
+     - --
+   * - HEK >= C5.0
+     - 3.62
+     - 0.429
+     - 7.29
+     - 1020 s (1.7%)
+   * - flux >= C5.0 alone
+     - 1.83
+     - 0.179
+     - 3.08
+     - 4560 s (7.7%)
+   * - HEK >= C5.0 **and** flux >= C5.0
+     - **1.83**
+     - **0.179**
+     - **3.08**
+     - 4650 s (7.9%)
+
+Half again off the reduced chi-squared, for four and a half times the exposure. What the
+flux threshold removes is contamination, and the exposure it costs was never usable
+background time in the first place.
+
+Note the third row honestly: on *this* observation the flux cut subsumes the catalogue
+almost entirely, and the catalogue adds only 90 s to what the flux alone would remove. That
+is not an argument for dropping it. The catalogue is what covers the flux series' own gaps
+-- 95 of the 1056 samples over this observation are ``NaN``, and a threshold cannot see a
+flare it has no measurement of -- and one observation is not evidence about the general
+case. The two are cheap to combine and fail in different ways, which is the whole reason
+for using both.
 
 Barycentring
 ~~~~~~~~~~~~

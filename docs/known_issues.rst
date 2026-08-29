@@ -267,11 +267,15 @@ each of those cases -- 80002092008's single flare falls well inside the observat
 would not have exercised any of them. An observation entirely covered by flares now raises
 with a clear message instead of writing an unusable GTI file.
 
-The GOES X-ray light curve is still not used *for the filtering*, which remains
-catalogue-driven. It is no longer thrown away, though: ``get_goes_gtis`` writes it to
+The measured GOES X-ray light curve is now used for the filtering as well, not just the
+catalogue: ``get_goes_gtis`` excludes the union of the catalogued flares and the times when
+the 1--8 A flux reaches ``flux_class``. It also writes the light curve to
 ``<root>_goes.fits`` on the event file's own time scale, and ``plot_flare_filtering`` plots
-it above the NuSTAR light curves so the cut can be checked by eye. See "Solar flare
-filtering" in ``technical_details.rst``.
+it above the NuSTAR light curves so the cut can be checked by eye. The two criteria catch
+different things, and adding the flux cut takes the background chi2/dof on 80002092008 from
+3.62 to 1.83. See "Solar flare filtering" in ``technical_details.rst``, which also records
+the one hazard of the flux threshold: set below the Sun's quiescent flux for the epoch, it
+excludes the whole observation.
 
 13. NuSTAR barycentring uses FPMA's orbit file for everything
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
