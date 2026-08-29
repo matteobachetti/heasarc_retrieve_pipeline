@@ -68,27 +68,21 @@ wrong OBSID. Those observations are now logged and skipped.
 
 With the workaround, the full test suite passes: ``11 passed``.
 
-2. The legacy fallback path cannot run
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2. The legacy fallback path cannot run -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``retrieve_heasarc_data_by_source_name_old`` (``core.py:385``) is what the code falls back
-to when astroquery fails, and it has at least four independent faults:
+Deleted, which is what this entry recommended. ``retrieve_heasarc_data_by_source_name_old``
+was the fallback for when astroquery failed, and it had four independent faults: it called
+``MISSION_CONFIG[mission]["path_func"]`` with a signature no path function accepted; those
+path functions were Prefect tasks being called outside a flow; it iterated over
+``results["cycle"]`` and ``results["prnb"]``, which exist only for RXTE; and it was a task
+calling tasks. It had never run.
 
-* ``remote_data_url`` (``core.py:32``) calls ``MISSION_CONFIG[mission]["path_func"]`` with
-  four positional arguments ``(obsid, time, cycle, prnb)``. No path function accepts that
-  signature: ``nu_heasarc_raw_data_path(obsid, **kwargs)`` raises ``TypeError``, and
-  ``rxte_heasarc_raw_data_path(obsid, cycle=None, prnb=None)`` silently receives ``time``
-  as its ``cycle``.
-* Those path functions are Prefect ``@task`` objects, being called outside a flow.
-* It iterates over ``results["cycle"]`` and ``results["prnb"]``, which
-  ``retrieve_heasarc_table_by_position`` only selects for RXTE -- ``KeyError`` for NuSTAR
-  and NICER.
-* It is a ``@task`` that calls other tasks (``get_source_position``), which Prefect does
-  not support.
-
-Suggested fix: delete it. The archive-path builders it depends on duplicate what the
-datalink service provides, and keeping a fallback that has never been exercised is worse
-than having none.
+Deleting it exposed a cascade with no other caller: ``remote_data_url``, the three
+``path_func`` entries of ``MISSION_CONFIG``, and the archive-path builders they named --
+``nu_heasarc_raw_data_path``, ``rxte_heasarc_raw_data_path`` and ``ni_raw_data_path``,
+which reconstructed by hand the directory layout that the datalink service already reports.
+227 lines went in total.
 
 3. ``calculate_spectra`` runs ``nuproducts`` outside its own loop -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -424,68 +418,129 @@ Prefect usage
 These are systematic rather than incidental, so they are grouped together. The net effect
 is that the package pays Prefect's complexity cost and receives only logging in return.
 
-15. ``wait_for`` is given functions, not futures
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+15. ``wait_for`` is given functions, not futures -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-About ten places (``core.py:414``, ``core.py:424``, ``core.py:479``, ``core.py:553``,
-``nustar.py:740`` and following) pass ``wait_for=[some_function_object]``. Prefect expects
-futures or states from previous calls. As written the declared dependencies are inert --
-they neither enforce ordering nor fail if the upstream step failed. Ordering happens to be
-correct only because everything runs synchronously.
+Thirteen declared edges across twelve call sites passed ``wait_for=[some_function_object]``.
+Measured on Prefect 3.8.4: with a function object the downstream body runs even though the
+upstream task raised. The edges were inert.
 
-Either capture and pass the actual return values, or drop ``wait_for`` entirely and rely on
-the sequential control flow that is already there.
+Eight of them were deleted rather than repaired, because the dependency was already stated
+more strongly by an argument -- ``splitdir`` *is* the return value of
+``recover_spacecraft_science_data`` -- or because the upstream was a subflow, and a subflow
+call is synchronous and raises. There is no ``flow.submit()`` on 3.8.4 to produce a future
+from one.
 
-16. Tasks call tasks
-~~~~~~~~~~~~~~~~~~~~
+The three remaining edges, in ``process_nustar_obsid``, are real: the dependent step does
+not consume the upstream result. Those upstreams are now ``.submit()``-ed and the future is
+passed. Each is paired with a ``.result()``, and that pairing is the point of the entry.
+Measured, with the upstream failing:
 
-Prefect does not support calling a task from inside another task. It happens in at least:
-``rootname`` -> ``splitext`` (``nustar.py:102``), ``goes_lc_file_name``/``goes_gti_file_name``
--> ``rootname`` (``nustar.py:121``, ``nustar.py:131``), ``barycentered_file_name`` ->
-``splitext`` (``nustar.py:111``), ``get_goes_gtis`` -> ``goes_gti_file_name``
-(``nustar.py:381``), ``get_best_source_region`` -> ``rootname`` (``nustar.py:551``),
-``get_best_source_regions`` -> ``rootname`` and -> ``get_best_source_region``,
-``calculate_spectra`` -> ``rootname``.
+=========================================  ==========================  ==============
+Pattern                                    Downstream                  Flow run ends
+=========================================  ==========================  ==============
+``downstream(wait_for=[future])``          skipped, returns ``None``   **COMPLETED**
+``future.result()``, then ``downstream``   exception re-raised         **FAILED**
+=========================================  ==========================  ==============
 
-17. Trivial helpers are cached tasks
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+So a bare future would have turned a failed Level-2 pipeline into a green flow run handing
+``None`` to the next step. The ``.result()`` keeps today's fail-fast behaviour; the
+``wait_for`` puts the edge in the run graph. Neither substitutes for the other.
 
-``splitext``, ``rootname``, ``barycentered_file_name``, ``goes_lc_file_name``,
-``goes_gti_file_name``, ``flare_filtered_event_file_name`` (``nustar.py:87-142``) are
-one-line string manipulations wrapped in ``@task`` with a 1000-day input-hash cache. Each
-call becomes a tracked run with a cache lookup. They should be plain functions in
-:mod:`~heasarc_retrieve_pipeline.utils`, next to ``splitext_improved``.
+An AST guard in ``tests/test_prefect_wiring.py`` now asserts that every name in a
+``wait_for`` list came from a ``.submit()``. It catches 13 offenders in the tree before this
+work and none after.
 
-18. ``.fn`` everywhere defeats the point
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+16. Tasks call tasks -- CORRECTED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Path builders, ``separate_sources_in_event_file``, ``get_goes_gtis``, ``merge_gtis`` and
-others are routinely invoked as ``task.fn(...)``, the undecorated function. That bypasses
-caching, retries and run tracking. Nothing is ever ``.submit()``-ed, so there is also no
-concurrency: downloads and reductions of independent observations run strictly one after
-another.
+The premise was wrong for the installed Prefect. "Prefect does not support calling a task
+from inside another task" was true of Prefect 2; on 3.8.4 the call returns the right answer
+and produces a nested task run, both inside a flow and outside one. Measured.
 
-A defensible resolution is to keep ``@flow`` on the four or five real entry points, make
-everything else a plain function, and add ``.submit()`` only where parallelism actually
-pays (per-observation downloads).
+What was really wrong with the examples listed here was not the nesting but what was being
+nested: one-line string helpers. That is issue 17, and fixing it removed most of these call
+chains anyway.
 
-19. ``merge_event_files`` uses a random temp filename
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+17. Trivial helpers are cached tasks -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``nustar.py:296``: ``f"{root}_{np.random.randint(1000000)}.gti"``. Non-deterministic inputs
-defeat ``task_input_hash`` caching for everything downstream, and 10\ :sup:`6` values is a
-small space for a collision. Use ``tempfile.NamedTemporaryFile`` / ``mkstemp``.
+Eighteen path and name builders were ``@task`` with a 1000-day input-hash cache, for work
+like inserting ``_bary`` before an extension. In the end-to-end log of 90901333002 they
+accounted for **85 of 199 task runs (43%)**: ``splitext`` 34, ``rootname`` 28,
+``goes_lc_file_name`` 10, ``goes_gti_file_name`` 10, ``flare_filtered_event_file_name`` 2,
+``nu_base_output_path`` 1. The steps actually worth watching -- barycentring, the joins, the
+flare diagnostics, the spectra, the source regions -- came to 18.
 
-20. A ``task_run_name`` template refers to a nonexistent parameter
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+They are plain functions now. ``nustar.splitext`` is gone (a one-line wrapper around
+``utils.splitext_improved``), ``rootname`` moved to :mod:`~heasarc_retrieve_pipeline.utils`
+since it is generic, and the mission path builders stay in their own modules. The package
+went from 45 tasks to 26, and the offline test suite from 9.4 s to 6.0 s.
 
-``nustar.py:146``: ``separate_sources_in_event_file`` has
-``task_run_name="separate_sources_in_event_file_{obsid}_..."`` but no ``obsid`` parameter.
-Prefect raises when it formats the name -- currently masked because the function is only
-ever called through ``.fn``.
+This is a legibility argument, not a speed one, and the difference should not be oversold:
+one cached trivial task call costs 3.89 ms against 0.33 us for the plain function, about
+12,000 times more, but 85 of them is 0.3 s inside a 50-minute run.
 
-Also, ``merge_gtis``, ``merge_event_files`` and ``separate_sources`` interpolate whole
-*lists* of filenames into their run names, producing unusable labels in the UI.
+Re-running the same observation after the change gives **89 task runs and no string helper
+among them** -- 66 of the 89 are the per-file downloads, and the rest are the steps that do
+work. (The run itself is short because every processing step skips on its sentinel; what it
+measures is which task runs the code asks for, not how long they take.)
+
+The characterization tests these builders never had came first, in ``tests/test_nustar.py``
+and the new ``tests/test_nicer.py`` and ``tests/test_rxte.py``. One of them went red
+immediately: ``ni_pipeline_done_file`` passed ``obsid`` as the ``config`` argument, so NICER
+never found its own sentinel file.
+
+18. ``.fn`` everywhere defeats the point -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Twenty-eight of the forty production ``.fn(`` calls went away with issue 17: they are calls
+to plain functions now. The remaining ten were tasks that do real work, and they are called
+as tasks. ``merge_gtis`` and ``merge_event_files`` appear in the run graph for the first
+time -- they ran zero times as tasks in the 199-run log, though they did the work. Checked
+directly, since the sentinels skip them on a re-run: called inside a flow they now log
+``nu_merge_event_files_into_out.evt_gti_OR`` with ``nu_merge_gtis_into_out_tmp.gti_gti_OR``
+nested inside it. So does ``get_best_source_region``, which the census run does show, twice.
+
+``get_remote_directory_listing`` was the one place where ``.fn`` was load-bearing: it
+recursed through ``self.fn``, and calling it as a task would have opened a task run per
+subdirectory. The walk is now a plain recursive function, ``walk_remote_directory``, with
+the task as its entry point, so one directory tree is one task run.
+
+``.fn`` in the tests stays: calling the undecorated function is the standard way to unit
+test a Prefect task.
+
+The concurrency half of this entry is not addressed. ``.submit()`` here buys dependency
+edges, not parallelism, because ``os.chdir`` in both observation loops (issue 26) makes
+concurrent observations unsafe -- HEASOFT tools resolve relative paths against the process
+working directory. Issue 26 is the prerequisite.
+
+19. ``merge_event_files`` uses a random temp filename -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The intermediate GTI file is now ``{root}_tmp.gti``, named after the output file. One output
+file means one intermediate, so a deterministic name cannot collide, and ``merge_gtis``
+unlinks it before writing in any case.
+
+The random name had a second fault this entry did not mention: ``os.unlink`` was the last
+statement of the task, so any HEASOFT call that raised left the file behind under a name
+nothing would ever look for again. Removal is in a ``finally`` now.
+
+``tempfile.mkstemp``, which the entry suggested, would have fixed the leak but not the
+non-determinism -- mkstemp names are random too.
+
+20. A ``task_run_name`` template refers to a nonexistent parameter -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``separate_sources_in_event_file`` named ``{obsid}``, which is not one of its parameters.
+Measured: Prefect raises ``KeyError: 'obsid'`` when it formats the name, before the body
+runs. It was masked only because the function was always reached through ``.fn`` -- and
+issue 18 was about to stop doing that.
+
+The three templates that interpolated whole lists of file names now name the output file, or
+the first input. A second AST guard in ``tests/test_prefect_wiring.py`` checks every
+``task_run_name`` and ``flow_run_name`` template in the package against the parameters of
+the function it decorates.
 
 
 Packaging and hygiene

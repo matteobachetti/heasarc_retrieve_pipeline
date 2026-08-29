@@ -1031,9 +1031,8 @@ only the first is used here).
 Orchestration with Prefect
 --------------------------
 
-Every function of consequence is decorated with ``@task`` or ``@flow``. In Prefect's model a
-*flow* is a unit of work that can call tasks and other flows; a *task* is an individually
-tracked, retryable, cacheable step. Many tasks here also carry::
+In Prefect's model a *flow* is a unit of work that can call tasks and other flows; a *task*
+is an individually tracked, retryable, cacheable step. Many tasks here also carry::
 
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000)
@@ -1041,13 +1040,45 @@ tracked, retryable, cacheable step. Many tasks here also carry::
 which asks Prefect to hash the inputs and reuse a previous result if the same inputs are
 seen again within a thousand days.
 
-In practice the package gets much less from Prefect than the decorators suggest, because
-the code very often calls ``some_task.fn(...)`` instead of ``some_task(...)``. ``.fn`` is
-the *undecorated* function: calling it bypasses the Prefect run, and with it the caching,
-the retry logic and the run tracking. Where tasks are called normally they run
-synchronously one after another (nothing is ``.submit()``-ed), so there is no concurrency
-either. What remains is the structured logging through ``get_run_logger()`` and the run
-names in the Prefect UI.
+Four rules decide what is decorated, and they are worth stating because the package spent a
+long time without them (issues 15--20 in :doc:`known_issues`):
+
+**Flows are entry points.** ``retrieve_heasarc_data_by_obsid``,
+``retrieve_heasarc_data_by_source_name`` and the per-mission ``process_*_obsid`` flows. A
+subflow call is synchronous and raises on failure; there is no ``flow.submit()`` in Prefect
+3.8.4.
+
+**Tasks are steps that do work** -- run a HEASOFT tool, download a file, read or write data.
+These are the steps a person watching a run wants to see, and the only ones worth a cache
+lookup or a retry.
+
+**Path and name builders are plain functions.** Inserting ``_bary`` before an extension is
+not a step. When these were tasks they were 43% of the task runs of a real observation, and
+the interesting work was lost among them.
+
+**Never call a task through ``.fn`` in production code.** ``.fn`` is the undecorated
+function: it bypasses the run, the run name, the cache and the retries. It is the right
+thing to use *in tests*, where calling the undecorated function is the standard way to unit
+test a task. Where a task must recurse, the recursion goes into a plain helper and the task
+stays as its entry point -- ``walk_remote_directory`` under
+``get_remote_directory_listing`` -- so that a whole tree is one task run.
+
+One rule about dependencies. ``wait_for`` accepts futures, and passing it a bare function
+object does nothing at all. When a real ordering constraint has to be declared -- the
+dependent step does not consume the upstream result, so no argument states it -- the
+upstream is ``.submit()``-ed and the future passed, **and the future is always resolved with
+``.result()``**. This is not redundant: measured on Prefect 3.8.4, a downstream call whose
+``wait_for`` future failed is skipped, returns ``None``, and leaves the flow run
+**COMPLETED**. Only ``.result()`` re-raises and fails the run. The ``.result()`` gives
+fail-fast; the ``wait_for`` gives the edge in the graph.
+
+Two AST guards in ``tests/test_prefect_wiring.py`` keep both rules from drifting: every name
+in a ``wait_for`` list must come from a ``.submit()``, and every ``task_run_name`` template
+must name real parameters of the function it decorates.
+
+Concurrency is still not used: tasks are submitted for their dependency edges, not for
+parallelism. ``os.chdir`` in the observation loops (issue 26) makes concurrent observations
+unsafe, since HEASOFT tools resolve relative paths against the process working directory.
 
 Idempotency is therefore achieved not by Prefect's cache but by **sentinel files** written
 into the output tree:
