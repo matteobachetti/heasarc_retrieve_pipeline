@@ -38,12 +38,8 @@ import os
 from .barycenter import barycenter_file
 from .utils import absolute_config
 
-try:
-    HAS_HEASOFT = True
-    import heasoftpy as hsp
-except ImportError:
-    HAS_HEASOFT = False
-    print("Warning: heasoftpy not installed. NICER L2 pipeline functionality will be disabled.")
+from . import heasoft
+from .heasoft import HAS_HEASOFT
 
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
@@ -168,7 +164,6 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
         )
         return ev_dir
 
-    nicerl2_hsp_task = hsp.HSPTask("nicerl2")
     logger.info("Running Nicer L2 pipeline for OBSID: %s", obsid)
 
     datadir = ni_base_output_path(config=config, obsid=obsid)
@@ -193,7 +188,10 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
     logger.info(f"Executing command: {' '.join(command)}")
     try:
         with open(log_file_path, "w") as log_f, open(error_log_path, "w") as err_f:
-            result = subprocess.run(command, stdout=log_f, stderr=err_f, check=False)
+            # nicerl2 is a HEASOFT tool like any other: it reads and rewrites its parameter
+            # file, so it takes the same lock even though it is run as a plain subprocess.
+            with heasoft.HEASOFT_LOCK:
+                result = subprocess.run(command, stdout=log_f, stderr=err_f, check=False)
         if result.returncode != 0:
             with open(error_log_path, "r") as f:
                 error_output = f.read()

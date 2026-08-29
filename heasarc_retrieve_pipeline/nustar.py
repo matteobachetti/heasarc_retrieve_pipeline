@@ -60,11 +60,8 @@ from .utils import (
     splitext_improved,
 )
 
-try:
-    HAS_HEASOFT = True
-    import heasoftpy as hsp
-except ImportError:
-    HAS_HEASOFT = False
+from . import heasoft
+from .heasoft import HAS_HEASOFT
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./", max_radius=80)
 
@@ -526,7 +523,6 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
         logger.info(f"Data for {obsid} already preprocessed")
         return
     logger = get_run_logger()
-    nupipeline = hsp.HSPTask("nupipeline")
     logger.info("Running NuSTAR L2 pipeline")
     datadir = nu_local_raw_data_path(obsid, config=config)
     ev_dir = nu_pipeline_output_path(obsid, config=config)
@@ -545,11 +541,9 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
         logger.info(f"Applying custom flags: {flags}")
         params.update(flags)
 
-    result = nupipeline(**params)
-    print("return code:", result.returncode)
-    if result.returncode != 0:
-        logger.error(f"nupipeline failed: {result.stderr}")
-        raise RuntimeError("nupipeline failed")
+    # No return-code check here: heasoft.run_task raises on a non-zero code, with the
+    # tool's own output in the message.
+    heasoft.run_task("nupipeline", **params)
 
     open(pipe_done_file, "a").close()
 
@@ -613,7 +607,8 @@ def recover_spacecraft_science_data(obsid, config):
             if "gpg" not in f
         ][0]
 
-        hsp.nusplitsc(
+        heasoft.run(
+            "nusplitsc",
             infile=evfile,
             chu123hkfile=chu123hkfile,
             hkfile=hkfile,
@@ -646,22 +641,25 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
     """
     if os.path.exists(outfile_gti):
         os.unlink(outfile_gti)
-    logger = get_run_logger()
+    logger = get_logger()
 
     logger.info(f"Creating GTI file {outfile_gti} from {files_to_join}")
 
-    hsp.ftmgtime(
+    heasoft.run(
+        "ftmgtime",
         ingtis=",".join([f + "[GTI]" for f in files_to_join]),
         outgti=outfile_gti,
         merge=gti_operation,
         chatter=5,
     )
 
-    hsp.ftsort(infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
+    heasoft.run("ftsort", infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
 
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
-    hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
+    heasoft.run(
+        "fthedit", infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
+    )
 
 
 @task(task_run_name="nu_merge_event_files_into_{outfile}_gti_{gti_operation}")
@@ -702,17 +700,19 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
 
         logger.info(f"Creating event file {outfile} from {files_to_join}")
 
-        hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
+        heasoft.run(
+            "ftmerge", infile=",".join(files_to_join), outfile=outfile, copyall="NO"
+        )
 
         logger.info(f"Sorting event file {outfile}")
 
-        hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
+        heasoft.run("ftsort", infile=outfile, outfile="!" + outfile, columns="TIME")
 
         logger.info(
             f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
         )
 
-        hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
+        heasoft.run("fappend", infile=f"{outfile_gti}[1]", outfile=outfile)
     finally:
         if os.path.exists(outfile_gti):
             logger.info(f"Removing {outfile_gti}")
@@ -1048,7 +1048,9 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     utils.make_usr_gti(gtis, overwrite=True, outfile=outfile_gti)
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
-    hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
+    heasoft.run(
+        "fthedit", infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
+    )
 
     if not os.path.exists(outfile_gti):
         raise RuntimeError(f"Failed to create GTI file {outfile_gti}")
@@ -1739,7 +1741,7 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
             grpphafile=os.path.join(outdir, stem + "_grp.pha"),
         )
         logger.debug("nuproducts " + " ".join(f"{k}={v}" for k, v in params.items()))
-        hsp.nuproducts(params, noprompt=True, clobber=True, verbose=True)
+        heasoft.run("nuproducts", params, noprompt=True, clobber=True, verbose=True)
 
     if problems > 0:
         logger.warning(

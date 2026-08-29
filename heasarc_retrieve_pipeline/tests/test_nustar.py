@@ -17,7 +17,7 @@ import pytest  # noqa: E402
 from astropy.coordinates import SkyCoord  # noqa: E402
 import astropy.units as u  # noqa: E402
 
-from heasarc_retrieve_pipeline import nustar  # noqa: E402
+from heasarc_retrieve_pipeline import heasoft, nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     chi2_dof_against_a_constant,
     flare_filtered_event_file_name,
@@ -653,7 +653,8 @@ class TestMergeEventFilesTemporary:
             open(outfile_gti, "w").close()
 
         monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
-        monkeypatch.setattr(nustar, "hsp", StubHeasoft(fail_on=fail_on), raising=False)
+        monkeypatch.setattr(heasoft, "hsp", StubHeasoft(fail_on=fail_on), raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         outfile = os.path.join(tmp_path, "nu123A_src1.evt")
         nustar.merge_event_files.fn(["a.evt", "b.evt"], outfile)

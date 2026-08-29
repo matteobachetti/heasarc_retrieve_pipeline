@@ -7,12 +7,8 @@ from prefect import task, get_run_logger
 
 from .utils import splitext_improved
 
-try:
-    import heasoftpy as hsp
-
-    HAS_HEASOFT = True
-except ImportError:
-    HAS_HEASOFT = False
+from . import heasoft
+from .heasoft import HAS_HEASOFT
 
 
 def barycentered_file_name(infile):
@@ -100,7 +96,8 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=
         logger.info(f"Output file {outfile} already exists, skipping")
         return outfile
 
-    hsp.barycorr(
+    heasoft.run(
+        "barycorr",
         infile=infile,
         outfile=outfile,
         ra=ra,
