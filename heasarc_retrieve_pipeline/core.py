@@ -40,6 +40,8 @@ from .rxte import process_rxte_obsid
 
 from prefect import flow, task, get_run_logger
 
+from .utils import get_logger
+
 
 def _download_pysmartdl(url: str, dest: str):
     """
@@ -57,14 +59,22 @@ def _download_pysmartdl(url: str, dest: str):
 
     Returns
     -------
-    str
+    dest : str
         The path pySmartDL actually wrote to.
+    expected_size : int or None
+        The size the server promised, in bytes, or ``None`` if it sent no
+        ``Content-Length``. This comes free: pySmartDL has already read the header to
+        decide how to split the file into chunks, so verifying what arrived costs no
+        second request.
     """
     from pySmartDL import SmartDL
 
     obj = SmartDL(url, dest)
     obj.start()
-    return obj.get_dest()
+    # pySmartDL stores 0 when the server sent no Content-Length, which means "unknown"
+    # rather than "empty" -- it disables the library's own size check too.
+    expected_size = obj.get_final_filesize() or None
+    return obj.get_dest(), expected_size
 
 
 def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
@@ -108,6 +118,88 @@ def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
     return url
 
 
+def remote_file_size(url: str):
+    """
+    The size a URL promises, from a HEAD request.
+
+    Parameters
+    ----------
+    url : str
+        Full URL of the file.
+
+    Returns
+    -------
+    int or None
+        ``Content-Length`` in bytes, or ``None`` if the server does not report one or
+        the request fails. ``None`` means "unknown", never "empty".
+
+    Notes
+    -----
+    Checked against the archive on 60 files of one NuSTAR observation: all 60 returned a
+    ``Content-Length``, and all 60 matched the local file exactly. The S3 transport does
+    not need this at all -- ``list_objects_v2`` already carries ``Size`` for every key.
+    """
+    from urllib.request import Request, urlopen
+
+    try:
+        with urlopen(Request(url, method="HEAD")) as response:
+            length = response.headers.get("Content-Length")
+        return int(length) if length is not None else None
+    except Exception:
+        return None
+
+
+def file_needs_download(path: str, expected_size):
+    """
+    Whether a local file has to be fetched, given the size the archive reports.
+
+    The local tree is a mirror and the archive is authoritative, so a file of the wrong
+    size is not precious data to be protected -- it is a failed download that has been
+    accepted as complete on every run since. Callers delete it and fetch it again.
+
+    Parameters
+    ----------
+    path : str
+        Local path.
+    expected_size : int or None
+        Size the archive reports. ``None`` when the server does not say.
+
+    Returns
+    -------
+    needed : bool
+        True if the file has to be transferred.
+    reason : str
+        Why, in words fit for a log line.
+
+    Examples
+    --------
+    >>> file_needs_download("/nonexistent/file.evt", 100)
+    (True, 'not present')
+    """
+    if not os.path.exists(path):
+        return True, "not present"
+    if expected_size is None:
+        return False, "present, size not verifiable (no Content-Length)"
+
+    local_size = os.path.getsize(path)
+    if local_size != expected_size:
+        return True, f"present but {local_size} bytes against {expected_size} expected"
+    return False, f"present and complete ({local_size} bytes)"
+
+
+def _remove_partial_download(dest: str):
+    """
+    Delete a failed transfer's leavings.
+
+    pySmartDL fetches into ``<dest>.000``, ``<dest>.001``, ... and combines them at the
+    end, so an interrupted download leaves the parts behind and, if it died during the
+    combine, a truncated ``dest`` as well.
+    """
+    for leftover in [dest] + glob.glob(f"{dest}.[0-9][0-9][0-9]"):
+        if os.path.exists(leftover):
+            os.remove(leftover)
+
+
 def download_cmd(url: str, dest: str):
     """
     Download one file, converting any exception into a return value.
@@ -123,13 +215,21 @@ def download_cmd(url: str, dest: str):
     -------
     fname : str or None
         The path that was written, or ``None`` if the download failed.
+    expected_size : int or None
+        The size the server promised, for the caller to check what arrived against.
     error : str or None
         The string form of the exception, or ``None`` on success.
+
+    Notes
+    -----
+    What a failure *means* is :func:`download_node`'s decision, not this function's. This
+    one only performs the transfer and reports what happened.
     """
     try:
-        return _download_pysmartdl(url, dest), None
+        fname, expected_size = _download_pysmartdl(url, dest)
+        return fname, expected_size, None
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
 
 
 def parse_directory_index(html, url):
@@ -232,7 +332,7 @@ def get_remote_directory_listing(url: str):
     return urls
 
 
-@task(task_run_name="download_{node}")
+@task(task_run_name="download_{node}", retries=3, retry_delay_seconds=10)
 def download_node(
     node: str,
     base_url: str,
@@ -240,6 +340,7 @@ def download_node(
     cut_ndirs: int = 0,
     test_str: str = ".",
     test: bool = False,
+    verify: bool = True,
 ):
     """
     Download one node (file or directory) of a remote listing to its local mirror.
@@ -266,26 +367,29 @@ def download_node(
         ``None`` to disable the check.
     test : bool, optional
         If True, log what would happen but transfer nothing.
+    verify : bool, optional
+        Check a file that is already on disk against the size the archive reports, and
+        fetch it again if they disagree. One HEAD request per existing file, about ten
+        seconds over a NuSTAR observation.
 
     Returns
     -------
     str or None
-        The local path, or ``None`` if the node was skipped or already present.
+        The local path, or ``None`` if there was nothing to do -- the node was filtered
+        out by ``test_str``, or the file is already present and complete.
 
-    Notes
-    -----
-    A failed download is logged as a warning but the local path is still returned,
-    so callers cannot tell success from failure. See issue 11 in
-    ``docs/known_issues.rst``.
+    Raises
+    ------
+    RuntimeError
+        If the transfer failed, or if what arrived is not the size the archive promised.
+        The task retries three times first; after that the observation stops rather than
+        being reduced from incomplete data. Re-running picks up where it left off,
+        because a file that is present and the right size is not fetched again.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     local_ver = os.path.join(outdir, *node.replace(base_url, "").split("/")[cut_ndirs:])
     if test_str is not None and test_str not in local_ver:
         logger.debug(f"Ignoring {node}")
-        return None
-    logger.info(f"Downloading {node} to {local_ver}")
-    if os.path.exists(local_ver):
-        logger.info(f"{local_ver} exists")
         return None
 
     is_dir = local_ver.endswith("/")
@@ -297,13 +401,34 @@ def download_node(
             logger.info(f"Faked creation of {local_ver}")
         return local_ver
 
-    if not test:
-        fname, exc_string = download_cmd(node, local_ver)
-    else:
+    if os.path.exists(local_ver):
+        expected_size = remote_file_size(node) if verify else None
+        needed, reason = file_needs_download(local_ver, expected_size)
+        if not needed:
+            logger.info(f"{local_ver} {reason}")
+            return None
+        # A file of the wrong size is a failed download that has been accepted as
+        # complete on every run since. The archive is authoritative; take it again.
+        logger.warning(f"Re-downloading {local_ver}: {reason}")
+        _remove_partial_download(local_ver)
+
+    logger.info(f"Downloading {node} to {local_ver}")
+    os.makedirs(os.path.dirname(local_ver) or ".", exist_ok=True)
+
+    if test:
         logger.info(f"Faked download of {node} to {local_ver}")
-        fname = local_ver
+        return local_ver
+
+    fname, expected_size, exc_string = download_cmd(node, local_ver)
     if fname is None:
-        logger.warning(f"Error downloading {node}: {exc_string}")
+        _remove_partial_download(local_ver)
+        raise RuntimeError(f"Error downloading {node} to {local_ver}: {exc_string}")
+
+    needed, reason = file_needs_download(fname, expected_size)
+    if needed:
+        _remove_partial_download(fname)
+        raise RuntimeError(f"Incomplete download of {node}: {reason}")
+    logger.debug(f"{fname} {reason}")
 
     return local_ver
 
@@ -419,6 +544,7 @@ def recursive_download_https(
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
+    verify: bool = True,
 ):
     """
     Mirror an observation directory from the HEASARC HTTPS archive.
@@ -443,12 +569,15 @@ def recursive_download_https(
         Regular expression; only URLs matching it are downloaded. Empty means "all".
     re_exclude : str, optional
         Regular expression; URLs matching it are skipped. Empty means "none".
+    verify : bool, optional
+        Check files that are already on disk against the size the archive reports.
 
     Returns
     -------
     list or bool
-        Local paths (with ``None`` for skipped nodes), or ``False`` if the remote
-        directory was empty or unreachable.
+        Local paths (``None`` where there was nothing to do), or ``False`` if the
+        remote directory was empty or unreachable. A file that cannot be transferred
+        completely raises out of :func:`download_node` rather than being reported here.
 
     Examples
     --------
@@ -491,6 +620,7 @@ def recursive_download_https(
                 cut_ndirs=cut_ndirs,
                 test_str=test_str,
                 test=test,
+                verify=verify,
             )
         )
     # open(rec_down_file, "a").close()
@@ -536,6 +666,7 @@ def recursive_download(
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
+    verify: bool = True,
 ):
 
     """
@@ -562,6 +693,8 @@ def recursive_download(
         Regular expression; only paths matching it are downloaded. Empty means "all".
     re_exclude : str, optional
         Regular expression; paths matching it are skipped. Empty means "none".
+    verify : bool, optional
+        Check files that are already on disk against the size reported by the archive.
 
     Returns
     -------
@@ -572,7 +705,7 @@ def recursive_download(
     """
     if url.startswith("http"):
         return recursive_download_https(
-            url, outdir, cut_ndirs, test_str, test, re_include, re_exclude
+            url, outdir, cut_ndirs, test_str, test, re_include, re_exclude, verify
         )
 
     if url.startswith("s3://"):
