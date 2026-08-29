@@ -26,6 +26,7 @@ coverage.xml
 out/
 out_e2e/
 out_test/
+out_flares/
 test_dload/
 *.jpg
 *.log
