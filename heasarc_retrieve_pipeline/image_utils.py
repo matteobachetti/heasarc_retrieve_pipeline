@@ -341,7 +341,7 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     plt.pcolormesh(xbins, ybins, img, vmin=np.median(img))
     plt.plot(coordinates[:, 1], coordinates[:, 0], "r.")
     plt.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
-    # plt.close(fig)
+    plt.close(fig)
 
     region_fluxes = []
     for i, coord in enumerate(coordinates):

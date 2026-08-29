@@ -10,6 +10,7 @@ import os
 # handler warns about that on every call; it has nothing to report to.
 os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
 
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from astropy.coordinates import SkyCoord  # noqa: E402
@@ -17,8 +18,10 @@ import astropy.units as u  # noqa: E402
 
 from heasarc_retrieve_pipeline import nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
+    chi2_dof_against_a_constant,
     get_best_source_regions,
     join_source_data,
+    plot_flare_filtering,
     mode_01_input_files,
     position_is_consistent,
     spectral_input_files,
@@ -408,3 +411,119 @@ class TestJoinSourceData:
             os.path.join(base, OBSID, f"nu{OBSID}A_src1.evt"),
             os.path.join(base, OBSID, f"nu{OBSID}B_src1.evt"),
         ]
+
+
+def make_synthetic_event_file(path, tstart=0.0, tstop=1000.0, nevents=500, seed=42):
+    """A NuSTAR-shaped event file: EVENTS with TIME and PI, plus a GTI extension."""
+    from astropy.io import fits
+
+    rng = np.random.default_rng(seed)
+    times = np.sort(rng.uniform(tstart, tstop, nevents))
+    # PI 35 is 3 keV and PI 1935 is 79 keV, via E = 0.04 * PI + 1.6.
+    pi = rng.integers(35, 1935, nevents)
+
+    events = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="TIME", format="D", array=times),
+            fits.Column(name="PI", format="J", array=pi),
+        ],
+        name="EVENTS",
+    )
+    events.header["TIMEZERO"] = 0.0
+    events.header["ONTIME"] = tstop - tstart
+    events.header["LIVETIME"] = 0.9 * (tstop - tstart)
+    events.header["EXPOSURE"] = 0.9 * (tstop - tstart)
+
+    gti = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="START", format="D", array=np.array([tstart])),
+            fits.Column(name="STOP", format="D", array=np.array([tstop])),
+        ],
+        name="GTI",
+    )
+    fits.HDUList([fits.PrimaryHDU(), events, gti]).writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestPlotFlareFiltering:
+    """The diagnostic figure. A smoke test, not a rendering test.
+
+    What is checked is that it runs headless, writes a non-empty file, and leaves no
+    figure behind in pyplot's registry -- the leak that issue 31 is about.
+    """
+
+    def test_it_writes_a_figure_and_leaks_none(self, tmp_path):
+        plt = pytest.importorskip("matplotlib.pyplot")
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+
+        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
+
+        assert outfile == str(tmp_path / f"nu{OBSID}_src1_flares.jpg")
+        assert os.path.getsize(outfile) > 0
+        assert len(plt.get_fignums()) == 0, "a figure was left open"
+
+    def test_the_goes_panel_is_used_when_the_light_curve_is_there(self, tmp_path):
+        """The panel is filled from ``<root>_goes.fits``, with no second download."""
+        pytest.importorskip("matplotlib")
+        from astropy.table import Table
+
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+        times = np.linspace(0, 1000, 100)
+        flux = np.full_like(times, 1e-7)
+        flux[40:60] = 1e-5  # an M-class flare in the middle
+        Table({"TIME": times, "XRSA": flux / 10, "XRSB": flux}).write(
+            tmp_path / f"nu{OBSID}_src1_goes.fits"
+        )
+
+        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
+
+        assert os.path.getsize(outfile) > 0
+
+    def test_it_works_without_a_goes_light_curve(self, tmp_path):
+        """A rerun skips the download, so the file may legitimately be missing."""
+        pytest.importorskip("matplotlib")
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+
+        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
+
+        assert os.path.getsize(outfile) > 0
+
+    def test_nothing_removed_still_draws(self, tmp_path):
+        pytest.importorskip("matplotlib")
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_back.evt")
+
+        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
+
+        assert os.path.exists(outfile)
+
+
+class TestChi2DofAgainstAConstant:
+    def test_a_constant_light_curve_gives_about_one(self):
+        rng = np.random.default_rng(0)
+        counts = rng.poisson(100, 200).astype(float)
+        lc = dict(
+            counts=counts,
+            exposure=np.full(200, 10.0),
+            rate=counts / 10.0,
+            time=np.arange(200) * 10.0,
+        )
+
+        assert chi2_dof_against_a_constant(lc) == pytest.approx(1.0, abs=0.2)
+
+    def test_a_flaring_light_curve_gives_much_more(self):
+        counts = np.full(200, 100.0)
+        counts[100:110] = 1000.0
+        lc = dict(counts=counts, exposure=np.full(200, 10.0), rate=counts / 10.0)
+
+        assert chi2_dof_against_a_constant(lc) > 10
+
+    def test_empty_bins_do_not_divide_by_zero(self):
+        counts = np.array([0.0, 0.0, 5.0])
+        lc = dict(counts=counts, exposure=np.full(3, 10.0), rate=counts / 10.0)
+
+        assert np.isfinite(chi2_dof_against_a_constant(lc))
+
+    def test_too_few_bins_to_say_anything(self):
+        lc = dict(counts=np.array([1.0]), exposure=np.array([10.0]), rate=np.array([0.1]))
+
+        assert np.isnan(chi2_dof_against_a_constant(lc))

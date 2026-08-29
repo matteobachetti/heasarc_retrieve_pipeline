@@ -13,6 +13,9 @@ from heasarc_retrieve_pipeline.utils import (
     apply_gti,
     binned_lightcurve,
     good_intervals,
+    intervals_removed,
+    mask_from_gti,
+    read_gti,
 )
 
 
@@ -287,3 +290,54 @@ class TestBinnedLightcurve:
 
         assert np.allclose(lc["rate"], [0.0, 0.0])
         assert np.allclose(lc["exposure"], [10.0, 10.0])
+
+
+class TestMaskFromGti:
+    def test_edges_count_as_inside(self):
+        mask = mask_from_gti([0.0, 5.0, 10.0, 15.0], [[0, 10]])
+        assert mask.tolist() == [True, True, True, False]
+
+    def test_several_intervals(self):
+        mask = mask_from_gti([5.0, 15.0, 25.0], [[0, 10], [20, 30]])
+        assert mask.tolist() == [True, False, True]
+
+    def test_an_empty_gti_selects_nothing(self):
+        assert mask_from_gti([5.0, 15.0], np.zeros((0, 2))).tolist() == [False, False]
+
+    def test_no_times(self):
+        assert mask_from_gti([], [[0, 10]]).tolist() == []
+
+
+class TestIntervalsRemoved:
+    def test_a_hole_punched_in_the_middle(self):
+        assert np.allclose(
+            intervals_removed([[0, 100]], [[0, 40], [60, 100]]), [[40, 60]]
+        )
+
+    def test_a_whole_interval_dropped(self):
+        assert np.allclose(intervals_removed([[0, 10], [20, 30]], [[0, 10]]), [[20, 30]])
+
+    def test_nothing_removed(self):
+        assert len(intervals_removed([[0, 100]], [[0, 100]])) == 0
+
+    def test_pre_existing_gaps_are_not_reported_as_removed(self):
+        """The gap between the two intervals was never good time; it is not our doing."""
+        removed = intervals_removed([[0, 10], [20, 30]], [[0, 10], [20, 25]])
+
+        assert np.allclose(removed, [[25, 30]])
+
+    def test_everything_removed(self):
+        assert np.allclose(
+            intervals_removed([[0, 10], [20, 30]], np.zeros((0, 2))),
+            [[0, 10], [20, 30]],
+        )
+
+
+class TestReadGti:
+    def test_it_finds_the_gti_extension_by_name(self):
+        hdul = make_event_file(times=[], gti=[[0, 10], [20, 30]], extra_extension_first=True)
+        assert np.allclose(read_gti(hdul), [[0, 10], [20, 30]])
+
+    def test_timezero_is_added(self):
+        hdul = make_event_file(times=[], gti=[[0, 10]], timezero=1000.0)
+        assert np.allclose(read_gti(hdul), [[1000, 1010]])

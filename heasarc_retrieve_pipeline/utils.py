@@ -14,6 +14,9 @@ __all__ = [
     "get_logger",
     "good_intervals",
     "gti_to_array",
+    "intervals_removed",
+    "mask_from_gti",
+    "read_gti",
     "splitext_improved",
 ]
 
@@ -197,6 +200,86 @@ def _extension_index(hdul, wanted, fallback, suffix=None):
     return fallback
 
 
+def mask_from_gti(times, gti):
+    """
+    Boolean mask selecting the times that fall inside a GTI.
+
+    Interval edges count as inside, so an event recorded exactly at a ``START`` or a
+    ``STOP`` is kept.
+
+    Parameters
+    ----------
+    times : array-like
+        Times, in the same scale as ``gti``.
+    gti : array-like or table
+        Good time intervals, as accepted by :func:`gti_to_array`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array, the same length as ``times``.
+    """
+    times = np.asarray(times, dtype=float)
+    mask = np.zeros(times.size, dtype=bool)
+    for start, stop in gti_to_array(gti):
+        mask |= (times >= start) & (times <= stop)
+    return mask
+
+
+def intervals_removed(before, after):
+    """
+    The stretches of time that ``before`` covers and ``after`` no longer does.
+
+    Used by the flare diagnostic to shade exactly what the filtering threw away, rather
+    than every gap in the light curve: the complement of ``after`` on its own would also
+    pick up Earth occultations and the other gaps that were never good time to begin with.
+
+    Parameters
+    ----------
+    before, after : array-like or table
+        Good time intervals, as accepted by :func:`gti_to_array`. ``after`` is expected to
+        be contained in ``before``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``.
+
+    Examples
+    --------
+    >>> intervals_removed([[0, 100]], [[0, 40], [60, 100]]).tolist()
+    [[40.0, 60.0]]
+    >>> intervals_removed([[0, 10], [20, 30]], [[0, 10]]).tolist()
+    [[20.0, 30.0]]
+    """
+    after = gti_to_array(after)
+    removed = []
+    for start, stop in gti_to_array(before):
+        removed.extend(good_intervals(after, start, stop).tolist())
+    return np.array(removed, dtype=float).reshape(-1, 2)
+
+
+def read_gti(hdul):
+    """
+    The good time intervals of an open event file, on the ``TIME + TIMEZERO`` scale.
+
+    The GTI extension is found by ``EXTNAME`` -- ``GTI`` or ``STDGTI``, or anything ending
+    in ``GTI`` -- falling back to index 2.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        Open event file.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``.
+    """
+    hdu = hdul[_extension_index(hdul, ("GTI", "STDGTI"), 2, suffix="GTI")]
+    return gti_to_array(hdu.data) + float(hdu.header.get("TIMEZERO", 0.0))
+
+
 def apply_gti(hdul, gti):
     """
     Filter an open event file on a new GTI, table *and* header.
@@ -253,8 +336,7 @@ def apply_gti(hdul, gti):
     events_timezero = float(events.header.get("TIMEZERO", 0.0))
     gti_timezero = float(gti_hdu.header.get("TIMEZERO", 0.0))
 
-    old_gti = gti_to_array(gti_hdu.data)
-    old_gti += gti_timezero
+    old_gti = read_gti(hdul)
     ontime_before = float(
         events.header.get("ONTIME", np.sum(old_gti[:, 1] - old_gti[:, 0]))
     )
@@ -262,9 +344,7 @@ def apply_gti(hdul, gti):
     exposure_before = float(events.header.get("EXPOSURE", livetime_before))
 
     times = np.asarray(events.data["TIME"], dtype=float) + events_timezero
-    mask = np.zeros(times.size, dtype=bool)
-    for start, stop in gti:
-        mask |= (times >= start) & (times <= stop)
+    mask = mask_from_gti(times, gti)
 
     nevents_before = times.size
     events.data = events.data[mask]
