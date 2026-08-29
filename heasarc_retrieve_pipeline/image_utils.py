@@ -49,7 +49,7 @@ import copy
 from astropy.table import Table
 from astropy.io import fits
 from astropy.visualization import hist
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from skimage.feature import peak_local_max
 from scipy.ndimage import gaussian_filter
 from statsmodels.robust import mad
@@ -337,11 +337,13 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     coordinates[:, 1] = coordinates[:, 1] * dx + dx + xmin
     coordinates[:, 0] = coordinates[:, 0] * dy + dy + ymin
 
-    fig = plt.figure(eventfile + "0")
-    plt.pcolormesh(xbins, ybins, img, vmin=np.median(img))
-    plt.plot(coordinates[:, 1], coordinates[:, 0], "r.")
-    plt.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
-    plt.close(fig)
+    # ``Figure`` rather than ``pyplot``: a worker process reducing an observation should
+    # not touch pyplot's global figure registry, or make it choose a display backend.
+    fig = Figure()
+    ax = fig.subplots()
+    ax.pcolormesh(xbins, ybins, img, vmin=np.median(img))
+    ax.plot(coordinates[:, 1], coordinates[:, 0], "r.")
+    fig.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
 
     region_fluxes = []
     for i, coord in enumerate(coordinates):
@@ -368,10 +370,10 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
         )
 
         x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
-        fig = plt.figure(eventfile + f"{i + 1}")
-        plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
-        plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
-        plt.close(fig)
+        fig = Figure()
+        ax = fig.subplots()
+        ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
+        fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
 
     table_filt = filter_table_outside_regions(table, coordinates, region_size=back_region_size)
 
@@ -382,9 +384,9 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
         overwrite=True,
     )
     x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
-    fig = plt.figure(eventfile + f"_back")
-    plt.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
-    plt.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
-    plt.close(fig)
+    fig = Figure()
+    ax = fig.subplots()
+    ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
+    fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
     hdul.close()
     return True
