@@ -42,6 +42,7 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
+from .barycenter import barycenter_file
 from .image_utils import filter_sources_in_images
 from .utils import (
     apply_gti,
@@ -287,9 +288,7 @@ def _cl_event_files(directory, pattern):
     list of str
         Matching paths, sorted.
     """
-    return sorted(
-        f for f in glob.glob(os.path.join(directory, pattern)) if not f.endswith(".gpg")
-    )
+    return sorted(f for f in glob.glob(os.path.join(directory, pattern)) if not f.endswith(".gpg"))
 
 
 def spectral_input_files(obsid, config):
@@ -573,7 +572,6 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
     task_run_name="separate_sources_{directories}_region_{region_size}_back_{back_region_size}",
 )
 def separate_sources(directories, config, region_size=30, back_region_size=55):
-
     """
     Run the image-based source separation over every cleaned event file in some directories.
 
@@ -842,7 +840,6 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
     task_run_name="nu_join_science_{obsid}_src{src_num}",
 )
 def join_source_data(obsid, directories, config, src_num=1):
-
     """
     Merge the per-source (or background) event files of one observation.
 
@@ -1100,8 +1097,7 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
                 np.ma.asarray(goes_table[channel], dtype=float), np.nan
             )
     logger.info(
-        f"Writing the GOES X-ray light curve ({len(lightcurve['TIME'])} points) "
-        f"to {outfile_lc}"
+        f"Writing the GOES X-ray light curve ({len(lightcurve['TIME'])} points) " f"to {outfile_lc}"
     )
     Table(lightcurve).write(outfile_lc, overwrite=True)
 
@@ -1120,17 +1116,13 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         if flare_start >= tstop or flare_end <= tstart:
             continue
 
-        logger.info(
-            f"Excluding {flare_class} flare, MET {flare_start:.1f} -> {flare_end:.1f}"
-        )
+        logger.info(f"Excluding {flare_class} flare, MET {flare_start:.1f} -> {flare_end:.1f}")
         flares.append((flare_start, flare_end))
 
     bright = np.zeros((0, 2))
     if flux_class is not None and "XRSB" in lightcurve:
         threshold = goes_class_to_flux(flux_class)
-        bright = intervals_above_threshold(
-            lightcurve["TIME"], lightcurve["XRSB"], threshold
-        )
+        bright = intervals_above_threshold(lightcurve["TIME"], lightcurve["XRSB"], threshold)
         excluded = float(np.sum(bright[:, 1] - bright[:, 0]))
         logger.info(
             f"GOES 1-8 A flux reaches {flux_class} ({threshold:.1e} W/m2) over "
@@ -1340,8 +1332,10 @@ def plot_flare_filtering(
         )
     axes[0].set_ylabel("Solar X-ray flux (W m$^{-2}$)")
 
-    bands = [(3.0, 10.0, "3--10 keV: where solar stray light lands"),
-             (10.0, 79.0, "10--79 keV: control, flares should not contribute here")]
+    bands = [
+        (3.0, 10.0, "3--10 keV: where solar stray light lands"),
+        (10.0, 79.0, "10--79 keV: control, flares should not contribute here"),
+    ]
     chi2 = {}
     for axis, (emin, emax, title) in zip(axes[1:], bands):
         in_band = (energy >= emin) & (energy < emax)
@@ -1353,17 +1347,30 @@ def plot_flare_filtering(
         )
 
         axis.errorbar(
-            before["time"], before["rate"], before["rate_err"],
-            fmt=".", color="0.65", ms=4, lw=0.8, label="before filtering", zorder=2,
+            before["time"],
+            before["rate"],
+            before["rate_err"],
+            fmt=".",
+            color="0.65",
+            ms=4,
+            lw=0.8,
+            label="before filtering",
+            zorder=2,
         )
         axis.errorbar(
-            after["time"], after["rate"], after["rate_err"],
-            fmt=".", color="tab:blue", ms=4, lw=0.8, label="after filtering", zorder=3,
+            after["time"],
+            after["rate"],
+            after["rate_err"],
+            fmt=".",
+            color="tab:blue",
+            ms=4,
+            lw=0.8,
+            label="after filtering",
+            zorder=3,
         )
         axis.set_ylabel(f"{emin:.0f}--{emax:.0f} keV rate (s$^{{-1}}$)")
         axis.set_title(
-            f"{title}   ($\\chi^2$/dof {chi2[emin][0]:.2f} $\\rightarrow$ "
-            f"{chi2[emin][1]:.2f})",
+            f"{title}   ($\\chi^2$/dof {chi2[emin][0]:.2f} $\\rightarrow$ " f"{chi2[emin][1]:.2f})",
             fontsize="small",
             loc="left",
         )
@@ -1436,9 +1443,7 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"
         logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
         return outfile_filtered
 
-    outfile_gti_goes = get_goes_gtis(
-        event_file, minimum_class=minimum_class, flux_class=flux_class
-    )
+    outfile_gti_goes = get_goes_gtis(event_file, minimum_class=minimum_class, flux_class=flux_class)
 
     merge_gtis([event_file, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
 
@@ -1472,69 +1477,6 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"
         logger.warning(f"Could not plot the flare filtering for {event_file}: {error}")
 
     return outfile_filtered
-
-
-@task(
-    task_run_name="nu_barycenter_{infile}_ra{ra}_dec{dec}_src{src}",
-)
-def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
-    """
-    Barycentre one event file with HEASOFT ``barycorr``.
-
-    Converts photon arrival times from the spacecraft frame to the solar system
-    barycentre, removing the up to ~500 s light-travel-time modulation caused by the
-    Earth's and the satellite's motion. This is a prerequisite for any coherent timing
-    analysis, and it is **position-dependent**: an error in the assumed RA/Dec translates
-    directly into a timing error.
-
-    Uses the JPL DE430 ephemeris in the ICRS frame.
-
-    Parameters
-    ----------
-    infile : str
-        Event file to barycentre.
-    attorb : str
-        Attitude/orbit file, as produced by ``nupipeline`` (``nu<OBSID><FPM>.attorb``).
-    ra, dec : float, optional
-        Source position in degrees. Accuracy here directly sets the timing accuracy.
-    src : int, optional
-        Source number; recorded in the task run name only.
-
-    Returns
-    -------
-    str
-        Path of the barycentred file.
-
-    Notes
-    -----
-    :mod:`heasarc_retrieve_pipeline.barycenter` holds a second implementation, which NICER
-    uses. It is not interchangeable with this one -- it is a plain function rather than a
-    Prefect task and takes no ``src`` -- but it does two things this one does not: it fails
-    with a clear message when heasoftpy is missing, and it checks that ``barycorr``
-    actually wrote the output. See issue 14 in ``docs/known_issues.rst``.
-    """
-    logger = get_run_logger()
-    logger.info(f"Barycentering {infile}")
-
-    outfile = infile.replace(".evt", "_bary.evt")
-    logger.info(f"Output file: {outfile}")
-
-    if os.path.exists(outfile):
-        logger.info(f"Output file {outfile} already exists, skipping")
-        return outfile
-
-    hsp.barycorr(
-        infile=infile,
-        outfile=outfile,
-        ra=ra,
-        dec=dec,
-        ephem="JPLEPH.430",
-        refframe="ICRS",
-        clobber="yes",
-        orbitfiles=attorb,
-    )
-
-    return outfile
 
 
 @flow(flow_run_name="nu_barycenter_{obsid}_src{src}_ra{ra}_dec{dec}")
@@ -1978,9 +1920,7 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         back_region_size=region_size + 25,
     )
 
-    source_files = join_source_data(
-        obsid, [pipedir, splitdir], config, wait_for=[separate_sources]
-    )
+    source_files = join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
     background_files = join_source_data(
         obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
     )
