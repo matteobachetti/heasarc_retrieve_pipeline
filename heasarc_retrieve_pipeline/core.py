@@ -1125,13 +1125,15 @@ def retrieve_and_process_data(
 
         os.chdir(outdir)
 
+        # recursive_download is a flow, and a subflow call is synchronous and raises:
+        # the ordering is already guaranteed by the line above. Prefect 3 has no
+        # flow.submit(), so there is no future to declare here either.
         processing(
             obsid,
             config=None,
             ra=ra,
             dec=dec,
             flags=flags,
-            wait_for=[recursive_download],
             return_state=True,
         )
     return result_table
@@ -1259,6 +1261,5 @@ def retrieve_heasarc_data_by_obsid(
         flags=flags,
         force_heasarc=force_heasarc,
         force_s3=force_s3,
-        wait_for=[retrieve_info_for_obsid],
     )
     return results

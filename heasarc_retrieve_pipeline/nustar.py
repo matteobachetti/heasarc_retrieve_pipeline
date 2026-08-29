@@ -1756,41 +1756,52 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     # splitdir = split_path(obsid, config=config)
     pipedir = nu_pipeline_output_path(obsid, config=config)
 
-    nu_run_l2_pipeline(obsid, config=config, flags=flags)
+    # A future declares a dependency; resolving it is what makes the dependency bite.
+    # Measured on Prefect 3.8.4: a task whose upstream future failed is skipped, returns
+    # None, and leaves the flow run COMPLETED -- so the pipeline would carry None onwards
+    # and report success. Calling .result() re-raises, and the flow run ends FAILED.
+    pipeline = nu_run_l2_pipeline.submit(obsid, config=config, flags=flags)
+    pipeline.result()
 
-    splitdir = recover_spacecraft_science_data(obsid, config, wait_for=[nu_run_l2_pipeline])
+    splitdir = recover_spacecraft_science_data(obsid, config, wait_for=[pipeline])
 
-    ra, dec, region_size = get_best_source_regions(obsid, config, wait_for=[nu_run_l2_pipeline])
+    ra, dec, region_size = get_best_source_regions(obsid, config, wait_for=[pipeline])
 
     region_size = region_size / 2.45
     # TODO: ACCROCCHIO! Conversione da arcosecondo a pixel
 
-    separate_sources(
+    # separate_sources needs splitdir, which is recover_spacecraft_science_data's return
+    # value: that argument is the dependency, and a stronger statement than wait_for.
+    separated = separate_sources.submit(
         [pipedir, splitdir],
         config,
-        wait_for=[recover_spacecraft_science_data],
         region_size=region_size,
         back_region_size=region_size + 25,
     )
+    separated.result()
 
-    source_files = join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
-    background_files = join_source_data(
-        obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
+    source_future = join_source_data.submit(
+        obsid, [pipedir, splitdir], config, wait_for=[separated]
     )
+    background_future = join_source_data.submit(
+        obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separated]
+    )
+    source_files = source_future.result()
+    background_files = background_future.result()
 
     # Source and background go through the same flare filter, so that they share one GTI.
     # Subtracting an unfiltered background from a filtered source over-subtracts: flare
     # stray light is diffuse, so it lands mostly in the large background region. On
     # 80002092008 the unfiltered background is 3.7% too high in 3--10 keV.
     for fname in source_files + background_files:
-        filter_from_solar_flares(fname, wait_for=[join_source_data])
+        filter_from_solar_flares(fname)
 
-    barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
-
-    calculate_spectra(
-        obsid,
-        config,
-        ra=ra,
-        dec=dec,
-        wait_for=[get_best_source_regions, filter_from_solar_flares],
+    # barycenter_data globs the output directory rather than taking the file list, so the
+    # join is a real dependency that no argument expresses.
+    barycenter_data(
+        obsid, ra=ra, dec=dec, config=config, wait_for=[source_future, background_future]
     )
+
+    # ra and dec come from get_best_source_regions, and filter_from_solar_flares is a
+    # subflow, which runs synchronously and raises: both dependencies already hold.
+    calculate_spectra(obsid, config, ra=ra, dec=dec)
