@@ -682,3 +682,28 @@ class TestMergeEventFilesTemporary:
             self.merge(tmp_path, monkeypatch, fail_on="fappend")
 
         assert glob.glob(os.path.join(tmp_path, "*.gti")) == []
+
+
+class TestGoesDownloadPath:
+    """Where the raw GOES files land.
+
+    Sunpy's default is one shared download directory. Two observations from the same day
+    ask for the same file, and with several reductions running at once one of them can be
+    handed a file the other is still writing. See issue 26 in ``docs/known_issues.rst``.
+    """
+
+    def test_the_files_land_beside_the_event_file(self):
+        path = nustar.goes_download_path("/data/90901333002/nu123A01_cl.evt")
+
+        assert path == "/data/90901333002/{file}"
+
+    def test_a_bare_file_name_gets_a_real_directory(self):
+        path = nustar.goes_download_path("nu123A01_cl.evt")
+
+        assert os.path.dirname(path) == os.getcwd()
+
+    def test_two_observations_do_not_share_a_directory(self):
+        first = nustar.goes_download_path("/data/90901333002/nu1A01_cl.evt")
+        second = nustar.goes_download_path("/data/80002092008/nu2A01_cl.evt")
+
+        assert first != second

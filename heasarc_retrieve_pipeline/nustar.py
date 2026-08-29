@@ -342,6 +342,30 @@ def goes_lc_file_name(event_file):
     return root + "_goes.fits"
 
 
+def goes_download_path(event_file):
+    """
+    Where the raw GOES files of an observation are downloaded to.
+
+    Sunpy downloads into one shared directory by default. Two observations taken on the
+    same day want the same GOES file, and when they are reduced at the same time one can
+    be handed a file the other is still writing -- the shared directory offers no way to
+    tell a finished download from a running one. Each observation therefore keeps its own
+    copy, next to the event file it was fetched for. They are a couple of megabytes each,
+    and having them beside the data is worth more than the duplicate download costs.
+
+    Parameters
+    ----------
+    event_file : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        A sunpy path template: the event file's directory, plus ``{file}``.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(event_file)), "{file}")
+
+
 def goes_gti_file_name(event_file):
     """
     Name of the solar-flare GTI file associated with an event file.
@@ -936,7 +960,7 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         a.Instrument.xrs & a.goes.SatelliteNumber(sat_id) & a.Resolution("avg1m")
         | a.hek.FL & (a.hek.FRM.Name == "SWPC"),
     )
-    files = Fido.fetch(result3, progress=False)
+    files = Fido.fetch(result3, progress=False, path=goes_download_path(event_file))
     goes_all = ts.TimeSeries(files, concatenate=True)
     goes = goes_all.truncate(datestart.iso, dateend.iso)
 
