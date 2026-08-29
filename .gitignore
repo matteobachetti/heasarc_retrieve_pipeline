@@ -24,10 +24,14 @@ coverage.xml
 
 # Pipeline output and downloads
 out/
+out_e2e/
 out_test/
 test_dload/
 *.jpg
 *.log
+
+# HEASOFT leftovers (xselect writes its command file into the working directory)
+*.xco
 
 # macOS
 .DS_Store
