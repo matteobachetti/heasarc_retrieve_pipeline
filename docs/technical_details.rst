@@ -1076,11 +1076,7 @@ Two AST guards in ``tests/test_prefect_wiring.py`` keep both rules from drifting
 in a ``wait_for`` list must come from a ``.submit()``, and every ``task_run_name`` template
 must name real parameters of the function it decorates.
 
-Concurrency is still not used: tasks are submitted for their dependency edges, not for
-parallelism. ``os.chdir`` in the observation loops (issue 26) makes concurrent observations
-unsafe, since HEASOFT tools resolve relative paths against the process working directory.
-
-Idempotency is therefore achieved not by Prefect's cache but by **sentinel files** written
+Idempotency is achieved not by Prefect's cache but by **sentinel files** written
 into the output tree:
 
 .. list-table::
@@ -1109,6 +1105,100 @@ observation with different ``flags``, a different ``minimum_class`` or a differe
 size will not invalidate them; the output directory has to be deleted by hand.
 
 
+Running several observations at once
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``retrieve_and_process_data`` takes ``n_workers``. Whatever its value, the observations are
+handed to a ``ProcessPoolTaskRunner``: one observation is one **process**, which downloads
+its data and reduces it from beginning to end. With the default ``n_workers=1`` that is a
+pool of one, so the ordinary single-observation run travels exactly the same code path as a
+parallel one and there is no second path to keep working.
+
+**Why a process and not a thread.** ``heasoftpy`` runs each tool as a subprocess and reads
+and rewrites ``$PFILES/<tool>.par`` around every call. ``PFILES`` is an environment
+variable, which belongs to the process; threads of one process cannot each have their own.
+Measured with 200 ``ftlist`` calls, eight at a time:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 28 20
+
+   * - eight at a time
+     - ``PFILES``
+     - failures
+   * - threads
+     - shared ``~/pfiles``
+     - 19 / 200
+   * - processes
+     - shared ``~/pfiles``
+     - 9 / 200
+   * - processes
+     - one directory each
+     - **0 / 200**
+
+The failures are ``parameter file .../ftlist.par not found``: one call deletes and rewrites
+the file another is in the middle of reading.
+
+**What a worker sets up.** ``core.prepare_worker(root)`` runs once per worker process, at
+the top of ``download_and_process_observation``, and is idempotent (a module-level
+``_WORKER_DIRECTORY`` guard) because Prefect 3.7 has no pool ``initializer``. It creates
+``<outdir>/.workers/worker_<pid>/``, points ``PFILES`` at a ``pfiles`` directory inside it
+(``"<private>;$HEADAS/syspfiles"`` -- the semicolon separates the writable copy from the
+read-only system one), and ``chdir``-s into it. That is the **only** ``os.chdir`` in the
+package, and a test asserts it stays that way: the working directory is a property of the
+whole process, so using it to steer where a step writes is what made concurrent
+observations impossible before. Every path a step is given is absolute --
+``utils.absolute_config`` resolves the configuration once, at the start of a reduction --
+and the process working directory exists only to catch the scratch files HEASOFT tools drop
+around themselves -- ``86758tmp_gti.fits``, ``87340_tmp_nuexpomap`` and their kin, by the
+dozen. Those carry the tool subprocess's PID, so they do not collide; the point of the
+private directory is that an interrupted run leaves its litter somewhere obviously
+disposable instead of in the output tree.
+
+**Inside one observation, one HEASOFT tool at a time.** The steps of a single reduction
+still run in threads of the worker process, and they share that process's ``PFILES``. So
+every HEASOFT call in the package goes through :mod:`heasarc_retrieve_pipeline.heasoft`,
+which holds a module-level lock for the duration::
+
+    heasoft.run("ftmerge", infile=..., outfile=..., copyall="NO")
+    heasoft.run_task("nupipeline", **params)
+
+A test in ``tests/test_heasoft.py`` reads every module's AST and fails if anything outside
+that module calls ``heasoftpy`` directly. The lock costs nothing measurable: a HEASOFT tool
+is an external process doing seconds to minutes of work, and two of them within one
+observation have nothing to gain from overlapping.
+
+``heasoft.run`` also **raises on a non-zero return code**. ``heasoftpy`` defaults to
+``allow_failure=True``, so a tool that fails comes back as an ordinary result and the
+caller carries on with a file that was never written. That is how ``ftsort`` came to fail on
+every single run of ``merge_gtis``, unnoticed, for as long as the code existed.
+
+**What each observation gets to itself.** GOES solar X-ray files are fetched into the
+observation's own directory (``goes_download_path``) rather than sunpy's shared download
+directory, where two observations from the same day would ask for the same file and one
+could be handed it while the other was still writing it. Plotting uses
+``matplotlib.figure.Figure`` directly instead of ``pyplot``, which keeps a process-wide
+figure registry and a global backend.
+
+**What is still shared.** All workers write to one Prefect SQLite database, and each worker
+process starts a temporary Prefect server of its own. This works, but it is the part that
+will complain first if ``n_workers`` is raised a long way.
+
+**Two consequences for callers.** A process pool re-imports the entry point in each worker,
+so a parallel run must be started from a real script guarded by
+``if __name__ == "__main__":`` -- a script piped through stdin dies with
+``BrokenProcessPool``. And when several workers download at once the S3 mirror serves them
+better than the HEASARC web server; S3 is the default, and asking for ``force_heasarc``
+together with ``n_workers > 1`` logs a warning.
+
+**One environment limit worth knowing.** Several HEASOFT tools are old Fortran ftools whose
+file-name parameters are ``character*160``. Measured with ``fappend``: an output path of 160
+characters works, 161 fails with ``could not open the named file``, status 104. Deep output
+directories therefore break the reduction, and since the merged path is
+``<outdir>/<obsid>/nu<obsid>A_src1.evt`` the practical budget for ``outdir`` is about 120
+characters.
+
+
 Configuration and environment
 -----------------------------
 
@@ -1122,10 +1212,12 @@ There is no configuration file format. Each mission module defines its own
     # nicer.py, rxte.py
     DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
-``out_data_path`` and ``input_data_path`` default to the current directory, which works
-because ``retrieve_and_process_data`` ``os.chdir``-s into ``outdir`` before calling the
-processing flow (and back to the original directory before the next download). All paths in
-the mission modules are therefore relative to ``outdir``.
+``out_data_path`` and ``input_data_path`` default to the current directory. They are not
+left that way: ``utils.absolute_config`` resolves both against the process working directory
+once, at the start of each reduction, so that every path handed to a step is absolute and
+means the same thing wherever it is used. The pipeline used to ``os.chdir`` into ``outdir``
+instead, which made every relative path depend on when it was read and made two concurrent
+observations impossible.
 
 ``core.read_config`` exists but is not called by anything and there is no schema for what it
 would read.
@@ -1137,7 +1229,11 @@ Relevant environment:
     the ``sciserver`` local-filesystem paths.
 ``HEADAS`` and the rest of the HEASOFT environment
     Required for all processing. ``heasoftpy`` is imported behind a ``try``/``except`` in
-    each mission module; the module-level flag ``HAS_HEASOFT`` records whether it worked.
+    :mod:`heasarc_retrieve_pipeline.heasoft`, the one module that invokes it; the flag
+    ``HAS_HEASOFT`` records whether it worked.
+``PFILES``
+    Set per worker process by ``core.prepare_worker``. Do not set it by hand for a parallel
+    run: a shared parameter directory is what the private one exists to avoid.
 ``CALDB``
     Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``.
 

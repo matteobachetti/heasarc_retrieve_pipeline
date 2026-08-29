@@ -607,14 +607,72 @@ with ``yaml.safe_load`` -- or delete the function.
 space), no error checking, and a shell injection vector if a filename is ever attacker-
 controlled. ``shutil.copy(nf, outdir)``.
 
-26. ``os.chdir`` in the processing loop
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+26. ``os.chdir`` in the processing loop -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``core.py:463`` and ``core.py:471`` change the process's working directory inside the loop
-over observations. If any step raises, the process is left in the wrong directory; and it
-makes concurrent processing impossible, which is a shame given that the whole package is
-built on a concurrency framework. Pass absolute paths through ``config["out_data_path"]``
-instead.
+The loop over observations changed the process working directory into ``outdir`` before
+each reduction and back afterwards, which is why the mission ``DEFAULT_CONFIG``\ s said
+``"./"``: every path the pipeline built meant "wherever this process is standing right
+now". ``outdir`` is now made absolute once and passed down as ``input_data_path`` and
+``out_data_path``; ``utils.absolute_config`` pins a configuration's paths at flow entry,
+and an AST guard asserts that no module calls ``os.chdir`` at all, with one name exempted.
+
+That was the smaller half of the problem. Reducing several observations at once needs
+three more things, and one of them decides the whole design.
+
+**HEASOFT parameter files are shared, and that forces processes.** ``heasoftpy`` runs each
+tool as a subprocess with ``env=os.environ.copy()``, and the tool reads and rewrites
+``<PFILES>/<tool>.par``. Concurrent calls delete the file under each other. Measured, 200
+calls of ``ftlist``, eight at a time:
+
+=====================================  ==================
+Setup                                  Failures out of 200
+=====================================  ==================
+8 threads, shared ``~/pfiles``         19
+8 processes, shared ``~/pfiles``       9
+8 processes, private ``PFILES`` each   **0**
+=====================================  ==================
+
+The failures are ``parameter file .../ftlist.par not found`` and ``FileNotFoundError``.
+``PFILES`` is an environment variable and the environment belongs to the process, so
+threads cannot be isolated this way at all: **an observation has to be a process**.
+``core.prepare_worker`` gives each worker a private ``PFILES`` directory and a private
+working directory. The second is for tidiness rather than correctness: HEASOFT scripts drop
+scratch files in the current directory (``86758tmp_gti.fits``, ``87340_tmp_nuexpomap``,
+``86758tmplnk_nu90901333002A01_sr.pha`` -- observed by the dozen during a three-observation
+run), and while they are prefixed with the tool subprocess's PID and so do not collide, an
+interrupted run leaves them behind. In ``.workers/worker_<pid>/`` they are obviously
+disposable; in the user's output tree they would be litter of unknown provenance.
+``prepare_worker`` is the one place in the package that calls ``os.chdir``, and it is the
+opposite of the pattern above: once, before any work, never during.
+
+**The GOES data were fetched into a shared directory.** ``Fido.fetch`` was called without
+a ``path``, so two observations from the same day wrote the same file, and a reduction
+could be handed a file another was still writing. Each observation now keeps its own copy
+beside its event file.
+
+**The diagnostic images went through pyplot**, whose figure registry is a global. They are
+built with ``matplotlib.figure.Figure`` now, as the flare diagnostic already was.
+
+``n_workers`` on the three entry flows says how many observations to reduce at once, and
+``retrieve_heasarc_data_by_obsid`` takes a list of OBSIDs so that there is something to
+parallelise. The default is one worker -- but still a worker process, so there is one code
+path and it is the isolated one.
+
+**Inside one observation, the steps are still threads, and they still share ``PFILES``.**
+The first three-observation run proved it: ``FileNotFoundError:
+.../worker_60907/pfiles/fthedit.par``, raised from the two ``join_source_data`` tasks that
+``process_nustar_obsid`` submits at once. A private directory per *process* does nothing
+for two threads inside it. Every HEASOFT call therefore now goes through
+:mod:`heasarc_retrieve_pipeline.heasoft`, which holds a process-wide lock for the duration
+of the call, and an AST guard fails if any other module invokes ``heasoftpy`` directly. The
+lock is free in practice: these are external subprocesses doing seconds to minutes of work.
+
+Two consequences to know about. The entry point must be a real script under
+``if __name__ == "__main__":``, since a process pool cannot re-import a ``__main__`` that
+came from standard input. And ``prepare_worker`` is called from inside the task rather
+than as the pool's ``initializer``, because Prefect grew that argument in 3.8 and the
+HEASOFT environment here has 3.7.
 
 27. Mutable default arguments
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -629,14 +687,18 @@ For NICER and RXTE this is an actual bug, not just a style issue: the body reads
 is not ``None``, so ``process_nicer_obsid("1234567890")`` reaches
 ``config["out_data_path"]`` and raises ``KeyError``. Use ``config=None``.
 
-28. Missing ``HAS_HEASOFT`` guards
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+28. Missing ``HAS_HEASOFT`` guards -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``nu_run_l2_pipeline`` and ``ni_run_l2_pipeline`` check the flag and raise a clear
-``ImportError``. These do not, and fail with ``NameError: name 'hsp' is not defined``:
+``nu_run_l2_pipeline`` and ``ni_run_l2_pipeline`` checked the flag and raised a clear
+``ImportError``. These did not, and failed with ``NameError: name 'hsp' is not defined``:
 ``recover_spacecraft_science_data``, ``merge_gtis``, ``merge_event_files``,
 ``join_source_data``, ``get_goes_gtis``, ``calculate_spectra``, and NuSTAR's local
 ``barycenter_file``.
+
+There is now one place that invokes HEASOFT, ``heasoft.run`` / ``heasoft.run_task``, and it
+raises ``ImportError("heasoftpy not installed")`` before doing anything else. Every one of
+these functions is covered by that, and no new call site can miss it.
 
 29. ``retrieve_heasarc_data_by_source_name`` drops ``flags``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -720,6 +782,66 @@ and the documentation builds clean under ``-W`` (warnings as errors).
 
 Either fix it or delete it; a ``tox.ini`` that fails on the first invocation is worse than
 none, and the CI workflow does not use it.
+
+
+35. HEASOFT failures were invisible -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``heasoftpy`` defaults to ``allow_failure=True`` -- it says so in a deprecation warning on
+every call -- so a tool that exits non-zero comes back as an ordinary result object with a
+non-zero ``returncode``. Only ``nu_run_l2_pipeline`` ever looked. Every other call in the
+package, some fifteen of them, carried on with whatever the tool had or had not written.
+
+Observed cost, on a real three-observation run: ``fappend`` failed while attaching the
+merged GTI extension, the merged event file went downstream with no GTI at all, and the
+first sign of trouble was ``IndexError: list index out of range`` several steps later, in
+``read_gti`` inside ``get_goes_gtis``. Nothing in the log connected the two.
+
+``heasoft.run`` and ``heasoft.run_task`` now raise ``RuntimeError`` on a non-zero return
+code, with the tool's own output in the message.
+
+36. ``ftsort`` never sorted the merged GTIs -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Found immediately after issue 35 made failures visible. ``merge_gtis`` ran::
+
+    ftsort infile=<gti file> outfile=!<gti file> columns=START
+
+``ftmgtime`` writes its output with an empty primary header, and ``ftsort`` given a bare
+file name lands on that primary header rather than on the table: ``CFITSIO ERROR NOT_TABLE:
+CHDU not a table extension``, return code 235. Measured single-threaded, on every run, for
+as long as the code has existed -- the sort simply never happened, and the failure was
+swallowed. ``fthedit`` then renamed the unsorted extension to ``GTI`` and the pipeline
+carried on.
+
+The fix is ``infile=<gti file>[1]``. Four tests in ``tests/test_nustar.py`` record what each
+of the three tool calls must say.
+
+Whether the ordering ever mattered scientifically is a separate question -- ``ftmgtime``
+appears to emit its intervals in order already -- but a call that fails every time is not
+something to leave in place.
+
+37. HEASOFT truncates file names at 160 characters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Several of the tools used here are old Fortran ftools, whose file-name parameters are
+``character*160``. Measured with ``fappend``, varying only the length of ``outfile``:
+
+============================  ================
+``outfile`` length            result
+============================  ================
+156, 158, 159, **160**        succeeds
+161, 162, 164, 170            ``could not open the named file``, status 104
+============================  ================
+
+The error message helpfully prints the truncated path, which is how it was identified. The
+merged event file of an observation is ``<outdir>/<obsid>/nu<obsid>A_src1.evt``, about 40
+characters past ``outdir``, so ``outdir`` has a practical budget of roughly 120 characters.
+
+Not fixed in code -- there is nothing sensible to do about a tool's own limit -- but the
+failure is now loud (issue 35) rather than a file that silently lacks an extension. It is
+recorded in :doc:`technical_details` so that a deep output directory is a known cause
+rather than a mystery.
 
 
 Science caveats
