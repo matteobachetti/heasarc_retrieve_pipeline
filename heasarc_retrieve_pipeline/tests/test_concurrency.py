@@ -19,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor
 import pytest
 from astropy.table import Table
 
+from heasarc_retrieve_pipeline import core
 from heasarc_retrieve_pipeline.core import (
     download_link_column,
     obsid_query,
@@ -211,3 +212,74 @@ class TestObsidQuery:
     def test_an_empty_list_is_refused(self):
         with pytest.raises(ValueError, match="No OBSID"):
             obsid_query([], "nustar")
+
+
+class TestOneFailureDoesNotStopTheRest:
+    """A bad observation must cost only that observation.
+
+    The old loop got this right by accident, with ``return_state=True`` and no report. The
+    flow is expected to do it on purpose: every OBSID is attempted, the failures come back
+    named, and the run does not stop at the first one.
+    """
+
+    def items(self, n=3):
+        return [
+            dict(obsid=f"obs{i}", url=f"https://example.invalid/obs{i}/", ra=1.0, dec=2.0)
+            for i in range(n)
+        ]
+
+    def run(self, monkeypatch, tmp_path, failing):
+        """Run the flow with the download and the reduction stubbed out."""
+        processed = []
+
+        def stub_download(url, outdir, test_str=".", test=False):
+            return []
+
+        def stub_processing(obsid, config=None, ra=None, dec=None, flags=None):
+            if obsid in failing:
+                raise ValueError(f"{obsid} is no good")
+            processed.append(obsid)
+            return obsid
+
+        monkeypatch.setattr(core, "recursive_download", stub_download)
+        monkeypatch.setattr(core, "prepare_worker", lambda root: str(tmp_path))
+        monkeypatch.setitem(
+            core.MISSION_CONFIG["nustar"], "obsid_processing", stub_processing
+        )
+
+        failed = core.process_observations(
+            self.items(),
+            outdir=str(tmp_path),
+            mission="nustar",
+            worker_root=str(tmp_path / ".workers"),
+        )
+        return failed, processed
+
+    def test_the_good_ones_all_run(self, tmp_path, monkeypatch):
+        _, processed = self.run(monkeypatch, tmp_path, failing={"obs1"})
+
+        assert sorted(processed) == ["obs0", "obs2"]
+
+    def test_the_bad_one_is_named(self, tmp_path, monkeypatch):
+        failed, _ = self.run(monkeypatch, tmp_path, failing={"obs1"})
+
+        assert failed == ["obs1"]
+
+    def test_the_first_failure_does_not_stop_the_rest(self, tmp_path, monkeypatch):
+        """The failure is the first item submitted, so a plain loop would end there."""
+        failed, processed = self.run(monkeypatch, tmp_path, failing={"obs0"})
+
+        assert failed == ["obs0"]
+        assert sorted(processed) == ["obs1", "obs2"]
+
+    def test_all_failing_is_reported_and_not_raised(self, tmp_path, monkeypatch):
+        failed, processed = self.run(monkeypatch, tmp_path, failing={"obs0", "obs1", "obs2"})
+
+        assert failed == ["obs0", "obs1", "obs2"]
+        assert processed == []
+
+    def test_nothing_failing_returns_an_empty_list(self, tmp_path, monkeypatch):
+        failed, processed = self.run(monkeypatch, tmp_path, failing=set())
+
+        assert failed == []
+        assert sorted(processed) == ["obs0", "obs1", "obs2"]
