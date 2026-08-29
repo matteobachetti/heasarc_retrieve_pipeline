@@ -216,9 +216,49 @@ returns a flat list of URLs. Each URL is then filtered against ``re_include`` an
 ``re_exclude`` and passed to ``download_node``, which maps it to a local path and fetches
 it with pySmartDL (a multi-threaded downloader).
 
+The parsing itself lives in ``parse_directory_index``, which takes the page and returns the
+entries, so it can be tested without touching the network. The rule is that only *relative*
+links are entries: an ``href`` starting with ``?``, ``#`` or ``/``, containing ``://``, or
+resolving to ``..`` is dropped. That is what separates the six real entries of a HEASARC
+index page from the four column-sort links (``?C=N;O=D`` and friends) and the absolute
+"Parent Directory" link that sit beside them. Directories keep their trailing slash, which
+is how the caller knows to recurse into them.
+
 **S3** (``recursive_download_s3``, ``core.py:122``). Creates an unsigned (anonymous) boto3
-client, lists the bucket under the key prefix, applies the same include/exclude regexes,
-and downloads each key.
+client, walks the bucket under the key prefix with ``get_paginator("list_objects_v2")``,
+applies the same include/exclude regexes, and downloads each key. The paginator matters:
+one ``list_objects_v2`` call returns at most 1000 keys, which is comfortably above a NuSTAR
+observation and below an RXTE one.
+
+Verifying what arrived
+^^^^^^^^^^^^^^^^^^^^^^
+
+Both remote transports check every file against the size the archive reports, and the check
+runs on files already on disk as well as on new ones. The reason for the second half is
+that a mirror is only useful if it is honest about being incomplete: a run killed
+mid-transfer, or a disk that filled up, leaves a short file that every later run would
+otherwise accept as finished, forever.
+
+``file_needs_download(path, expected_size)`` holds the policy in one pure function and
+returns a reason fit for a log line. Absent means fetch. Matching size means skip. A
+differing size means fetch again, with a WARNING naming both numbers -- the local tree is a
+mirror and the archive is authoritative, so a short file is a failed download rather than
+data worth protecting. An unknown size means accept the file and say in the log that it
+could not be verified.
+
+Where the expected size comes from differs by transport, and neither costs much:
+
+* HTTPS: ``remote_file_size`` makes a HEAD request for ``Content-Length``. Only files
+  already on disk need it -- for a fresh download, pySmartDL has already fetched the header
+  and ``_download_pysmartdl`` passes ``get_final_filesize()`` back with the destination.
+* S3: ``Size`` arrives with every key in the listing, so the check is free.
+
+A transfer that fails, or that lands the wrong size, raises ``RuntimeError`` and takes any
+``<dest>.000``-style part files with it. ``download_node`` sets ``retries=3,
+retry_delay_seconds=10``, so a transient network failure is retried and a persistent one
+stops the observation instead of letting the pipeline reduce an incomplete dataset.
+Aborting is safe to recover from: on the next run every verified file is skipped, and the
+download picks up where it stopped.
 
 **Local** (``copy_local_directory``, ``core.py:237``). ``shutil.copytree`` into
 ``<outdir>/<basename>``.

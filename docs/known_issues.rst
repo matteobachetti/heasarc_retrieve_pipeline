@@ -220,37 +220,87 @@ then uses ``event_gz_files[0]``. GoodXenon observations always produce **two** f
 event files covering different time ranges. Silently keeping one of them discards data
 without a warning.
 
-9. ``recursive_download_s3`` never paginates
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+9. ``recursive_download_s3`` never paginates -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``core.py:151``. ``list_objects_v2`` returns at most 1000 keys per call and sets
-``IsTruncated``; the code reads ``response["Contents"]`` once and stops. Any observation
-with more than 1000 files is silently truncated. Use
-``s3_client.get_paginator("list_objects_v2")``.
+``list_objects_v2`` returns at most 1000 keys per call and sets ``IsTruncated``; the code
+read ``response["Contents"]`` once and stopped. Any observation with more than 1000 files
+was silently truncated. NuSTAR observations are well under that; RXTE observations are not.
 
-10. The HTTPS scraper reads link text instead of ``href``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**Fixed.** The listing walks ``s3_client.get_paginator("list_objects_v2")``. The
+key-to-destination decision moved into the pure ``s3_key_destination``, and the client
+construction into ``_s3_client``, so both can be tested against a stub bucket offline: two
+pages of keys are both downloaded, and an empty second page ends the listing cleanly.
 
-``core.py:67``: ``file_name = i.extract().get_text()``. *Verified against a real HEASARC
-index*: this yields five spurious entries per directory -- ``Name``, ``Last modified``,
-``Size``, ``Description`` (the column-sort links) and ``Parent Directory``.
+The paginated listing also carries a ``Size`` for every key, so the completeness check
+described under issue 11 costs nothing at all on this transport -- no extra request.
 
-They cause no damage today only because the default ``test_str="."`` rejects names without
-a dot. Pass ``test_str=None`` and the downloader will try to fetch
-``.../Parent Directory``. ``Parent Directory`` is also a latent recursion hazard.
+10. The HTTPS scraper reads link text instead of ``href`` -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use ``i.get("href")``, skip anything starting with ``?`` or ``/``, and skip ``../``.
+``file_name = i.extract().get_text()``. *Verified against a real HEASARC index*: this
+yielded five spurious entries per directory -- ``Name``, ``Last modified``, ``Size``,
+``Description`` (the column-sort links, whose ``href`` is ``?C=N;O=D`` and whose *text* is
+the column name) and ``Parent Directory`` (whose ``href`` is absolute and points up the
+tree). *Verified in the end-to-end logs*: **25 spurious download tasks per observation**,
+five per directory, each reported ``Finished in state Completed()``.
 
-11. ``download_node`` reports success after a failed download
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+They caused no damage only because the default ``test_str="."`` rejects names without a
+dot. With ``test_str=None`` the downloader would have tried to fetch
+``.../Parent Directory``, and ``Parent Directory`` was also a latent recursion hazard.
 
-``core.py:110``. ``download_cmd`` swallows every exception and returns ``(None, message)``;
-``download_node`` logs a warning and then returns ``local_ver`` regardless. The caller
-cannot distinguish a downloaded file from a missing one, and the pipeline proceeds to
-process an incomplete observation. Return ``None`` on failure, or raise and let Prefect's
-``retries=`` handle it (no task in the package sets ``retries``).
+**Fixed.** ``parse_directory_index`` reads ``href``, and keeps only relative ones: an
+``href`` that starts with ``?``, ``#`` or ``/``, contains ``://``, or resolves to ``..`` is
+dropped. ``get_remote_directory_listing`` keeps the fetch and the recursion and delegates
+the parsing, which makes the parsing testable without network -- the tests run against the
+real index page of 80002092008, captured verbatim. Live afterwards, that directory lists
+64 entries, four directories and sixty files, with none spurious.
 
-There is also no checksum verification against the archive.
+11. ``download_node`` reports success after a failed or partial download -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``download_cmd`` swallowed every exception and returned ``(None, message)``;
+``download_node`` logged a warning and then returned ``local_ver`` regardless. The caller
+could not distinguish a downloaded file from a missing one, and the pipeline went on to
+process an incomplete observation.
+
+The sharper half of the same problem was **incompleteness**. ``pySmartDL`` downloads in
+parallel chunks to ``<dest>.000``, ``<dest>.001``, ... and combines them only at the end,
+and it does compare the combined size against the server's ``Content-Length`` -- but it
+skips that check entirely when the server sends no ``Content-Length``, and it tolerates a
+shortfall of 4 kB per thread. The real hole was elsewhere: ``download_node`` returned early
+on ``os.path.exists(local_ver)`` and never looked at the file's size, so a file left short
+by a killed run, a full disk, or a copy from elsewhere was accepted as complete on every
+later run, forever.
+
+**Fixed.** Every file is now checked against the size the archive reports.
+
+* ``remote_file_size`` asks for ``Content-Length`` with a HEAD request. *Measured*: 60 of
+  60 files of one NuSTAR observation reported one, and all 60 matched the local copy
+  exactly, so exact verification is possible over HTTPS. On S3 the size comes free with the
+  listing (issue 9).
+* ``file_needs_download`` holds the policy and is pure, so the tests pin the policy down:
+  absent means fetch, matching size means skip, differing size means fetch again, and an
+  unknown size means accept with the log line saying it could not be verified.
+* A newly downloaded file costs no extra request: ``_download_pysmartdl`` returns
+  ``get_final_filesize()``, the ``Content-Length`` the library already fetched.
+* A file on disk of the wrong size is **re-downloaded with a WARNING naming both sizes**,
+  the policy chosen deliberately: the local tree is a mirror and the archive is
+  authoritative, so a short file is a failed download, not precious data.
+* A failed transfer, or one landing the wrong size, **raises** ``RuntimeError`` naming the
+  URL, the local path and the reason, and any ``<dest>.000``-style part files are removed.
+  ``download_node`` carries ``retries=3, retry_delay_seconds=10`` -- the first use of
+  Prefect's retries in the package -- so a transient failure retries and a persistent one
+  stops the observation. Re-running an aborted observation is cheap, since verified files
+  are skipped.
+
+*Verified against the real archive*: all 60 local files of 90901333002 verified and
+skipped, nothing re-fetched; then one copy truncated to two thirds was reported as
+``present but 19556794 bytes against 29335191 expected``, re-downloaded, and restored to
+exactly its archive size.
+
+Checksum verification remains out of reach: size is what the archive exposes cheaply and
+exactly, and there is no per-file hash to check against.
 
 12. ``get_goes_gtis`` can emit negative-length GTIs -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
