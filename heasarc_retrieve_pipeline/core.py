@@ -242,8 +242,7 @@ def parse_directory_index(html, url):
     return entries
 
 
-@task(task_run_name="get_remote_directory_listing_{url}")
-def get_remote_directory_listing(url: str):
+def walk_remote_directory(url: str):
     """
     List every file below a remote directory, recursively.
 
@@ -266,7 +265,9 @@ def get_remote_directory_listing(url: str):
     Notes
     -----
     The parsing is done by :func:`parse_directory_index`; this function adds the
-    fetching and the recursion into subdirectories.
+    fetching and the recursion into subdirectories. It is a plain function, called
+    recursively; :func:`get_remote_directory_listing` is the Prefect task that wraps
+    it, so a whole tree is one task run.
     """
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
@@ -282,11 +283,34 @@ def get_remote_directory_listing(url: str):
     for entry in parse_directory_index(a, url):
         urls.append(entry)
         if entry.endswith("/"):
-            below = get_remote_directory_listing.fn(entry)
+            below = walk_remote_directory(entry)
             if below is not None:
                 urls.extend(below)
 
     return urls
+
+
+@task(task_run_name="get_remote_directory_listing_{url}")
+def get_remote_directory_listing(url: str):
+    """
+    List every file below a remote directory, recursively.
+
+    The single task run for a whole directory tree. The walk itself lives in
+    :func:`walk_remote_directory`, a plain function, so that recursing into a
+    subdirectory does not open a nested task run for every level of the tree.
+
+    Parameters
+    ----------
+    url : str
+        URL of the directory to list.
+
+    Returns
+    -------
+    list of str or None
+        All URLs found below ``url``, directories included, or ``None`` if the
+        request returned an HTTP error.
+    """
+    return walk_remote_directory(url)
 
 
 @task(task_run_name="download_{node}", retries=3, retry_delay_seconds=10)
@@ -622,7 +646,7 @@ def recursive_download_https(
     #     return
     logger = get_run_logger()
     logger.info("Getting remote directory listing...")
-    listing = get_remote_directory_listing.fn(url)
+    listing = get_remote_directory_listing(url)
     if listing is None or listing == []:
         logger.warning(f"No data found in remote directory {url}")
         return False
@@ -947,8 +971,8 @@ def retrieve_heasarc_table_by_source_name(
     astropy.table.Table
         One row per matching observation.
     """
-    pos = get_source_position.fn(source)
-    results = retrieve_heasarc_table_by_position.fn(
+    pos = get_source_position(source)
+    results = retrieve_heasarc_table_by_position(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
     return results
@@ -1187,7 +1211,7 @@ def retrieve_heasarc_data_by_source_name(
     """
     pos = get_source_position(source)
 
-    results = retrieve_heasarc_table_by_position.fn(
+    results = retrieve_heasarc_table_by_position(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
     results = retrieve_and_process_data(

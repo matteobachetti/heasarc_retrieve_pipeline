@@ -7,12 +7,14 @@ touches the network.
 
 import os
 import re
+from urllib.error import HTTPError
 
 import pytest
 
 from heasarc_retrieve_pipeline import core
 from heasarc_retrieve_pipeline.core import (
     download_node,
+    get_remote_directory_listing,
     file_needs_download,
     parse_directory_index,
     recursive_download_s3,
@@ -449,3 +451,96 @@ class TestRecursiveDownloadS3:
 
         assert client.downloaded == []
         assert len(results) == 1
+
+
+class StubIndexServer:
+    """A tiny fake archive: a mapping of URL to the HTML index it serves."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.requested = []
+
+    def urlopen(self, req):
+        url = req.full_url
+        self.requested.append(url)
+        if url not in self.pages:
+            raise HTTPError(url, 404, "Not Found", None, None)
+
+        class Response:
+            def read(inner):
+                return self.pages[url].encode()
+
+        return Response()
+
+
+def index_page(base, *names):
+    """An index listing ``names`` under ``base``, in the Apache shape we parse."""
+    links = "".join(f'<a href="{name}">{name}</a>\n' for name in names)
+    return f"<html><body><pre>{links}</pre></body></html>"
+
+
+class TestWalkRemoteDirectory:
+    """The recursion under a directory listing, with no network."""
+
+    def serve(self, monkeypatch, pages):
+        server = StubIndexServer(pages)
+        monkeypatch.setattr("urllib.request.urlopen", server.urlopen)
+        return server
+
+    def test_the_files_of_a_flat_directory_come_back(self, monkeypatch):
+        self.serve(monkeypatch, {BASE_URL: index_page(BASE_URL, "a.evt", "b.evt")})
+
+        assert core.walk_remote_directory(BASE_URL) == [
+            BASE_URL + "a.evt",
+            BASE_URL + "b.evt",
+        ]
+
+    def test_a_subdirectory_is_descended_into(self, monkeypatch):
+        sub = BASE_URL + "event_cl/"
+        self.serve(
+            monkeypatch,
+            {
+                BASE_URL: index_page(BASE_URL, "event_cl/", "pipe.log"),
+                sub: index_page(sub, "cl.evt"),
+            },
+        )
+
+        assert core.walk_remote_directory(BASE_URL) == [
+            sub,
+            sub + "cl.evt",
+            BASE_URL + "pipe.log",
+        ]
+
+    def test_every_directory_is_fetched_exactly_once(self, monkeypatch):
+        sub = BASE_URL + "event_cl/"
+        deep = sub + "deeper/"
+        server = self.serve(
+            monkeypatch,
+            {
+                BASE_URL: index_page(BASE_URL, "event_cl/"),
+                sub: index_page(sub, "deeper/"),
+                deep: index_page(deep, "cl.evt"),
+            },
+        )
+
+        core.walk_remote_directory(BASE_URL)
+
+        assert server.requested == [BASE_URL, sub, deep]
+
+    def test_an_http_error_gives_nothing(self, monkeypatch):
+        self.serve(monkeypatch, {})
+
+        assert core.walk_remote_directory(BASE_URL) is None
+
+    def test_a_subdirectory_that_errors_does_not_sink_the_listing(self, monkeypatch):
+        self.serve(monkeypatch, {BASE_URL: index_page(BASE_URL, "gone/", "pipe.log")})
+
+        assert core.walk_remote_directory(BASE_URL) == [
+            BASE_URL + "gone/",
+            BASE_URL + "pipe.log",
+        ]
+
+    def test_the_task_returns_what_the_walk_returns(self, monkeypatch):
+        self.serve(monkeypatch, {BASE_URL: index_page(BASE_URL, "a.evt")})
+
+        assert get_remote_directory_listing.fn(BASE_URL) == [BASE_URL + "a.evt"]

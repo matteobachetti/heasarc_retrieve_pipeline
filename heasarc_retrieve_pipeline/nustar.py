@@ -451,7 +451,7 @@ def separate_sources(directories, config, region_size=30, back_region_size=55):
         logger = get_run_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
-            separate_sources_in_event_file.fn(
+            separate_sources_in_event_file(
                 event_file, region_size=region_size, back_region_size=back_region_size
             )
         with open(separate_done_file, "w") as f:
@@ -1577,7 +1577,7 @@ def get_best_source_regions(obsid, config):
     for _, infile in mode_01_input_files(obsid, config):
         # get_best_source_region returns early when the region files already exist,
         # reading the position and radius back out of them, so every file counts.
-        result = get_best_source_region.fn(infile, config=config)
+        result = get_best_source_region(infile, config=config)
         if result is None:
             continue
         ra, dec, rlimit, _, _ = result
@@ -1666,7 +1666,7 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
         if not os.path.exists(this_src) or not os.path.exists(this_bkg):
             # Every CHU combination has its own aspect solution, so it needs its own
             # region; the mode-01 position is the reference it has to agree with.
-            get_best_source_region.fn(
+            get_best_source_region(
                 infile,
                 config=config,
                 reference=reference if is_mode_06 else None,
@@ -1678,9 +1678,9 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
             logger.warning(f"No usable extraction region for {infile}, skipping")
             continue
 
-        outfile_gti_goes = get_goes_gtis.fn(infile)
+        outfile_gti_goes = get_goes_gtis(infile)
         outfile_gti_temp = os.path.join(filedir, root_name + "_noflares.gti")
-        merge_gtis.fn([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+        merge_gtis([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
         if not os.path.exists(outfile_gti_temp):
             logger.warning(f"Flare-free GTI file missing for {infile}, skipping")
             problems += 1
