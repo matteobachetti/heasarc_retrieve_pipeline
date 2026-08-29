@@ -14,7 +14,10 @@ __all__ = [
     "get_logger",
     "good_intervals",
     "gti_to_array",
+    "intersect_intervals",
+    "intervals_above_threshold",
     "intervals_removed",
+    "merge_intervals",
     "mask_from_gti",
     "read_gti",
     "splitext_improved",
@@ -93,6 +96,123 @@ def splitext_improved(path):
     return os.path.join(dir, froot), ext
 
 
+def merge_intervals(intervals):
+    """
+    Sort a set of intervals and merge the ones that overlap or touch.
+
+    Intervals of zero or negative length are dropped, so the result always satisfies the
+    three properties a good time interval list is expected to have: positive length,
+    sorted, disjoint.
+
+    Parameters
+    ----------
+    intervals : iterable of (float, float)
+        Can also be an ``(N, 2)`` array. Any order.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``.
+
+    Examples
+    --------
+    >>> merge_intervals([[20, 30], [0, 10], [5, 15]]).tolist()
+    [[0.0, 15.0], [20.0, 30.0]]
+    """
+    intervals = np.asarray(intervals, dtype=float).reshape(-1, 2)
+
+    merged = []
+    order = np.argsort(intervals[:, 0]) if intervals.size else []
+    for start, stop in intervals[order]:
+        if stop <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], stop)
+        else:
+            merged.append([start, stop])
+
+    return np.array(merged, dtype=float).reshape(-1, 2)
+
+
+def intervals_above_threshold(times, values, threshold, cadence=None):
+    """
+    The intervals over which a sampled light curve sits at or above a threshold.
+
+    Written for the GOES X-ray flux, where it complements the HEK flare catalogue: the
+    catalogue says when a *solar* flare began and ended, the flux says when the Sun was
+    actually bright. The two disagree in ways that matter -- a flare's decay tail keeps
+    NuSTAR's background elevated well past the catalogued end time, and a rise that was
+    never catalogued at the requested class is invisible to the catalogue entirely.
+
+    Each sample at or above the threshold is taken to cover its own cadence bin,
+    ``[t - cadence/2, t + cadence/2]``, and the resulting intervals are merged. Samples
+    that are ``NaN`` never contribute: a gap in the coverage is missing information, not a
+    flare.
+
+    Parameters
+    ----------
+    times : array-like
+        Sample times.
+    values : array-like
+        Sampled quantity, same length as ``times``. ``NaN`` is allowed.
+    threshold : float
+        Samples at or above this count as bad.
+    cadence : float, optional
+        Width of one sample. Defaults to the median spacing of ``times``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``, sorted and disjoint.
+
+    Examples
+    --------
+    >>> times = [0.0, 60.0, 120.0, 180.0]
+    >>> flux = [1e-7, 1e-5, 1e-5, 1e-7]
+    >>> intervals_above_threshold(times, flux, 5e-6).tolist()
+    [[30.0, 150.0]]
+    """
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if times.size == 0:
+        return np.zeros((0, 2))
+
+    if cadence is None:
+        cadence = float(np.median(np.diff(times))) if times.size > 1 else 0.0
+
+    hot = times[np.isfinite(values) & (values >= threshold)]
+    return merge_intervals(np.column_stack([hot - cadence / 2, hot + cadence / 2]))
+
+
+def intersect_intervals(first, second):
+    """
+    The times covered by both interval lists.
+
+    Parameters
+    ----------
+    first, second : array-like or table
+        Intervals, as accepted by :func:`gti_to_array`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``, sorted and disjoint.
+
+    Examples
+    --------
+    >>> intersect_intervals([[0, 100], [200, 300]], [[50, 250]]).tolist()
+    [[50.0, 100.0], [200.0, 250.0]]
+    """
+    second = gti_to_array(second)
+    overlaps = []
+    for start, stop in gti_to_array(first):
+        for other_start, other_stop in second:
+            low, high = max(start, other_start), min(stop, other_stop)
+            if high > low:
+                overlaps.append([low, high])
+    return merge_intervals(overlaps)
+
+
 def good_intervals(bad, tstart, tstop):
     """
     The complement of a set of bad intervals inside ``[tstart, tstop]``.
@@ -135,17 +255,7 @@ def good_intervals(bad, tstart, tstop):
     [[0.0, 40.0], [70.0, 100.0]]
     """
     bad = np.asarray(bad, dtype=float).reshape(-1, 2)
-
-    merged = []
-    for start, stop in bad[np.argsort(bad[:, 0])] if bad.size else bad:
-        start = max(start, tstart)
-        stop = min(stop, tstop)
-        if stop <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], stop)
-        else:
-            merged.append([start, stop])
+    merged = merge_intervals(np.clip(bad, tstart, tstop) if bad.size else bad)
 
     good = []
     current = tstart

@@ -13,8 +13,11 @@ from heasarc_retrieve_pipeline.utils import (
     apply_gti,
     binned_lightcurve,
     good_intervals,
+    intersect_intervals,
+    intervals_above_threshold,
     intervals_removed,
     mask_from_gti,
+    merge_intervals,
     read_gti,
 )
 
@@ -369,3 +372,117 @@ class TestApplyGtiWithAStaleHeader:
         stats = apply_gti(hdul, [[0, 100]])
 
         assert stats["ontime_before"] == pytest.approx(100.0)
+
+
+class TestMergeIntervals:
+    def test_overlapping_intervals_are_merged(self):
+        assert np.allclose(merge_intervals([[0, 10], [5, 20]]), [[0, 20]])
+
+    def test_touching_intervals_are_merged(self):
+        assert np.allclose(merge_intervals([[0, 10], [10, 20]]), [[0, 20]])
+
+    def test_disjoint_intervals_are_kept_apart(self):
+        assert np.allclose(merge_intervals([[0, 10], [20, 30]]), [[0, 10], [20, 30]])
+
+    def test_out_of_order_input_is_sorted(self):
+        assert np.allclose(merge_intervals([[20, 30], [0, 10]]), [[0, 10], [20, 30]])
+
+    def test_zero_and_negative_length_intervals_are_dropped(self):
+        assert np.allclose(merge_intervals([[5, 5], [10, 8], [20, 30]]), [[20, 30]])
+
+    def test_nested_intervals(self):
+        assert np.allclose(merge_intervals([[0, 100], [20, 30]]), [[0, 100]])
+
+    def test_nothing_in_nothing_out(self):
+        assert len(merge_intervals([])) == 0
+
+
+class TestIntervalsAboveThreshold:
+    """Turning a sampled light curve into the intervals where it is too bright.
+
+    This is how the GOES X-ray flux becomes a set of times to exclude, alongside the HEK
+    catalogue of flare start and end times.
+    """
+
+    def test_each_hot_sample_covers_its_own_cadence_bin(self):
+        times = np.array([0.0, 60.0, 120.0])
+        values = np.array([1e-7, 1e-5, 1e-7])
+
+        assert np.allclose(
+            intervals_above_threshold(times, values, 5e-6), [[30.0, 90.0]]
+        )
+
+    def test_consecutive_hot_samples_merge_into_one_interval(self):
+        times = np.array([0.0, 60.0, 120.0, 180.0])
+        values = np.array([1e-7, 1e-5, 1e-5, 1e-7])
+
+        assert np.allclose(
+            intervals_above_threshold(times, values, 5e-6), [[30.0, 150.0]]
+        )
+
+    def test_separate_flares_stay_separate(self):
+        times = np.arange(0.0, 600.0, 60.0)
+        values = np.full(times.size, 1e-7)
+        values[[1, 7]] = 1e-5
+
+        assert np.allclose(
+            intervals_above_threshold(times, values, 5e-6), [[30, 90], [390, 450]]
+        )
+
+    def test_a_sample_exactly_at_the_threshold_counts(self):
+        times = np.array([0.0, 60.0])
+        values = np.array([5e-6, 1e-9])
+
+        assert len(intervals_above_threshold(times, values, 5e-6)) == 1
+
+    def test_nan_samples_are_never_excluded(self):
+        """A gap in the GOES coverage is missing information, not a flare."""
+        times = np.array([0.0, 60.0, 120.0])
+        values = np.array([1e-7, np.nan, 1e-7])
+
+        assert len(intervals_above_threshold(times, values, 5e-6)) == 0
+
+    def test_nothing_above_the_threshold(self):
+        times = np.arange(0.0, 300.0, 60.0)
+        assert len(intervals_above_threshold(times, np.full(5, 1e-9), 5e-6)) == 0
+
+    def test_everything_above_the_threshold_gives_one_interval(self):
+        times = np.arange(0.0, 300.0, 60.0)
+        result = intervals_above_threshold(times, np.full(5, 1e-4), 5e-6)
+
+        assert np.allclose(result, [[-30.0, 270.0]])
+
+    def test_the_cadence_can_be_given_explicitly(self):
+        times = np.array([0.0, 60.0, 120.0])
+        values = np.array([1e-7, 1e-5, 1e-7])
+
+        assert np.allclose(
+            intervals_above_threshold(times, values, 5e-6, cadence=10.0),
+            [[55.0, 65.0]],
+        )
+
+    def test_no_samples_at_all(self):
+        assert len(intervals_above_threshold([], [], 5e-6)) == 0
+
+
+class TestIntersectIntervals:
+    def test_a_simple_overlap(self):
+        assert np.allclose(intersect_intervals([[0, 100]], [[50, 150]]), [[50, 100]])
+
+    def test_no_overlap_gives_nothing(self):
+        assert len(intersect_intervals([[0, 50]], [[100, 150]])) == 0
+
+    def test_several_intervals_on_both_sides(self):
+        result = intersect_intervals([[0, 100], [200, 300]], [[50, 250]])
+
+        assert np.allclose(result, [[50, 100], [200, 250]])
+
+    def test_touching_at_a_single_point_is_not_an_overlap(self):
+        assert len(intersect_intervals([[0, 50]], [[50, 100]])) == 0
+
+    def test_an_empty_side_gives_nothing(self):
+        assert len(intersect_intervals([[0, 100]], np.zeros((0, 2)))) == 0
+
+    def test_it_accepts_a_fits_gti_table(self):
+        hdul = make_event_file(times=[], gti=[[0, 100]])
+        assert np.allclose(intersect_intervals(hdul["GTI"].data, [[50, 150]]), [[50, 100]])
