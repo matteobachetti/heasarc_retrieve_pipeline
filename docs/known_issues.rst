@@ -637,14 +637,39 @@ The failures are ``parameter file .../ftlist.par not found`` and ``FileNotFoundE
 ``PFILES`` is an environment variable and the environment belongs to the process, so
 threads cannot be isolated this way at all: **an observation has to be a process**.
 ``core.prepare_worker`` gives each worker a private ``PFILES`` directory and a private
-working directory. The second is for tidiness rather than correctness: HEASOFT scripts drop
-scratch files in the current directory (``86758tmp_gti.fits``, ``87340_tmp_nuexpomap``,
-``86758tmplnk_nu90901333002A01_sr.pha`` -- observed by the dozen during a three-observation
-run), and while they are prefixed with the tool subprocess's PID and so do not collide, an
-interrupted run leaves them behind. In ``.workers/worker_<pid>/`` they are obviously
-disposable; in the user's output tree they would be litter of unknown provenance.
-``prepare_worker`` is the one place in the package that calls ``os.chdir``, and it is the
-opposite of the pattern above: once, before any work, never during.
+working directory. Both are needed. HEASOFT scripts drop scratch files in the current
+directory by the dozen, and while most carry the tool subprocess's PID
+(``86758tmp_gti.fits``, ``87340_tmp_nuexpomap``), not all of them do -- ``xselect`` writes
+``xsel_timefile.asc``, with no PID at all. ``prepare_worker`` is the one place in the
+package that calls ``os.chdir``, and it is the opposite of the pattern above: once, before
+any work, never during.
+
+**The whole thing measured, end to end.** Three real NuSTAR reductions of 90901333002, in
+three worker processes, from the join step through spectra:
+
+===========================================  =============================  ==========
+Setup                                        Result                         Task runs
+                                                                            failed
+===========================================  =============================  ==========
+private ``PFILES`` + working directory       3 of 3 completed, 1433 s each  **0**
+shared ``~/pfiles`` + shared directory       2 of 3 completed, 1412 s each  3
+===========================================  =============================  ==========
+
+The isolated run produced identical output in all three trees: 97 product files, 80 split
+files, the same event counts, and merged GTIs present and sorted. Running three at once
+costs nothing in wall-clock time per observation.
+
+The shared run failed inside ``nuproducts``, and the log shows exactly how. ``xselect``
+offered one worker the *other* worker's session as a default::
+
+    !> Enter session name >[xsel37372] xsel37575
+     Command not found; type ? for a command listing
+    !xsel37575:SUZAKU > read eve lnk-nu90901333002A06_chu23_N_cl.evt
+    !> Enter the Event file dir >[37372_tmp_nuproducts/] 37575_tmp_nuproducts/
+
+-- note the mission guessed as ``SUZAKU`` -- and the run ended with ``Cannot open
+xsel_timefile.asc`` and a failed ``numkrmf``. This is the failure the isolation prevents,
+and it is worth knowing what it looks like, because nothing in it says "concurrency".
 
 **The GOES data were fetched into a shared directory.** ``Fido.fetch`` was called without
 a ``path``, so two observations from the same day wrote the same file, and a reduction

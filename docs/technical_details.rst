@@ -1149,11 +1149,10 @@ package, and a test asserts it stays that way: the working directory is a proper
 whole process, so using it to steer where a step writes is what made concurrent
 observations impossible before. Every path a step is given is absolute --
 ``utils.absolute_config`` resolves the configuration once, at the start of a reduction --
-and the process working directory exists only to catch the scratch files HEASOFT tools drop
-around themselves -- ``86758tmp_gti.fits``, ``87340_tmp_nuexpomap`` and their kin, by the
-dozen. Those carry the tool subprocess's PID, so they do not collide; the point of the
-private directory is that an interrupted run leaves its litter somewhere obviously
-disposable instead of in the output tree.
+and the process working directory exists to catch the scratch files HEASOFT tools drop
+around themselves. Most carry the tool subprocess's PID -- ``86758tmp_gti.fits``,
+``87340_tmp_nuexpomap`` -- but not all: ``xselect`` writes ``xsel_timefile.asc``, and two
+workers sharing a directory destroy each other's.
 
 **Inside one observation, one HEASOFT tool at a time.** The steps of a single reduction
 still run in threads of the worker process, and they share that process's ``PFILES``. So
@@ -1183,6 +1182,16 @@ figure registry and a global backend.
 **What is still shared.** All workers write to one Prefect SQLite database, and each worker
 process starts a temporary Prefect server of its own. This works, but it is the part that
 will complain first if ``n_workers`` is raised a long way.
+
+**Measured, three at a time.** Three real reductions of NuSTAR observation 90901333002 from
+the join step through spectra, in three worker processes: with a private ``PFILES`` and
+working directory each, 3 of 3 completed with no failed task run, 1433 s each, and all three
+trees ended with identical output (97 product files, 80 split files, the same event counts,
+merged GTIs present and sorted). With a shared parameter directory and a shared working
+directory, 2 of 3 completed and 3 task runs failed -- one worker's ``xselect`` session was
+offered as the default for another's, the mission was guessed as ``SUZAKU``, and the run
+died on ``Cannot open xsel_timefile.asc``. Running three at once costs nothing per
+observation; getting it wrong costs a whole observation and says nothing about why.
 
 **Two consequences for callers.** A process pool re-imports the entry point in each worker,
 so a parallel run must be started from a real script guarded by
