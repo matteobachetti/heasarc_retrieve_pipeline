@@ -1038,7 +1038,7 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     from sunpy.net import attrs as a
     from sunpy.time import parse_time
     from astropy.io import fits
-    from astropy.io.fits import getheader, getdata
+    from astropy.io.fits import getheader
     from astropy.table import Table
     from nustar_gen import info, utils
 
