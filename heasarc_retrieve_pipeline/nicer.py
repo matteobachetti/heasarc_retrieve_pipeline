@@ -71,8 +71,6 @@ def ni_raw_data_path(obsid, time, **kwargs):
     str
         ``/FTP/nicer/data/obs/<YYYY>_<MM>/<OBSID>``.
     """
-    from astropy.time import Time
-
     mjd = Time(time.data, format="mjd")
     mjd_dt = mjd.to_datetime()
 

@@ -207,3 +207,51 @@ class TestPositionIsConsistent:
     def test_without_a_reference_everything_is_accepted(self):
         anywhere = SkyCoord(12.3, -45.6, unit="deg")
         assert position_is_consistent(anywhere, None, 3 * u.arcmin)
+
+
+def _shadowing_imports(path):
+    """Function-local imports that rebind a name already imported at module level.
+
+    Python decides at compile time that a name assigned anywhere in a function is local
+    to the *whole* function. An ``import x`` inside one branch therefore makes ``x``
+    unbound on every path that does not run that branch, even though the module imports
+    it at the top -- an ``UnboundLocalError`` that only fires on the untaken branch.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text())
+    module_level = {
+        alias.asname or alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    found = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                if name in module_level:
+                    found.append(f"{path.name}:{node.lineno} {func.name}() rebinds '{name}'")
+    return found
+
+
+def test_no_function_local_import_shadows_a_module_level_one():
+    """Guard the bug that made ``u`` unbound in ``get_best_source_region``.
+
+    ``get_best_source_region`` imported ``astropy.units as u`` inside its
+    already-have-the-regions branch, which shadowed the module-level import and made
+    ``u.arcmin`` raise on the branch that actually measures a region -- the path no
+    offline test can reach, because it needs ``nustar_gen`` and a real image.
+    """
+    import pathlib
+
+    package = pathlib.Path(__file__).parent.parent
+    offenders = []
+    for path in sorted(package.glob("*.py")):
+        offenders.extend(_shadowing_imports(path))
+    assert offenders == []

@@ -1245,7 +1245,6 @@ def get_best_source_region(
     bkg_out = os.path.join(indir, out_rootname + "_bkg.reg")
     if os.path.exists(src_out) and os.path.exists(bkg_out):
         from regions import Regions
-        import astropy.units as u
 
         region_src = Regions.read(src_out, format="ds9")[0]
         logger.info(f"Source and background region files already exist for {infile}")
