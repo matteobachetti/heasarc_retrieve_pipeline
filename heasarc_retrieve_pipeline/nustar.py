@@ -653,7 +653,11 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
         chatter=5,
     )
 
-    heasoft.run("ftsort", infile=outfile_gti, outfile="!" + outfile_gti, columns="START")
+    # "[1]" is not decoration: ftmgtime writes an empty primary header, and ftsort with a
+    # bare file name lands on it and dies with CFITSIO ERROR NOT_TABLE (return code 235).
+    heasoft.run(
+        "ftsort", infile=outfile_gti + "[1]", outfile="!" + outfile_gti, columns="START"
+    )
 
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 

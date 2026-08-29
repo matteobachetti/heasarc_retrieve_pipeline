@@ -641,6 +641,51 @@ class StubHeasoft:
         self._record("fappend", **kwargs)
 
 
+class TestMergeGtisCallsHeasoftCorrectly:
+    """Every HEASOFT call in ``merge_gtis`` has to say which extension it means.
+
+    Measured in the HEASOFT x86 environment: ``ftsort infile=<gti file>`` with no extension
+    lands on the primary header and fails with ``CFITSIO ERROR NOT_TABLE``, return code 235,
+    single-threaded and every time. It went unnoticed for as long as it did because
+    ``heasoftpy`` defaults to ``allow_failure=True`` and the pipeline never looked at the
+    return code, so the merged GTIs were simply never sorted.
+    """
+
+    def calls(self, monkeypatch, tmp_path):
+        recorded = []
+
+        def stub_run(name, *args, **kwargs):
+            recorded.append((name, kwargs))
+            return None
+
+        monkeypatch.setattr(nustar.heasoft, "run", stub_run)
+        out = os.path.join(tmp_path, "merged.gti")
+        nustar.merge_gtis.fn(["a.evt", "b.evt"], out)
+        return out, dict(recorded), [name for name, _ in recorded]
+
+    def test_the_tools_run_in_order(self, tmp_path, monkeypatch):
+        _, _, names = self.calls(monkeypatch, tmp_path)
+
+        assert names == ["ftmgtime", "ftsort", "fthedit"]
+
+    def test_ftsort_names_the_table_extension(self, tmp_path, monkeypatch):
+        out, calls, _ = self.calls(monkeypatch, tmp_path)
+
+        assert calls["ftsort"]["infile"] == out + "[1]"
+
+    def test_ftsort_writes_back_over_the_same_file(self, tmp_path, monkeypatch):
+        out, calls, _ = self.calls(monkeypatch, tmp_path)
+
+        assert calls["ftsort"]["outfile"] == "!" + out
+        assert calls["ftsort"]["columns"] == "START"
+
+    def test_ftmgtime_asks_for_the_gti_extensions(self, tmp_path, monkeypatch):
+        out, calls, _ = self.calls(monkeypatch, tmp_path)
+
+        assert calls["ftmgtime"]["ingtis"] == "a.evt[GTI],b.evt[GTI]"
+        assert calls["ftmgtime"]["outgti"] == out
+
+
 class TestMergeEventFilesTemporary:
     """The intermediate GTI file must be predictable, and must not survive."""
 
