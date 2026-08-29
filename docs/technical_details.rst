@@ -703,6 +703,42 @@ flare it has no measurement of -- and one observation is not evidence about the 
 case. The two are cheap to combine and fail in different ways, which is the whole reason
 for using both.
 
+**A second observation, where the catalogue does nothing at all.** 90901333002 sits in a
+period of frequent small flares: the GOES 1--8 A curve has about eight peaks across its
+73.6 ks, and the HEK catalogue lists none of them at or above C5.0. Catalogue-only
+filtering therefore removes one event out of 67743 -- rounding, not filtering. Two of those
+peaks do cross C5.0 in the measured flux, and they are exactly where the NuSTAR background
+spikes, to 1.0 and 0.6 c/s against a 0.3 c/s baseline.
+
+.. list-table::
+   :header-rows: 1
+
+   * - criterion
+     - background chi2/dof
+     - background frms
+     - source chi2/dof
+     - good time removed
+   * - HEK >= C5.0
+     - 1.64
+     - 0.178
+     - 2.09
+     - 0 s
+   * - HEK >= C5.0 **and** flux >= C5.0
+     - **1.22**
+     - **0.070**
+     - 2.10
+     - 2280 s (3.1%)
+
+The source column moves by 0.01 in reduced chi-squared, which is the control holding: 2054
+source-region events go with the cut, and the source light curve does not notice. This is
+the case the flux criterion exists for, and no threshold on the catalogue could have found
+it.
+
+The same figure supports the default threshold rather than a lower one. Six of the eight
+GOES peaks in that observation stay below C5.0, and none of them raises the NuSTAR
+background visibly. Cutting at C1.0 would have thrown away most of the observation to
+remove nothing.
+
 Barycentring
 ~~~~~~~~~~~~
 
