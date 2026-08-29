@@ -44,7 +44,7 @@ from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
 from .barycenter import barycenter_file
-from .utils import get_logger, good_intervals, splitext_improved
+from .utils import apply_gti, get_logger, good_intervals, splitext_improved
 
 try:
     HAS_HEASOFT = True
@@ -1060,11 +1060,19 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
 def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     """
-    Write a copy of an event file whose GTIs exclude solar flares.
+    Write a flare-free copy of an event file.
 
     Combines the event file's own GTIs with the flare-free intervals from
     :func:`get_goes_gtis` using a logical AND, and writes the result as
     ``<root>_noflares.evt``.
+
+    The events recorded during the excluded intervals are removed from the event table and
+    the exposure keywords are corrected, by
+    :func:`~heasarc_retrieve_pipeline.utils.apply_gti`. Doing only half of this -- swapping
+    the GTI extension and leaving the rest alone, as this function used to -- produces a
+    file that still contains its flare counts and still advertises its original
+    ``EXPOSURE``, so any tool that ignores GTIs, or takes a rate from the header, gets a
+    wrong answer from a file whose name promises otherwise.
 
     Parameters
     ----------
@@ -1077,22 +1085,16 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     -------
     str
         Path of the filtered file.
-
-    Notes
-    -----
-    Only the GTI extension is replaced: the event table is copied unchanged and the
-    exposure keywords are not recomputed, so tools that ignore GTIs or read rates from the
-    header will be wrong. See issue 5 in ``docs/known_issues.rst``.
     """
     from astropy.io import fits
-    from astropy.table import Table
 
     root = rootname(event_file)
     outfile_gti_temp = root + "_tmp.gti"
     outfile_filtered = flare_filtered_event_file_name(event_file)
 
+    logger = get_logger()
+
     if os.path.exists(outfile_filtered):
-        logger = get_run_logger()
         logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
         return outfile_filtered
 
@@ -1101,9 +1103,15 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     merge_gtis([event_file, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
 
     with fits.open(event_file) as hdul, fits.open(outfile_gti_temp) as gti_hdul:
-        hdul[2].data = gti_hdul[1].data
-
+        stats = apply_gti(hdul, gti_hdul[1].data)
         hdul.writeto(outfile_filtered, overwrite=True)
+
+    logger.info(
+        f"{outfile_filtered}: "
+        f"{stats['nevents_before'] - stats['nevents_after']} of "
+        f"{stats['nevents_before']} events removed, live time "
+        f"{stats['livetime_before']:.1f} -> {stats['livetime_after']:.1f} s"
+    )
 
     os.unlink(outfile_gti_temp)
 
