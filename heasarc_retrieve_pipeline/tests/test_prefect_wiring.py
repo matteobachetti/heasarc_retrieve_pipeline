@@ -7,6 +7,7 @@ sidestepped by a code path that happens not to be exercised.
 
 import ast
 import pathlib
+import string
 
 import pytest
 
@@ -86,3 +87,58 @@ def test_every_wait_for_argument_comes_from_submit(path):
                 assert element.id in submitted, (
                     f"{path.name}: wait_for={element.id}, which no .submit() produced"
                 )
+
+
+def run_name_fields(source):
+    """
+    Every ``task_run_name``/``flow_run_name`` template, with the names it refers to.
+
+    Yields ``(function, template, root_names)``. Prefect formats these with the call's
+    arguments, so a name that is not a parameter raises ``KeyError`` at call time --
+    which stays invisible for as long as the function is only called through ``.fn``.
+
+    Examples
+    --------
+    >>> list(run_name_fields('@task(task_run_name="x_{a}")\\ndef f(a): pass'))
+    [('f', 'x_{a}', ['a'])]
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            for keyword in decorator.keywords:
+                if keyword.arg not in ("task_run_name", "flow_run_name"):
+                    continue
+                if not isinstance(keyword.value, ast.Constant):
+                    continue
+                template = keyword.value.value
+                roots = [
+                    field.split(".")[0].split("[")[0]
+                    for _, field, _, _ in string.Formatter().parse(template)
+                    if field
+                ]
+                yield node.name, template, roots
+
+
+@pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
+def test_run_name_templates_only_name_real_parameters(path):
+    """Measured on Prefect 3.8.4: a template naming something that is not a parameter
+    raises KeyError when the task is called."""
+    tree = ast.parse(path.read_text())
+    parameters = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = node.args
+            parameters[node.name] = {
+                a.arg for a in args.posonlyargs + args.args + args.kwonlyargs
+            }
+
+    for function, template, roots in run_name_fields(path.read_text()):
+        for root in roots:
+            assert root in parameters[function], (
+                f"{path.name}: {function} run name {template!r} names {root!r}, "
+                f"which is not one of its parameters"
+            )

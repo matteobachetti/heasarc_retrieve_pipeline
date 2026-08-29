@@ -378,7 +378,7 @@ def flare_filtered_event_file_name(event_file):
 
 
 @task(
-    task_run_name="separate_sources_in_event_file_{obsid}_{event_file}_region_{region_size}_back_{back_region_size}",
+    task_run_name="nu_separate_sources_{event_file}_region_{region_size}",
 )
 def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
     """
@@ -421,7 +421,7 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="separate_sources_{directories}_region_{region_size}_back_{back_region_size}",
+    task_run_name="nu_separate_sources_in_{directories[0]}_region_{region_size}",
 )
 def separate_sources(directories, config, region_size=30, back_region_size=55):
     """
@@ -599,7 +599,7 @@ def recover_spacecraft_science_data(obsid, config):
     return splitdir
 
 
-@task(task_run_name="nu_merge_gtis_{files_to_join}_into_{outfile_gti}_gti_{gti_operation}")
+@task(task_run_name="nu_merge_gtis_into_{outfile_gti}_gti_{gti_operation}")
 def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
     """
     Merge the GTI extensions of several event files into one GTI file.
@@ -639,7 +639,7 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
     hsp.fthedit(infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI")
 
 
-@task(task_run_name="nu_merge_event_files_{files_to_join}_into_{outfile}_gti_{gti_operation}")
+@task(task_run_name="nu_merge_event_files_into_{outfile}_gti_{gti_operation}")
 def merge_event_files(files_to_join, outfile, gti_operation="OR"):
     """
     Merge several event files, and their GTIs, into a single event file.
