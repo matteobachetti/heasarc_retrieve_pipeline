@@ -433,6 +433,73 @@ def download_node(
     return local_ver
 
 
+def _s3_client():
+    """
+    An anonymous client for the public ``nasa-heasarc`` bucket.
+
+    Unsigned requests, so no AWS credentials are needed. Kept apart from the caller so
+    the tests can put a stub bucket in its place.
+    """
+    import boto3
+    import botocore
+
+    config = botocore.client.Config(signature_version=botocore.UNSIGNED)
+    return boto3.resource("s3", config=config).meta.client
+
+
+def s3_key_destination(
+    key: str,
+    prefix: str,
+    outdir: str,
+    test_str: str = ".",
+    re_include=None,
+    re_exclude=None,
+):
+    """
+    Local path a bucket key maps to, or ``None`` if it is filtered out.
+
+    The last component of the prefix is the observation identifier, and it is kept: the
+    key ``.../obs/09/9/90901333002/auxil/x.fits`` under the prefix ``.../obs/09/9/90901333002/``
+    lands in ``<outdir>/90901333002/auxil/x.fits``, matching the other transports.
+
+    Parameters
+    ----------
+    key : str
+        Full key in the bucket.
+    prefix : str
+        Key prefix the listing was made with.
+    outdir : str
+        Local root directory of the download.
+    test_str : str, optional
+        Substring that must appear in the local path. ``None`` accepts everything.
+    re_include : re.Pattern or None, optional
+        Only keys matching this are kept.
+    re_exclude : re.Pattern or None, optional
+        Keys matching this are dropped, whatever ``re_include`` says.
+
+    Returns
+    -------
+    str or None
+        Local path, or ``None`` when a filter rejects the key.
+
+    Examples
+    --------
+    >>> s3_key_destination("nustar/obs/90901333002/auxil/x.fits",
+    ...                    "nustar/obs/90901333002/", "out")
+    'out/90901333002/auxil/x.fits'
+    """
+    if re_include is not None and not re_include.search(key):
+        return None
+    if re_exclude is not None and re_exclude.search(key):
+        return None
+
+    above = "/".join(prefix.strip("/").split("/")[:-1])
+    dest = os.path.join(outdir, key[len(above) + 1 :])
+    if test_str is not None and test_str not in dest:
+        return None
+    return dest
+
+
 @task(task_run_name="recursive_download_s3_{url}")
 def recursive_download_s3(
     url: str,
@@ -472,66 +539,67 @@ def recursive_download_s3(
     list of str
         Local paths of the files downloaded or already present.
 
+    Raises
+    ------
+    RuntimeError
+        If a transferred file does not end up the size the listing announced.
+
     Notes
     -----
-    ``list_objects_v2`` is called once and returns at most 1000 keys, so
-    observations with more files than that are silently truncated. See issue 9 in
-    ``docs/known_issues.rst``.
+    The listing is paginated: ``list_objects_v2`` returns at most 1000 keys per call, so
+    a single call truncates any observation with more files than that. It also carries a
+    ``Size`` for every key, which makes verifying the local copies free -- unlike the
+    HTTPS transport, no extra request is needed.
     """
-    import boto3
-    import botocore
     from urllib.parse import urlparse
 
     os.makedirs(outdir, exist_ok=True)
-    logger = get_run_logger()
+    logger = get_logger()
     logger.info("Recursively downloading from S3...")
 
-    # Parse S3 URL
     parsed = urlparse(url)
     bucket_name = parsed.netloc
 
-    # Adapted from astroquery.heasarc
     logger.info("Enabling anonymous cloud data access ...")
-    config = botocore.client.Config(signature_version=botocore.UNSIGNED)
-    s3_resource = boto3.resource("s3", config=config)
-
-    s3_client = s3_resource.meta.client
+    s3_client = _s3_client()
 
     path = url.replace(f"s3://{bucket_name}/", "")
-    response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=path)
 
     re_include = re.compile(re_include) if re_include != "" else None
     re_exclude = re.compile(re_exclude) if re_exclude != "" else None
 
-    content = response.get("Contents", [])
     local_vers = []
-    for obj in content:
-        key = obj["Key"]
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=path):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            dest = s3_key_destination(key, path, outdir, test_str, re_include, re_exclude)
+            if dest is None:
+                logger.debug(f"Ignoring {key}")
+                continue
 
-        if re_include is not None and not re_include.search(key):
-            logger.info(f"Skipping {key} because not included in {re_include.pattern}")
-            continue
-        if re_exclude is not None and re_exclude.search(key):
-            logger.info(f"Skipping {key} because excluded in {re_exclude.pattern}")
-            continue
+            needed, reason = file_needs_download(dest, obj.get("Size"))
+            if not needed:
+                logger.info(f"{dest} {reason}")
+                local_vers.append(dest)
+                continue
+            if os.path.exists(dest):
+                logger.warning(f"Re-downloading {dest}: {reason}")
+                _remove_partial_download(dest)
 
-        path2 = "/".join(path.strip("/").split("/")[:-1])
-        dest = os.path.join(outdir, key[len(path2) + 1 :])
-        if test_str is not None and test_str not in dest:
-            logger.debug(f"Ignoring {key}")
-            continue
-        if os.path.exists(dest):
-            logger.info(f"{dest} already exists, skipping download.")
-            local_vers.append(dest)
-            continue
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+            logger.info(f"Downloading s3://{bucket_name}/{key} to {dest}")
+            if test:
+                logger.info(f"Faked download of s3://{bucket_name}/{key} to {dest}")
+                local_vers.append(dest)
+                continue
 
-        if not test:
             s3_client.download_file(bucket_name, key, dest)
-        else:
-            logger.info(f"Faked download of s3://{bucket_name}/{key} to {dest}")
-        local_vers.append(dest)
+            needed, reason = file_needs_download(dest, obj.get("Size"))
+            if needed:
+                _remove_partial_download(dest)
+                raise RuntimeError(f"Incomplete download of {key}: {reason}")
+            local_vers.append(dest)
     return local_vers
 
 

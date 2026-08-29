@@ -6,6 +6,7 @@ touches the network.
 """
 
 import os
+import re
 
 import pytest
 
@@ -14,6 +15,8 @@ from heasarc_retrieve_pipeline.core import (
     download_node,
     file_needs_download,
     parse_directory_index,
+    recursive_download_s3,
+    s3_key_destination,
 )
 
 BASE_URL = "https://heasarc.gsfc.nasa.gov/FTP/nustar/data/obs/00/8/80002092008/"
@@ -291,3 +294,158 @@ class TestDownloadNode:
 
         assert result == str(tmp_path / "80002092008" / "nu80002092008.cat.gz")
         assert not os.path.exists(result)
+
+
+PREFIX = "nustar/data/obs/09/9/90901333002/"
+
+
+class TestS3KeyDestination:
+    """Where a bucket key lands locally, and whether it is wanted at all."""
+
+    def test_the_obsid_becomes_the_top_local_directory(self, tmp_path):
+        dest = s3_key_destination(PREFIX + "auxil/nu1_att.fits.gz", PREFIX, str(tmp_path))
+
+        assert dest == str(tmp_path / "90901333002" / "auxil" / "nu1_att.fits.gz")
+
+    def test_a_key_not_matching_re_include_is_dropped(self, tmp_path):
+        dest = s3_key_destination(
+            PREFIX + "auxil/nu1_att.fits.gz", PREFIX, str(tmp_path),
+            re_include=re.compile(r"evt"),
+        )
+
+        assert dest is None
+
+    def test_a_key_matching_re_exclude_is_dropped(self, tmp_path):
+        dest = s3_key_destination(
+            PREFIX + "event_cl/nu1A02_cl.evt.gz", PREFIX, str(tmp_path),
+            re_exclude=re.compile(r"[AB]0[2-5]"),
+        )
+
+        assert dest is None
+
+    def test_exclude_beats_include(self, tmp_path):
+        dest = s3_key_destination(
+            PREFIX + "event_cl/nu1A02_cl.evt.gz", PREFIX, str(tmp_path),
+            re_include=re.compile(r"evt"), re_exclude=re.compile(r"[AB]0[2-5]"),
+        )
+
+        assert dest is None
+
+    def test_the_test_str_filter_still_applies(self, tmp_path):
+        dest = s3_key_destination(
+            PREFIX + "event_cl/nu1A01_cl.evt.gz", PREFIX, str(tmp_path), test_str="_uf"
+        )
+
+        assert dest is None
+
+    def test_no_filters_keeps_everything(self, tmp_path):
+        dest = s3_key_destination(PREFIX + "hk/nu1A_fpm.hk.gz", PREFIX, str(tmp_path))
+
+        assert dest is not None
+
+
+class StubS3Client:
+    """Enough of a boto3 S3 client to exercise the listing and the transfers.
+
+    boto3 is a hard dependency and imports fine offline; what is missing offline is the
+    *bucket*, which is what this stands in for.
+    """
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.downloaded = []
+
+    def get_paginator(self, operation):
+        assert operation == "list_objects_v2"
+        client = self
+
+        class Paginator:
+            def paginate(self, **kwargs):
+                return iter(client.pages)
+
+        return Paginator()
+
+    def download_file(self, bucket, key, dest):
+        self.downloaded.append(key)
+        with open(dest, "wb") as fobj:
+            fobj.write(b"x" * self._size_of(key))
+
+    def _size_of(self, key):
+        for page in self.pages:
+            for obj in page.get("Contents", []):
+                if obj["Key"] == key:
+                    return obj["Size"]
+        raise KeyError(key)
+
+
+def page(*entries):
+    return {"Contents": [{"Key": key, "Size": size} for key, size in entries]}
+
+
+class TestRecursiveDownloadS3:
+    def test_keys_beyond_the_first_page_are_downloaded(self, tmp_path, monkeypatch):
+        """list_objects_v2 returns at most 1000 keys; the rest are on later pages."""
+        client = StubS3Client([
+            page((PREFIX + "auxil/first.fits.gz", 10)),
+            page((PREFIX + "hk/second.hk.gz", 20)),
+        ])
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+
+        results = recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
+
+        assert len(client.downloaded) == 2
+        assert len(results) == 2
+
+    def test_an_empty_page_ends_the_listing_cleanly(self, tmp_path, monkeypatch):
+        client = StubS3Client([page((PREFIX + "auxil/only.fits.gz", 10)), {}])
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+
+        results = recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
+
+        assert len(results) == 1
+
+    def test_a_local_file_of_the_right_size_is_not_fetched(self, tmp_path, monkeypatch):
+        client = StubS3Client([page((PREFIX + "auxil/there.fits.gz", 10))])
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+        local = tmp_path / "90901333002" / "auxil" / "there.fits.gz"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(b"y" * 10)
+
+        recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
+
+        assert client.downloaded == []
+        assert local.read_bytes() == b"y" * 10
+
+    def test_a_local_file_of_the_wrong_size_is_fetched_again(self, tmp_path, monkeypatch):
+        """The listing carries Size for every key, so this check costs nothing here."""
+        client = StubS3Client([page((PREFIX + "auxil/short.fits.gz", 10))])
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+        local = tmp_path / "90901333002" / "auxil" / "short.fits.gz"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(b"y" * 4)
+
+        recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
+
+        assert client.downloaded == [PREFIX + "auxil/short.fits.gz"]
+        assert local.read_bytes() == b"x" * 10
+
+    def test_an_incomplete_transfer_raises(self, tmp_path, monkeypatch):
+        client = StubS3Client([page((PREFIX + "auxil/lies.fits.gz", 100))])
+        client.download_file = lambda bucket, key, dest: open(dest, "wb").write(b"z" * 40)
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+
+        with pytest.raises(RuntimeError, match="40"):
+            recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
+
+        assert not (tmp_path / "90901333002" / "auxil" / "lies.fits.gz").exists()
+
+    def test_test_mode_transfers_nothing(self, tmp_path, monkeypatch):
+        client = StubS3Client([page((PREFIX + "auxil/x.fits.gz", 10))])
+        monkeypatch.setattr(core, "_s3_client", lambda: client)
+
+        results = recursive_download_s3.fn(
+            f"s3://nasa-heasarc/{PREFIX}", str(tmp_path), test=True
+        )
+
+        assert client.downloaded == []
+        assert len(results) == 1
