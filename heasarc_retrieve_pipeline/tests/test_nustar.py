@@ -15,8 +15,10 @@ import pytest  # noqa: E402
 from astropy.coordinates import SkyCoord  # noqa: E402
 import astropy.units as u  # noqa: E402
 
+from heasarc_retrieve_pipeline import nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     get_best_source_regions,
+    join_source_data,
     mode_01_input_files,
     position_is_consistent,
     spectral_input_files,
@@ -305,3 +307,104 @@ def test_no_function_local_import_shadows_a_module_level_one():
     for path in sorted(package.glob("*.py")):
         offenders.extend(_shadowing_imports(path))
     assert offenders == []
+
+
+class TestJoinSourceData:
+    """The list of files the join step hands to the rest of the pipeline.
+
+    ``process_nustar_obsid`` flare-filters and barycentres whatever comes back from
+    :func:`join_source_data`, so returning a different set on a rerun than on a fresh run
+    changes what the pipeline does the second time it is run. See issue 6 in
+    ``docs/known_issues.rst``.
+    """
+
+    @staticmethod
+    def _tree(base, label="_src1", extra=()):
+        """An output directory as it looks after a successful join."""
+        outdir = os.path.join(base, OBSID)
+        os.makedirs(outdir, exist_ok=True)
+        names = [
+            f"nu{OBSID}{label}.evt",  # the combined FPMA+FPMB file: the only real product
+            f"nu{OBSID}A{label}.evt",  # per-module intermediates
+            f"nu{OBSID}B{label}.evt",
+            f"nu{OBSID}A01{label}.evt",  # per-mode intermediates, copied in by the join
+            f"nu{OBSID}B01{label}.evt",
+        ]
+        for name in list(names) + list(extra):
+            open(os.path.join(outdir, name), "w").close()
+        return outdir, dict(out_data_path=str(base), input_data_path=str(base))
+
+    def test_a_rerun_returns_only_the_combined_file(self, tmp_path):
+        outdir, config = self._tree(tmp_path)
+        open(os.path.join(outdir, "JOIN_DONE_SRC1.TXT"), "w").close()
+
+        files = join_source_data.fn(OBSID, [], config)
+
+        assert files == [os.path.join(outdir, f"nu{OBSID}_src1.evt")]
+
+    def test_a_rerun_of_the_background_returns_only_its_combined_file(self, tmp_path):
+        outdir, config = self._tree(tmp_path, label="_back")
+        open(os.path.join(outdir, "JOIN_DONE_SRC0.TXT"), "w").close()
+
+        files = join_source_data.fn(OBSID, [], config, src_num=0)
+
+        assert files == [os.path.join(outdir, f"nu{OBSID}_back.evt")]
+
+    def test_a_rerun_without_the_combined_file_returns_nothing(self, tmp_path):
+        """A sentinel with no product behind it is not a reason to hand back a path."""
+        outdir = os.path.join(tmp_path, OBSID)
+        os.makedirs(outdir)
+        open(os.path.join(outdir, "JOIN_DONE_SRC1.TXT"), "w").close()
+
+        assert join_source_data.fn(OBSID, [], dict(out_data_path=str(tmp_path))) == []
+
+    def test_a_rerun_returns_what_the_fresh_run_returned(self, tmp_path, monkeypatch):
+        """The two code paths must agree; today the cached one returns five files."""
+        merged = []
+
+        def fake_merge(files, outfile, gti_operation="OR"):
+            merged.append((list(files), outfile, gti_operation))
+            open(outfile, "w").close()
+
+        monkeypatch.setattr(nustar, "merge_event_files", fake_merge)
+
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        os.makedirs(pipedir)
+        for fpm in "A", "B":
+            for mode in "01", "06":
+                open(os.path.join(pipedir, f"nu{OBSID}{fpm}{mode}_src1.evt"), "w").close()
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+
+        fresh = join_source_data.fn(OBSID, [pipedir], config)
+        rerun = join_source_data.fn(OBSID, [pipedir], config)
+
+        assert fresh == rerun
+
+    def test_the_fpmb_file_is_not_derived_by_replacing_every_a_in_the_path(
+        self, tmp_path, monkeypatch
+    ):
+        """``a_file.replace("A", "B")`` rewrites directory names as well as the module."""
+        merged = []
+
+        def fake_merge(files, outfile, gti_operation="OR"):
+            merged.append((list(files), outfile, gti_operation))
+            open(outfile, "w").close()
+
+        monkeypatch.setattr(nustar, "merge_event_files", fake_merge)
+
+        base = os.path.join(tmp_path, "ARCHIVE")  # a capital A in the output path
+        pipedir = os.path.join(base, OBSID, "event_pipe")
+        os.makedirs(pipedir)
+        for fpm in "A", "B":
+            open(os.path.join(pipedir, f"nu{OBSID}{fpm}01_src1.evt"), "w").close()
+        config = dict(out_data_path=base, input_data_path=base)
+
+        join_source_data.fn(OBSID, [pipedir], config)
+
+        combined = [call for call in merged if call[2] == "AND"]
+        assert len(combined) == 1
+        inputs = combined[0][0]
+        assert inputs == [
+            os.path.join(base, OBSID, f"nu{OBSID}A_src1.evt"),
+            os.path.join(base, OBSID, f"nu{OBSID}B_src1.evt"),
+        ]

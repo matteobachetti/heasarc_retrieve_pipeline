@@ -867,15 +867,18 @@ def join_source_data(obsid, directories, config, src_num=1):
     Returns
     -------
     list of str
-        The combined FPMA+FPMB event files.
+        The combined FPMA+FPMB event file, or an empty list if it is missing.
 
     Notes
     -----
-    The early return takes a different code path and returns a wider set of files than the
-    normal one; and FPMB file names are derived by replacing every ``A`` in the FPMA path.
-    See issue 6 in ``docs/known_issues.rst``.
+    Both code paths return the same thing. They used to differ: the early return globbed
+    ``nu<obsid>*<label>.evt``, which on a real observation also matches the per-module and
+    per-mode intermediates that stage 1 leaves in the directory -- five files rather than
+    one on 80002092008. Since ``process_nustar_obsid`` flare-filters and barycentres
+    whatever this returns, a rerun did five times the work of a fresh run, on files that
+    are not meant to be science products. See issue 6 in ``docs/known_issues.rst``.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
 
     if src_num > 0:
@@ -883,13 +886,12 @@ def join_source_data(obsid, directories, config, src_num=1):
     else:
         label = "_back"
 
-    join_done_file = os.path.join(
-        nu_base_output_path.fn(obsid, config=config), f"JOIN_DONE_SRC{src_num}.TXT"
-    )
+    combined_file = os.path.join(outdir, f"nu{obsid}{label}.evt")
+
+    join_done_file = os.path.join(outdir, f"JOIN_DONE_SRC{src_num}.TXT")
     if os.path.exists(join_done_file):
-        logger = get_run_logger()
         logger.info(f"Source data for {obsid} already joined")
-        return glob.glob(os.path.join(outdir, f"nu{obsid}*{label}.evt"))
+        return [combined_file] if os.path.exists(combined_file) else []
 
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
@@ -914,15 +916,14 @@ def join_source_data(obsid, directories, config, src_num=1):
             files_to_join.extend(new_files)
         merge_event_files(files_to_join, outfile)
 
-    outfiles = []
-    for a_file in glob.glob(os.path.join(outdir, f"nu{obsid}A{label}.evt")):
-        b_file = a_file.replace("A", "B")
-        outfile = os.path.join(outdir, f"nu{obsid}{label}.evt")
-        merge_event_files([a_file, b_file], outfile, gti_operation="AND")
-        outfiles.append(outfile)
+    # Both module file names are known, so build them rather than globbing for FPMA and
+    # deriving FPMB from it with str.replace: an output path containing a capital A --
+    # /Users/.../ARCHIVE/, say -- would have had that A rewritten too.
+    module_files = [os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt") for fpm in "AB"]
+    merge_event_files(module_files, combined_file, gti_operation="AND")
 
     open(join_done_file, "a").close()
-    return outfiles
+    return [combined_file]
 
 
 @task(task_run_name="goes_lightcurve_{event_file}_mincat_{minimum_class}")
