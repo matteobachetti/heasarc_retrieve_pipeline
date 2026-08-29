@@ -51,32 +51,6 @@ DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 valid_re = re.compile(r"ni[0-9]{11}")
 
 
-@task
-def ni_raw_data_path(obsid, time, **kwargs):
-    """
-    Path of an observation in the HEASARC NICER archive.
-
-    NICER observations are filed by the year and month of the observation, which is why
-    this path builder needs the observation time and the others do not.
-
-    Parameters
-    ----------
-    obsid : str
-        Observation identifier.
-    time : astropy.table.Column or float
-        Observation start time, MJD.
-
-    Returns
-    -------
-    str
-        ``/FTP/nicer/data/obs/<YYYY>_<MM>/<OBSID>``.
-    """
-    mjd = Time(time.data, format="mjd")
-    mjd_dt = mjd.to_datetime()
-
-    return os.path.normpath(f"/FTP/nicer/data/obs/{mjd_dt.year}_{mjd_dt.month:02d}//{obsid}/")
-
-
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),

@@ -96,31 +96,6 @@ def nu_local_raw_data_path(obsid, config, **kwargs):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="nu_remote_raw_path_{obsid}",
-)
-def nu_heasarc_raw_data_path(obsid, **kwargs):
-    """
-    Path of an observation in the HEASARC archive.
-
-    NuSTAR observations are filed by the third and fourth digits of the OBSID, then by its
-    first digit; for example ``90101005001`` lives under ``.../obs/01/9/90101005001/``.
-
-    Parameters
-    ----------
-    obsid : str
-        Observation identifier.
-
-    Returns
-    -------
-    str
-        ``/FTP/nustar/data/obs/<obsid[1:3]>/<obsid[0]>/<OBSID>``.
-    """
-    return os.path.normpath(f"/FTP/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/")
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="nu_base_output_{obsid}",
 )
 def nu_base_output_path(obsid, config):

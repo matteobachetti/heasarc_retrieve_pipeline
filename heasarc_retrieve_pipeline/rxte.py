@@ -43,35 +43,6 @@ DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="rxte_remote_raw_path_{obsid}",
-)
-def rxte_heasarc_raw_data_path(obsid, cycle=None, prnb=None):
-    """
-    Path of an observation in the HEASARC RXTE archive.
-
-    RXTE data are filed by proposal cycle and proposal number rather than by OBSID digits,
-    which is why this path builder needs ``cycle`` and ``prnb``.
-
-    Parameters
-    ----------
-    obsid : str
-        Observation identifier.
-    cycle : int, optional
-        Proposal cycle (announcement of opportunity number).
-    prnb : int, optional
-        Proposal number.
-
-    Returns
-    -------
-    str
-        ``/FTP/rxte/data/archive/AO<cycle>/P<prnb>/<OBSID>``.
-    """
-    return os.path.normpath(f"/FTP/rxte/data/archive/AO{cycle}/P{prnb}/{obsid}/")
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="rxte_base_output_{obsid}",
 )
 def rxte_base_output_path(config, obsid):

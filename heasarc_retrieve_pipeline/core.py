@@ -32,10 +32,8 @@ import pyvo
 from astropy.coordinates import SkyCoord
 
 
-from .nustar import nu_heasarc_raw_data_path as nu_raw_data_path
 from .nustar import process_nustar_obsid
-from .nicer import ni_raw_data_path, process_nicer_obsid
-from .rxte import rxte_heasarc_raw_data_path as rxte_raw_data_path
+from .nicer import process_nicer_obsid
 from .rxte import process_rxte_obsid
 
 from prefect import flow, task, get_run_logger
@@ -75,47 +73,6 @@ def _download_pysmartdl(url: str, dest: str):
     # rather than "empty" -- it disables the library's own size check too.
     expected_size = obj.get_final_filesize() or None
     return obj.get_dest(), expected_size
-
-
-def remote_data_url(mission, obsid, time, cycle=None, prnb=None):
-    """
-    Build the public HTTPS URL of an observation's directory in the HEASARC archive.
-
-    This is the legacy way of locating data, from before ``astroquery`` gained the
-    ``locate_data`` datalink interface. It is only used by
-    :func:`retrieve_heasarc_data_by_source_name_old`.
-
-    Parameters
-    ----------
-    mission : str
-        One of the keys of ``MISSION_CONFIG``.
-    obsid : str
-        Observation identifier.
-    time : float
-        Observation start time (MJD). Needed by NICER, whose archive is laid out by
-        year and month.
-    cycle : int, optional
-        Proposal cycle. Needed by RXTE (``AO<cycle>``).
-    prnb : int, optional
-        Proposal number. Needed by RXTE (``P<prnb>``).
-
-    Returns
-    -------
-    str
-        URL of the observation directory, with a trailing slash.
-
-    Notes
-    -----
-    This function does not currently work: it calls the per-mission ``path_func``
-    with four positional arguments, and none of the path builders accepts that
-    signature. See issue 2 in ``docs/known_issues.rst``.
-    """
-    url = (
-        "https://heasarc.gsfc.nasa.gov/"
-        + MISSION_CONFIG[mission]["path_func"](obsid, time, cycle, prnb)
-        + "/"
-    )
-    return url
 
 
 def remote_file_size(url: str):
@@ -785,7 +742,6 @@ def recursive_download(
 MISSION_CONFIG = {
     "nustar": {
         "table": "numaster",
-        "path_func": nu_raw_data_path,
         "expo_column": "exposure_a",
         "additional": "solar_activity",
         "obsid_processing": process_nustar_obsid,
@@ -793,7 +749,6 @@ MISSION_CONFIG = {
     },
     "nicer": {
         "table": "nicermastr",
-        "path_func": ni_raw_data_path,
         "expo_column": "exposure",
         "additional": "",
         "obsid_processing": process_nicer_obsid,
@@ -801,7 +756,6 @@ MISSION_CONFIG = {
     },
     "rxte": {
         "table": "xtemaster",
-        "path_func": rxte_raw_data_path,
         "expo_column": "exposure",
         "additional": "cycle, prnb",
         "obsid_processing": process_rxte_obsid,
@@ -997,86 +951,6 @@ def retrieve_heasarc_table_by_source_name(
     results = retrieve_heasarc_table_by_position.fn(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
-    return results
-
-
-@task
-def retrieve_heasarc_data_by_source_name_old(
-    source: str,
-    outdir: str = "out",
-    mission: str = "nustar",
-    radius_deg: float = 0.1,
-    test: bool = False,
-):
-
-    """
-    Legacy retrieve-and-process path, using hand-built archive URLs.
-
-    Predates ``astroquery``'s ``locate_data`` datalink interface: instead of asking
-    HEASARC where the files are, it builds the archive path itself from the OBSID
-    with :func:`remote_data_url`. Kept as a fallback for
-    :func:`retrieve_heasarc_data_by_source_name`.
-
-    Parameters
-    ----------
-    source : str
-        Source name, as understood by ``SkyCoord.from_name``.
-    outdir : str, optional
-        Directory to download into and process in.
-    mission : str, optional
-        One of the keys of ``MISSION_CONFIG``.
-    radius_deg : float, optional
-        Cone-search radius in degrees.
-    test : bool, optional
-        If True, fake the downloads and stop after the first observation.
-
-    Returns
-    -------
-    astropy.table.Table
-        The catalogue rows that were processed.
-
-    Notes
-    -----
-    This function cannot run as written: the archive path builders reject the
-    argument list it passes them, it reads ``cycle`` and ``prnb`` columns that are
-    only selected for RXTE, and it hardcodes the NuSTAR processing flow regardless
-    of ``mission``. See issue 2 in ``docs/known_issues.rst``.
-    """
-    logger = get_run_logger()
-    pos = get_source_position(source)
-
-    results = retrieve_heasarc_table_by_position.fn(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
-    )
-
-    for row in results:
-        logger.info(f"{row['obsid']}, {row['time']}")
-    cwd = os.getcwd()
-    for obsid, time, cycle, prnb in zip(
-        results["obsid"], results["time"], results["cycle"], results["prnb"]
-    ):
-        os.chdir(cwd)
-        url = remote_data_url(mission, obsid, time, cycle, prnb)
-        recursive_download(
-            url,
-            outdir,
-            cut_ndirs=0,
-            test_str=".",
-            test=test,
-            wait_for=[remote_data_url],
-        )
-        if test:
-            break
-        os.chdir(outdir)
-        process_nustar_obsid(
-            obsid,
-            config=None,
-            ra=pos.ra.deg,
-            dec=pos.dec.deg,
-            wait_for=[recursive_download],
-            return_state=True,
-        )
-
     return results
 
 
@@ -1278,9 +1152,8 @@ def retrieve_heasarc_data_by_source_name(
     Download and reduce every observation of a named source.
 
     Top-level entry point. Resolves the name, cone-searches the mission's master
-    catalogue, and hands the results to :func:`retrieve_and_process_data`. Falls
-    back to :func:`retrieve_heasarc_data_by_source_name_old` if locating the data
-    through ``astroquery`` raises.
+    catalogue, and hands the results to :func:`retrieve_and_process_data`, which
+    locates the downloadable products for each row.
 
     Parameters
     ----------
@@ -1310,23 +1183,11 @@ def retrieve_heasarc_data_by_source_name(
     argument, so Level-2 pipeline parameters cannot be customised when working by
     source name.
     """
-    logger = get_run_logger()
     pos = get_source_position(source)
 
     results = retrieve_heasarc_table_by_position.fn(
         pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
     )
-    try:
-        links = Heasarc.locate_data(results, catalog_name=MISSION_CONFIG[mission]["table"])
-    except Exception as e:
-        logger.error(f"Error using astroquery to locate data: {str(e)}")
-        return retrieve_heasarc_data_by_source_name_old.fn(
-            source=source,
-            outdir=outdir,
-            mission=mission,
-            radius_deg=radius_deg,
-            test=test,
-        )
     results = retrieve_and_process_data(
         result_table=results,
         source_position=pos,

@@ -142,13 +142,16 @@ in the download half of the code:
      - ``target_name``
      - ``cycle``, ``prnb``
 
-Each entry also carries ``path_func`` (build the archive path from the OBSID) and
-``obsid_processing`` (the flow that reduces one observation).
+Each entry also carries ``obsid_processing``, the flow that reduces one observation.
 
 The differences are real archive quirks, not arbitrary: NuSTAR's master catalogue reports
-per-telescope exposures (``exposure_a`` is FPMA), RXTE's catalogue uses ``target_name``
-rather than ``name``, and RXTE's archive is laid out by proposal cycle and proposal number
-(``AO<cycle>/P<prnb>/<obsid>``) rather than by OBSID digits.
+per-telescope exposures (``exposure_a`` is FPMA), and RXTE's catalogue uses ``target_name``
+rather than ``name`` and needs ``cycle`` and ``prnb`` selected alongside it.
+
+Entries used to carry a ``path_func`` as well, building an archive path from the OBSID.
+Nothing needs it: the URL of an observation's directory comes from the datalink service,
+which is authoritative, while a hand-built path encodes a layout convention that can drift.
+The builders and their only caller were deleted with the legacy fallback path they served.
 
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
