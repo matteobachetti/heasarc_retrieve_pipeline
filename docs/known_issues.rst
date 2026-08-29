@@ -157,29 +157,48 @@ Pinned by ``test_existing_regions_are_read_back_on_a_rerun``, which runs offline
 Correctness
 -----------
 
-5. ``filter_from_solar_flares`` does not filter events or exposure
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+5. ``filter_from_solar_flares`` does not filter events or exposure -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``nustar.py:476`` replaces ``hdul[2].data`` with the flare-free GTI and writes
-``*_noflares.evt``, but copies the event table unchanged and does not update ``EXPOSURE``,
-``ONTIME`` or ``LIVETIME``. The name promises a filtered event file; the content is an
+``nustar.py`` replaced ``hdul[2].data`` with the flare-free GTI and wrote
+``*_noflares.evt``, but copied the event table unchanged and did not update ``EXPOSURE``,
+``ONTIME`` or ``LIVETIME``. The name promised a filtered event file; the content was an
 unfiltered event file with a narrower GTI. Any tool that computes a rate from the header,
-or that ignores GTIs, gets the wrong answer.
+or that ignores GTIs, got the wrong answer. Measured on 80002092008::
 
-It also assumes the GTI lives in extension 2. Look it up by ``EXTNAME`` instead.
+    nu80002092008_src1.evt           events=51870  EXPOSURE=33646.06  GTI sum=58888.6s
+    nu80002092008_src1_noflares.evt  events=51870  EXPOSURE=33646.06  GTI sum=56850.9s
 
-6. ``join_source_data``: brittle FPM substitution and an inconsistent return value
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+It also assumed the GTI lives in extension 2.
 
-``nustar.py:363``: ``b_file = a_file.replace("A", "B")`` replaces *every* ``A`` in the
-path. Any output directory containing a capital A -- a source name, a user directory --
-produces a nonexistent filename. Use the FPM loop variable to build both names.
+**Fixed.** The write goes through ``utils.apply_gti``, which drops the events outside the
+new intervals, sets ``ONTIME`` to their exact total, and scales ``LIVETIME`` and
+``EXPOSURE`` by the ``ONTIME`` ratio. It finds both the events and the GTI extension by
+``EXTNAME``, and honours ``TIMEZERO``. See "Solar flare filtering" in
+``technical_details.rst`` for the measurement that justifies scaling ``LIVETIME`` rather
+than integrating the housekeeping live fraction.
 
-``nustar.py:404`` vs ``nustar.py:437``: on the cached path the function returns
-``glob.glob(f"nu{obsid}*{label}.evt")``, which matches the per-FPM files *and* the combined
-file; on the fresh path it returns only the combined files. ``process_nustar_obsid`` feeds
-that list to ``filter_from_solar_flares``, so a re-run silently processes three times as
-many files as a first run.
+Related, and fixed at the same time: ``process_nustar_obsid`` filtered only the ``src_num=1``
+join and left the background alone, so a background-subtracted rate mixed a filtered source
+with an unfiltered background. Both joins now go through the same filter.
+
+6. ``join_source_data``: brittle FPM substitution and an inconsistent return value -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``b_file = a_file.replace("A", "B")`` replaced *every* ``A`` in the path. Any output
+directory containing a capital A -- a source name, a user directory -- produced a
+nonexistent filename.
+
+On the cached path the function returned ``glob.glob(f"nu{obsid}*{label}.evt")``, which
+matches the per-FPM and per-mode intermediates *as well as* the combined file; on the fresh
+path it returned only the combined file. On the real 80002092008 tree that is **five** files
+against one. ``process_nustar_obsid`` feeds that list to ``filter_from_solar_flares`` and
+then to ``barycenter_data``, so a rerun did five times the work of a first run, on files
+that are not science products.
+
+**Fixed.** Both module file names are now built from the FPM loop variable rather than by
+string substitution, and both code paths return ``[combined_file]`` -- the cached one after
+checking the file is actually there.
 
 7. RXTE cleaned event files carry no GTI and a stale exposure
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -233,19 +252,26 @@ process an incomplete observation. Return ``None`` on failure, or raise and let 
 
 There is also no checksum verification against the archive.
 
-12. ``get_goes_gtis`` can emit negative-length GTIs
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+12. ``get_goes_gtis`` can emit negative-length GTIs -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``nustar.py:373``. A flare that starts before ``TSTART`` but ends during the observation
-passes the ``flare_start >= tstop or flare_end <= tstart`` guard, and then appends
-``{"START": tstart, "STOP": flare_start}`` with ``flare_start < tstart``. The HEK rows are
-also assumed to be sorted in time and non-overlapping; neither is guaranteed. Clip flare
-intervals to ``[tstart, tstop]``, sort them, merge overlaps, and drop empty intervals.
+A flare that starts before ``TSTART`` but ends during the observation passed the
+``flare_start >= tstop or flare_end <= tstart`` guard, and then appended
+``{"START": tstart, "STOP": flare_start}`` with ``flare_start < tstart``. The HEK rows were
+also assumed to be sorted in time and non-overlapping; neither is guaranteed.
 
-Separately: the GOES X-ray light curve is downloaded (``Fido.search`` /
-``Fido.fetch``, and a ``goes_lc_file_name`` task exists) but never used -- the filtering
-runs entirely off the HEK flare catalogue. Either use the light curve with a flux
-threshold, which is a more direct proxy for NuSTAR's background, or drop the download.
+**Fixed.** The flares that pass the class cut are collected and handed to
+``utils.good_intervals``, which clips them to ``[TSTART, TSTOP]``, sorts them, merges
+overlaps and drops empty intervals, and returns the complement. Its offline tests cover
+each of those cases -- 80002092008's single flare falls well inside the observation, so it
+would not have exercised any of them. An observation entirely covered by flares now raises
+with a clear message instead of writing an unusable GTI file.
+
+The GOES X-ray light curve is still not used *for the filtering*, which remains
+catalogue-driven. It is no longer thrown away, though: ``get_goes_gtis`` writes it to
+``<root>_goes.fits`` on the event file's own time scale, and ``plot_flare_filtering`` plots
+it above the NuSTAR light curves so the cut can be checked by eye. See "Solar flare
+filtering" in ``technical_details.rst``.
 
 13. NuSTAR barycentring uses FPMA's orbit file for everything
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -266,6 +292,47 @@ handles this correctly via ``splitext_improved``, and it is never called.
 and ``nustar.py:488`` immediately redefines it. The shared implementation -- which has the
 ``HAS_HEASOFT`` guard and verifies that the output file was actually created -- is
 unreachable from the NuSTAR path. NICER uses the good one. Delete the NuSTAR copy.
+
+35. Merged event files carry a stale ``ONTIME``, ``LIVETIME`` and ``EXPOSURE``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Found while verifying the fix to issue 5 on real data, and it is why ``apply_gti`` scales on
+the GTI rather than on the header.
+
+``ftmerge`` copies the exposure keywords from its first input instead of recomputing them,
+and ``join_source_data`` does not correct them afterwards. On 80002092008::
+
+    nu80002092008_src1.evt   ONTIME=36058.05  LIVETIME=33646.06  GTI total=58888.6
+
+``ONTIME`` is by definition the total of the GTI, so those two numbers cannot both be right:
+the GTI is the union of 303 intervals from all the merged mode-01 and per-CHU mode-06 files,
+while the keyword belongs to whichever single file ``ftmerge`` saw first. ``LIVETIME`` and
+``EXPOSURE`` are stale in the same way, and they are the numbers anything computing a rate
+from the header will use.
+
+``apply_gti`` sets ``ONTIME`` to the exact GTI total, so the ``*_noflares.evt`` products are
+self-consistent afterwards; their ``LIVETIME`` is still the stale value times the correct
+ratio, so it remains wrong in absolute terms. Fixing it properly means recomputing the
+keywords in ``join_source_data``: the OR merge of one module's files can sum their live
+times, but the AND merge of FPMA and FPMB needs a decision about what "live time" even means
+for two telescopes in one event list.
+
+**Scope: this does not touch the spectra.** Header exposure keywords barely matter for
+timing, which works from event times and GTIs, but they are central to spectroscopy, where
+the count rate per channel is counts divided by exposure. The spectral path never sees these
+files. ``spectral_input_files`` yields the per-mode cleaned files from ``nupipeline`` and
+``nusplitsc`` -- ten of them for 80002092008, none of them merged -- and those are
+self-consistent, ``ONTIME`` matching their own GTI total to within a millisecond. Checked on
+the real tree::
+
+    nu80002092008A01_cl.evt           ONTIME=36058.05  GTI total=36058.05
+    nu80002092008A06_chu3_N_cl.evt    ONTIME=11487.52  GTI total=11487.52
+
+``nuproducts`` then computes the exposure of each spectrum itself, and it honours the
+flare-free GTI passed as ``usrgtifile``: ``nu80002092008A01_sr.pha`` carries
+``ONTIME=35038.05`` against its input file's ``36058.05``, exactly the 1020 s flare window
+shorter. So the spectra get the right exposure, and the defect above is confined to the
+merged timing products.
 
 
 Prefect usage
@@ -448,14 +515,22 @@ high-risk injection surface -- it is a read-only public TAP service -- but a quo
 OBSID produces a confusing service error rather than a clear validation message. Validate
 the OBSID against a per-mission pattern before interpolating.
 
-31. Matplotlib figures are never closed, and no backend is forced
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+31. Matplotlib figures are never closed, and no backend is forced -- PARTLY FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``image_utils.py:110`` creates a figure whose ``plt.close(fig)`` is commented out. Looping
-over observations therefore leaks one figure per event file and triggers matplotlib's
-"more than 20 figures have been opened" warning. The module also imports ``pyplot`` at
-import time without selecting a non-interactive backend, so importing the package on a
-machine with a display can try to open a window.
+``image_utils.py`` created a figure whose ``plt.close(fig)`` was commented out. Looping
+over observations therefore leaked one figure per event file and triggered matplotlib's
+"more than 20 figures have been opened" warning.
+
+**Half fixed.** That ``plt.close(fig)`` is uncommented, so nothing leaks any more. The new
+diagnostic ``plot_flare_filtering`` sidesteps the problem entirely by building its figure
+with ``matplotlib.figure.Figure`` instead of ``pyplot``: that is headless by construction
+and never enters pyplot's global figure registry, so there is nothing to close and no
+backend to force. Its test asserts ``len(plt.get_fignums()) == 0`` afterwards.
+
+**Still open**: ``image_utils.py`` imports ``pyplot`` at import time without selecting a
+non-interactive backend, so importing the package on a machine with a display can still try
+to open a window. Converting those three plots to ``Figure`` as well would close this.
 
 32. Dead code and unused imports
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

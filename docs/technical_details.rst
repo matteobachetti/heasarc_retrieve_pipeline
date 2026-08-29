@@ -447,10 +447,9 @@ exclude flare intervals:
 2. ``sunpy``'s ``Fido`` queries the GOES XRS instrument for that interval, choosing the
    highest-numbered (i.e. most recent) GOES satellite that covers it.
 3. The same query retrieves the **HEK flare catalogue** entries flagged by SWPC.
-4. Every catalogued flare at or above ``minimum_class`` (default ``"C5.0"``) is cut out:
-   the good intervals are the gaps between flares, from ``TSTART`` to the first flare
-   start, between each flare end and the next flare start, and from the last flare end to
-   ``TSTOP``.
+4. Every catalogued flare at or above ``minimum_class`` (default ``"C5.0"``) is collected
+   and handed to ``utils.good_intervals``, which returns the complement of those flares
+   inside ``[TSTART, TSTOP]``.
 5. ``nustar_gen.utils.make_usr_gti`` writes the intervals as a GTI file.
 
 Flare classes are compared by splitting the class string into its letter and its number
@@ -458,17 +457,177 @@ Flare classes are compared by splitting the class string into its letter and its
 runs A, B, C, M, X, which happens to be alphabetical, so a plain string comparison gives
 the right ordering.
 
-Note that although the GOES X-ray light curve is downloaded, the filtering uses only the
-HEK *catalogue* of flare start/end times, not the light curve itself. A threshold on the
-measured GOES flux would be a more direct proxy for the background actually seen by NuSTAR.
+Putting the interval arithmetic in ``good_intervals`` rather than inline is what makes the
+awkward cases correct: a flare that began before the observation started, two flares that
+overlap, HEK rows that come back out of order. The function clips to the observation, sorts,
+merges overlaps and drops empty intervals, so that its output always satisfies the three
+properties a GTI list is expected to have -- positive length, sorted, disjoint. It is pure,
+and its tests are offline; 80002092008's single flare falls well inside the observation, so
+no real observation in hand would have exercised any of those cases.
 
-``filter_from_solar_flares`` (``nustar.py:458``) then ANDs the flare GTIs with the event
-file's existing GTIs and writes ``*_noflares.evt``, in which the GTI extension has been
-replaced. The event table itself is copied unchanged, so downstream tools must honour the
-GTIs; and the exposure keywords in the header are *not* recomputed.
+The filtering itself uses only the HEK *catalogue* of flare start/end times, not the GOES
+light curve. A threshold on the measured GOES flux would be a more direct proxy for the
+background actually seen by NuSTAR, and remains a possible improvement. The light curve is
+written all the same, to ``<root>_goes.fits``, with its ``TIME`` column converted to the
+event file's mission elapsed time; that is what the diagnostic below plots against, at no
+extra network cost.
 
-The flare-free GTI is passed to ``nuproducts`` as ``usrgtifile``, so it does affect the
+``filter_from_solar_flares`` then ANDs the flare GTIs with the event file's existing GTIs
+and writes ``*_noflares.evt`` through ``utils.apply_gti``, which does the whole job: events
+outside the surviving intervals are dropped from the event table, the new intervals replace
+the GTI extension, ``ONTIME`` becomes their exact total, and ``LIVETIME`` and ``EXPOSURE``
+are scaled by the ``ONTIME`` ratio.
+
+Doing only half of that -- swapping the GTI extension and leaving the events and the header
+alone, which is what this step used to do -- produces a file whose name promises one thing
+and whose contents say another. On 80002092008 the "filtered" file had exactly the same
+51870 events and exactly the same ``EXPOSURE`` of 33646.06 s as the unfiltered one, over a
+GTI that had shrunk from 58888.6 s to 56850.9 s.
+
+**On scaling LIVETIME.** The exact surviving live time is the integral of the instrument's
+live fraction over the surviving intervals, which needs the housekeeping file. That
+integral was measured on 80002092008 to check whether proportional scaling is good enough:
+integrating the housekeeping live fraction over the full GTI gives 33675.99 s against a
+header ``LIVETIME`` of 33646.06 s, a 0.089% difference, which is the accuracy of the
+integration itself. Over the flare-free GTI, exact integration gives 32725.75 s against
+32694.29 s for proportional scaling -- 0.096%, the same order. Scaling is therefore adequate,
+and it keeps ``apply_gti`` independent of any mission's housekeeping file. Note the sign:
+dead time is worse during a flare, so scaling proportionally very slightly *under*\ estimates
+the surviving live time.
+
+Both the source and the background go through this filter. They did not always: the
+``src_num=0`` join used to run after the filtering step and be left alone, so a
+background-subtracted rate mixed a filtered source with an unfiltered background. That
+over-subtracts, because flare stray light is diffuse and therefore lands mostly in the large
+background region rather than in the compact source aperture. Measured on 80002092008 over
+the one catalogued flare window, 3--10 keV:
+
+.. list-table::
+   :header-rows: 1
+
+   * - region
+     - rate inside the flare
+     - rate outside
+     - ratio
+   * - background
+     - 0.726 c/s
+     - 0.205 c/s
+     - **3.54**
+   * - source 1
+     - 0.386 c/s
+     - 0.361 c/s
+     - 1.07
+
+The flare-free GTI is also passed to ``nuproducts`` as ``usrgtifile``, so it affects the
 spectral products properly.
+
+The filtering diagnostic
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Cleaning an event file is easy to get wrong in ways that leave no trace in the output: too
+little is removed, or too much, and the file looks fine either way. That is exactly how the
+two problems above survived. So every filtered product now comes with a figure,
+``<root>_flares.jpg``, written by ``plot_flare_filtering`` next to the event file --  the
+same convention ``image_utils`` already uses for its image cut-outs. Three panels share one
+time axis:
+
+1. the GOES X-ray flux in the 1--8 A and 0.5--4 A channels, on a log scale, with the
+   A/B/C/M/X class thresholds drawn as horizontal lines and the ``minimum_class`` cut marked
+   on top of them, so the cut is visible where it acts;
+2. the event file's 3--10 keV light curve, the band solar stray light lands in, with the
+   light curve before filtering in grey and the one after in colour;
+3. the same in 10--79 keV. This is the control: solar flares do not produce hard X-rays at
+   NuSTAR's aperture, so this panel should look the same before and after. If filtering
+   visibly changes it, the cut is removing more than solar flares.
+
+The intervals removed are shaded in all three panels -- and only the intervals this step
+actually removed. ``utils.intervals_removed`` subtracts the two GTIs rather than taking the
+complement of the surviving one, so Earth occultations and orbit gaps, which were never good
+time to begin with, are not shaded as though the flare filter had caused them.
+
+The figure is annotated with what the filtering cost and bought: events removed, live time
+before and after, and reduced chi-squared against a constant before and after, for each
+band. Light curves are built with ``utils.binned_lightcurve``, which gives every bin its real
+exposure -- the overlap between the bin and the GTIs -- rather than assuming a full bin
+width. Without that, every GTI edge produces a spurious dip that looks like source
+variability.
+
+``plot_flare_filtering`` builds its figure with ``matplotlib.figure.Figure`` rather than
+``pyplot``. That is headless by construction, so there is no backend to force on a pipeline
+machine, and it cannot leak a figure into pyplot's global registry -- which is the defect
+issue 31 in ``known_issues.rst`` records for ``image_utils``. A failure to draw is logged
+rather than raised: the science product is already on disk by that point, and a diagnostic
+must not take an observation down with it.
+
+What the filtering measurably does
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Measured on 80002092008, which contains one catalogued M1.7 flare, excluded over a 1020 s
+window (MET 129784853.8 -> 129785873.8). Light curves are 3--10 keV, 100 s bins, GTI-aware,
+built with ``binned_lightcurve``; "before" is the joined product with its own GTI, "after"
+is the ``*_noflares.evt`` the pipeline wrote from it.
+
+.. list-table::
+   :header-rows: 1
+
+   * - quantity
+     - background before
+     - background after
+     - source before
+     - source after
+   * - chi2/dof against a constant
+     - 5.17
+     - **3.62**
+     - 1.23
+     - 1.22
+   * - fractional rms
+     - 0.703
+     - **0.429**
+     - 0.050
+     - 0.050
+   * - max / median bin
+     - 13.20
+     - **7.29**
+     - 1.45
+     - 1.45
+   * - mean rate (c/s)
+     - 0.3892
+     - 0.3755
+     - 0.7087
+     - 0.7086
+   * - usable 100 s bins
+     - 588
+     - 578
+     - 588
+     - 578
+
+Read the two halves of that table together. The background becomes markedly steadier -- a
+third off its reduced chi-squared, nearly half off its fractional rms -- while the source is
+untouched to three decimal places. That is the signature of removing background
+contamination rather than discarding good source signal, and it is what makes the source
+column the honest control rather than a disappointment: flare stray light is diffuse, so it
+swamps the large background region and barely reaches the compact source aperture. The
+filtering costs 1.7% of the live time (33646 -> 33063 s) and 1830 of 63936 background events.
+
+**The claim must not overreach.** The background is still variable afterwards: chi2/dof 3.62
+and a brightest bin seven times the median. Other backgrounds, sub-threshold flares and
+Earth-limb effects are untouched by this work.
+
+Two things the diagnostic figure shows that the numbers do not, both visible on
+``nu80002092008_back_flares.jpg``:
+
+* **The excluded window ends too early.** The 3--10 keV background peaks at 4.6 c/s, more
+  than ten times its 0.35 c/s baseline, inside the shaded window -- but it is still at
+  2.5, 2.0 and 1.5 c/s in the three bins *after* it. The HEK catalogue's flare end time is
+  when the *solar* flare ended, not when NuSTAR's background recovered from it.
+* **A second rise at the end of the observation is not excluded at all.** The GOES 1--8 A
+  flux climbs back above the C5.0 cut in the last few hundred seconds, and the NuSTAR
+  background rises with it to about 1 c/s, with nothing shaded.
+
+Both point the same way, and it is the improvement already noted for issue 12: a threshold
+on the measured GOES flux would track NuSTAR's actual background better than the catalogue
+of flare start and end times does. The diagnostic exists to make exactly this kind of thing
+visible, and it did so on its first run against real data.
 
 Barycentring
 ~~~~~~~~~~~~
