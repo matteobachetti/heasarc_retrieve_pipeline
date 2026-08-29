@@ -888,22 +888,72 @@ def retrieve_heasarc_table_by_position(
     return results
 
 
-@task(task_run_name="retrieve_info_for_obsid_{obsid}")
-def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
+#: What an OBSID may look like. They go into the query text, so nothing else is allowed.
+OBSID_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def obsid_query(obsid, mission: str = "nustar"):
     """
-    Look up a single observation in a mission's master catalogue.
+    The catalogue query that looks one or several observations up.
 
     Parameters
     ----------
-    obsid : str
-        Observation identifier, matched exactly.
+    obsid : str or list of str
+        One observation identifier, or several.
+    mission : str, optional
+        One of the keys of ``MISSION_CONFIG``.
+
+    Returns
+    -------
+    str
+        An ADQL query.
+
+    Raises
+    ------
+    ValueError
+        If no OBSID is given, or one of them is not an identifier.
+    """
+    obsids = [obsid] if isinstance(obsid, str) else list(obsid)
+    if not obsids:
+        raise ValueError("No OBSID to look up")
+    for one in obsids:
+        if not OBSID_RE.fullmatch(str(one)):
+            raise ValueError(f"{one!r} is not a valid OBSID")
+
+    expo_name = MISSION_CONFIG[mission]["expo_column"]
+    additional = MISSION_CONFIG[mission]["additional"]
+    table = MISSION_CONFIG[mission]["table"]
+    name_column = MISSION_CONFIG[mission]["name_column"]
+    if additional != "":
+        additional = f", {additional}"
+    wanted = ", ".join(f"'{one}'" for one in obsids)
+
+    return f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
+        FROM public.{table} as cat
+        where
+        cat.obsid IN ({wanted})
+        and
+        cat.{expo_name} >= 0 order by cat.time
+        """
+
+
+@task(task_run_name="retrieve_info_{mission}_obsids")
+def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
+    """
+    Look observations up in a mission's master catalogue, by OBSID.
+
+    Parameters
+    ----------
+    obsid : str or list of str
+        Observation identifier, or several of them, matched exactly. Several are one
+        query, not one each.
     mission : str, optional
         One of the keys of ``MISSION_CONFIG``.
 
     Returns
     -------
     astropy.table.Table
-        Zero or one row, with the mission's name, ``cycle``, ``obsid``, ``time``,
+        One row per OBSID found, with the mission's name, ``cycle``, ``obsid``, ``time``,
         exposure, ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
 
     Notes
@@ -912,21 +962,10 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     mission's name column to ``source_name``, so the two functions return tables
     with slightly different schemas.
     """
-    expo_name = MISSION_CONFIG[mission]["expo_column"]
-    additional = MISSION_CONFIG[mission]["additional"]
-    table = MISSION_CONFIG[mission]["table"]
-    name_column = MISSION_CONFIG[mission]["name_column"]
-    if additional != "":
-        additional = f", {additional}"
-    query = f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
-        FROM public.{table} as cat
-        where
-        cat.obsid='{obsid}'
-        and
-        cat.{expo_name} >= 0 order by cat.time
-        """
+    logger = get_logger()
+    logger.info(f"Looking up {obsid} in the {mission} catalogue")
 
-    results = Heasarc.query_tap(query).to_table()
+    results = Heasarc.query_tap(obsid_query(obsid, mission)).to_table()
     return results
 
 
@@ -1462,7 +1501,7 @@ def retrieve_heasarc_data_by_source_name(
 
 @flow
 def retrieve_heasarc_data_by_obsid(
-    obsid: str,
+    obsid: typing.Union[str, typing.List[str]],
     outdir: str = "out",
     mission: str = "nustar",
     test: bool = False,
@@ -1473,17 +1512,18 @@ def retrieve_heasarc_data_by_obsid(
 ):
 
     """
-    Download and reduce a single observation, by OBSID.
+    Download and reduce observations, by OBSID.
 
-    Top-level entry point. Looks the OBSID up in the mission's master catalogue and
-    hands the single-row result to :func:`retrieve_and_process_data`. Since no
-    source position is given, the observation is barycentred at its own pointing
-    coordinates (for NuSTAR, at the position measured from the image).
+    Top-level entry point. Looks the OBSIDs up in the mission's master catalogue and
+    hands the result to :func:`retrieve_and_process_data`. Since no source position is
+    given, each observation is barycentred at its own pointing coordinates (for NuSTAR,
+    at the position measured from the image).
 
     Parameters
     ----------
-    obsid : str
-        Observation identifier.
+    obsid : str or list of str
+        Observation identifier, or a list of them. With ``n_workers`` above 1, several
+        are reduced at the same time, one worker process each.
     outdir : str, optional
         Directory to download into and process in.
     mission : str, optional
@@ -1502,8 +1542,8 @@ def retrieve_heasarc_data_by_obsid(
     Returns
     -------
     astropy.table.Table or None
-        The catalogue row that was processed, or ``None`` if the OBSID is not in the
-        catalogue.
+        The catalogue rows that were processed, or ``None`` if none of the OBSIDs is in
+        the catalogue.
     """
     logger = get_run_logger()
 
@@ -1511,6 +1551,11 @@ def retrieve_heasarc_data_by_obsid(
     if not results:
         logger.warning(f"No observations found for OBSID {obsid} in HEASARC query.")
         return None
+
+    wanted = [obsid] if isinstance(obsid, str) else list(obsid)
+    missing = set(wanted) - set(str(found) for found in results["obsid"])
+    if missing:
+        logger.warning(f"Not in the {mission} catalogue, skipped: {sorted(missing)}")
 
     results = retrieve_and_process_data(
         result_table=results,

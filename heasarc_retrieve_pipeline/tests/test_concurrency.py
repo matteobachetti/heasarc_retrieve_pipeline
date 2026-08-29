@@ -21,6 +21,7 @@ from astropy.table import Table
 
 from heasarc_retrieve_pipeline.core import (
     download_link_column,
+    obsid_query,
     observation_work_items,
     prepare_worker,
 )
@@ -181,3 +182,32 @@ class TestObservationWorkItems:
 
         assert items[0]["url"] == "s3://bucket/90901333002"
         assert items[1]["url"] == "s3://bucket/80002092008"
+
+
+class TestObsidQuery:
+    """The catalogue query behind "reduce these observations"."""
+
+    def test_one_obsid_is_looked_up_by_itself(self):
+        query = obsid_query("90901333002", "nustar")
+
+        assert "cat.obsid IN ('90901333002')" in query
+
+    def test_many_obsids_are_one_query(self):
+        query = obsid_query(["90901333002", "80002092008"], "nustar")
+
+        assert "cat.obsid IN ('90901333002', '80002092008')" in query
+        assert query.count("SELECT") == 1
+
+    def test_the_mission_decides_the_table_and_the_columns(self):
+        assert "public.numaster" in obsid_query("1", "nustar")
+        assert "public.xtemaster" in obsid_query("1", "rxte")
+        assert "cycle, prnb" in obsid_query("1", "rxte")
+
+    def test_an_obsid_that_is_not_an_identifier_is_refused(self):
+        """An OBSID goes into the query text, so it may only look like an OBSID."""
+        with pytest.raises(ValueError, match="not a valid OBSID"):
+            obsid_query("90901333002'; DROP TABLE cat --", "nustar")
+
+    def test_an_empty_list_is_refused(self):
+        with pytest.raises(ValueError, match="No OBSID"):
+            obsid_query([], "nustar")
