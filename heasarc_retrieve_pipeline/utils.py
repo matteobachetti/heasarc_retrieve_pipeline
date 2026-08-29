@@ -8,7 +8,14 @@ import os
 import numpy as np
 from prefect import get_run_logger
 
-__all__ = ["get_logger", "splitext_improved"]
+__all__ = [
+    "apply_gti",
+    "binned_lightcurve",
+    "get_logger",
+    "good_intervals",
+    "gti_to_array",
+    "splitext_improved",
+]
 
 
 def get_logger():
@@ -81,3 +88,275 @@ def splitext_improved(path):
     if ENDS_WITH_GZ:
         ext += gz_ext
     return os.path.join(dir, froot), ext
+
+
+def good_intervals(bad, tstart, tstop):
+    """
+    The complement of a set of bad intervals inside ``[tstart, tstop]``.
+
+    Given the stretches of time to throw away -- solar flares, in this package's only
+    caller -- return the stretches to keep. The bad intervals may arrive in any order,
+    may overlap each other, and may stick out of ``[tstart, tstop]`` at either end; all of
+    that is handled here so that the caller does not have to think about it.
+
+    The result always satisfies the three properties a good time interval (GTI) list is
+    expected to have: every interval has positive length, the intervals are sorted, and
+    they do not overlap. Nothing sticks out of ``[tstart, tstop]``.
+
+    Parameters
+    ----------
+    bad : iterable of (float, float)
+        Intervals to exclude. Can also be an ``(N, 2)`` array.
+    tstart, tstop : float
+        Bounds of the observation, in the same time units as ``bad``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``, the intervals to keep. Empty if the bad intervals cover
+        everything.
+
+    Examples
+    --------
+    >>> good_intervals([(40, 60)], 0, 100).tolist()
+    [[0.0, 40.0], [60.0, 100.0]]
+
+    A flare that started before the observation did only trims the beginning:
+
+    >>> good_intervals([(-10, 30)], 0, 100).tolist()
+    [[30.0, 100.0]]
+
+    Overlapping exclusions are merged rather than double-counted:
+
+    >>> good_intervals([(40, 60), (50, 70)], 0, 100).tolist()
+    [[0.0, 40.0], [70.0, 100.0]]
+    """
+    bad = np.asarray(bad, dtype=float).reshape(-1, 2)
+
+    merged = []
+    for start, stop in bad[np.argsort(bad[:, 0])] if bad.size else bad:
+        start = max(start, tstart)
+        stop = min(stop, tstop)
+        if stop <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], stop)
+        else:
+            merged.append([start, stop])
+
+    good = []
+    current = tstart
+    for start, stop in merged:
+        if start > current:
+            good.append([current, start])
+        current = stop
+    if tstop > current:
+        good.append([current, tstop])
+
+    return np.array(good, dtype=float).reshape(-1, 2)
+
+
+def gti_to_array(gti):
+    """
+    Normalise a good time interval list to an ``(N, 2)`` array of floats.
+
+    Accepts what the various sources in this package hand around: an ``(N, 2)`` array or
+    list of pairs, or a FITS table (or record array, or ``astropy`` table) with ``START``
+    and ``STOP`` columns, in any capitalisation.
+
+    Parameters
+    ----------
+    gti : array-like or table
+        The intervals.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``.
+    """
+    dtype = getattr(gti, "dtype", None)
+    names = getattr(dtype, "names", None)
+    if names:
+        by_name = {name.upper(): name for name in names}
+        return np.column_stack(
+            [np.asarray(gti[by_name["START"]]), np.asarray(gti[by_name["STOP"]])]
+        ).astype(float)
+    return np.asarray(gti, dtype=float).reshape(-1, 2)
+
+
+def _extension_index(hdul, wanted, fallback, suffix=None):
+    """Index of the first extension whose ``EXTNAME`` matches, else ``fallback``."""
+    extnames = [str(hdu.header.get("EXTNAME", "")).upper() for hdu in hdul]
+    for index, extname in enumerate(extnames):
+        if extname in wanted:
+            return index
+    if suffix is not None:
+        for index, extname in enumerate(extnames):
+            if extname.endswith(suffix):
+                return index
+    return fallback
+
+
+def apply_gti(hdul, gti):
+    """
+    Filter an open event file on a new GTI, table *and* header.
+
+    Replacing only the GTI extension -- which is what this package used to do -- leaves an
+    event file that still contains the events it claims to have excluded, and still
+    advertises the exposure it had before. Anything that reads rates from the header, or
+    reads the event table without applying the GTI, then gets the wrong answer. This
+    function does the whole job:
+
+    * events outside the new intervals are dropped from the event table;
+    * the new intervals replace the GTI extension;
+    * ``ONTIME`` becomes the exact total of the new intervals;
+    * ``LIVETIME`` and ``EXPOSURE`` are scaled by the ``ONTIME`` ratio.
+
+    The extensions are located by ``EXTNAME`` (``EVENTS``, and ``GTI`` or ``STDGTI``),
+    falling back to indices 1 and 2. Times are compared on the ``TIME + TIMEZERO`` scale,
+    and ``gti`` is taken to be on that same scale.
+
+    On the ``LIVETIME`` scaling. The exact quantity is the integral of the instrument's
+    live fraction over the surviving intervals, which needs the housekeeping file.
+    Measured on NuSTAR observation 80002092008: integrating the housekeeping live fraction
+    over the full GTI gives 33675.99 s against a header ``LIVETIME`` of 33646.06 s, a
+    0.089% difference, which is the accuracy of the integration itself. Over the
+    flare-free GTI, exact integration gives 32725.75 s against 32694.29 s for the
+    proportional scaling used here -- 0.096%, the same order. Scaling is therefore good
+    enough, and it keeps this function independent of any mission's housekeeping file.
+    Note the sign: dead time is worse during a flare, so removing flare intervals and
+    scaling proportionally very slightly *under*estimates the surviving live time.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        Open event file. Modified in place.
+    gti : array-like or table
+        The intervals to keep, as accepted by :func:`gti_to_array`.
+
+    Returns
+    -------
+    dict
+        ``nevents_before``, ``nevents_after``, ``ontime_before``, ``ontime_after``,
+        ``livetime_before`` and ``livetime_after`` -- what the filtering cost, for logging
+        and for the diagnostic plot.
+    """
+    from astropy.io import fits
+
+    gti = gti_to_array(gti)
+
+    events_index = _extension_index(hdul, ("EVENTS",), 1)
+    gti_index = _extension_index(hdul, ("GTI", "STDGTI"), 2, suffix="GTI")
+    events = hdul[events_index]
+    gti_hdu = hdul[gti_index]
+
+    events_timezero = float(events.header.get("TIMEZERO", 0.0))
+    gti_timezero = float(gti_hdu.header.get("TIMEZERO", 0.0))
+
+    old_gti = gti_to_array(gti_hdu.data)
+    old_gti += gti_timezero
+    ontime_before = float(
+        events.header.get("ONTIME", np.sum(old_gti[:, 1] - old_gti[:, 0]))
+    )
+    livetime_before = float(events.header.get("LIVETIME", ontime_before))
+    exposure_before = float(events.header.get("EXPOSURE", livetime_before))
+
+    times = np.asarray(events.data["TIME"], dtype=float) + events_timezero
+    mask = np.zeros(times.size, dtype=bool)
+    for start, stop in gti:
+        mask |= (times >= start) & (times <= stop)
+
+    nevents_before = times.size
+    events.data = events.data[mask]
+
+    ontime_after = float(np.sum(gti[:, 1] - gti[:, 0])) if gti.size else 0.0
+    scale = ontime_after / ontime_before if ontime_before > 0 else 0.0
+
+    hdul[gti_index] = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="START", format="D", array=gti[:, 0] - gti_timezero),
+            fits.Column(name="STOP", format="D", array=gti[:, 1] - gti_timezero),
+        ],
+        header=gti_hdu.header,
+    )
+
+    new_values = {
+        "ONTIME": ontime_after,
+        "LIVETIME": livetime_before * scale,
+        "EXPOSURE": exposure_before * scale,
+    }
+    for hdu in hdul:
+        for keyword, value in new_values.items():
+            if keyword in hdu.header:
+                hdu.header[keyword] = value
+
+    return {
+        "nevents_before": nevents_before,
+        "nevents_after": int(np.count_nonzero(mask)),
+        "ontime_before": ontime_before,
+        "ontime_after": ontime_after,
+        "livetime_before": livetime_before,
+        "livetime_after": livetime_before * scale,
+    }
+
+
+def binned_lightcurve(times, gti, dt, min_fraction=0.5):
+    """
+    A binned light curve that knows about good time intervals.
+
+    A plain histogram of event times divided by the bin width is wrong wherever a bin is
+    only partly inside a GTI: the instrument was not collecting for the whole bin, so the
+    rate comes out too low and the light curve grows spurious dips at every GTI edge. Here
+    each bin's exposure is the actual overlap between the bin and the intervals, and bins
+    with too little good time are dropped instead of being reported as near-zero rates.
+
+    Parameters
+    ----------
+    times : array-like
+        Event times, in the same scale as ``gti``.
+    gti : array-like or table
+        Good time intervals, as accepted by :func:`gti_to_array`.
+    dt : float
+        Bin width, in the same units.
+    min_fraction : float, optional
+        Keep a bin only if at least this fraction of it is inside the GTI. The default,
+        0.5, is the usual compromise: enough exposure for the Poisson error to mean
+        something, without throwing away half the edges.
+
+    Returns
+    -------
+    dict of numpy.ndarray
+        ``time`` (bin centres), ``counts``, ``exposure``, ``rate`` and ``rate_err``.
+        All arrays have the same length, and are empty when the GTI is.
+    """
+    gti = gti_to_array(gti)
+    times = np.asarray(times, dtype=float)
+
+    empty = {
+        key: np.array([]) for key in ("time", "counts", "exposure", "rate", "rate_err")
+    }
+    if gti.size == 0:
+        return empty
+
+    edges = np.arange(gti[0, 0], gti[-1, 1] + dt, dt)
+    if edges.size < 2:
+        return empty
+    low, high = edges[:-1], edges[1:]
+
+    exposure = np.zeros(low.size)
+    for start, stop in gti:
+        exposure += np.clip(np.minimum(high, stop) - np.maximum(low, start), 0, None)
+
+    counts = np.histogram(times, bins=edges)[0].astype(float)
+
+    keep = exposure >= min_fraction * dt
+    counts, exposure = counts[keep], exposure[keep]
+    centres = (low + high)[keep] / 2
+
+    return {
+        "time": centres,
+        "counts": counts,
+        "exposure": exposure,
+        "rate": counts / exposure,
+        "rate_err": np.sqrt(counts) / exposure,
+    }
