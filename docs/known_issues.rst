@@ -340,14 +340,19 @@ by exactly 0 km, ``VELOCITY`` by 0 km/s, ``RA``/``DEC`` by 0 degrees. There is o
 spacecraft carrying both focal-plane modules, so there is one ephemeris, written twice
 under two names. Passing FPMA's file to an FPMB event file is passing the same numbers.
 
-What remains is cosmetic, and does not trigger in the current layout:
+The naming half of this entry **is fixed**, and it was worse than the entry said. The
+output name was built with ``infile.replace(".evt", "_bary.evt")``. That is harmless for
+NuSTAR and NICER, whose files end in ``.evt``, but ``barycenter_file`` is shared, and for a
+mission that calls its event files ``.fits``, ``.ds`` or ``evt2.fits`` there is no ``.evt``
+to replace: the output name came back **equal to the input**, at which point the
+already-exists check fires and hands the caller its own unbarycentred file. A directory
+with ``.evt`` in its name would have been renamed instead of the file, for the same reason
+-- ``str.replace`` substitutes the first occurrence anywhere in the path.
 
-* The output name is built with ``infile.replace(".evt", "_bary.evt")``, which would turn
-  ``x.evt.gz`` into ``x_bary.evt.gz`` -- a gzip extension on a file ``barycorr`` will not
-  compress. The files reaching this step are the uncompressed ``nupipeline`` outputs, so
-  the ``.gz`` case does not arise today.
-* ``barycentered_file_name`` handles the name correctly via ``splitext_improved``, and is
-  never called.
+``barycentered_file_name`` now builds the name for every mission, using
+``splitext_improved``: ``_bary`` goes before the extension whatever the extension is, and a
+compression suffix stays last, so ``x.evt.gz`` gives ``x_bary.evt.gz``. It used to be a
+second, unused copy in ``nustar.py``; that copy is gone.
 
 14. ``barycenter.barycenter_file`` is shadowed and dead -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

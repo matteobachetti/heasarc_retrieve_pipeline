@@ -787,7 +787,10 @@ observation's output directory, writing ``*_bary.evt``. The ``barycorr`` call it
 in :mod:`heasarc_retrieve_pipeline.barycenter`, shared with NICER: it refuses to start with
 a readable message when heasoftpy is missing, checks afterwards that ``barycorr`` actually
 wrote the file rather than assuming it did, and skips a file whose output is already there
-unless the caller passes ``overwrite=True``. The parameters are
+unless the caller passes ``overwrite=True``. The output name comes from
+``barycentered_file_name``, which puts ``_bary`` before the extension whatever that
+extension is and keeps a compression suffix last -- missions do not agree on whether an
+event file is ``.evt``, ``.fits`` or ``.ds``. The parameters are
 
 * ``ephem="JPLEPH.430"`` -- the JPL DE430 solar-system ephemeris;
 * ``refframe="ICRS"``;

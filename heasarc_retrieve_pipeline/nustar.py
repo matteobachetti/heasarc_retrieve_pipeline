@@ -423,38 +423,6 @@ def rootname(infile):
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
-    task_run_name="barycentered_file_name_{infile}",
-)
-def barycentered_file_name(infile):
-    """
-    Name of the barycentred version of an event file.
-
-    Inserts ``_bary`` before the extension, so that ``x.evt.gz`` becomes
-    ``x_bary.evt.gz`` rather than being mangled by a naive string replacement.
-
-    Parameters
-    ----------
-    infile : str
-        Event file path.
-
-    Returns
-    -------
-    str
-        The barycentred file name.
-
-    Notes
-    -----
-    Currently unused: left to itself, :func:`barycenter_file` builds the output name with
-    ``str.replace``. It now takes an ``outfile`` argument, so this is what a caller would
-    pass to get ``.evt.gz`` handled properly. See issue 13 in ``docs/known_issues.rst``.
-    """
-    root, ext = splitext(infile)
-    return root + "_bary" + ext
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
     task_run_name="goes_lc_file_name_{event_file}",
 )
 def goes_lc_file_name(event_file):

@@ -5,6 +5,8 @@ Barycentric correction of event arrival times, shared by the mission modules.
 import os
 from prefect import task, get_run_logger
 
+from .utils import splitext_improved
+
 try:
     import heasoftpy as hsp
 
@@ -12,6 +14,38 @@ try:
 except ImportError:
     HAS_HEASOFT = False
 
+
+def barycentered_file_name(infile):
+    """
+    Name of the barycentred version of an event file.
+
+    Inserts ``_bary`` before the extension, whatever the extension is, and keeps any
+    compression suffix last. Missions do not agree on what to call an event file --
+    ``.evt``, ``.fits``, ``.ds``, ``evt2.fits`` -- and the naive
+    ``infile.replace(".evt", "_bary.evt")`` this replaces does nothing at all to a name
+    with no ``.evt`` in it, handing back an output name equal to the input.
+
+    Parameters
+    ----------
+    infile : str
+        Event file path.
+
+    Returns
+    -------
+    str
+        The barycentred file name, in the same directory.
+
+    Examples
+    --------
+    >>> barycentered_file_name("nu123A01_cl.evt")
+    'nu123A01_cl_bary.evt'
+    >>> barycentered_file_name("nu123A01_cl.evt.gz")
+    'nu123A01_cl_bary.evt.gz'
+    >>> barycentered_file_name("P0123_events.ds")
+    'P0123_events_bary.ds'
+    """
+    root, ext = splitext_improved(infile)
+    return root + "_bary" + ext
 
 @task(
     task_run_name="barycenter_{infile}_ra{ra}_dec{dec}_to_{outfile}_overwrite_{overwrite}",
@@ -39,7 +73,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=
     overwrite : bool, optional
         If True, overwrite existing output file. If False, do not overwrite.
     outfile : str, optional
-        Output file name. If None, a default name is used.
+        Output file name. If None, :func:`barycentered_file_name` builds it.
 
     Returns
     -------
@@ -59,7 +93,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy is required for barycenter correction but is not installed.")
     if outfile is None:
-        outfile = infile.replace(".evt", "_bary.evt")
+        outfile = barycentered_file_name(infile)
     logger.info(f"Output file: {outfile}")
 
     if os.path.exists(outfile) and not overwrite:
