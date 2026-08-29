@@ -1621,11 +1621,20 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         back_region_size=region_size + 25,
     )
 
-    files = join_source_data(obsid, [pipedir, splitdir], config, wait_for=[separate_sources])
-    for fname in files:
+    source_files = join_source_data(
+        obsid, [pipedir, splitdir], config, wait_for=[separate_sources]
+    )
+    background_files = join_source_data(
+        obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources]
+    )
+
+    # Source and background go through the same flare filter, so that they share one GTI.
+    # Subtracting an unfiltered background from a filtered source over-subtracts: flare
+    # stray light is diffuse, so it lands mostly in the large background region. On
+    # 80002092008 the unfiltered background is 3.7% too high in 3--10 keV.
+    for fname in source_files + background_files:
         filter_from_solar_flares(fname, wait_for=[join_source_data])
 
-    join_source_data(obsid, [pipedir, splitdir], config, src_num=0, wait_for=[separate_sources])
     barycenter_data(obsid, ra=ra, dec=dec, config=config, wait_for=[join_source_data])
 
     calculate_spectra(
