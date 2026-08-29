@@ -327,25 +327,40 @@ different things, and adding the flux cut takes the background chi2/dof on 80002
 the one hazard of the flux threshold: set below the Sun's quiescent flux for the epoch, it
 excludes the whole observation.
 
-13. NuSTAR barycentring uses FPMA's orbit file for everything
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+13. NuSTAR barycentring uses FPMA's orbit file for everything -- CORRECTED, harmless
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``nustar.py:514``. ``barycenter_data`` globs every ``nu<OBSID>*.evt*`` in the output
-directory and passes ``nu<OBSID>A.attorb`` for all of them, including FPMB files and the
-combined A+B file. Match the attitude/orbit file to the FPM.
+``barycenter_data`` globs every ``nu<OBSID>*.evt*`` in the output directory and passes
+``nu<OBSID>A.attorb`` for all of them, including FPMB files and the combined A+B file. This
+entry claimed that introduces a timing error. **It does not.**
 
-The output name is built with ``infile.replace(".evt", "_bary.evt")``, which turns
-``x.evt.gz`` into ``x_bary.evt.gz`` -- a gzip extension on a file ``barycorr`` will not
-compress. The module already contains ``barycentered_file_name`` (``nustar.py:110``), which
-handles this correctly via ``splitext_improved``, and it is never called.
+*Measured on 90901333002*: ``nu90901333002A.attorb`` and ``nu90901333002B.attorb`` are
+identical in every column ``barycorr`` reads -- the same TIME grid, ``POSITION`` differing
+by exactly 0 km, ``VELOCITY`` by 0 km/s, ``RA``/``DEC`` by 0 degrees. There is one
+spacecraft carrying both focal-plane modules, so there is one ephemeris, written twice
+under two names. Passing FPMA's file to an FPMB event file is passing the same numbers.
 
-14. ``barycenter.barycenter_file`` is shadowed and dead
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+What remains is cosmetic, and does not trigger in the current layout:
 
-``nustar.py:10`` imports ``barycenter_file`` from :mod:`~heasarc_retrieve_pipeline.barycenter`,
-and ``nustar.py:488`` immediately redefines it. The shared implementation -- which has the
-``HAS_HEASOFT`` guard and verifies that the output file was actually created -- is
-unreachable from the NuSTAR path. NICER uses the good one. Delete the NuSTAR copy.
+* The output name is built with ``infile.replace(".evt", "_bary.evt")``, which would turn
+  ``x.evt.gz`` into ``x_bary.evt.gz`` -- a gzip extension on a file ``barycorr`` will not
+  compress. The files reaching this step are the uncompressed ``nupipeline`` outputs, so
+  the ``.gz`` case does not arise today.
+* ``barycentered_file_name`` handles the name correctly via ``splitext_improved``, and is
+  never called.
+
+14. ``barycenter.barycenter_file`` is shadowed and dead -- PARTLY FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nustar.py`` imported ``barycenter_file`` from
+:mod:`~heasarc_retrieve_pipeline.barycenter` and then immediately redefined it, so the
+import was dead code that ruff flags under the rules the CI runs.
+
+**Fixed** to the extent of deleting the import. The duplication itself remains: the NuSTAR
+copy is a Prefect task and takes a ``src`` argument, so it is not a drop-in for the shared
+function, which is what NICER uses. Two things in the shared one are still worth having on
+the NuSTAR side -- it fails with a clear message when heasoftpy is missing, and it checks
+that ``barycorr`` actually wrote the output file rather than trusting that it did.
 
 35. Merged event files carry a stale ``ONTIME``, ``LIVETIME`` and ``EXPOSURE``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

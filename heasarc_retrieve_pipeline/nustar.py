@@ -43,7 +43,6 @@ from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
-from .barycenter import barycenter_file
 from .utils import (
     apply_gti,
     binned_lightcurve,
@@ -1508,9 +1507,11 @@ def barycenter_file(infile, attorb, ra=None, dec=None, src=1):
 
     Notes
     -----
-    This shadows the guarded implementation in
-    :mod:`heasarc_retrieve_pipeline.barycenter`, which is imported at the top of this
-    module and then never used. See issue 14 in ``docs/known_issues.rst``.
+    :mod:`heasarc_retrieve_pipeline.barycenter` holds a second implementation, which NICER
+    uses. It is not interchangeable with this one -- it is a plain function rather than a
+    Prefect task and takes no ``src`` -- but it does two things this one does not: it fails
+    with a clear message when heasoftpy is missing, and it checks that ``barycorr``
+    actually wrote the output. See issue 14 in ``docs/known_issues.rst``.
     """
     logger = get_run_logger()
     logger.info(f"Barycentering {infile}")
