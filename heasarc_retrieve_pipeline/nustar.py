@@ -291,7 +291,8 @@ def spectral_input_files(obsid, config):
     deliberately not included, because its aspect solution has not been reconstructed yet.
 
     Mode 01 is yielded first for each module, because it defines the reference position the
-    mode-06 detections are checked against.
+    mode-06 detections are checked against. Use :func:`mode_01_input_files` when only the
+    mode-01 files are wanted.
 
     Parameters
     ----------
@@ -313,6 +314,42 @@ def spectral_input_files(obsid, config):
         for infile in _cl_event_files(pipedir, f"nu{obsid}{fpm}01_cl.evt*"):
             yield fpm, infile
         for infile in _cl_event_files(splitdir, f"nu{obsid}{fpm}06_chu*_cl.evt*"):
+            yield fpm, infile
+
+
+def mode_01_input_files(obsid, config):
+    """
+    Normal-science (mode 01) event files only, with the module each one belongs to.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Yields
+    ------
+    fpm : {"A", "B"}
+        Focal-plane module the file belongs to.
+    infile : str
+        Path of the cleaned event file.
+
+    Notes
+    -----
+    :func:`get_best_source_regions` averages over these files alone, and deliberately not
+    over the mode-06 ones. Each CHU combination has its own aspect reconstruction, scattered
+    by about 2 arcmin, so averaging them in moves the position the data are barycentred at:
+    measured on 80002092008 the mean shifted by 63 arcsec, which is roughly 150 ms of
+    barycentric delay -- ruinous for timing.
+
+    Keeping mode-06 files out of this function also keeps their region files unwritten until
+    :func:`calculate_spectra` asks for them, which is what lets that function apply the
+    mode-01 reference position as a consistency check.
+    """
+    pipedir = nu_pipeline_output_path.fn(obsid, config=config)
+    for fpm in "A", "B":
+        for infile in _cl_event_files(pipedir, f"nu{obsid}{fpm}01_cl.evt*"):
             yield fpm, infile
 
 
@@ -1335,8 +1372,10 @@ def get_best_source_regions(obsid, config):
     """
     Build extraction regions for both focal-plane modules and average their parameters.
 
-    Runs :func:`get_best_source_region` on each mode-01 cleaned event file that does not
-    already have region files, and returns the mean of the resulting positions and radii.
+    Runs :func:`get_best_source_region` on each mode-01 cleaned event file and returns the
+    mean of the resulting positions and radii. The position feeds the barycentric
+    correction, so mode-06 files are deliberately excluded -- see
+    :func:`mode_01_input_files`.
 
     Parameters
     ----------
@@ -1356,7 +1395,8 @@ def get_best_source_regions(obsid, config):
     -----
     Files whose region files already exist still contribute: :func:`get_best_source_region`
     reads the position and radius back out of them. ``(0.0, 0.0, 0.0)`` is returned only
-    when there is no cleaned event file at all.
+    when there is no mode-01 cleaned event file at all -- which happens: 80002092003 has
+    none.
     """
     logger = get_logger()
     outdir = nu_pipeline_output_path.fn(obsid, config=config)
@@ -1364,7 +1404,7 @@ def get_best_source_regions(obsid, config):
 
     mean_ra = mean_dec = mean_rlimit = 0.0
     count = 0
-    for _, infile in spectral_input_files(obsid, config):
+    for _, infile in mode_01_input_files(obsid, config):
         # get_best_source_region returns early when the region files already exist,
         # reading the position and radius back out of them, so every file counts.
         result = get_best_source_region.fn(infile, config=config)

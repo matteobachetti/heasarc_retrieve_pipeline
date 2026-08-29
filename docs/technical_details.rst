@@ -557,6 +557,43 @@ The check takes a single reference position because the pipeline extracts one so
 brightest. Extending it to several means passing the list of mode-01 positions and matching
 each detected peak to its nearest one; the comparison itself does not change.
 
+Two things follow from this ordering, and both are easy to get wrong.
+``get_best_source_regions`` iterates ``mode_01_input_files``, **not**
+``spectral_input_files``. First, its mean position is what ``process_nustar_obsid`` hands to
+the barycentric correction, and the CHU scatter has no business in it: measured on
+80002092008, averaging the eight CHU positions in with the two mode-01 ones moved the mean
+by 63 arcsec. The barycentric delay is the Earth-Sun vector, about 499 light-seconds,
+projected on the source direction, so 63 arcsec is worth roughly 150 ms of delay -- enough
+to destroy any timing analysis downstream. Second, ``get_best_source_regions`` runs before
+``calculate_spectra``, and ``get_best_source_region`` skips any file whose region files
+already exist. Had it measured the mode-06 files too, their regions would already be on disk
+by the time ``calculate_spectra`` looked, and the reference check above would never run at
+all.
+
+Measured offsets on 80002092008, mode 06 against mode 01 of the same module:
+
+.. list-table::
+   :header-rows: 1
+
+   * - CHU combination
+     - FPMA
+     - FPMB
+   * - ``chu2``
+     - 0.85'
+     - 0.83'
+   * - ``chu12``
+     - 1.21'
+     - 1.25'
+   * - ``chu23``
+     - 1.44'
+     - 1.48'
+   * - ``chu3``
+     - 1.77'
+     - 1.77'
+
+All well inside the 3 arcmin default, and consistent with the roughly 2 arcmin scatter the
+``nusplitsc`` documentation quotes.
+
 The resulting spectra are one set per CHU combination per module. They are **not** to be
 combined by merging their event files -- the merged event files this pipeline produces are
 timing-only precisely because they mix aspect solutions and exposures. Combine them at the

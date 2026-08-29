@@ -17,6 +17,7 @@ import astropy.units as u  # noqa: E402
 
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     get_best_source_regions,
+    mode_01_input_files,
     position_is_consistent,
     spectral_input_files,
 )
@@ -145,6 +146,55 @@ def test_existing_regions_are_read_back_on_a_rerun(tmp_path):
 def test_no_event_files_gives_no_position(tmp_path):
     config = make_obsid_tree(tmp_path)
     assert get_best_source_regions.fn(OBSID, config) == (0.0, 0.0, 0.0)
+
+
+def test_mode_01_input_files_excludes_mode_06(full_observation):
+    """The averaged position must come from mode 01 alone.
+
+    Each CHU combination has its own aspect reconstruction, so mode-06 detections scatter
+    by about 2 arcmin around the true position.
+    """
+    found = [os.path.basename(f) for _, f in mode_01_input_files(OBSID, full_observation)]
+    assert found == [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+    assert not any("chu" in f for f in found)
+
+
+def test_chu_positions_do_not_move_the_barycentring_position(tmp_path):
+    """Regression: mode-06 regions must not be averaged into the returned position.
+
+    Measured on 80002092008, averaging the eight CHU positions in alongside the two mode-01
+    ones moved the mean by 63 arcsec. The barycentric delay is the Earth-Sun vector -- about
+    499 light-seconds -- projected on the source direction, so an error of 63 arcsec is
+    worth roughly 150 ms of delay, which ruins any timing analysis downstream.
+
+    The numbers below reproduce that geometry: the mode-01 pair straddles the true position,
+    and every CHU region sits about 2 arcmin north of it.
+    """
+    pytest.importorskip("regions")
+    truth_ra, truth_dec = 148.9575, 69.6794
+    chu_dec = truth_dec + 2 / 60  # the CHU aspect scatter, all in one direction
+
+    split_files = [f"nu{OBSID}A06_chu{c}_N_cl.evt" for c in ("2", "3", "12", "23")]
+    split_files += [f"nu{OBSID}B06_chu{c}_N_cl.evt" for c in ("2", "3", "12", "23")]
+    config = make_obsid_tree(
+        tmp_path,
+        pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"],
+        split_files=split_files,
+    )
+
+    pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+    write_region_files(pipedir, f"nu{OBSID}A01_cl", truth_ra, truth_dec - 0.0005, 80.0)
+    write_region_files(pipedir, f"nu{OBSID}B01_cl", truth_ra, truth_dec + 0.0005, 80.0)
+
+    splitdir = os.path.join(tmp_path, OBSID, "split")
+    for name in split_files:
+        write_region_files(splitdir, name[: -len(".evt")], truth_ra, chu_dec, 80.0)
+
+    ra, dec, _ = get_best_source_regions.fn(OBSID, config)
+
+    assert dec == pytest.approx(truth_dec, abs=1e-6)
+    measured = SkyCoord(ra, dec, unit="deg")
+    assert measured.separation(SkyCoord(truth_ra, truth_dec, unit="deg")) < 1 * u.arcsec
 
 
 def test_mode_06_chu_files_are_found(full_observation):
