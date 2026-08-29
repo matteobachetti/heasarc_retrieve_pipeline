@@ -132,6 +132,59 @@ def download_cmd(url: str, dest: str):
         return None, str(e)
 
 
+def parse_directory_index(html, url):
+    """
+    The files and subdirectories an Apache index page actually lists.
+
+    An index page is mostly ``<a>`` elements, but only some of them are data. The four
+    column-sort links (``href="?C=N;O=D"`` and friends) and the "Parent Directory" link
+    are navigation, and the parent's ``href`` is *absolute* and points up the tree, so
+    following it walks out of the observation and recurses.
+
+    Reading each link's ``href`` and keeping only the relative ones separates the two
+    cleanly. Reading the link *text* instead, which is what this used to do, does not:
+    the sort links' text is ``Name``, ``Last modified``, ``Size`` and ``Description``, and
+    those became five phantom files per directory -- 25 per NuSTAR observation.
+
+    Parameters
+    ----------
+    html : str or bytes
+        The index page.
+    url : str
+        URL of the directory the page describes, with a trailing slash. Entries are
+        returned relative to it.
+
+    Returns
+    -------
+    list of str
+        Absolute URLs. Subdirectories keep their trailing slash, which is how callers
+        tell them from files.
+
+    Examples
+    --------
+    >>> page = '<a href="?C=N;O=D">Name</a><a href="sub/">sub/</a><a href="x.evt">x</a>'
+    >>> parse_directory_index(page, "https://example.com/obs/")
+    ['https://example.com/obs/sub/', 'https://example.com/obs/x.evt']
+    """
+    from bs4 import BeautifulSoup
+
+    entries = []
+    for anchor in BeautifulSoup(html, "html.parser").find_all("a"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        # Query strings are the sort links; a leading slash or a scheme is an absolute
+        # link, which on this page means the parent directory; ".." is the same escape
+        # written relatively.
+        if href.startswith(("?", "#", "/")) or "://" in href:
+            continue
+        if href == ".." or href.startswith(("./", "../")):
+            continue
+        entries.append((url + href).replace(" ", "%20"))
+
+    return entries
+
+
 @task(task_run_name="get_remote_directory_listing_{url}")
 def get_remote_directory_listing(url: str):
     """
@@ -155,14 +208,11 @@ def get_remote_directory_listing(url: str):
 
     Notes
     -----
-    The listing is built from the *text* of each ``<a>`` element rather than its
-    ``href``, so the index's own column-sort links and its "Parent Directory" link
-    end up in the result. See issue 10 in ``docs/known_issues.rst``.
+    The parsing is done by :func:`parse_directory_index`; this function adds the
+    fetching and the recursion into subdirectories.
     """
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
-
-    from bs4 import BeautifulSoup
 
     url = url.replace(" ", "%20")
     req = Request(url)
@@ -171,21 +221,13 @@ def get_remote_directory_listing(url: str):
     except HTTPError:
         return None
 
-    soup = BeautifulSoup(a, "html.parser")
-    x = soup.find_all("a")
     urls = []
-    for i in x:
-        file_name = i.extract().get_text()
-        url_new = url + file_name
-        url_new = url_new.replace(" ", "%20")
-        if file_name[-1] == "/" and file_name[0] != ".":
-            urls.append(url_new)
-            url_new = get_remote_directory_listing.fn(url_new)
-            if url_new is None:
-                continue
-            urls.extend(url_new)
-        else:
-            urls.append(url_new)
+    for entry in parse_directory_index(a, url):
+        urls.append(entry)
+        if entry.endswith("/"):
+            below = get_remote_directory_listing.fn(entry)
+            if below is not None:
+                urls.extend(below)
 
     return urls
 
