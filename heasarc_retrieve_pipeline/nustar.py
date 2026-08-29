@@ -50,6 +50,8 @@ from .utils import (
     get_logger,
     good_intervals,
     gti_to_array,
+    intersect_intervals,
+    intervals_above_threshold,
     intervals_removed,
     mask_from_gti,
     read_gti,
@@ -937,8 +939,37 @@ def join_source_data(obsid, directories, config, src_num=1):
     return [combined_file]
 
 
+#: Lower flux bound of each GOES flare class, in W m^-2 of 1--8 A solar X-ray flux. The
+#: scale is logarithmic and each class is ten times the previous one.
+GOES_CLASS_FLUX = {"A": 1e-8, "B": 1e-7, "C": 1e-6, "M": 1e-5, "X": 1e-4}
+
+
+def goes_class_to_flux(goes_class):
+    """
+    Convert a GOES flare class such as ``"C5.0"`` to a 1--8 A flux in W m^-2.
+
+    Parameters
+    ----------
+    goes_class : str
+        A letter from A, B, C, M, X followed by a multiplier.
+
+    Returns
+    -------
+    float
+        The flux in W m^-2.
+
+    Examples
+    --------
+    >>> f"{goes_class_to_flux('C5.0'):.1e}"
+    '5.0e-06'
+    >>> f"{goes_class_to_flux('M1.0'):.1e}"
+    '1.0e-05'
+    """
+    return GOES_CLASS_FLUX[goes_class[0].upper()] * float(goes_class[1:])
+
+
 @task(task_run_name="goes_lightcurve_{event_file}_mincat_{minimum_class}")
-def get_goes_gtis(event_file, minimum_class="C5.0"):
+def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     """
     Build good time intervals that exclude solar flares.
 
@@ -950,9 +981,20 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     mission-elapsed time to civil time; ask ``sunpy``'s ``Fido`` for the GOES XRS data of
     that interval, picking the highest-numbered (most recent) satellite that covers it;
     retrieve the HEK flare catalogue entries flagged by SWPC; and cut out every catalogued
-    flare at or above ``minimum_class``. The surviving intervals are the complement of
-    the flares inside ``[TSTART, TSTOP]``, computed by
+    flare at or above ``minimum_class``, together with every minute in which the measured
+    GOES 1--8 A flux reached ``flux_class``. The surviving intervals are the complement of
+    all of those inside ``[TSTART, TSTOP]``, computed by
     :func:`~heasarc_retrieve_pipeline.utils.good_intervals`.
+
+    **Why both.** The catalogue and the flux disagree in ways that matter, and each catches
+    what the other misses. The catalogue's end time is when the *solar* flare ended, not
+    when NuSTAR's background recovered from it: on 80002092008 the 3--10 keV background is
+    still three times its baseline for several hundred seconds past the catalogued end. And
+    a rise that was never catalogued at the requested class is invisible to the catalogue
+    entirely; that same observation ends with the GOES flux back above C5.0 and the NuSTAR
+    background climbing with it, with nothing excluded. Conversely the flux is sampled once
+    a minute and has gaps, so a short flare between samples, or during a gap, is something
+    only the catalogue knows about. The union of the two is what gets excluded.
 
     Flare classes are compared by letter and number separately. The GOES scale runs
     A, B, C, M, X, which is alphabetical, so comparing the letters as characters gives the
@@ -969,7 +1011,18 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     event_file : str
         Event file whose time range defines the search interval.
     minimum_class : str, optional
-        Smallest flare class to exclude, e.g. ``"C5.0"``.
+        Smallest **catalogued** flare class to exclude, e.g. ``"C5.0"``.
+    flux_class : str or None, optional
+        Exclude every sample whose measured GOES 1--8 A flux reaches this class. ``None``
+        turns the flux criterion off and leaves the filtering catalogue-driven.
+
+        Choose this above the Sun's quiescent 1--8 A flux, which moves with the solar
+        cycle and was around 1.5e-6 W m^-2 (mid C1) in February 2014. A threshold below
+        quiescent excludes the entire observation except where the flux is missing: on
+        80002092008, ``"C1.0"`` throws away 54013 s of 58889 s. This is why it is a
+        parameter of its own rather than sharing ``minimum_class``: lowering the class at
+        which catalogued flares are excluded is a reasonable thing to want, and it must
+        not silently destroy the observation.
 
     Returns
     -------
@@ -1076,15 +1129,48 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
         )
         flares.append((flare_start, flare_end))
 
+    bright = np.zeros((0, 2))
+    if flux_class is not None and "XRSB" in lightcurve:
+        threshold = goes_class_to_flux(flux_class)
+        bright = intervals_above_threshold(
+            lightcurve["TIME"], lightcurve["XRSB"], threshold
+        )
+        excluded = float(np.sum(bright[:, 1] - bright[:, 0]))
+        logger.info(
+            f"GOES 1-8 A flux reaches {flux_class} ({threshold:.1e} W/m2) over "
+            f"{len(bright)} intervals totalling {excluded:.1f} s"
+        )
+
     # good_intervals does the clipping, sorting, merging and empty-interval dropping, so
-    # a flare overlapping TSTART or two overlapping flares cannot produce a broken GTI.
-    good = good_intervals(flares, tstart, tstop)
+    # a flare overlapping TSTART, two overlapping flares, or a catalogue window that runs
+    # into a bright-flux window cannot produce a broken GTI.
+    bad = np.vstack([np.array(flares).reshape(-1, 2), bright])
+    good = good_intervals(bad, tstart, tstop)
     if len(good) == 0:
         raise RuntimeError(
-            f"Flares of class {minimum_class} or above cover the whole of {event_file} "
-            f"(MET {tstart} -- {tstop}); no good time is left."
+            f"Solar flares cover the whole of {event_file} (MET {tstart} -- {tstop}); no "
+            f"good time is left. If flux_class={flux_class} is below the Sun's quiescent "
+            f"1-8 A flux, raise it: that alone will exclude everything."
         )
-    logger.info(f"{len(flares)} flares excluded, leaving {len(good)} good intervals")
+    logger.info(
+        f"{len(flares)} catalogued flares and {len(bright)} bright-flux intervals "
+        f"excluded, leaving {len(good)} good intervals"
+    )
+
+    # A warning rather than an error: a genuinely flare-dominated observation really can
+    # lose most of its good time, and only the person analysing it can tell that case from
+    # a threshold set below the Sun's quiescent flux for the epoch.
+    surviving = intersect_intervals(file_gti, good)
+    before = float(np.sum(file_gti[:, 1] - file_gti[:, 0]))
+    after = float(np.sum(surviving[:, 1] - surviving[:, 0])) if len(surviving) else 0.0
+    if before > 0 and after < 0.5 * before:
+        logger.warning(
+            f"Flare filtering would remove {100 * (1 - after / before):.0f}% of the good "
+            f"time in {event_file} ({before:.0f} -> {after:.0f} s). If that is not a "
+            f"genuinely flare-dominated observation, flux_class={flux_class} is probably "
+            f"below the Sun's quiescent 1-8 A flux for this epoch. Check the diagnostic "
+            f"figure written next to the filtered file."
+        )
 
     gtis = [{"START": start, "STOP": stop} for start, stop in good]
 
@@ -1097,12 +1183,6 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
         raise RuntimeError(f"Failed to create GTI file {outfile_gti}")
 
     return outfile_gti
-
-
-#: Lower flux bound of each GOES flare class, in W m^-2 of 1--8 A solar X-ray flux. The
-#: scale is logarithmic and each class is ten times the previous one, so "C5.0" -- the
-#: default cut in :func:`get_goes_gtis` -- means 5e-6 W m^-2.
-GOES_CLASS_FLUX = {"A": 1e-8, "B": 1e-7, "C": 1e-6, "M": 1e-5, "X": 1e-4}
 
 
 def chi2_dof_against_a_constant(lightcurve):
@@ -1139,7 +1219,13 @@ def chi2_dof_against_a_constant(lightcurve):
 
 @task(task_run_name="nu_flare_diagnostic_{event_file}")
 def plot_flare_filtering(
-    event_file, gti_before, gti_after, outfile=None, dt=100.0, minimum_class="C5.0"
+    event_file,
+    gti_before,
+    gti_after,
+    outfile=None,
+    dt=100.0,
+    minimum_class="C5.0",
+    flux_class="C5.0",
 ):
     """
     Show what the solar-flare filtering removed, and what it left alone.
@@ -1176,7 +1262,10 @@ def plot_flare_filtering(
     dt : float, optional
         Light-curve bin width in seconds.
     minimum_class : str, optional
-        The flare class cut used, drawn on the GOES panel as a horizontal line.
+        The catalogued-flare class cut used, named in the GOES panel's legend.
+    flux_class : str or None, optional
+        The flux cut used. This one acts directly on the curve in the top panel, so it is
+        drawn there as a horizontal line.
 
     Returns
     -------
@@ -1234,11 +1323,15 @@ def plot_flare_filtering(
                 fontsize="small",
                 color="0.4",
             )
-        cut = GOES_CLASS_FLUX[minimum_class[0]] * float(minimum_class[1:])
-        axes[0].axhline(
-            cut, color="tab:orange", lw=1.2, label=f"cut at {minimum_class}"
-        )
-        axes[0].legend(loc="upper right", fontsize="small", ncol=3)
+        if flux_class is not None:
+            axes[0].axhline(
+                goes_class_to_flux(flux_class),
+                color="tab:orange",
+                lw=1.2,
+                label=f"flux cut {flux_class}",
+            )
+        axes[0].plot([], [], " ", label=f"HEK catalogue $\\geq$ {minimum_class}")
+        axes[0].legend(loc="upper right", fontsize="small", ncol=4)
     else:
         logger.warning(f"No GOES light curve at {goes_file}; leaving that panel empty")
         axes[0].text(
@@ -1300,7 +1393,7 @@ def plot_flare_filtering(
 
 
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
-def filter_from_solar_flares(event_file, minimum_class="C5.0"):
+def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"):
     """
     Write a flare-free copy of an event file.
 
@@ -1321,7 +1414,10 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     event_file : str
         Event file to filter.
     minimum_class : str, optional
-        Smallest flare class to exclude.
+        Smallest catalogued flare class to exclude.
+    flux_class : str or None, optional
+        Also exclude every minute in which the measured GOES 1--8 A flux reaches this
+        class. See :func:`get_goes_gtis` for why this is separate from ``minimum_class``.
 
     A diagnostic figure, ``<root>_flares.jpg``, is written alongside by
     :func:`plot_flare_filtering`. Failing to draw it is logged, not raised: the science
@@ -1344,7 +1440,9 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
         logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
         return outfile_filtered
 
-    outfile_gti_goes = get_goes_gtis(event_file, minimum_class=minimum_class)
+    outfile_gti_goes = get_goes_gtis(
+        event_file, minimum_class=minimum_class, flux_class=flux_class
+    )
 
     merge_gtis([event_file, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
 
@@ -1368,7 +1466,11 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0"):
     # observation down with it, so it is logged rather than raised.
     try:
         plot_flare_filtering(
-            event_file, gti_before, gti_after, minimum_class=minimum_class
+            event_file,
+            gti_before,
+            gti_after,
+            minimum_class=minimum_class,
+            flux_class=flux_class,
         )
     except Exception as error:
         logger.warning(f"Could not plot the flare filtering for {event_file}: {error}")

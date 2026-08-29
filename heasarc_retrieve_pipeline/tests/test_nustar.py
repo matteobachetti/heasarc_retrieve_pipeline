@@ -20,6 +20,7 @@ from heasarc_retrieve_pipeline import nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     chi2_dof_against_a_constant,
     get_best_source_regions,
+    goes_class_to_flux,
     join_source_data,
     plot_flare_filtering,
     mode_01_input_files,
@@ -527,3 +528,40 @@ class TestChi2DofAgainstAConstant:
         lc = dict(counts=np.array([1.0]), exposure=np.array([10.0]), rate=np.array([0.1]))
 
         assert np.isnan(chi2_dof_against_a_constant(lc))
+
+
+class TestGoesClassToFlux:
+    def test_the_class_letters_are_decades(self):
+        assert goes_class_to_flux("C1.0") == pytest.approx(1e-6)
+        assert goes_class_to_flux("M1.0") == pytest.approx(1e-5)
+        assert goes_class_to_flux("X1.0") == pytest.approx(1e-4)
+
+    def test_the_multiplier_scales_within_a_decade(self):
+        assert goes_class_to_flux("C5.0") == pytest.approx(5e-6)
+        assert goes_class_to_flux("M2.5") == pytest.approx(2.5e-5)
+
+    def test_a_lower_case_letter_works(self):
+        assert goes_class_to_flux("c5.0") == pytest.approx(5e-6)
+
+    def test_the_default_cut_is_where_it_should_be(self):
+        """C5.0 must sit above the quiescent 1--8 A flux, not below it."""
+        assert goes_class_to_flux("C5.0") > 1.5e-6  # Feb 2014 quiescent level
+
+
+class TestPlotFlareFilteringWithoutTheFluxCut:
+    def test_flux_class_none_still_draws(self, tmp_path):
+        """The flux criterion can be turned off; the figure must still be produced."""
+        pytest.importorskip("matplotlib")
+        from astropy.table import Table
+
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+        times = np.linspace(0, 1000, 100)
+        Table({"TIME": times, "XRSA": np.full(100, 1e-8), "XRSB": np.full(100, 1e-7)}).write(
+            tmp_path / f"nu{OBSID}_src1_goes.fits"
+        )
+
+        outfile = plot_flare_filtering.fn(
+            event_file, [[0, 1000]], [[0, 400], [600, 1000]], flux_class=None
+        )
+
+        assert os.path.getsize(outfile) > 0
