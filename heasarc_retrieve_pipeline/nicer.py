@@ -36,6 +36,7 @@ import subprocess
 import os
 
 from .barycenter import barycenter_file
+from .utils import absolute_config
 
 try:
     HAS_HEASOFT = True
@@ -282,7 +283,7 @@ def process_nicer_obsid(obsid: str, config={}, ra="NONE", dec="NONE", flags=None
     flags : dict, optional
         Extra ``nicerl2`` parameters.
     """
-    current_config = DEFAULT_CONFIG if config is None else config
+    current_config = absolute_config(config, DEFAULT_CONFIG)
     logger = get_run_logger()
     logger.info(f"Processing Nicer observation {obsid}")
     base_output_dir_for_obsid = ni_base_output_path(config=current_config, obsid=obsid)

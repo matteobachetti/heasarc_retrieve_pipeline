@@ -4,12 +4,15 @@ These need neither the network nor a HEASOFT installation. Every function tested
 pure: it takes arrays and headers in, and gives arrays and headers back.
 """
 
+import os
+
 import numpy as np
 import pytest
 
 from astropy.io import fits
 
 from heasarc_retrieve_pipeline.utils import (
+    absolute_config,
     apply_gti,
     binned_lightcurve,
     good_intervals,
@@ -522,3 +525,67 @@ class TestIntersectIntervals:
     def test_it_accepts_a_fits_gti_table(self):
         hdul = make_event_file(times=[], gti=[[0, 100]])
         assert np.allclose(intersect_intervals(hdul["GTI"].data, [[50, 150]]), [[50, 100]])
+
+
+class TestAbsoluteConfig:
+    """Configuration paths are pinned once, not resolved against a moving target.
+
+    Every path the pipeline builds hangs off ``input_data_path`` and ``out_data_path``.
+    While those were relative (``"./"``), the meaning of every one of them depended on the
+    process working directory *at the moment it was used*, which is what made concurrent
+    observations impossible. See issue 26 in ``docs/known_issues.rst``.
+    """
+
+    DEFAULT = dict(out_data_path="./", input_data_path="./", max_radius=80)
+
+    def test_the_default_is_resolved_against_the_current_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        config = absolute_config(None, self.DEFAULT)
+
+        assert config["out_data_path"] == str(tmp_path)
+        assert config["input_data_path"] == str(tmp_path)
+
+    def test_a_relative_path_given_by_the_caller_is_resolved_too(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        config = absolute_config(dict(out_data_path="out", input_data_path="raw"), self.DEFAULT)
+
+        assert config["out_data_path"] == os.path.join(tmp_path, "out")
+        assert config["input_data_path"] == os.path.join(tmp_path, "raw")
+
+    def test_an_absolute_path_is_left_alone(self, tmp_path):
+        given = dict(out_data_path="/data/out", input_data_path="/data/raw")
+
+        config = absolute_config(given, self.DEFAULT)
+
+        assert config["out_data_path"] == "/data/out"
+        assert config["input_data_path"] == "/data/raw"
+
+    def test_the_other_settings_survive(self):
+        assert absolute_config(None, self.DEFAULT)["max_radius"] == 80
+
+    def test_the_caller_dict_is_not_modified(self):
+        given = dict(out_data_path="out", input_data_path="raw")
+
+        absolute_config(given, self.DEFAULT)
+
+        assert given == dict(out_data_path="out", input_data_path="raw")
+
+    def test_the_defaults_are_not_modified(self):
+        default = dict(self.DEFAULT)
+
+        absolute_config(None, default)
+
+        assert default == self.DEFAULT
+
+    def test_a_later_chdir_cannot_move_the_paths(self, tmp_path, monkeypatch):
+        """The whole point: resolve once, at flow entry, not at every path build."""
+        monkeypatch.chdir(tmp_path)
+        config = absolute_config(None, self.DEFAULT)
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        assert config["out_data_path"] == str(tmp_path)

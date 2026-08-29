@@ -9,6 +9,7 @@ import numpy as np
 from prefect import get_run_logger
 
 __all__ = [
+    "absolute_config",
     "apply_gti",
     "binned_lightcurve",
     "get_logger",
@@ -41,6 +42,45 @@ def get_logger():
         return get_run_logger()
     except Exception:
         return logging.getLogger("heasarc_retrieve_pipeline")
+
+
+def absolute_config(config, default):
+    """
+    A pipeline configuration whose paths cannot move under the pipeline's feet.
+
+    ``input_data_path`` and ``out_data_path`` are the root of every path the pipeline
+    builds. When they are relative -- ``"./"``, as the mission defaults have them -- each
+    path means "wherever this process happens to be standing right now", so a single
+    ``os.chdir`` anywhere changes where files are read and written. Resolving them once, at
+    flow entry, pins them for the whole run, which is what allows several observations to be
+    reduced at the same time in different processes. See issue 26 in
+    ``docs/known_issues.rst``.
+
+    Parameters
+    ----------
+    config : dict or None
+        Configuration given by the caller. ``None`` means "use the mission default".
+    default : dict
+        The mission's ``DEFAULT_CONFIG``.
+
+    Returns
+    -------
+    dict
+        A copy, with the two path entries made absolute. Neither input is modified.
+
+    Examples
+    --------
+    >>> config = absolute_config(dict(out_data_path="out"), dict(out_data_path="./"))
+    >>> config["out_data_path"] == os.path.join(os.getcwd(), "out")
+    True
+    >>> absolute_config(None, dict(other=3))["other"]
+    3
+    """
+    config = dict(default if config is None else config)
+    for key in ("input_data_path", "out_data_path"):
+        if key in config:
+            config[key] = os.path.abspath(config[key])
+    return config
 
 
 def splitext_improved(path):

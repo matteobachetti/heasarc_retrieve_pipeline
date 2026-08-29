@@ -32,13 +32,13 @@ import pyvo
 from astropy.coordinates import SkyCoord
 
 
-from .nustar import process_nustar_obsid
-from .nicer import process_nicer_obsid
-from .rxte import process_rxte_obsid
+from .nustar import process_nustar_obsid, DEFAULT_CONFIG as NUSTAR_DEFAULT_CONFIG
+from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
+from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 
 from prefect import flow, task, get_run_logger
 
-from .utils import get_logger
+from .utils import absolute_config, get_logger
 
 
 def _download_pysmartdl(url: str, dest: str):
@@ -769,6 +769,7 @@ MISSION_CONFIG = {
         "expo_column": "exposure_a",
         "additional": "solar_activity",
         "obsid_processing": process_nustar_obsid,
+        "default_config": NUSTAR_DEFAULT_CONFIG,
         "name_column": "name",
     },
     "nicer": {
@@ -776,6 +777,7 @@ MISSION_CONFIG = {
         "expo_column": "exposure",
         "additional": "",
         "obsid_processing": process_nicer_obsid,
+        "default_config": NICER_DEFAULT_CONFIG,
         "name_column": "name",
     },
     "rxte": {
@@ -783,6 +785,7 @@ MISSION_CONFIG = {
         "expo_column": "exposure",
         "additional": "cycle, prnb",
         "obsid_processing": process_rxte_obsid,
+        "default_config": RXTE_DEFAULT_CONFIG,
         "name_column": "target_name",
     },
 }
@@ -1064,9 +1067,9 @@ def retrieve_and_process_data(
     set; otherwise, if ``SCISERVER_USER_ID`` is in the environment the local
     SciServer paths are used; otherwise AWS S3.
 
-    The processing flow is run with the working directory changed to ``outdir``,
-    which is why the mission modules' ``DEFAULT_CONFIG`` uses ``"./"`` for both
-    input and output paths.
+    ``outdir`` is made absolute and handed to the processing flow as its
+    ``input_data_path`` and ``out_data_path``, so nothing in the run depends on the
+    process working directory.
 
     Parameters
     ----------
@@ -1103,7 +1106,15 @@ def retrieve_and_process_data(
     Observations with no public data products -- typically ones still in their
     proprietary period -- are logged and skipped.
     """
-    cwd = os.getcwd()
+    outdir = os.path.abspath(outdir)
+    os.makedirs(outdir, exist_ok=True)
+    # Absolute, once: the reduction used to be steered by chdir-ing into ``outdir``, which
+    # made every path in the mission defaults ("./") mean whatever the process working
+    # directory happened to be. See issue 26 in ``docs/known_issues.rst``.
+    config = absolute_config(
+        dict(input_data_path=outdir, out_data_path=outdir),
+        MISSION_CONFIG[mission]["default_config"],
+    )
     processing = MISSION_CONFIG[mission]["obsid_processing"]
     logger = get_run_logger()
     links = locate_data(result_table, MISSION_CONFIG[mission]["table"])
@@ -1141,20 +1152,17 @@ def retrieve_and_process_data(
             )
             continue
 
-        os.chdir(cwd)
         recursive_download(link[link_col_name], outdir, test_str=".", test=test)
         if test:
             break
         # Heasarc.download_data(link, host=host, location=outdir)
-
-        os.chdir(outdir)
 
         # recursive_download is a flow, and a subflow call is synchronous and raises:
         # the ordering is already guaranteed by the line above. Prefect 3 has no
         # flow.submit(), so there is no future to declare here either.
         processing(
             obsid,
-            config=None,
+            config=config,
             ra=ra,
             dec=dec,
             flags=flags,

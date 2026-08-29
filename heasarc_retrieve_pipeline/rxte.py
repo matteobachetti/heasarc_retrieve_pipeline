@@ -35,6 +35,8 @@ from botocore import UNSIGNED
 from botocore.config import Config
 from prefect import flow, get_run_logger, task
 
+from .utils import absolute_config
+
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
 
@@ -300,8 +302,7 @@ def process_rxte_obsid(obsid: str, config={}, flags=None, ra: float = None, dec:
         Accepted for signature compatibility, and ignored: RXTE data are not barycentred
         by this pipeline.
     """
-    DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
-    current_config = DEFAULT_CONFIG if config is None else config
+    current_config = absolute_config(config, DEFAULT_CONFIG)
     logger = get_run_logger()
     logger.info(f"Processing RXTE observation {obsid}")
     raw_data_dir = rxte_base_output_path(config=current_config, obsid=obsid)

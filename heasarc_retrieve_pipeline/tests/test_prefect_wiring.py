@@ -142,3 +142,51 @@ def test_run_name_templates_only_name_real_parameters(path):
                 f"{path.name}: {function} run name {template!r} names {root!r}, "
                 f"which is not one of its parameters"
             )
+
+
+def enclosing_function(tree, target):
+    """Name of the function a node sits in, or ``None`` at module level."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(child is target for child in ast.walk(node)):
+                return node.name
+    return None
+
+
+def chdir_calls(source):
+    """
+    Functions that call ``os.chdir``.
+
+    The working directory belongs to the whole process. Changing it to steer where a step
+    writes means no two observations can be reduced at the same time, and it makes every
+    relative path in the configuration mean something different depending on when it is
+    used.
+
+    Examples
+    --------
+    >>> chdir_calls("def f():\\n    os.chdir('x')")
+    ['f']
+    >>> chdir_calls("def f():\\n    os.makedirs('x')")
+    []
+    """
+    tree = ast.parse(source)
+    callers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "chdir":
+            callers.append(enclosing_function(tree, node))
+    return callers
+
+
+#: The one place a working directory may be set: a worker process, once, before it runs
+#: anything, into a private directory of its own.
+CHDIR_ALLOWED_IN = {"prepare_worker"}
+
+
+@pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
+def test_nothing_steers_the_pipeline_by_changing_directory(path):
+    offenders = [name for name in chdir_calls(path.read_text()) if name not in CHDIR_ALLOWED_IN]
+
+    assert offenders == [], f"{path.name}: os.chdir in {offenders}"

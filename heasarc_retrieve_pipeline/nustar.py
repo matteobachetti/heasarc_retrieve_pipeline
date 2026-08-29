@@ -45,6 +45,7 @@ from prefect.tasks import task_input_hash
 from .barycenter import barycenter_file
 from .image_utils import filter_sources_in_images
 from .utils import (
+    absolute_config,
     apply_gti,
     binned_lightcurve,
     get_logger,
@@ -1754,7 +1755,9 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     flags : dict, optional
         Extra ``nupipeline`` parameters.
     """
-    config = DEFAULT_CONFIG if config is None else config
+    # Pinned here, once: every path below hangs off these two entries, and a relative
+    # path would mean "wherever this process is standing" at each separate use.
+    config = absolute_config(config, DEFAULT_CONFIG)
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")
     os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
