@@ -660,32 +660,38 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
 
     Notes
     -----
-    The temporary GTI file is named with ``np.random.randint``, which makes the task's
-    inputs non-deterministic. See issue 19 in ``docs/known_issues.rst``.
+    The merged GTIs go to an intermediate file named after ``outfile``, so the name is the
+    same on every run of the same merge -- it used to carry ``np.random.randint(1000000)``,
+    which made the task's inputs different every time and left a stray file behind whenever
+    a HEASOFT call raised. One output file means one intermediate, so the deterministic name
+    cannot collide, and it is removed in a ``finally``.
     """
     outdir, fname = os.path.split(outfile)
     root = splitext_improved(fname)[0]
-    logger = get_run_logger()
+    logger = get_logger()
 
-    outfile_gti = os.path.join(outdir, f"{root}_{np.random.randint(1000000)}.gti")
+    outfile_gti = os.path.join(outdir, f"{root}_tmp.gti")
 
-    merge_gtis(files_to_join, outfile_gti, gti_operation=gti_operation)
+    try:
+        merge_gtis(files_to_join, outfile_gti, gti_operation=gti_operation)
 
-    logger.info(f"Creating event file {outfile} from {files_to_join}")
+        logger.info(f"Creating event file {outfile} from {files_to_join}")
 
-    hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
+        hsp.ftmerge(infile=",".join(files_to_join), outfile=outfile, copyall="NO")
 
-    logger.info(f"Sorting event file {outfile}")
+        logger.info(f"Sorting event file {outfile}")
 
-    hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
+        hsp.ftsort(infile=outfile, outfile="!" + outfile, columns="TIME")
 
-    logger.info(f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}")
+        logger.info(
+            f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
+        )
 
-    hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
-
-    logger.info(f"Removing {outfile_gti}")
-
-    os.unlink(outfile_gti)
+        hsp.fappend(infile=f"{outfile_gti}[1]", outfile=outfile)
+    finally:
+        if os.path.exists(outfile_gti):
+            logger.info(f"Removing {outfile_gti}")
+            os.unlink(outfile_gti)
 
 
 @task(

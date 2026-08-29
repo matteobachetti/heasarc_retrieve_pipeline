@@ -10,6 +10,7 @@ import os
 # handler warns about that on every call; it has nothing to report to.
 os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
 
+import glob  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
@@ -614,3 +615,70 @@ class TestNustarPaths:
 
     def test_a_compression_suffix_does_not_end_up_in_the_middle(self):
         assert goes_lc_file_name("nu123A01_cl.evt.gz") == "nu123A01_cl_goes.fits"
+
+
+class StubHeasoft:
+    """The three HEASOFT calls ``merge_event_files`` makes, recorded, not run."""
+
+    def __init__(self, fail_on=None):
+        self.calls = []
+        self.fail_on = fail_on
+
+    def _record(self, name, **kwargs):
+        self.calls.append((name, kwargs))
+        if name == self.fail_on:
+            raise RuntimeError(f"{name} failed")
+        if name == "ftmerge":
+            open(kwargs["outfile"].lstrip("!"), "w").close()
+
+    def ftmerge(self, **kwargs):
+        self._record("ftmerge", **kwargs)
+
+    def ftsort(self, **kwargs):
+        self._record("ftsort", **kwargs)
+
+    def fappend(self, **kwargs):
+        self._record("fappend", **kwargs)
+
+
+class TestMergeEventFilesTemporary:
+    """The intermediate GTI file must be predictable, and must not survive."""
+
+    def merge(self, tmp_path, monkeypatch, fail_on=None):
+        """Run the merge with HEASOFT and the GTI merge stubbed out."""
+        gti_names = []
+
+        def stub_merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
+            gti_names.append(outfile_gti)
+            open(outfile_gti, "w").close()
+
+        monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
+        monkeypatch.setattr(nustar, "hsp", StubHeasoft(fail_on=fail_on), raising=False)
+
+        outfile = os.path.join(tmp_path, "nu123A_src1.evt")
+        nustar.merge_event_files.fn(["a.evt", "b.evt"], outfile)
+        return gti_names[0]
+
+    def test_no_gti_file_is_left_behind(self, tmp_path, monkeypatch):
+        self.merge(tmp_path, monkeypatch)
+
+        assert glob.glob(os.path.join(tmp_path, "*.gti")) == []
+
+    def test_the_intermediate_name_is_the_same_every_run(self, tmp_path, monkeypatch):
+        first = self.merge(tmp_path, monkeypatch)
+        second = self.merge(tmp_path, monkeypatch)
+
+        assert first == second
+
+    def test_the_intermediate_sits_beside_its_output(self, tmp_path, monkeypatch):
+        name = self.merge(tmp_path, monkeypatch)
+
+        assert os.path.dirname(name) == str(tmp_path)
+        assert name.endswith(".gti")
+        assert "nu123A_src1" in os.path.basename(name)
+
+    def test_a_failed_merge_still_cleans_up(self, tmp_path, monkeypatch):
+        with pytest.raises(RuntimeError):
+            self.merge(tmp_path, monkeypatch, fail_on="fappend")
+
+        assert glob.glob(os.path.join(tmp_path, "*.gti")) == []
