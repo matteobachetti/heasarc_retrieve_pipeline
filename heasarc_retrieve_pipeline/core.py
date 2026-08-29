@@ -37,6 +37,7 @@ from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
 from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 
 from prefect import flow, task, get_run_logger
+from prefect.task_runners import ProcessPoolTaskRunner
 
 from .utils import absolute_config, get_logger
 
@@ -1045,6 +1046,249 @@ def locate_data(result_table, catalog_name):
     return dl_result
 
 
+_WORKER_DIRECTORY = None
+
+
+def prepare_worker(root):
+    """
+    Give a worker process its own parameter files and its own directory.
+
+    Called at the top of every observation, and does its work once per process: the
+    second call in the same worker returns the directory the first one made. It is not
+    the process pool's ``initializer`` because Prefect only grew that argument in 3.8,
+    and the environment this pipeline runs in has 3.7.
+
+    Two pieces of state are shared by every HEASOFT call in a process. The first is
+    ``PFILES``: ``heasoftpy`` reads and rewrites ``<PFILES>/<tool>.par`` around each call,
+    so concurrent calls delete the file under each other. Measured with 200 calls of
+    ``ftlist``, eight at a time: 19 failures from threads sharing ``~/pfiles``, 9 from
+    processes sharing it, **0** from processes with a private directory each. Since
+    ``PFILES`` is an environment variable, and the environment belongs to the process,
+    this only works one process at a time -- which is why an observation is a process.
+
+    The second is the working directory, where several HEASOFT scripts drop scratch files
+    under fixed names. Each worker stands in a directory of its own, so those cannot
+    collide either. This is the one place in the package that calls ``os.chdir``, and it
+    is the opposite of the pattern it replaced: set once, before any work, never during.
+
+    Parameters
+    ----------
+    root : str
+        Directory to create the per-worker directories under.
+
+    Returns
+    -------
+    str
+        This process's private directory.
+    """
+    global _WORKER_DIRECTORY
+    if _WORKER_DIRECTORY is not None:
+        return _WORKER_DIRECTORY
+
+    workdir = os.path.join(root, f"worker_{os.getpid()}")
+    pfiles = os.path.join(workdir, "pfiles")
+    os.makedirs(pfiles, exist_ok=True)
+    if "HEADAS" in os.environ:
+        # First entry is where parameters are written, after the ";" is the read-only
+        # system copy the tools fall back on.
+        system = os.path.join(os.environ["HEADAS"], "syspfiles")
+        os.environ["PFILES"] = f"{pfiles};{system}"
+    os.chdir(workdir)
+
+    _WORKER_DIRECTORY = workdir
+    return workdir
+
+
+def download_link_column(force_heasarc=False, force_s3=False, environ=None):
+    """
+    Which column of the datalink table the downloads should come from.
+
+    The default is the public AWS S3 mirror, which is also what several observations at
+    once should use: S3 serves parallel readers well, while the HTTPS archive at HEASARC
+    is a directory-index scraper hitting one server.
+
+    Parameters
+    ----------
+    force_heasarc, force_s3 : bool, optional
+        Explicit choices, which win over everything else.
+    environ : dict, optional
+        Environment to inspect. Defaults to ``os.environ``.
+
+    Returns
+    -------
+    str
+        ``"aws"``, ``"access_url"`` (HEASARC over HTTPS) or ``"sciserver"`` (local copies).
+    """
+    environ = os.environ if environ is None else environ
+    if force_s3:
+        return "aws"
+    if force_heasarc:
+        return "access_url"
+    if "SCISERVER_USER_ID" in environ:
+        return "sciserver"
+    return "aws"
+
+
+def observation_work_items(result_table, links, link_col_name, source_position=None):
+    """
+    One unit of work per observation that actually has data to download.
+
+    Parameters
+    ----------
+    result_table : astropy.table.Table
+        Catalogue rows, with ``obsid``, ``ra``, ``dec`` and ``__row``.
+    links : astropy.table.Table
+        Datalink answer, with ``ID`` and one column per mirror.
+    link_col_name : str
+        Which mirror column to take the URL from.
+    source_position : astropy.coordinates.SkyCoord or None, optional
+        Position to barycentre at. ``None`` means each observation's own pointing.
+
+    Returns
+    -------
+    list of dict
+        ``obsid``, ``url``, ``ra`` and ``dec`` for each observation with public products.
+
+    Notes
+    -----
+    Links are matched to catalogue rows through the datalink ``ID``, not by position: the
+    service does not return one usable row per input row. Observations with no public data
+    products -- typically ones still in their proprietary period -- are logged and skipped.
+    """
+    logger = get_logger()
+    link_by_row = {str(i).split("?")[-1]: row for i, row in zip(links["ID"], links)}
+
+    items = []
+    for row in result_table:
+        obsid = row["obsid"]
+        link = link_by_row.get(row["__row"])
+        if link is None or not link[link_col_name]:
+            logger.info(
+                f"No public data products for OBSID {obsid} "
+                "(still in its proprietary period?), skipping"
+            )
+            continue
+
+        if source_position is not None:
+            ra, dec = source_position.ra.deg, source_position.dec.deg
+        else:
+            ra, dec = row["ra"], row["dec"]
+
+        items.append(dict(obsid=obsid, url=link[link_col_name], ra=ra, dec=dec))
+
+    return items
+
+
+@task(task_run_name="observation_{obsid}")
+def download_and_process_observation(
+    obsid, url, ra, dec, outdir, mission, worker_root, flags=None, test=False
+):
+    """
+    Download one observation and reduce it, in this process alone.
+
+    This is the unit of parallelism: it runs in a worker of the process pool, and the
+    first thing it does is give that process a private ``PFILES`` and a private working
+    directory. Everything below it is sequential.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    url : str
+        Where to download from, as chosen by :func:`download_link_column`.
+    ra, dec : float
+        Position to barycentre at.
+    outdir : str
+        Absolute output directory, shared by all observations. Each writes into its own
+        ``<outdir>/<obsid>`` subtree.
+    mission : str
+        One of the keys of ``MISSION_CONFIG``.
+    worker_root : str
+        Where this process's private directory goes; see :func:`prepare_worker`.
+    flags : dict, optional
+        Extra parameters for the mission's Level-2 pipeline.
+    test : bool, optional
+        If True, fake the download and do not process.
+    """
+    prepare_worker(worker_root)
+
+    config = absolute_config(
+        dict(input_data_path=outdir, out_data_path=outdir),
+        MISSION_CONFIG[mission]["default_config"],
+    )
+
+    recursive_download(url, outdir, test_str=".", test=test)
+    if test:
+        return None
+
+    # recursive_download is a flow, and a subflow call is synchronous and raises, so the
+    # ordering is already guaranteed by the line above. Prefect 3 has no flow.submit().
+    return MISSION_CONFIG[mission]["obsid_processing"](
+        obsid, config=config, ra=ra, dec=dec, flags=flags
+    )
+
+
+@flow(flow_run_name="process_{mission}_observations")
+def process_observations(items, outdir, mission, worker_root, flags=None, test=False):
+    """
+    Reduce every observation, one process each.
+
+    The task runner is supplied by the caller through ``with_options``, because the number
+    of workers and the directory their private state lives in are only known then.
+
+    A failed observation is reported and the others carry on, which is what the old loop
+    did with ``return_state=True``. The difference is that the failure is now named in the
+    log and counted, instead of passing in silence.
+
+    Parameters
+    ----------
+    items : list of dict
+        As returned by :func:`observation_work_items`.
+    outdir : str
+        Absolute output directory.
+    mission : str
+        One of the keys of ``MISSION_CONFIG``.
+    worker_root : str
+        Where the workers' private directories go; see :func:`prepare_worker`.
+    flags : dict, optional
+        Extra parameters for the mission's Level-2 pipeline.
+    test : bool, optional
+        If True, fake the downloads and process nothing.
+
+    Returns
+    -------
+    list of str
+        The OBSIDs that failed.
+    """
+    logger = get_run_logger()
+    futures = [
+        download_and_process_observation.submit(
+            item["obsid"],
+            item["url"],
+            item["ra"],
+            item["dec"],
+            outdir=outdir,
+            mission=mission,
+            worker_root=worker_root,
+            flags=flags,
+            test=test,
+        )
+        for item in items
+    ]
+
+    failed = []
+    for item, future in zip(items, futures):
+        try:
+            future.result()
+        except Exception as exc:
+            failed.append(item["obsid"])
+            logger.error(f"OBSID {item['obsid']} failed: {type(exc).__name__}: {exc}")
+
+    if failed:
+        logger.error(f"{len(failed)} of {len(items)} observations failed: {failed}")
+    return failed
+
+
 @flow
 def retrieve_and_process_data(
     result_table: Table,
@@ -1055,6 +1299,7 @@ def retrieve_and_process_data(
     flags={},
     force_heasarc: bool = False,
     force_s3: bool = False,
+    n_workers: int = 1,
 ):
 
     """
@@ -1093,6 +1338,12 @@ def retrieve_and_process_data(
         Download over HTTPS from HEASARC, whatever the environment suggests.
     force_s3 : bool, optional
         Download from the public AWS S3 mirror, whatever the environment suggests.
+    n_workers : int, optional
+        How many observations to reduce at the same time. Each gets a worker process of
+        its own, with its own HEASOFT parameter files and its own working directory; see
+        :func:`prepare_worker` for why that isolation is necessary. The default, 1, is one
+        observation at a time -- in a worker process all the same, so there is one code
+        path, not two.
 
     Returns
     -------
@@ -1108,66 +1359,36 @@ def retrieve_and_process_data(
     """
     outdir = os.path.abspath(outdir)
     os.makedirs(outdir, exist_ok=True)
-    # Absolute, once: the reduction used to be steered by chdir-ing into ``outdir``, which
-    # made every path in the mission defaults ("./") mean whatever the process working
-    # directory happened to be. See issue 26 in ``docs/known_issues.rst``.
-    config = absolute_config(
-        dict(input_data_path=outdir, out_data_path=outdir),
-        MISSION_CONFIG[mission]["default_config"],
-    )
-    processing = MISSION_CONFIG[mission]["obsid_processing"]
     logger = get_run_logger()
+
     links = locate_data(result_table, MISSION_CONFIG[mission]["table"])
     # Restore this once astroquery #3652 is fixed, and delete ``locate_data`` above:
     # links = Heasarc.locate_data(
     #     result_table, catalog_name=MISSION_CONFIG[mission]["table"]
     # )
-    # Match links to catalogue rows by identity, not by position: observations
-    # with no public data products do come back, but not in a downloadable form.
-    link_by_row = {str(i).split("?")[-1]: row for i, row in zip(links["ID"], links)}
-    if force_s3:
-        link_col_name = "aws"
-    elif force_heasarc:
-        link_col_name = "access_url"
-    elif "SCISERVER_USER_ID" in os.environ:
-        link_col_name = "sciserver"
-    else:
-        # Defaults to AWS
-        link_col_name = "aws"
-
-    for row in result_table:
-        obsid = row["obsid"]
-        if source_position is not None:
-            ra = source_position.ra.deg
-            dec = source_position.dec.deg
-        else:
-            ra = row["ra"]
-            dec = row["dec"]
-
-        link = link_by_row.get(row["__row"])
-        if link is None or not link[link_col_name]:
-            logger.info(
-                f"No public data products for OBSID {obsid} "
-                "(still in its proprietary period?), skipping"
-            )
-            continue
-
-        recursive_download(link[link_col_name], outdir, test_str=".", test=test)
-        if test:
-            break
-        # Heasarc.download_data(link, host=host, location=outdir)
-
-        # recursive_download is a flow, and a subflow call is synchronous and raises:
-        # the ordering is already guaranteed by the line above. Prefect 3 has no
-        # flow.submit(), so there is no future to declare here either.
-        processing(
-            obsid,
-            config=config,
-            ra=ra,
-            dec=dec,
-            flags=flags,
-            return_state=True,
+    link_col_name = download_link_column(force_heasarc, force_s3)
+    if n_workers > 1 and link_col_name == "access_url":
+        logger.warning(
+            f"{n_workers} workers will scrape the HEASARC HTTPS archive in parallel. "
+            "The S3 mirror (the default, force_s3=True) serves parallel readers better."
         )
+
+    items = observation_work_items(result_table, links, link_col_name, source_position)
+    if test:
+        items = items[:1]
+
+    worker_root = os.path.join(outdir, ".workers")
+    runner = ProcessPoolTaskRunner(max_workers=n_workers)
+    logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
+    process_observations.with_options(task_runner=runner)(
+        items,
+        outdir=outdir,
+        mission=mission,
+        worker_root=worker_root,
+        flags=flags,
+        test=test,
+    )
+
     return result_table
 
 
@@ -1180,6 +1401,7 @@ def retrieve_heasarc_data_by_source_name(
     test: bool = False,
     force_heasarc: bool = False,
     force_s3: bool = False,
+    n_workers: int = 1,
 ):
 
     """
@@ -1205,6 +1427,8 @@ def retrieve_heasarc_data_by_source_name(
         Download over HTTPS from HEASARC.
     force_s3 : bool, optional
         Download from the public AWS S3 mirror.
+    n_workers : int, optional
+        How many observations to reduce at the same time, one worker process each.
 
     Returns
     -------
@@ -1230,6 +1454,7 @@ def retrieve_heasarc_data_by_source_name(
         test=test,
         force_heasarc=force_heasarc,
         force_s3=force_s3,
+        n_workers=n_workers,
     )
 
     return results
@@ -1244,6 +1469,7 @@ def retrieve_heasarc_data_by_obsid(
     flags: dict = {},
     force_heasarc: bool = False,
     force_s3: bool = False,
+    n_workers: int = 1,
 ):
 
     """
@@ -1270,6 +1496,8 @@ def retrieve_heasarc_data_by_obsid(
         Download over HTTPS from HEASARC.
     force_s3 : bool, optional
         Download from the public AWS S3 mirror.
+    n_workers : int, optional
+        How many observations to reduce at the same time, one worker process each.
 
     Returns
     -------
@@ -1293,5 +1521,6 @@ def retrieve_heasarc_data_by_obsid(
         flags=flags,
         force_heasarc=force_heasarc,
         force_s3=force_s3,
+        n_workers=n_workers,
     )
     return results
