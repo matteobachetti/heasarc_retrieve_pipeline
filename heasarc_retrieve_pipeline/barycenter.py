@@ -3,9 +3,7 @@ Barycentric correction of event arrival times, shared by the mission modules.
 """
 
 import os
-from datetime import timedelta
 from prefect import task, get_run_logger
-from prefect.tasks import task_input_hash
 
 try:
     import heasoftpy as hsp

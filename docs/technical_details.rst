@@ -783,7 +783,11 @@ Barycentring
 ~~~~~~~~~~~~
 
 ``barycenter_data`` (``nustar.py:514``) runs HEASOFT ``barycorr`` on every event file in the
-observation's output directory, writing ``*_bary.evt``. The parameters are
+observation's output directory, writing ``*_bary.evt``. The ``barycorr`` call itself lives
+in :mod:`heasarc_retrieve_pipeline.barycenter`, shared with NICER: it refuses to start with
+a readable message when heasoftpy is missing, checks afterwards that ``barycorr`` actually
+wrote the file rather than assuming it did, and skips a file whose output is already there
+unless the caller passes ``overwrite=True``. The parameters are
 
 * ``ephem="JPLEPH.430"`` -- the JPL DE430 solar-system ephemeris;
 * ``refframe="ICRS"``;

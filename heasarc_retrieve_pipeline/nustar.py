@@ -444,8 +444,9 @@ def barycentered_file_name(infile):
 
     Notes
     -----
-    Currently unused: :func:`barycenter_file` builds the output name with
-    ``str.replace`` instead. See issue 13 in ``docs/known_issues.rst``.
+    Currently unused: left to itself, :func:`barycenter_file` builds the output name with
+    ``str.replace``. It now takes an ``outfile`` argument, so this is what a caller would
+    pass to get ``.evt.gz`` handled properly. See issue 13 in ``docs/known_issues.rst``.
     """
     root, ext = splitext(infile)
     return root + "_bary" + ext
@@ -1493,12 +1494,14 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     config : dict
         Must contain ``out_data_path``.
     src : int, optional
-        Source number, passed through to :func:`barycenter_file`.
+        Source number. Recorded in the flow run name only -- every event file in the
+        directory is barycentred regardless.
 
     Notes
     -----
     FPMA's attitude/orbit file is used for every file, including the FPMB and combined
-    ones. See issue 13 in ``docs/known_issues.rst``.
+    ones. That is harmless: the two attitude/orbit files are identical in every column
+    ``barycorr`` reads. See issue 13 in ``docs/known_issues.rst``.
     """
     logger = get_run_logger()
     outdir = nu_base_output_path.fn(obsid, config=config)
@@ -1515,7 +1518,6 @@ def barycenter_data(obsid, ra, dec, config, src=1):
             os.path.join(pipe_outdir, f"nu{obsid}A.attorb"),
             ra=ra,
             dec=dec,
-            src=src,
         )
 
 

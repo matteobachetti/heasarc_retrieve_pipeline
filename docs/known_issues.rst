@@ -349,18 +349,27 @@ What remains is cosmetic, and does not trigger in the current layout:
 * ``barycentered_file_name`` handles the name correctly via ``splitext_improved``, and is
   never called.
 
-14. ``barycenter.barycenter_file`` is shadowed and dead -- PARTLY FIXED
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+14. ``barycenter.barycenter_file`` is shadowed and dead -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``nustar.py`` imported ``barycenter_file`` from
-:mod:`~heasarc_retrieve_pipeline.barycenter` and then immediately redefined it, so the
-import was dead code that ruff flags under the rules the CI runs.
+:mod:`~heasarc_retrieve_pipeline.barycenter` and then immediately redefined it, so NICER
+used the guarded implementation and NuSTAR silently used a weaker copy of its own.
 
-**Fixed** to the extent of deleting the import. The duplication itself remains: the NuSTAR
-copy is a Prefect task and takes a ``src`` argument, so it is not a drop-in for the shared
-function, which is what NICER uses. Two things in the shared one are still worth having on
-the NuSTAR side -- it fails with a clear message when heasoftpy is missing, and it checks
-that ``barycorr`` actually wrote the output file rather than trusting that it did.
+**Fixed.** There is now one ``barycenter_file``, in
+:mod:`~heasarc_retrieve_pipeline.barycenter`, and both missions call it. The merged
+function keeps what each side had:
+
+* the ``ImportError`` with a readable message when heasoftpy is missing, and the
+  ``FileNotFoundError`` when ``barycorr`` returns without writing its output -- the two
+  things the shared version had and the NuSTAR copy did not;
+* the skip when the output is already there, which the NuSTAR copy had and the shared one
+  did not. It is now under an ``overwrite`` flag, defaulting to skipping, so re-running an
+  observation does not redo work that is already done;
+* an ``outfile`` argument, so a caller that wants to name the output itself can.
+
+``src`` is gone from it. It never affected the barycentring -- it only appeared in the
+Prefect task run name -- and ``barycenter_data`` still takes it for its own flow run name.
 
 35. Merged event files carry a stale ``ONTIME``, ``LIVETIME`` and ``EXPOSURE``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
