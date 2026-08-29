@@ -55,6 +55,7 @@ from .utils import (
     intervals_removed,
     mask_from_gti,
     read_gti,
+    rootname,
     splitext_improved,
 )
 
@@ -69,11 +70,6 @@ DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./", max_radius=80)
 valid_re = re.compile(r"nu[0-9]{11}[AB]0[16].*")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="nu_local_raw_path_{obsid}",
-)
 def nu_local_raw_data_path(obsid, config, **kwargs):
     """
     Directory holding the raw (Level-1) data of an observation.
@@ -93,11 +89,6 @@ def nu_local_raw_data_path(obsid, config, **kwargs):
     return os.path.join(config["input_data_path"], obsid)
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="nu_base_output_{obsid}",
-)
 def nu_base_output_path(obsid, config):
     """
     Top-level output directory of an observation.
@@ -117,11 +108,6 @@ def nu_base_output_path(obsid, config):
     return os.path.join(config["out_data_path"], obsid)
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="nu_pipeline_output_{obsid}",
-)
 def nu_pipeline_output_path(obsid, config):
     """
     Directory for the ``nupipeline`` output of an observation.
@@ -141,11 +127,6 @@ def nu_pipeline_output_path(obsid, config):
     return os.path.join(config["out_data_path"], obsid + "/event_pipe/")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="nu_product_output_{obsid}",
-)
 def nu_product_output_path(obsid, config):
     """
     Directory for the ``nuproducts`` output of an observation.
@@ -165,11 +146,6 @@ def nu_product_output_path(obsid, config):
     return os.path.join(config["out_data_path"], obsid + "/products/")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="nu_pipeline_output_{obsid}",
-)
 def nu_pipeline_done_file(obsid, config):
     """
     Path of the sentinel file marking a finished ``nupipeline`` run.
@@ -190,14 +166,9 @@ def nu_pipeline_done_file(obsid, config):
     str
         ``<out_data_path>/<OBSID>/event_pipe/PIPELINE_DONE.TXT``.
     """
-    return os.path.join(nu_pipeline_output_path.fn(obsid, config), "PIPELINE_DONE.TXT")
+    return os.path.join(nu_pipeline_output_path(obsid, config), "PIPELINE_DONE.TXT")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="split_path_{obsid}",
-)
 def split_path(obsid, config):
     """
     Directory for the ``nusplitsc`` output of an observation.
@@ -215,32 +186,6 @@ def split_path(obsid, config):
         ``<out_data_path>/<OBSID>/split/``.
     """
     return os.path.join(config["out_data_path"], obsid + "/split/")
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="splitext_{infile}",
-)
-def splitext(infile):
-    """
-    Split a path into root and extension, treating ``.evt.gz`` as one extension.
-
-    Thin wrapper around :func:`heasarc_retrieve_pipeline.utils.splitext_improved`.
-
-    Parameters
-    ----------
-    infile : str
-        File path.
-
-    Returns
-    -------
-    root : str
-        The path without its extension.
-    ext : str
-        The extension, including any compression suffix.
-    """
-    return splitext_improved(infile)
 
 
 def _cl_event_files(directory, pattern):
@@ -293,8 +238,8 @@ def spectral_input_files(obsid, config):
     infile : str
         Path of the cleaned event file.
     """
-    pipedir = nu_pipeline_output_path.fn(obsid, config=config)
-    splitdir = split_path.fn(obsid, config=config)
+    pipedir = nu_pipeline_output_path(obsid, config=config)
+    splitdir = split_path(obsid, config=config)
     for fpm in "A", "B":
         for infile in _cl_event_files(pipedir, f"nu{obsid}{fpm}01_cl.evt*"):
             yield fpm, infile
@@ -332,7 +277,7 @@ def mode_01_input_files(obsid, config):
     :func:`calculate_spectra` asks for them, which is what lets that function apply the
     mode-01 reference position as a consistency check.
     """
-    pipedir = nu_pipeline_output_path.fn(obsid, config=config)
+    pipedir = nu_pipeline_output_path(obsid, config=config)
     for fpm in "A", "B":
         for infile in _cl_event_files(pipedir, f"nu{obsid}{fpm}01_cl.evt*"):
             yield fpm, infile
@@ -373,33 +318,6 @@ def position_is_consistent(position, reference, max_offset):
     return position.separation(reference) <= max_offset
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="rootname_{infile}",
-)
-def rootname(infile):
-    """
-    Return a path with its extension removed.
-
-    Parameters
-    ----------
-    infile : str
-        File path.
-
-    Returns
-    -------
-    str
-        ``infile`` without its (possibly compound) extension.
-    """
-    return splitext(infile)[0]
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="goes_lc_file_name_{event_file}",
-)
 def goes_lc_file_name(event_file):
     """
     Name of the GOES light-curve file associated with an event file.
@@ -423,11 +341,6 @@ def goes_lc_file_name(event_file):
     return root + "_goes.fits"
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="goes_gti_file_name_{event_file}",
-)
 def goes_gti_file_name(event_file):
     """
     Name of the solar-flare GTI file associated with an event file.
@@ -446,11 +359,6 @@ def goes_gti_file_name(event_file):
     return root + "_goes.gti"
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="flare_filtered_event_file_name_{event_file}",
-)
 def flare_filtered_event_file_name(event_file):
     """
     Name of the flare-filtered version of an event file.
@@ -587,7 +495,7 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
-    pipe_done_file = nu_pipeline_done_file.fn(obsid, config=config)
+    pipe_done_file = nu_pipeline_done_file(obsid, config=config)
     if os.path.exists(pipe_done_file):
         logger = get_run_logger()
         logger.info(f"Data for {obsid} already preprocessed")
@@ -595,8 +503,8 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
     logger = get_run_logger()
     nupipeline = hsp.HSPTask("nupipeline")
     logger.info("Running NuSTAR L2 pipeline")
-    datadir = nu_local_raw_data_path.fn(obsid, config=config)
-    ev_dir = nu_pipeline_output_path.fn(obsid, config=config)
+    datadir = nu_local_raw_data_path(obsid, config=config)
+    ev_dir = nu_pipeline_output_path(obsid, config=config)
     os.makedirs(ev_dir, exist_ok=True)
     params = {
         "indir": datadir,
@@ -657,9 +565,9 @@ def recover_spacecraft_science_data(obsid, config):
     """
     logger = get_run_logger()
     logger.info(f"Squeezing every photon from spacecraft science data in {obsid}")
-    datadir = nu_local_raw_data_path.fn(obsid, config)
-    ev_dir = nu_pipeline_output_path.fn(obsid, config)
-    splitdir = split_path.fn(obsid, config=config)
+    datadir = nu_local_raw_data_path(obsid, config)
+    ev_dir = nu_pipeline_output_path(obsid, config)
+    splitdir = split_path(obsid, config=config)
     recover_done_file = os.path.join(splitdir, "RECOVER_DONE.TXT")
     hk_dir = os.path.join(datadir, "hk")
 
@@ -832,7 +740,7 @@ def join_source_data(obsid, directories, config, src_num=1):
     are not meant to be science products. See issue 6 in ``docs/known_issues.rst``.
     """
     logger = get_logger()
-    outdir = nu_base_output_path.fn(obsid, config=config)
+    outdir = nu_base_output_path(obsid, config=config)
 
     if src_num > 0:
         label = f"_src{src_num}"
@@ -1234,7 +1142,7 @@ def plot_flare_filtering(
     fig = Figure(figsize=(11, 9))
     axes = fig.subplots(3, 1, sharex=True)
 
-    goes_file = goes_lc_file_name.fn(event_file)
+    goes_file = goes_lc_file_name(event_file)
     if os.path.exists(goes_file):
         goes = Table.read(goes_file)
         for column, label, colour in (
@@ -1447,9 +1355,9 @@ def barycenter_data(obsid, ra, dec, config, src=1):
     ``barycorr`` reads. See issue 13 in ``docs/known_issues.rst``.
     """
     logger = get_run_logger()
-    outdir = nu_base_output_path.fn(obsid, config=config)
+    outdir = nu_base_output_path(obsid, config=config)
     logger.info(f"Barycentering data in directory {outdir}")
-    pipe_outdir = nu_pipeline_output_path.fn(obsid, config=config)
+    pipe_outdir = nu_pipeline_output_path(obsid, config=config)
 
     infiles = glob.glob(os.path.join(outdir, f"nu{obsid}*.evt*"))
     for infile in infiles:
@@ -1538,7 +1446,7 @@ def get_best_source_region(
         config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
     if out_rootname is None:
-        out_rootname = rootname.fn(fname)
+        out_rootname = rootname(fname)
 
     src_out = os.path.join(indir, out_rootname + "_src.reg")
     bkg_out = os.path.join(indir, out_rootname + "_bkg.reg")
@@ -1661,7 +1569,7 @@ def get_best_source_regions(obsid, config):
     none.
     """
     logger = get_logger()
-    outdir = nu_pipeline_output_path.fn(obsid, config=config)
+    outdir = nu_pipeline_output_path(obsid, config=config)
     os.makedirs(outdir, exist_ok=True)
 
     mean_ra = mean_dec = mean_rlimit = 0.0
@@ -1730,8 +1638,8 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
     next run retries instead of the observation being marked done forever.
     """
     logger = get_run_logger()
-    indir = nu_pipeline_output_path.fn(obsid, config=config)
-    outdir = nu_product_output_path.fn(obsid, config=config)
+    indir = nu_pipeline_output_path(obsid, config=config)
+    outdir = nu_product_output_path(obsid, config=config)
     product_done_file = os.path.join(outdir, "PRODUCTS_DONE.TXT")
     if os.path.exists(product_done_file):
         logger.info(f"Spectra for {obsid} already calculated")
@@ -1746,7 +1654,7 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
 
     problems = 0
     for fpm, infile in spectral_input_files(obsid, config):
-        root_name = rootname.fn(os.path.basename(infile))
+        root_name = rootname(os.path.basename(infile))
         stem = root_name[: -len("_cl")] if root_name.endswith("_cl") else root_name
         filedir = os.path.dirname(infile)
         is_mode_06 = f"{fpm}06" in os.path.basename(infile)
@@ -1844,9 +1752,9 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")
     os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
-    basedir = nu_base_output_path.fn(obsid, config=config)
-    # splitdir = split_path.fn(obsid, config=config)
-    pipedir = nu_pipeline_output_path.fn(obsid, config=config)
+    basedir = nu_base_output_path(obsid, config=config)
+    # splitdir = split_path(obsid, config=config)
+    pipedir = nu_pipeline_output_path(obsid, config=config)
 
     nu_run_l2_pipeline(obsid, config=config, flags=flags)
 

@@ -19,6 +19,15 @@ import astropy.units as u  # noqa: E402
 from heasarc_retrieve_pipeline import nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     chi2_dof_against_a_constant,
+    flare_filtered_event_file_name,
+    goes_gti_file_name,
+    goes_lc_file_name,
+    nu_base_output_path,
+    nu_local_raw_data_path,
+    nu_pipeline_done_file,
+    nu_pipeline_output_path,
+    nu_product_output_path,
+    split_path,
     get_best_source_regions,
     goes_class_to_flux,
     join_source_data,
@@ -565,3 +574,43 @@ class TestPlotFlareFilteringWithoutTheFluxCut:
         )
 
         assert os.path.getsize(outfile) > 0
+
+
+class TestNustarPaths:
+    """The local layout one NuSTAR observation maps to.
+
+    These are plain functions, not Prefect tasks: they are one-line string joins, and
+    wrapping them made them 43% of the task runs in a real observation.
+    """
+
+    CONFIG = {"out_data_path": "out", "input_data_path": "raw"}
+
+    def test_the_output_directory_is_the_obsid_under_out_data_path(self):
+        assert nu_base_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID)
+
+    def test_the_level_2_products_go_in_event_pipe(self):
+        assert nu_pipeline_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/event_pipe/")
+
+    def test_the_spectral_products_go_in_products(self):
+        assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/products/")
+
+    def test_the_per_chu_files_go_in_split(self):
+        assert split_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/split/")
+
+    def test_the_sentinel_sits_beside_the_level_2_products(self):
+        done = nu_pipeline_done_file(OBSID, self.CONFIG)
+
+        assert done == os.path.join("out", OBSID + "/event_pipe/", "PIPELINE_DONE.TXT")
+
+    def test_the_raw_data_directory_comes_from_input_data_path(self):
+        assert nu_local_raw_data_path(OBSID, self.CONFIG) == os.path.join("raw", OBSID)
+
+    def test_the_derived_names_hang_off_the_event_file_root(self):
+        event_file = "out/x/nu123A01_cl.evt"
+
+        assert goes_lc_file_name(event_file) == "out/x/nu123A01_cl_goes.fits"
+        assert goes_gti_file_name(event_file) == "out/x/nu123A01_cl_goes.gti"
+        assert flare_filtered_event_file_name(event_file) == "out/x/nu123A01_cl_noflares.evt"
+
+    def test_a_compression_suffix_does_not_end_up_in_the_middle(self):
+        assert goes_lc_file_name("nu123A01_cl.evt.gz") == "nu123A01_cl_goes.fits"

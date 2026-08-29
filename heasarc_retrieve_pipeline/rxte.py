@@ -34,17 +34,10 @@ from astropy.table import Table
 from botocore import UNSIGNED
 from botocore.config import Config
 from prefect import flow, get_run_logger, task
-from prefect.tasks import task_input_hash
-from datetime import timedelta
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="rxte_base_output_{obsid}",
-)
 def rxte_base_output_path(config, obsid):
     """
     Top-level output directory of an observation.
@@ -311,7 +304,7 @@ def process_rxte_obsid(obsid: str, config={}, flags=None, ra: float = None, dec:
     current_config = DEFAULT_CONFIG if config is None else config
     logger = get_run_logger()
     logger.info(f"Processing RXTE observation {obsid}")
-    raw_data_dir = rxte_base_output_path.fn(config=current_config, obsid=obsid)
+    raw_data_dir = rxte_base_output_path(config=current_config, obsid=obsid)
     os.makedirs(raw_data_dir, exist_ok=True)
 
     paths = setup_workspace(raw_data_dir, obsid)

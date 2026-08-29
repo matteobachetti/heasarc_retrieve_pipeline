@@ -95,6 +95,31 @@ def splitext_improved(path):
         ext += gz_ext
     return os.path.join(dir, froot), ext
 
+def rootname(infile):
+    """
+    A path with its extension removed, compression suffix and all.
+
+    Parameters
+    ----------
+    infile : str
+        File path.
+
+    Returns
+    -------
+    str
+        ``infile`` without its (possibly compound) extension.
+
+    Examples
+    --------
+    >>> rootname("nu123A01_cl.evt")
+    'nu123A01_cl'
+    >>> rootname("nu123A01_cl.evt.gz")
+    'nu123A01_cl'
+    """
+    return splitext_improved(infile)[0]
+
+
+
 
 def merge_intervals(intervals, tolerance=0.0):
     """

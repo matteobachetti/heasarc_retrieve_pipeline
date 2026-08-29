@@ -51,11 +51,6 @@ DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 valid_re = re.compile(r"ni[0-9]{11}")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="ni_base_output_{obsid}",
-)
 def ni_base_output_path(config, obsid):
     """
     Top-level output directory of an observation.
@@ -76,7 +71,6 @@ def ni_base_output_path(config, obsid):
     return os.path.join(config["out_data_path"], obsid)
 
 
-@task
 def ni_pipeline_output_path(config, obsid):
     """
     Directory for the ``nicerl2`` output of an observation.
@@ -96,11 +90,6 @@ def ni_pipeline_output_path(config, obsid):
     return os.path.join(config["out_data_path"], obsid + "/l2files/")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="ni_pipeline_done_file_{obsid}",
-)
 def ni_pipeline_done_file(obsid, config):
     """
     Path of the sentinel file marking a finished ``nicerl2`` run.
@@ -117,7 +106,7 @@ def ni_pipeline_done_file(obsid, config):
     str
         ``<out_data_path>/<OBSID>/l2files/PIPELINE_DONE.TXT``.
     """
-    return os.path.join(ni_pipeline_output_path.fn(obsid, config), "PIPELINE_DONE.TXT")
+    return os.path.join(ni_pipeline_output_path(config=config, obsid=obsid), "PIPELINE_DONE.TXT")
 
 
 @task(
@@ -167,7 +156,7 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
         logger.error("heasoftpy not installed, cannot run NICER L2 pipeline.")
         raise ImportError("heasoftpy not installed")
 
-    ev_dir = ni_pipeline_output_path.fn(config=config, obsid=obsid)
+    ev_dir = ni_pipeline_output_path(config=config, obsid=obsid)
     os.makedirs(ev_dir, exist_ok=True)
 
     full_pipe_done_file_path = os.path.join(ev_dir, "PIPELINE_DONE.TXT")
@@ -181,7 +170,7 @@ def ni_run_l2_pipeline(obsid, config, flags=None):
     nicerl2_hsp_task = hsp.HSPTask("nicerl2")
     logger.info("Running Nicer L2 pipeline for OBSID: %s", obsid)
 
-    datadir = ni_base_output_path.fn(config=config, obsid=obsid)
+    datadir = ni_base_output_path(config=config, obsid=obsid)
     os.makedirs(ev_dir, exist_ok=True)
     logger.info(f"Ensuring desired final output directory exists: {ev_dir}")
 
@@ -256,7 +245,7 @@ def barycenter_data(obsid: str, ra: float, dec: float, config: dict):
     found.
     """
     logger = get_run_logger()
-    outdir = ni_base_output_path.fn(config=config, obsid=obsid)
+    outdir = ni_base_output_path(config=config, obsid=obsid)
     logger.info(f"Barycentering NICER data in directory {outdir}")
     infile = os.path.join(outdir, "l2files", f"ni{obsid}_0mpu7_cl.evt")
     if not os.path.exists(infile):
@@ -296,7 +285,7 @@ def process_nicer_obsid(obsid: str, config={}, ra="NONE", dec="NONE", flags=None
     current_config = DEFAULT_CONFIG if config is None else config
     logger = get_run_logger()
     logger.info(f"Processing Nicer observation {obsid}")
-    base_output_dir_for_obsid = ni_base_output_path.fn(config=current_config, obsid=obsid)
+    base_output_dir_for_obsid = ni_base_output_path(config=current_config, obsid=obsid)
     os.makedirs(base_output_dir_for_obsid, exist_ok=True)
     logger.info(f"Ensured base output directory exists: {base_output_dir_for_obsid}")
     ni_run_l2_pipeline(obsid, config=current_config, flags=flags)
