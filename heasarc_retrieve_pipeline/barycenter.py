@@ -16,9 +16,9 @@ except ImportError:
 
 
 @task(
-    task_run_name="barycenter_{infile}_ra{ra}_dec{dec}_to_{outfile}_{overwrite}",
+    task_run_name="barycenter_{infile}_ra{ra}_dec{dec}_to_{outfile}_overwrite_{overwrite}",
 )
-def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=1, outfile=None):
+def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=None):
     """
     Barycentre one event file with HEASOFT ``barycorr``.
 
@@ -35,11 +35,11 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=1, outfile=None
     infile : str
         Event file to barycentre.
     attorb : str
-        Attitude/orbit file, as produced by ``nupipeline`` (``nu<OBSID><FPM>.attorb``).
+        Orbit, or Attitude/orbit, file, as produced by the relevant mission pipeline.
     ra, dec : float, optional
         Source position in degrees. Accuracy here directly sets the timing accuracy.
-    overwrite : int, optional
-        If 1, overwrite existing output file. If 0, do not overwrite.
+    overwrite : bool, optional
+        If True, overwrite existing output file. If False, do not overwrite.
     outfile : str, optional
         Output file name. If None, a default name is used.
 
@@ -48,17 +48,18 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=1, outfile=None
     str
         Path of the barycentered file.
 
-    Notes
-    -----
-    :mod:`heasarc_retrieve_pipeline.barycenter` holds a second implementation, which NICER
-    uses. It is not interchangeable with this one -- it is a plain function rather than a
-    Prefect task and takes no ``src`` -- but it does two things this one does not: it fails
-    with a clear message when heasoftpy is missing, and it checks that ``barycorr``
-    actually wrote the output. See issue 14 in ``docs/known_issues.rst``.
+    Raises
+    ------
+    ImportError
+        If ``heasoftpy`` is not available.
+    FileNotFoundError
+        If ``barycorr`` returned without creating the output file.
+
     """
     logger = get_run_logger()
     logger.info(f"Barycentering {infile}")
-
+    if not HAS_HEASOFT:
+        raise ImportError("heasoftpy is required for barycenter correction but is not installed.")
     if outfile is None:
         outfile = infile.replace(".evt", "_bary.evt")
     logger.info(f"Output file: {outfile}")
@@ -76,6 +77,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=1, outfile=None
         refframe="ICRS",
         clobber="yes",
         orbitfiles=attorb,
+        chatter=5,
     )
     if not os.path.exists(outfile):
         raise FileNotFoundError(f"Barycentered output file not created: {outfile}")
