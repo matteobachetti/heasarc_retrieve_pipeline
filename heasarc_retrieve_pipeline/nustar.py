@@ -44,7 +44,7 @@ from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .image_utils import filter_sources_in_images
 from .barycenter import barycenter_file
-from .utils import get_logger, splitext_improved
+from .utils import get_logger, good_intervals, splitext_improved
 
 try:
     HAS_HEASOFT = True
@@ -938,8 +938,9 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
     mission-elapsed time to civil time; ask ``sunpy``'s ``Fido`` for the GOES XRS data of
     that interval, picking the highest-numbered (most recent) satellite that covers it;
     retrieve the HEK flare catalogue entries flagged by SWPC; and cut out every catalogued
-    flare at or above ``minimum_class``. Good intervals run from ``TSTART`` to the first
-    flare, between consecutive flares, and from the last flare to ``TSTOP``.
+    flare at or above ``minimum_class``. The surviving intervals are the complement of
+    the flares inside ``[TSTART, TSTOP]``, computed by
+    :func:`~heasarc_retrieve_pipeline.utils.good_intervals`.
 
     Flare classes are compared by letter and number separately. The GOES scale runs
     A, B, C, M, X, which is alphabetical, so comparing the letters as characters gives the
@@ -961,9 +962,8 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 
     Notes
     -----
-    The GOES X-ray light curve is downloaded but not used: the filtering runs entirely off
-    the HEK flare catalogue. A flare overlapping ``TSTART`` also produces a
-    negative-length interval. See issue 12 in ``docs/known_issues.rst``.
+    The GOES X-ray light curve is downloaded but not used for the filtering itself, which
+    runs entirely off the HEK flare catalogue.
     """
     from sunpy import timeseries as ts
     from sunpy.net import Fido
@@ -1014,11 +1014,9 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
 
     # goes.to_table().write(root + "_goes.fits", overwrite=True)
 
-    gtis = []
-    previous_gti_start = tstart
+    flares = []
     for flare_hek in flares_hek:
         flare_class = flare_hek["fl_goescls"]
-        print(flare_class)
         category = flare_class[0]
         number = float(flare_class[1:])
         if category < min_cat:
@@ -1031,11 +1029,22 @@ def get_goes_gtis(event_file, minimum_class="C5.0"):
         if flare_start >= tstop or flare_end <= tstart:
             continue
 
-        gtis.append({"START": previous_gti_start, "STOP": flare_start})
-        previous_gti_start = flare_end
+        logger.info(
+            f"Excluding {flare_class} flare, MET {flare_start:.1f} -> {flare_end:.1f}"
+        )
+        flares.append((flare_start, flare_end))
 
-    gtis.append({"START": previous_gti_start, "STOP": tstop})
-    print(gtis)
+    # good_intervals does the clipping, sorting, merging and empty-interval dropping, so
+    # a flare overlapping TSTART or two overlapping flares cannot produce a broken GTI.
+    good = good_intervals(flares, tstart, tstop)
+    if len(good) == 0:
+        raise RuntimeError(
+            f"Flares of class {minimum_class} or above cover the whole of {event_file} "
+            f"(MET {tstart} -- {tstop}); no good time is left."
+        )
+    logger.info(f"{len(flares)} flares excluded, leaving {len(good)} good intervals")
+
+    gtis = [{"START": start, "STOP": stop} for start, stop in good]
 
     utils.make_usr_gti(gtis, overwrite=True, outfile=outfile_gti)
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
