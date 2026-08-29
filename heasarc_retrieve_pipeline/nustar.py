@@ -1024,15 +1024,14 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         which catalogued flares are excluded is a reasonable thing to want, and it must
         not silently destroy the observation.
 
+    The GOES X-ray light curve is also written to :func:`goes_lc_file_name`, on the event
+    file's own time scale, so that :func:`plot_flare_filtering` can show what the Sun was
+    doing without downloading anything a second time.
+
     Returns
     -------
     str
         Path of the GTI file, ``<root>_goes.gti``.
-
-    The GOES X-ray light curve is not used for the filtering itself, which runs entirely
-    off the HEK flare catalogue. It is written to :func:`goes_lc_file_name` all the same,
-    on the event file's own time scale, so that :func:`plot_flare_filtering` can show what
-    the Sun was doing without downloading anything a second time.
     """
     from sunpy import timeseries as ts
     from sunpy.net import Fido
@@ -1049,8 +1048,6 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         logger = get_run_logger()
         logger.info(f"GOES GTI file {outfile_gti} already exists, skipping")
         return outfile_gti
-
-    # categories = ["A", "B", "C", "M", "X"]
 
     min_cat = minimum_class[0]
     min_num = float(minimum_class[1:])
