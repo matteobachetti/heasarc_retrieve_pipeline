@@ -1179,9 +1179,32 @@ could be handed it while the other was still writing it. Plotting uses
 ``matplotlib.figure.Figure`` directly instead of ``pyplot``, which keeps a process-wide
 figure registry and a global backend.
 
-**What is still shared.** All workers write to one Prefect SQLite database, and each worker
-process starts a temporary Prefect server of its own. This works, but it is the part that
-will complain first if ``n_workers`` is raised a long way.
+**What is still shared, and what to do about it.** By default each worker process starts a
+temporary Prefect server of its own, and all of them write one SQLite file. Measured with
+``n_workers=4``: **five** temporary servers, one per worker plus the parent, and
+``sqlite3.OperationalError: database is locked`` from the server's own telemetry service.
+
+Give the whole run one server instead::
+
+    export PREFECT_HOME=/somewhere/local/prefect_home
+    export PREFECT_SERVER_DATABASE_CONNECTION_URL="sqlite+aiosqlite:///$PREFECT_HOME/run.db"
+    export PREFECT_SERVER_ANALYTICS_ENABLED=false
+    export PREFECT_SERVER_DATABASE_TIMEOUT=60
+
+    prefect server start --host 127.0.0.1 --port 4277 &
+    until curl -sf http://127.0.0.1:4277/api/health >/dev/null; do sleep 2; done
+
+    export PREFECT_API_URL=http://127.0.0.1:4277/api
+    python run_the_pipeline.py
+
+With ``PREFECT_API_URL`` set, the workers connect as clients: measured, zero temporary
+servers and no lock errors. ``PREFECT_SERVER_ANALYTICS_ENABLED=false`` turns off the
+telemetry heartbeat, which is a pure-noise writer to the same database. Both settings exist
+under these names in Prefect 3.7 and 3.8.
+
+``PREFECT_HOME`` should be on **local** disk. SQLite locking over NFS or Lustre is
+unreliable, so a database under a network-mounted home or scratch directory can report
+"database is locked" no matter how few writers there are.
 
 **Measured, three at a time.** Three real reductions of NuSTAR observation 90901333002 from
 the join step through spectra, in three worker processes: with a private ``PFILES`` and

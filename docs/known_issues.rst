@@ -869,6 +869,30 @@ recorded in :doc:`technical_details` so that a deep output directory is a known 
 rather than a mystery.
 
 
+38. Every worker starts its own Prefect server on one SQLite file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reported from a real 56-observation run at ``n_workers=4``::
+
+    sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) database is locked
+    [SQL: INSERT INTO configuration ("key", value, id, created, updated) ...]
+    [parameters: {'key': 'TELEMETRY_SESSION', ...}]
+
+Measured here with ``n_workers=4``: **five** temporary servers are started, one per worker
+plus the parent, all writing the same SQLite file. In that particular traceback the loser
+of the race is the server's own telemetry heartbeat, which is harmless -- the run carries
+on -- but it is the first symptom of a database with more writers than SQLite wants.
+
+Not a code fix: it is how the run is launched. Start one server and set ``PREFECT_API_URL``
+so the workers connect to it as clients (measured: zero temporary servers, no lock errors),
+turn the telemetry writer off with ``PREFECT_SERVER_ANALYTICS_ENABLED=false``, and raise
+``PREFECT_SERVER_DATABASE_TIMEOUT``. The recipe is in :doc:`technical_details`.
+
+Keep ``PREFECT_HOME`` on local disk. SQLite locking over NFS or Lustre is unreliable, so a
+database under a network-mounted home or scratch directory can report "database is locked"
+with any number of writers.
+
+
 Science caveats
 ---------------
 
