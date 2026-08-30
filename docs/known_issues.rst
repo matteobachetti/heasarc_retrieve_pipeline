@@ -893,6 +893,56 @@ database under a network-mounted home or scratch directory can report "database 
 with any number of writers.
 
 
+39. ``xselect`` truncates file names at 128 characters -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A different limit from issue 37, in a different tool, and much lower. Every one of the 56
+observations in the M82 run failed at ``nusplitsc``::
+
+    filter time file /scratch/.../out/80002092008/split//nu80002092008_chu2_gti_31721.fits
+    Error determining file type for /scratch/.../split//nu80002092008_chu2_gti_31721.fi
+    The file was not found
+
+The name in the error ends ``.fi``, two characters short of ``.fits``. ``maketime`` had
+just written that file successfully; ``xselect`` chopped the name and then looked for
+something that does not exist. A few lines later the same truncation cuts the closing
+quote off the shell command ``save events`` builds::
+
+    save events /scratch/.../out/80002092008/split//nu80002092008B06_chu2_N_cl.evt
+    sh: -c: line 0: unexpected EOF while looking for matching `"'
+    sh: -c: line 1: syntax error: unexpected end of file
+    Output event list not found.
+
+**Measured.** Every ``Error determining file type for <path>`` in the run log was
+extracted: **2376 of them, and all 2376 are exactly 128 characters long**, against real
+paths of 130. That is a hard 128-character buffer, and nothing reports it as one.
+
+**Not reproducible here.** On macOS, same ``XSELECT V2.5c``, ``save events`` was run at
+100, 120, 126, 127, 128, 129, 130, 132 and 140 characters, with both a short and a
+105-character input directory: every one succeeded. So this is a property of that HEASOFT
+build, not of ``xselect`` in general, and the fix has to be to avoid long names rather
+than to shorten any particular one.
+
+**Which side of the tool matters.** ``xselect`` resolves the directory it *reads* from --
+it prints the real path in ``Data Directory is:`` even when given a symbolic link -- but
+takes output names exactly as given. The read path is the one measured good to 247
+characters in issue 26, so the constraint is entirely on the write side.
+
+**Fixed** by :func:`heasarc_retrieve_pipeline.utils.short_workspace`, which gives the
+output directory a name about fifteen characters long in a private temporary directory,
+and by :func:`heasarc_retrieve_pipeline.utils.check_name_length`, which refuses an
+impossible path before anything is downloaded. Measured with the tool that was failing: a
+real output tree 80 characters deep, reached through a 15-character link, ran ``nusplitsc``
+to ``Exit with success`` with the files appearing in the real tree.
+
+The budget, for reference: the reduction adds **58 characters** after the output root
+(``/<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits``, seven-digit PID), so against a
+128-character limit an output root has to be 69 characters or fewer if it is used
+directly. The user's was 77. Through the link it is about 73 characters in total whatever
+the root is called.
+
+
+
 Science caveats
 ---------------
 

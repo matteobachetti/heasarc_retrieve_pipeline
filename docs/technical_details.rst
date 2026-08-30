@@ -1142,7 +1142,7 @@ the file another is in the middle of reading.
 **What a worker sets up.** ``core.prepare_worker(root)`` runs once per worker process, at
 the top of ``download_and_process_observation``, and is idempotent (a module-level
 ``_WORKER_DIRECTORY`` guard) because Prefect 3.7 has no pool ``initializer``. It creates
-``<outdir>/.workers/worker_<pid>/``, points ``PFILES`` at a ``pfiles`` directory inside it
+``<scratch>/worker_<pid>/``, points ``PFILES`` at a ``pfiles`` directory inside it
 (``"<private>;$HEADAS/syspfiles"`` -- the semicolon separates the writable copy from the
 read-only system one), and ``chdir``-s into it. That is the **only** ``os.chdir`` in the
 package, and a test asserts it stays that way: the working directory is a property of the
@@ -1223,12 +1223,59 @@ so a parallel run must be started from a real script guarded by
 better than the HEASARC web server; S3 is the default, and asking for ``force_heasarc``
 together with ``n_workers > 1`` logs a warning.
 
-**One environment limit worth knowing.** Several HEASOFT tools are old Fortran ftools whose
-file-name parameters are ``character*160``. Measured with ``fappend``: an output path of 160
-characters works, 161 fails with ``could not open the named file``, status 104. Deep output
-directories therefore break the reduction, and since the merged path is
-``<outdir>/<obsid>/nu<obsid>A_src1.evt`` the practical budget for ``outdir`` is about 120
-characters.
+How long a file name may be
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+HEASOFT has two separate file-name limits, and the reduction can run into either.
+
+**160 characters, in the old Fortran ftools**, whose file-name parameters are
+``character*160``. Measured with ``fappend``: an output path of 160 characters works, 161
+fails with ``could not open the named file``, status 104.
+
+**128 characters, in some builds of** ``xselect``. Measured on a cluster run of 56
+observations: 2376 messages of the form ``Error determining file type for <path>``, every
+one of them exactly 128 characters long against real paths of 130. The tool says nothing
+about having truncated anything; it reports "The file was not found" about a file that
+exists, and ``save events`` emits a shell command whose closing quote has been cut off.
+The same test on macOS with the same ``XSELECT V2.5c`` succeeded at 140 characters, so
+this is a property of the build rather than of the tool.
+
+``xselect`` resolves the directory it *reads* from -- it prints the real path in
+``Data Directory is:`` even when handed a symbolic link -- but takes output names exactly
+as given. The read side was measured good to 247 characters, so the constraint is on the
+write side alone.
+
+**What the pipeline does about it.** ``utils.short_workspace`` makes a private temporary
+directory (``tempfile.mkdtemp``: unpredictable name, owner-only, so nothing can be planted
+at that path on a shared node) and puts a symbolic link to the output directory inside it.
+The flow hands the workers the link, so the output root is about fifteen characters however
+deep the real tree is. The bytes never move, and the link is removed at the end of the run;
+cleanup unlinks symbolic links and nothing else, so it cannot delete an output tree.
+
+Measured with the tool that was failing: a real output tree 80 characters deep, reached
+through a 15-character link, ran ``nusplitsc`` to ``Exit with success``, and the files
+appeared in the real tree.
+
+The budget, if the link cannot be made and the real path is used: the reduction adds **58
+characters** after the output root, the longest being ``nusplitsc``'s
+``<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits`` with a seven-digit PID. Against the
+128-character limit that leaves 69 characters for the root.
+``utils.check_name_length`` raises before anything is downloaded when it does not fit,
+naming the path and both lengths; ``nustar.nu_longest_output_name`` is what it checks, and
+a test pins that as longer than every other name any step builds.
+
+**Scratch state goes to local disk.** The workers' private directories used to live under
+``<outdir>/.workers``, on the shared filesystem. One ``nupipeline`` run spawns at least 44
+sub-tools, and ``heasoftpy`` reads and rewrites ``<PFILES>/<tool>.par`` around every one of
+them, so each was a network round trip for a file nobody keeps. They now go in the same
+temporary directory as the link, which on a compute node is local disk, and are deleted
+with it. Nothing in the package writes an output to a bare relative name, so this cannot
+strand a result there.
+
+A reduced observation is 352 files, median 31 kB, 79% of them under 1 MB: metadata-bound
+work, which is the case a parallel filesystem handles worst and local disk handles best.
+Whether it is worth copying whole observations to local disk and back is a separate
+question, and one to settle by measuring the two filesystems rather than by argument.
 
 
 Configuration and environment
@@ -1264,7 +1311,8 @@ Relevant environment:
     :mod:`heasarc_retrieve_pipeline.heasoft`, the one module that invokes it; the flag
     ``HAS_HEASOFT`` records whether it worked.
 ``PFILES``
-    Set per worker process by ``core.prepare_worker``. Do not set it by hand for a parallel
+    Set per worker process by ``core.prepare_worker``, inside the local scratch directory
+    of ``utils.short_workspace``. Do not set it by hand for a parallel
     run: a shared parameter directory is what the private one exists to avoid.
 ``CALDB``
     Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``.
