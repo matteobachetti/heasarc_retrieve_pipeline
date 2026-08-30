@@ -628,15 +628,78 @@ class TestShortWorkspace:
 
         assert (outdir / "hello.txt").read_text() == "written through the alias"
 
-    def test_the_scratch_directory_exists_and_is_not_inside_the_output(self, tmp_path):
+    def test_the_parameter_files_go_off_the_shared_filesystem(self, tmp_path):
+        """Kilobytes, rewritten around every one of 44-plus HEASOFT calls per run."""
         outdir = tmp_path / "out"
         outdir.mkdir()
 
         with short_workspace(str(outdir)) as workspace:
-            assert os.path.isdir(workspace.scratch)
-            assert not os.path.realpath(workspace.scratch).startswith(
+            assert os.path.isdir(workspace.pfiles)
+            assert not os.path.realpath(workspace.pfiles).startswith(
                 os.path.realpath(str(outdir))
             )
+
+    def test_the_working_directories_go_under_the_output_by_default(self, tmp_path):
+        """Measured at 182.5 MB for one observation, so they go where there is room.
+
+        The user's cluster had 7.9 GB free on a shared ``/tmp``, against roughly 90% of
+        the raw data size per worker. The output filesystem is the one with space on it.
+        """
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert os.path.isdir(workspace.work)
+            assert os.path.realpath(workspace.work).startswith(
+                os.path.realpath(str(outdir))
+            )
+
+    def test_an_explicit_scratch_dir_moves_the_working_directories(self, tmp_path):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+        fast = tmp_path / "fast"
+        fast.mkdir()
+
+        with short_workspace(str(outdir), scratch_dir=str(fast)) as workspace:
+            assert os.path.realpath(workspace.work).startswith(
+                os.path.realpath(str(fast))
+            )
+            assert os.path.isdir(workspace.work)
+
+    def test_the_parameter_files_and_the_working_directories_are_kept_apart(
+        self, tmp_path
+    ):
+        """The whole point of the split: one is tiny and hot, the other is bulky."""
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert os.path.realpath(workspace.pfiles) != os.path.realpath(
+                workspace.work
+            )
+
+    def test_a_scratch_dir_someone_else_supplied_is_not_removed(self, tmp_path):
+        """We delete only the run directory we made, never the directory we were given."""
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+        fast = tmp_path / "fast"
+        fast.mkdir()
+
+        with short_workspace(str(outdir), scratch_dir=str(fast)) as workspace:
+            work = workspace.work
+
+        assert not os.path.exists(work)
+        assert fast.is_dir()
+
+    def test_another_run_sharing_the_scratch_dir_is_left_alone(self, tmp_path):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as first:
+            with short_workspace(str(outdir)) as second:
+                open(os.path.join(second.work, "busy"), "w").close()
+            assert os.path.isdir(os.path.dirname(first.work))
+            assert os.path.isdir(first.work)
 
     def test_the_output_directory_survives_the_cleanup(self, tmp_path):
         outdir = tmp_path / ("a" * 120)
@@ -649,16 +712,19 @@ class TestShortWorkspace:
         assert not os.path.lexists(alias)
         assert (outdir / "precious.txt").read_text() == "keep me"
 
-    def test_the_scratch_directory_is_removed_with_its_contents(self, tmp_path):
+    def test_the_scratch_directories_are_removed_with_their_contents(self, tmp_path):
         outdir = tmp_path / "out"
         outdir.mkdir()
 
         with short_workspace(str(outdir)) as workspace:
-            scratch = workspace.scratch
-            os.makedirs(os.path.join(scratch, "worker_1234"))
-            open(os.path.join(scratch, "worker_1234", "ftlist.par"), "w").close()
+            pfiles, work = workspace.pfiles, workspace.work
+            os.makedirs(os.path.join(pfiles, "worker_1234", "pfiles"))
+            open(os.path.join(pfiles, "worker_1234", "pfiles", "ftlist.par"), "w").close()
+            os.makedirs(os.path.join(work, "worker_1234", "1234_tmp_nucoord"))
 
-        assert not os.path.exists(scratch)
+        assert not os.path.exists(pfiles)
+        assert not os.path.exists(work)
+        assert outdir.is_dir()
 
     def test_an_exception_inside_the_block_still_cleans_up(self, tmp_path):
         outdir = tmp_path / "out"
@@ -666,11 +732,13 @@ class TestShortWorkspace:
 
         with pytest.raises(ValueError):
             with short_workspace(str(outdir)) as workspace:
-                alias, scratch = workspace.data, workspace.scratch
+                alias = workspace.data
+                pfiles, work = workspace.pfiles, workspace.work
                 raise ValueError("something went wrong in the middle of a run")
 
         assert not os.path.lexists(alias)
-        assert not os.path.exists(scratch)
+        assert not os.path.exists(pfiles)
+        assert not os.path.exists(work)
         assert outdir.is_dir()
 
     def test_the_directory_is_used_as_is_when_the_alias_would_be_longer(self, tmp_path):
@@ -727,7 +795,8 @@ class TestShortWorkspace:
 
         with short_workspace(str(outdir)) as workspace:
             assert workspace.data == str(outdir)
-            assert os.path.isdir(workspace.scratch)
+            assert os.path.isdir(workspace.pfiles)
+            assert os.path.isdir(workspace.work)
 
 
 class TestCheckNameLength:

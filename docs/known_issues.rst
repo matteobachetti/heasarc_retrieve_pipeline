@@ -941,6 +941,21 @@ The budget, for reference: the reduction adds **58 characters** after the output
 directly. The user's was 77. Through the link it is about 73 characters in total whatever
 the root is called.
 
+**What went to local disk with it, and what did not.** ``short_workspace`` also moves the
+workers' private state off the shared filesystem, but only half of it. The HEASOFT
+parameter files go on local disk: ``heasoftpy`` rewrites ``<PFILES>/<tool>.par`` around
+each of the 44-plus sub-tools a single ``nupipeline`` run spawns, and on a parallel
+filesystem every one of those was a network round trip for a few hundred bytes. The
+workers' *working* directories do not. Measured on NuSTAR observation 80202020006 (32.6 ks,
+202 MB of raw input) with a watcher polling the directory every five seconds, one worker's
+working directory peaked at **182.5 MB** during ``nupipeline``, the largest contributor
+being ``<pid>_tmp_nucoord``. That is about 90% of the raw data size and scales with it, so
+eight workers on full-length observations would want gigabytes -- against 7.9 GB free on
+the cluster's ``/tmp``, which is part of a root filesystem already 85% full and shared with
+every other job on the node. The working directories therefore default to
+``<outdir>/.workers``, and ``retrieve_and_process_data(scratch_dir=...)`` moves them to a
+local disk where one has the room.
+
 
 
 Science caveats

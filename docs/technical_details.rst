@@ -1139,14 +1139,15 @@ Measured with 200 ``ftlist`` calls, eight at a time:
 The failures are ``parameter file .../ftlist.par not found``: one call deletes and rewrites
 the file another is in the middle of reading.
 
-**What a worker sets up.** ``core.prepare_worker(root)`` runs once per worker process, at
-the top of ``download_and_process_observation``, and is idempotent (a module-level
-``_WORKER_DIRECTORY`` guard) because Prefect 3.7 has no pool ``initializer``. It creates
-``<scratch>/worker_<pid>/``, points ``PFILES`` at a ``pfiles`` directory inside it
+**What a worker sets up.** ``core.prepare_worker(pfiles_root, work_root)`` runs once per
+worker process, at the top of ``download_and_process_observation``, and is idempotent (a
+module-level ``_WORKER_DIRECTORY`` guard) because Prefect 3.7 has no pool ``initializer``.
+It points ``PFILES`` at ``<pfiles_root>/worker_<pid>/pfiles``
 (``"<private>;$HEADAS/syspfiles"`` -- the semicolon separates the writable copy from the
-read-only system one), and ``chdir``-s into it. That is the **only** ``os.chdir`` in the
-package, and a test asserts it stays that way: the working directory is a property of the
-whole process, so using it to steer where a step writes is what made concurrent
+read-only system one), creates ``<work_root>/worker_<pid>/``, and ``chdir``-s into
+it. The two roots are on different filesystems by design; see `How long a file name may
+be`_. The ``chdir`` is the **only** one in the package, and a test asserts it stays that
+way: the working directory is a property of the whole process, so using it to steer where a step writes is what made concurrent
 observations impossible before. Every path a step is given is absolute --
 ``utils.absolute_config`` resolves the configuration once, at the start of a reduction --
 and the process working directory exists to catch the scratch files HEASOFT tools drop
@@ -1274,16 +1275,35 @@ characters** after the output root, the longest being ``nusplitsc``'s
 naming the path and both lengths; ``nustar.nu_longest_output_name`` is what it checks, and
 a test pins that as longer than every other name any step builds.
 
-**Scratch state goes to local disk.** The workers' private directories used to live under
-``<outdir>/.workers``, on the shared filesystem. One ``nupipeline`` run spawns at least 44
-sub-tools, and ``heasoftpy`` reads and rewrites ``<PFILES>/<tool>.par`` around every one of
-them, so each was a network round trip for a file nobody keeps. They now go in the same
-temporary directory as the link, which on a compute node is local disk, and are deleted
-with it. Nothing in the package writes an output to a bare relative name, so this cannot
-strand a result there.
+**Two kinds of scratch state, in two places.** A worker keeps two things nobody wants
+afterwards, and they want opposite filesystems, so ``short_workspace`` hands back a
+directory for each and ``prepare_worker(pfiles_root, work_root)`` takes both.
 
-A reduced observation is 352 files, median 31 kB, 79% of them under 1 MB: metadata-bound
-work, which is the case a parallel filesystem handles worst and local disk handles best.
+*Parameter files* are the small, hot half. One ``nupipeline`` run spawns at least 44
+sub-tools, and ``heasoftpy`` reads and rewrites ``<PFILES>/<tool>.par`` around every one of
+them. On the shared filesystem each of those was a network round trip for a few hundred
+bytes -- metadata-bound work, which is the case a parallel filesystem handles worst and
+local disk handles best. (A whole reduced observation is 352 files, median 31 kB, 79% of
+them under 1 MB, so the same argument applies to the outputs; they have to be kept, which
+settles where they go.) ``pfiles`` therefore goes in the same temporary directory as the
+link, on local disk, and costs kilobytes.
+
+*Working directories* are the large, cold half. HEASOFT scripts drop bulky temporary trees
+beside themselves, and on NuSTAR observation 80202020006 -- 32.6 ks, 202 MB of raw input --
+one worker's working directory peaked at **182.5 MB**, the largest contributor being
+``<pid>_tmp_nucoord``. That is about 90% of the raw data size, and it scales with it, so
+``n_workers`` full-length observations want gigabytes. The cluster this pipeline runs on
+has 7.9 GB free on a ``/tmp`` that is part of a root filesystem already 85% full and shared
+with every other job on the node, which is the wrong place to spend a gigabyte per worker.
+``work`` therefore defaults to ``<outdir>/.workers``, on the filesystem that has room, and
+the ``scratch_dir`` argument to ``retrieve_and_process_data`` moves it to a faster disk
+where one exists.
+
+Neither placement can strand a result: nothing in the package writes an output to a bare
+relative name, and the HEASOFT tools address files inside the working directory by relative
+name, so the working directory needs neither a short path nor a durable one. Both
+directories are removed at the end of the run, and cleanup removes only directories
+``short_workspace`` created -- a ``scratch_dir`` shared with another run survives.
 Whether it is worth copying whole observations to local disk and back is a separate
 question, and one to settle by measuring the two filesystems rather than by argument.
 
@@ -1321,8 +1341,8 @@ Relevant environment:
     :mod:`heasarc_retrieve_pipeline.heasoft`, the one module that invokes it; the flag
     ``HAS_HEASOFT`` records whether it worked.
 ``PFILES``
-    Set per worker process by ``core.prepare_worker``, inside the local scratch directory
-    of ``utils.short_workspace``. Do not set it by hand for a parallel
+    Set per worker process by ``core.prepare_worker``, inside the local temporary
+    directory of ``utils.short_workspace``. Do not set it by hand for a parallel
     run: a shared parameter directory is what the private one exists to avoid.
 ``CALDB``
     Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``.

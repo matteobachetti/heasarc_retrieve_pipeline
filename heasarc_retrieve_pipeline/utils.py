@@ -106,17 +106,17 @@ def _shortest_temporary_directory():
     return min(writable, key=len) if writable else tempfile.gettempdir()
 
 
-#: What :func:`short_workspace` hands back: a short name for the output directory, and a
-#: scratch directory for state that must not live on a shared filesystem.
-Workspace = namedtuple("Workspace", "data scratch")
+#: What :func:`short_workspace` hands back: a short name for the output directory, and
+#: two places to put per-worker state that nobody keeps.
+Workspace = namedtuple("Workspace", "data pfiles work")
 
 
 @contextlib.contextmanager
-def short_workspace(outdir, tmpdir=None):
+def short_workspace(outdir, tmpdir=None, scratch_dir=None):
     """
-    A short name for the output directory, and scratch space off the shared disk.
+    A short name for the output directory, and somewhere to put per-worker state.
 
-    Two problems with one answer, both measured on the user's cluster.
+    Three problems with one answer, all measured on the user's cluster.
 
     **File names.** Some HEASOFT builds truncate file names at 128 characters. Measured in
     a 56-observation run: 2376 messages of the form ``Error determining file type for
@@ -136,42 +136,56 @@ def short_workspace(outdir, tmpdir=None):
     is:`` -- but that is the code path measured good to 247 characters, so it is not the
     constraint.
 
-    **Scratch space.** The workers' private HEASOFT parameter files and working
-    directories used to sit under the output directory, on the shared filesystem. One
-    ``nupipeline`` run spawns at least 44 sub-tools, and ``heasoftpy`` reads and rewrites
-    ``<PFILES>/<tool>.par`` around every one of them, so each was a network round trip for
-    a file nobody wants to keep. ``scratch`` is a directory on the same local temporary
-    filesystem, and it is deleted at the end of the run.
+    **Parameter files.** ``heasoftpy`` reads and rewrites ``<PFILES>/<tool>.par`` around
+    every HEASOFT call, and one ``nupipeline`` run spawns at least 44 sub-tools. On a
+    shared filesystem each of those is a network round trip for a file of a few hundred
+    bytes that nobody wants to keep: the worst case for a parallel filesystem, which is
+    slow per operation and fast per byte. ``pfiles`` therefore goes on local temporary
+    disk, next to the link, and it costs kilobytes.
 
-    Nothing in the package writes an output to a bare relative name, so moving the
-    workers' working directory off the shared disk cannot strand a result there.
+    **Working directories.** These are a different animal, and the difference is the whole
+    reason the two are separated. HEASOFT scripts drop bulky temporary trees into the
+    working directory -- measured on a 32.6 ks NuSTAR observation with 202 MB of raw
+    input, one worker's working directory peaked at **182.5 MB**, the largest single
+    contributor being ``<pid>_tmp_nucoord``. That is about 90% of the raw data size, and
+    it scales with it, so eight workers on full-length observations want gigabytes. On the
+    user's cluster ``/tmp`` had 7.9 GB free on a root filesystem already 85% full and
+    shared with every other job on the node, which is not a safe place for that. ``work``
+    therefore defaults to ``<outdir>/.workers``, on the same roomy filesystem as the
+    results, and ``scratch_dir`` moves it somewhere faster when there is room.
+
+    Nothing in the package writes an output to a bare relative name, and the HEASOFT
+    tools address files inside the working directory by relative name, so the working
+    directory neither needs a short path nor can strand a result.
 
     Parameters
     ----------
     outdir : str
         The real output directory. Created if it does not exist, and made absolute.
     tmpdir : str, optional
-        Where to put the workspace. By default the shortest writable choice among
-        ``tempfile.gettempdir()`` and ``/tmp``, both of which are local disk on a compute
-        node. The scratch directory holds HEASOFT's own temporaries as well as the
-        parameter files -- ``nuscreen`` writes a ``<pid>_tmp_nuscreen/`` tree into the
-        working directory -- so the filesystem chosen needs room for them; pass ``tmpdir``
-        explicitly if the default is a small one.
+        Where to put the short link and the parameter files. By default the shortest
+        writable choice among ``tempfile.gettempdir()`` and ``/tmp``, both of which are
+        local disk on a compute node. A few kilobytes go here.
+    scratch_dir : str, optional
+        Where to put the workers' working directories. By default ``<outdir>/.workers``.
+        Pass a local disk to make the reduction faster, but only with room for roughly
+        the raw size of one observation per worker.
 
     Yields
     ------
     Workspace
         ``data`` is the name to use as the output directory -- the short link, or
-        ``outdir`` itself when a link would be no shorter or cannot be made. ``scratch``
-        is a directory for throwaway per-worker state.
+        ``outdir`` itself when a link would be no shorter or cannot be made. ``pfiles``
+        and ``work`` are directories for throwaway per-worker state, both removed at the
+        end of the run.
 
     Notes
     -----
     The link lives in a directory made by :func:`tempfile.mkdtemp`, so its name is
     unpredictable and it is readable only by its owner: on a shared node nobody else can
     plant something at that path first. Cleanup unlinks symbolic links and nothing else,
-    so the output tree cannot be removed by this function even if something replaces the
-    link with a real directory.
+    and removes only directories this function made, so neither the output tree nor
+    another run's scratch can be lost to it.
 
     All workers must see the same ``data`` name, which they do while they are processes on
     one node. A task runner that spread them across nodes would need the link made on each.
@@ -183,8 +197,14 @@ def short_workspace(outdir, tmpdir=None):
         tmpdir = _shortest_temporary_directory()
     base = tempfile.mkdtemp(prefix="hrp", dir=tmpdir)
     alias = os.path.join(base, "d")
-    scratch = os.path.join(base, "w")
-    os.makedirs(scratch, exist_ok=True)
+    pfiles = os.path.join(base, "p")
+    os.makedirs(pfiles, exist_ok=True)
+
+    scratch_root = scratch_dir
+    if scratch_root is None:
+        scratch_root = os.path.join(outdir, ".workers")
+    os.makedirs(scratch_root, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="run", dir=scratch_root)
 
     data = outdir
     if len(alias) < len(outdir):
@@ -198,16 +218,21 @@ def short_workspace(outdir, tmpdir=None):
             )
 
     try:
-        yield Workspace(data=data, scratch=scratch)
+        yield Workspace(data=data, pfiles=pfiles, work=work)
     finally:
         if os.path.islink(alias):
             os.unlink(alias)
-        shutil.rmtree(scratch, ignore_errors=True)
-        try:
-            os.rmdir(base)
-        except OSError:
-            # Something else is in there; leave it rather than delete what we did not make.
-            pass
+        shutil.rmtree(pfiles, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
+        for leftover in (base, scratch_root if scratch_dir is None else None):
+            if leftover is None:
+                continue
+            try:
+                os.rmdir(leftover)
+            except OSError:
+                # Something else is in there -- another run, most likely. Leave it
+                # rather than delete what we did not make.
+                pass
 
 
 #: How long a file name HEASOFT will accept. Measured on the user's cluster, where

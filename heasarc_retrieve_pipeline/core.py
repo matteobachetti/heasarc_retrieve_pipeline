@@ -1093,7 +1093,7 @@ def locate_data(result_table, catalog_name):
 _WORKER_DIRECTORY = None
 
 
-def prepare_worker(root):
+def prepare_worker(pfiles_root, work_root):
     """
     Give a worker process its own parameter files and its own directory.
 
@@ -1115,26 +1115,38 @@ def prepare_worker(root):
     collide either. This is the one place in the package that calls ``os.chdir``, and it
     is the opposite of the pattern it replaced: set once, before any work, never during.
 
+    The two are kept apart because they cost different things.
+    :func:`heasarc_retrieve_pipeline.utils.short_workspace` puts ``pfiles_root`` on local
+    temporary disk, where the 44-plus parameter-file rewrites of a single ``nupipeline``
+    run cost nothing, and leaves ``work_root`` on the roomy filesystem by default, because
+    a working directory was measured peaking at 182.5 MB for one observation -- about 90%
+    of its raw data size, and scaling with it.
+
     Parameters
     ----------
-    root : str
-        Directory to create the per-worker directories under. The flow passes the local
-        scratch directory of :func:`heasarc_retrieve_pipeline.utils.short_workspace`: this
-        state is written to on every HEASOFT call and kept by nobody, so it has no business
-        on a shared filesystem.
+    pfiles_root : str
+        Directory to create this process's ``PFILES`` directory under. Kilobytes, written
+        on every HEASOFT call, kept by nobody: it wants to be on the fastest local disk
+        available.
+    work_root : str
+        Directory to create this process's working directory under. This is where HEASOFT
+        scripts drop their bulky temporary trees, so it wants room more than it wants
+        speed.
 
     Returns
     -------
     str
-        This process's private directory.
+        This process's private working directory.
     """
     global _WORKER_DIRECTORY
     if _WORKER_DIRECTORY is not None:
         return _WORKER_DIRECTORY
 
-    workdir = os.path.join(root, f"worker_{os.getpid()}")
-    pfiles = os.path.join(workdir, "pfiles")
+    name = f"worker_{os.getpid()}"
+    workdir = os.path.join(work_root, name)
+    pfiles = os.path.join(pfiles_root, name, "pfiles")
     os.makedirs(pfiles, exist_ok=True)
+    os.makedirs(workdir, exist_ok=True)
     if "HEADAS" in os.environ:
         # First entry is where parameters are written, after the ";" is the read-only
         # system copy the tools fall back on.
@@ -1228,7 +1240,7 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
 
 @task(task_run_name="observation_{obsid}")
 def download_and_process_observation(
-    obsid, url, ra, dec, outdir, mission, worker_root, flags=None, test=False
+    obsid, url, ra, dec, outdir, mission, pfiles_root, work_root, flags=None, test=False
 ):
     """
     Download one observation and reduce it, in this process alone.
@@ -1252,16 +1264,15 @@ def download_and_process_observation(
         so that HEASOFT never sees a file name long enough to be truncated.
     mission : str
         One of the keys of ``MISSION_CONFIG``.
-    worker_root : str
-        Where this process's private directory goes; see :func:`prepare_worker`. It is on
-        local disk, off the shared filesystem, because nothing in it is worth keeping and
-        every HEASOFT call rewrites a parameter file there.
+    pfiles_root, work_root : str
+        Where this process's private parameter files and working directory go; see
+        :func:`prepare_worker`.
     flags : dict, optional
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
         If True, fake the download and do not process.
     """
-    prepare_worker(worker_root)
+    prepare_worker(pfiles_root, work_root)
 
     config = absolute_config(
         dict(input_data_path=outdir, out_data_path=outdir),
@@ -1280,7 +1291,9 @@ def download_and_process_observation(
 
 
 @flow(flow_run_name="process_{mission}_observations")
-def process_observations(items, outdir, mission, worker_root, flags=None, test=False):
+def process_observations(
+    items, outdir, mission, pfiles_root, work_root, flags=None, test=False
+):
     """
     Reduce every observation, one process each.
 
@@ -1299,9 +1312,9 @@ def process_observations(items, outdir, mission, worker_root, flags=None, test=F
         Absolute output directory.
     mission : str
         One of the keys of ``MISSION_CONFIG``.
-    worker_root : str
-        Where the workers' private directories go; see :func:`prepare_worker`. On local
-        disk, not under ``outdir``.
+    pfiles_root, work_root : str
+        Where the workers' private parameter files and working directories go; see
+        :func:`prepare_worker`.
     flags : dict, optional
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
@@ -1321,7 +1334,8 @@ def process_observations(items, outdir, mission, worker_root, flags=None, test=F
             item["dec"],
             outdir=outdir,
             mission=mission,
-            worker_root=worker_root,
+            pfiles_root=pfiles_root,
+            work_root=work_root,
             flags=flags,
             test=test,
         )
@@ -1352,6 +1366,7 @@ def retrieve_and_process_data(
     force_heasarc: bool = False,
     force_s3: bool = False,
     n_workers: int = 1,
+    scratch_dir: typing.Union[str, None] = None,
 ):
 
     """
@@ -1396,6 +1411,12 @@ def retrieve_and_process_data(
         :func:`prepare_worker` for why that isolation is necessary. The default, 1, is one
         observation at a time -- in a worker process all the same, so there is one code
         path, not two.
+    scratch_dir : str, optional
+        Where the workers' working directories go. The default, ``<outdir>/.workers``, is
+        the safe choice: HEASOFT's temporary trees were measured at 182.5 MB for a single
+        observation, about 90% of its raw data size, so ``n_workers`` of them want
+        gigabytes and a small shared ``/tmp`` is the wrong place for that. Point this at a
+        local disk with room and the reduction gets faster.
 
     Returns
     -------
@@ -1438,8 +1459,9 @@ def retrieve_and_process_data(
 
     # The workers are given a short name for outdir, not outdir itself: some HEASOFT
     # builds truncate file names at 128 characters, and the pipeline adds 58 of its own
-    # after the output root. Their scratch state goes to local disk in the same place.
-    with short_workspace(outdir) as workspace:
+    # after the output root. Their parameter files go to local disk in the same place;
+    # their working directories stay where there is room for them.
+    with short_workspace(outdir, scratch_dir=scratch_dir) as workspace:
         # Before anything is downloaded: would the longest name this reduction builds
         # survive HEASOFT? On the cluster this run got as far as nusplitsc, 90 GB and one
         # Level-2 pipeline per observation later, before saying anything at all.
@@ -1456,7 +1478,8 @@ def retrieve_and_process_data(
             items,
             outdir=workspace.data,
             mission=mission,
-            worker_root=workspace.scratch,
+            pfiles_root=workspace.pfiles,
+            work_root=workspace.work,
             flags=flags,
             test=test,
         )
@@ -1474,6 +1497,7 @@ def retrieve_heasarc_data_by_source_name(
     force_heasarc: bool = False,
     force_s3: bool = False,
     n_workers: int = 1,
+    scratch_dir: typing.Union[str, None] = None,
 ):
 
     """
@@ -1501,6 +1525,9 @@ def retrieve_heasarc_data_by_source_name(
         Download from the public AWS S3 mirror.
     n_workers : int, optional
         How many observations to reduce at the same time, one worker process each.
+    scratch_dir : str, optional
+        Where the workers' working directories go; see
+        :func:`retrieve_and_process_data`.
 
     Returns
     -------
@@ -1527,6 +1554,7 @@ def retrieve_heasarc_data_by_source_name(
         force_heasarc=force_heasarc,
         force_s3=force_s3,
         n_workers=n_workers,
+        scratch_dir=scratch_dir,
     )
 
     return results
@@ -1542,6 +1570,7 @@ def retrieve_heasarc_data_by_obsid(
     force_heasarc: bool = False,
     force_s3: bool = False,
     n_workers: int = 1,
+    scratch_dir: typing.Union[str, None] = None,
 ):
 
     """
@@ -1571,6 +1600,9 @@ def retrieve_heasarc_data_by_obsid(
         Download from the public AWS S3 mirror.
     n_workers : int, optional
         How many observations to reduce at the same time, one worker process each.
+    scratch_dir : str, optional
+        Where the workers' working directories go; see
+        :func:`retrieve_and_process_data`.
 
     Returns
     -------
@@ -1600,5 +1632,6 @@ def retrieve_heasarc_data_by_obsid(
         force_heasarc=force_heasarc,
         force_s3=force_s3,
         n_workers=n_workers,
+        scratch_dir=scratch_dir,
     )
     return results

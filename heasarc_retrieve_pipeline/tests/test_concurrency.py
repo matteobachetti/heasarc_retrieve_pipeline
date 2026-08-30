@@ -28,23 +28,50 @@ from heasarc_retrieve_pipeline.core import (
 )
 
 
-def worker_state(root):
+def worker_state(roots):
     """What a worker process looks like once :func:`prepare_worker` has run.
 
     Calls it twice on purpose: an observation calls it every time, and it must settle the
     process the first time and then leave it alone.
     """
-    first = prepare_worker(root)
-    second = prepare_worker(root)
+    first = prepare_worker(*roots)
+    second = prepare_worker(*roots)
     return os.getpid(), os.environ.get("PFILES"), os.path.realpath(os.getcwd()), first == second
 
 
 class TestPrepareWorker:
-    """Each worker process gets its own parameter files and its own directory."""
+    """Each worker process gets its own parameter files and its own directory.
 
-    def run_in_workers(self, root, n_workers=2, n_calls=6):
+    The two roots are separate because they cost different things: the parameter files
+    are kilobytes rewritten around every HEASOFT call, and want the fastest local disk;
+    the working directory was measured peaking at 182.5 MB for one observation, and wants
+    room.
+    """
+
+    def run_in_workers(self, root, n_workers=2, n_calls=6, pfiles_root=None):
+        if pfiles_root is None:
+            pfiles_root = root
+        roots = (str(pfiles_root), str(root))
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            return list(pool.map(worker_state, [str(root)] * n_calls))
+            return list(pool.map(worker_state, [roots] * n_calls))
+
+    def test_the_parameter_files_and_the_working_directory_can_be_far_apart(
+        self, tmp_path, monkeypatch
+    ):
+        """The flow puts one on local disk and the other on the roomy filesystem."""
+        headas = tmp_path / "headas"
+        (headas / "syspfiles").mkdir(parents=True)
+        monkeypatch.setenv("HEADAS", str(headas))
+
+        states = self.run_in_workers(
+            tmp_path / "roomy", n_workers=1, pfiles_root=tmp_path / "fast"
+        )
+
+        pid, pfiles, cwd, _ = states[0]
+        assert pfiles.split(";")[0] == os.path.join(
+            tmp_path, "fast", f"worker_{pid}", "pfiles"
+        )
+        assert cwd == os.path.realpath(os.path.join(tmp_path, "roomy", f"worker_{pid}"))
 
     def test_no_two_workers_share_a_directory(self, tmp_path):
         states = self.run_in_workers(tmp_path)
@@ -242,7 +269,9 @@ class TestOneFailureDoesNotStopTheRest:
             return obsid
 
         monkeypatch.setattr(core, "recursive_download", stub_download)
-        monkeypatch.setattr(core, "prepare_worker", lambda root: str(tmp_path))
+        monkeypatch.setattr(
+            core, "prepare_worker", lambda pfiles_root, work_root: str(tmp_path)
+        )
         monkeypatch.setitem(
             core.MISSION_CONFIG["nustar"], "obsid_processing", stub_processing
         )
@@ -251,7 +280,8 @@ class TestOneFailureDoesNotStopTheRest:
             self.items(),
             outdir=str(tmp_path),
             mission="nustar",
-            worker_root=str(tmp_path / ".workers"),
+            pfiles_root=str(tmp_path / ".pfiles"),
+            work_root=str(tmp_path / ".workers"),
         )
         return failed, processed
 
@@ -286,18 +316,19 @@ class TestOneFailureDoesNotStopTheRest:
 
 
 class TestTheFlowUsesAShortWorkspace:
-    """The reduction runs under a short name, and the workers' scratch is off the output.
+    """The reduction runs under a short name, and the parameter files are off the output.
 
     A HEASOFT build that truncates file names at 128 characters -- measured on the user's
     cluster, 2376 truncations, every one at exactly 128 -- makes an output root longer
     than 69 characters unusable, because the pipeline adds 58 characters of its own after
     it. The flow hands the workers a symbolic link instead of the real directory, and the
-    workers' parameter files go to local disk rather than the shared filesystem. See
+    workers' parameter files go to local disk rather than the shared filesystem. Their
+    working directories do not: those were measured at 182.5 MB apiece. See
     :func:`heasarc_retrieve_pipeline.utils.short_workspace` and issue 39 in
     ``docs/known_issues.rst``.
     """
 
-    def run(self, monkeypatch, outdir):
+    def run(self, monkeypatch, outdir, **kwargs):
         """Run the flow with everything but the workspace stubbed out."""
         seen = {}
 
@@ -305,12 +336,23 @@ class TestTheFlowUsesAShortWorkspace:
             def with_options(self, **kwargs):
                 return self
 
-            def __call__(self, items, outdir, mission, worker_root, flags=None, test=False):
+            def __call__(
+                self,
+                items,
+                outdir,
+                mission,
+                pfiles_root,
+                work_root,
+                flags=None,
+                test=False,
+            ):
                 seen["outdir"] = outdir
-                seen["worker_root"] = worker_root
+                seen["pfiles_root"] = pfiles_root
+                seen["work_root"] = work_root
                 # A worker writes its results through the name it was given.
                 open(os.path.join(outdir, "a_result.txt"), "w").close()
-                os.makedirs(os.path.join(worker_root, "worker_1"), exist_ok=True)
+                os.makedirs(os.path.join(pfiles_root, "worker_1"), exist_ok=True)
+                os.makedirs(os.path.join(work_root, "worker_1"), exist_ok=True)
                 return []
 
         monkeypatch.setattr(core, "locate_data", lambda table, catalog_name=None: table)
@@ -323,7 +365,9 @@ class TestTheFlowUsesAShortWorkspace:
         )
         monkeypatch.setattr(core, "process_observations", Recorder())
 
-        core.retrieve_and_process_data(Table({"__row": [0]}), outdir=str(outdir))
+        core.retrieve_and_process_data(
+            Table({"__row": [0]}), outdir=str(outdir), **kwargs
+        )
         return seen
 
     def long_outdir(self, tmp_path):
@@ -347,16 +391,37 @@ class TestTheFlowUsesAShortWorkspace:
 
         assert (outdir / "a_result.txt").is_file()
 
-    def test_the_worker_scratch_is_not_inside_the_output_directory(
+    def test_the_parameter_files_are_not_inside_the_output_directory(
         self, tmp_path, monkeypatch
     ):
-        """It used to be ``<outdir>/.workers``, on the shared filesystem."""
+        """They used to be ``<outdir>/.workers/*/pfiles``, on the shared filesystem."""
         outdir = self.long_outdir(tmp_path)
 
         seen = self.run(monkeypatch, outdir)
 
-        assert not os.path.realpath(seen["worker_root"]).startswith(
+        assert not os.path.realpath(seen["pfiles_root"]).startswith(
             os.path.realpath(str(outdir))
+        )
+
+    def test_the_working_directories_stay_where_there_is_room(self, tmp_path, monkeypatch):
+        """182.5 MB per worker will not fit on a shared /tmp with 7.9 GB free."""
+        outdir = self.long_outdir(tmp_path)
+
+        seen = self.run(monkeypatch, outdir)
+
+        assert os.path.realpath(seen["work_root"]).startswith(
+            os.path.realpath(str(outdir))
+        )
+
+    def test_scratch_dir_moves_the_working_directories(self, tmp_path, monkeypatch):
+        outdir = self.long_outdir(tmp_path)
+        fast = tmp_path / "fast"
+        fast.mkdir()
+
+        seen = self.run(monkeypatch, outdir, scratch_dir=str(fast))
+
+        assert os.path.realpath(seen["work_root"]).startswith(
+            os.path.realpath(str(fast))
         )
 
     def test_the_workspace_is_cleaned_up_but_the_output_is_not(self, tmp_path, monkeypatch):
@@ -365,7 +430,8 @@ class TestTheFlowUsesAShortWorkspace:
         seen = self.run(monkeypatch, outdir)
 
         assert not os.path.lexists(seen["outdir"])
-        assert not os.path.exists(seen["worker_root"])
+        assert not os.path.exists(seen["pfiles_root"])
+        assert not os.path.exists(seen["work_root"])
         assert (outdir / "a_result.txt").is_file()
 
 
@@ -446,7 +512,7 @@ def _no_workspace(tmpdir):
     """``short_workspace`` forced to put its directory somewhere that is no shorter."""
     from heasarc_retrieve_pipeline.utils import short_workspace
 
-    def wrapped(outdir, tmpdir=tmpdir):
-        return short_workspace(outdir, tmpdir=tmpdir)
+    def wrapped(outdir, tmpdir=tmpdir, scratch_dir=None):
+        return short_workspace(outdir, tmpdir=tmpdir, scratch_dir=scratch_dir)
 
     return wrapped
