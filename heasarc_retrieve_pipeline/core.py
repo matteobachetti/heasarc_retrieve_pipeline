@@ -32,14 +32,18 @@ import pyvo
 from astropy.coordinates import SkyCoord
 
 
-from .nustar import process_nustar_obsid, DEFAULT_CONFIG as NUSTAR_DEFAULT_CONFIG
+from .nustar import (
+    nu_longest_output_name,
+    process_nustar_obsid,
+    DEFAULT_CONFIG as NUSTAR_DEFAULT_CONFIG,
+)
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
 from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
 
-from .utils import absolute_config, get_logger, short_workspace
+from .utils import absolute_config, check_name_length, get_logger, short_workspace
 
 
 def _download_pysmartdl(url: str, dest: str):
@@ -772,6 +776,7 @@ MISSION_CONFIG = {
         "obsid_processing": process_nustar_obsid,
         "default_config": NUSTAR_DEFAULT_CONFIG,
         "name_column": "name",
+        "longest_output_name": nu_longest_output_name,
     },
     "nicer": {
         "table": "nicermastr",
@@ -1397,6 +1402,13 @@ def retrieve_and_process_data(
     astropy.table.Table
         The input table, unchanged.
 
+    Raises
+    ------
+    ValueError
+        If the longest file name the reduction would build is too long for HEASOFT, even
+        under the short name :func:`~heasarc_retrieve_pipeline.utils.short_workspace`
+        gives it. Raised before anything is downloaded.
+
     Notes
     -----
     Links are matched to catalogue rows through the datalink ``ID``, not by
@@ -1428,6 +1440,16 @@ def retrieve_and_process_data(
     # builds truncate file names at 128 characters, and the pipeline adds 58 of its own
     # after the output root. Their scratch state goes to local disk in the same place.
     with short_workspace(outdir) as workspace:
+        # Before anything is downloaded: would the longest name this reduction builds
+        # survive HEASOFT? On the cluster this run got as far as nusplitsc, 90 GB and one
+        # Level-2 pipeline per observation later, before saying anything at all.
+        longest_name = MISSION_CONFIG[mission].get("longest_output_name")
+        if longest_name is not None:
+            for item in items:
+                check_name_length(
+                    longest_name(item["obsid"], dict(out_data_path=workspace.data))
+                )
+
         runner = ProcessPoolTaskRunner(max_workers=n_workers)
         logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
         process_observations.with_options(task_runner=runner)(

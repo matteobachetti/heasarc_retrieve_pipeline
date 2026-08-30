@@ -367,3 +367,86 @@ class TestTheFlowUsesAShortWorkspace:
         assert not os.path.lexists(seen["outdir"])
         assert not os.path.exists(seen["worker_root"])
         assert (outdir / "a_result.txt").is_file()
+
+
+class TestTheFlowRefusesNamesHeasoftCannotHandle:
+    """A path too long to work stops the run in milliseconds, not after 90 GB.
+
+    On the user's cluster the whole 56-observation run downloaded, ran the Level-2
+    pipeline, and only then failed at ``nusplitsc`` -- 1050 times, all from file names
+    truncated to 128 characters. Nothing in that chain said "too long". See issue 39 in
+    ``docs/known_issues.rst``.
+    """
+
+    def run(self, monkeypatch, outdir, tmpdir=None):
+        """Run the flow far enough to reach the check, with the reduction stubbed out."""
+        called = []
+
+        class Recorder:
+            def with_options(self, **kwargs):
+                return self
+
+            def __call__(self, *args, **kwargs):
+                called.append(kwargs)
+                return []
+
+        monkeypatch.setattr(core, "locate_data", lambda table, catalog_name=None: table)
+        monkeypatch.setattr(
+            core,
+            "observation_work_items",
+            lambda table, links, column, position: [
+                dict(obsid="80002092008", url="https://example.invalid/", ra=1.0, dec=2.0)
+            ],
+        )
+        monkeypatch.setattr(core, "process_observations", Recorder())
+        if tmpdir is not None:
+            monkeypatch.setattr(core, "short_workspace", _no_workspace(tmpdir))
+
+        core.retrieve_and_process_data(Table({"__row": [0]}), outdir=str(outdir))
+        return called
+
+    def test_a_workable_output_directory_runs(self, tmp_path, monkeypatch):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        assert self.run(monkeypatch, outdir) != []
+
+    def test_an_impossible_one_is_refused_before_anything_is_downloaded(
+        self, tmp_path, monkeypatch
+    ):
+        """With the short name unavailable, a 120-character root cannot be made to fit."""
+        outdir = tmp_path / ("d" * 120)
+        outdir.mkdir()
+        no_shorter = tmp_path / ("t" * 150)
+        no_shorter.mkdir()
+
+        with pytest.raises(ValueError, match="HEASOFT limit"):
+            self.run(monkeypatch, outdir, tmpdir=str(no_shorter))
+
+    def test_the_message_names_the_offending_path(self, tmp_path, monkeypatch):
+        outdir = tmp_path / ("d" * 120)
+        outdir.mkdir()
+        no_shorter = tmp_path / ("t" * 150)
+        no_shorter.mkdir()
+
+        with pytest.raises(ValueError, match="_chu123_merge_"):
+            self.run(monkeypatch, outdir, tmpdir=str(no_shorter))
+
+    def test_the_short_name_is_what_saves_a_long_output_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """The same 120-character root is fine once the workspace has renamed it."""
+        outdir = tmp_path / ("d" * 120)
+        outdir.mkdir()
+
+        assert self.run(monkeypatch, outdir) != []
+
+
+def _no_workspace(tmpdir):
+    """``short_workspace`` forced to put its directory somewhere that is no shorter."""
+    from heasarc_retrieve_pipeline.utils import short_workspace
+
+    def wrapped(outdir, tmpdir=tmpdir):
+        return short_workspace(outdir, tmpdir=tmpdir)
+
+    return wrapped

@@ -181,9 +181,48 @@ def split_path(obsid, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/split/``.
+        ``<out_data_path>/<OBSID>/split``. No trailing slash: ``nusplitsc`` adds one of
+        its own, and the ``split//`` that resulted wasted a character of a budget that is
+        only 128 wide on some HEASOFT builds.
     """
-    return os.path.join(config["out_data_path"], obsid + "/split/")
+    return os.path.join(config["out_data_path"], obsid, "split")
+
+
+def nu_longest_output_name(obsid, config):
+    """
+    The longest file name the reduction of one observation will build.
+
+    Some HEASOFT builds truncate file names at 128 characters without saying so; see
+    :func:`heasarc_retrieve_pipeline.utils.check_name_length`. The flow refuses to start
+    when this name does not fit, which is cheap and happens before any download.
+
+    The winner is one of ``nusplitsc``'s temporaries: it merges the three star-tracker
+    housekeeping extensions into ``nu<OBSID>_chu123_merge_<pid>.fits`` under ``split``,
+    which beats every event file, GTI file, spectrum and barycentred product the pipeline
+    makes. ``tests/test_nustar.py`` checks that against the full list. Seven digits are
+    allowed for the process identifier, which is as long as a Linux PID gets.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        The longest name, which need not exist.
+
+    Examples
+    --------
+    >>> name = nu_longest_output_name("80002092008", {"out_data_path": "/scratch/out"})
+    >>> len(name) - len("/scratch/out")
+    58
+    >>> name.endswith("80002092008/split/nu80002092008_chu123_merge_9999999.fits")
+    True
+    """
+    return os.path.join(split_path(obsid, config), f"nu{obsid}_chu123_merge_{'9' * 7}.fits")
 
 
 def _cl_event_files(directory, pattern):

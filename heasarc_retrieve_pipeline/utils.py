@@ -16,6 +16,7 @@ __all__ = [
     "absolute_config",
     "apply_gti",
     "binned_lightcurve",
+    "check_name_length",
     "get_logger",
     "good_intervals",
     "gti_to_array",
@@ -184,6 +185,59 @@ def short_workspace(outdir, tmpdir=None):
         except OSError:
             # Something else is in there; leave it rather than delete what we did not make.
             pass
+
+
+#: How long a file name HEASOFT will accept. Measured on the user's cluster, where
+#: ``xselect`` truncated 2376 file names and every one of the 2376 came out at exactly
+#: 128 characters. A build that does not truncate is not harmed by staying under it.
+HEASOFT_NAME_LIMIT = 128
+
+
+def check_name_length(name, limit=HEASOFT_NAME_LIMIT):
+    """
+    Refuse a file name that HEASOFT would silently truncate.
+
+    The failure this prevents costs a whole run. ``xselect`` on the affected build chops
+    the name, says nothing about having done so, and then reports "The file was not found"
+    about a file that is sitting right there; or, in ``save events``, builds a shell
+    command whose closing quote has been cut off, and the shell answers ``unexpected EOF
+    while looking for matching "``. Neither message mentions length. On the user's
+    56-observation run this appeared 1050 times and took every observation with it, after
+    the downloads and the Level-2 pipeline had already been paid for.
+
+    Parameters
+    ----------
+    name : str
+        The file name the pipeline intends to build.
+    limit : int, optional
+        The longest name accepted, in characters.
+
+    Returns
+    -------
+    str
+        ``name``, unchanged, when it fits.
+
+    Raises
+    ------
+    ValueError
+        When it does not, naming the path and both lengths.
+
+    Examples
+    --------
+    >>> check_name_length("/tmp/hrpab12/d/80002092008/split/f.fits")
+    '/tmp/hrpab12/d/80002092008/split/f.fits'
+    >>> check_name_length("/" + "a" * 200)
+    Traceback (most recent call last):
+        ...
+    ValueError: ...201 characters...limit is 128...
+    """
+    if len(name) > limit:
+        raise ValueError(
+            f"{name} is {len(name)} characters long, and the HEASOFT limit is {limit}. "
+            "Use a shorter output directory: some builds truncate the name without "
+            "saying so, and the run fails much later with a file that cannot be found."
+        )
+    return name
 
 
 def splitext_improved(path):

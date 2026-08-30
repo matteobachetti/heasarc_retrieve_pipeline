@@ -5,6 +5,7 @@ pure: it takes arrays and headers in, and gives arrays and headers back.
 """
 
 import os
+import re
 import shutil
 
 import numpy as np
@@ -15,6 +16,7 @@ from astropy.io import fits
 from heasarc_retrieve_pipeline.utils import (
     absolute_config,
     apply_gti,
+    check_name_length,
     binned_lightcurve,
     good_intervals,
     intersect_intervals,
@@ -724,3 +726,34 @@ class TestShortWorkspace:
         with short_workspace(str(outdir)) as workspace:
             assert workspace.data == str(outdir)
             assert os.path.isdir(workspace.scratch)
+
+
+class TestCheckNameLength:
+    """A file name too long for HEASOFT is refused before any work is done.
+
+    Measured on the user's cluster: 2376 file names truncated to exactly 128 characters,
+    with no error from the tool that truncated them -- ``xselect`` went on to report "The
+    file was not found" about a file that existed. Silence is the problem; this turns it
+    into a message naming the path. See issue 39 in ``docs/known_issues.rst``.
+    """
+
+    def test_a_short_name_is_returned_unchanged(self):
+        assert check_name_length("/tmp/hrpab12/d/obs/f.fits") == "/tmp/hrpab12/d/obs/f.fits"
+
+    def test_a_name_exactly_at_the_limit_is_allowed(self):
+        name = "/" + "a" * 127
+
+        assert check_name_length(name, limit=128) == name
+
+    def test_a_name_one_character_over_the_limit_is_refused(self):
+        with pytest.raises(ValueError):
+            check_name_length("/" + "a" * 128, limit=128)
+
+    def test_the_message_names_the_path_and_both_lengths(self):
+        name = "/" + "a" * 200
+
+        with pytest.raises(ValueError, match=r"201 characters.*limit is 128"):
+            check_name_length(name, limit=128)
+
+        with pytest.raises(ValueError, match=re.escape(name)):
+            check_name_length(name, limit=128)

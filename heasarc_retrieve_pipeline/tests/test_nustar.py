@@ -28,6 +28,7 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     nu_pipeline_done_file,
     nu_pipeline_output_path,
     nu_product_output_path,
+    nu_longest_output_name,
     split_path,
     get_best_source_regions,
     goes_class_to_flux,
@@ -596,7 +597,9 @@ class TestNustarPaths:
         assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/products/")
 
     def test_the_per_chu_files_go_in_split(self):
-        assert split_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/split/")
+        """No trailing slash: nusplitsc adds one, and "split//" wastes a character of a
+        budget that is only 128 wide on some HEASOFT builds."""
+        assert split_path(OBSID, self.CONFIG) == os.path.join("out", OBSID, "split")
 
     def test_the_sentinel_sits_beside_the_level_2_products(self):
         done = nu_pipeline_done_file(OBSID, self.CONFIG)
@@ -753,3 +756,73 @@ class TestGoesDownloadPath:
         second = nustar.goes_download_path("/data/80002092008/nu2A01_cl.evt")
 
         assert first != second
+
+
+class TestLongestOutputName:
+    """What the length check has to be measured against.
+
+    Some HEASOFT builds truncate file names at 128 characters, so the flow refuses to
+    start when the longest name the reduction would build does not fit. That is only
+    meaningful if the name it checks really is the longest one. See issue 39 in
+    ``docs/known_issues.rst``.
+    """
+
+    CONFIG = {"out_data_path": "/scratch/out", "input_data_path": "/scratch/raw"}
+
+    def other_names_the_reduction_builds(self, obsid, config):
+        """Every long name any step constructs, for comparison."""
+        pid = "9" * 7
+        split = split_path(obsid, config)
+        events = nu_pipeline_output_path(obsid, config)
+        base = nu_base_output_path(obsid, config)
+        products = nu_product_output_path(obsid, config)
+        return [
+            # nusplitsc, per CHU combination
+            os.path.join(split, f"nu{obsid}_chu123_gti_{pid}.fits"),
+            os.path.join(split, f"nu{obsid}A06_chu123_N_cl.evt"),
+            os.path.join(split, f"xselect_chu123_{pid}.xco"),
+            # nupipeline and nuscreen
+            os.path.join(events, f"nu{obsid}A01_gti.fits"),
+            os.path.join(events, f"nu{obsid}A01_cl.evt"),
+            os.path.join(events, f"nu{obsid}A_uf.evt"),
+            # merging, flare filtering, barycentring
+            os.path.join(base, f"nu{obsid}A01_cl_noflares_bary.evt"),
+            os.path.join(base, f"nu{obsid}_src1_noflares_bary.evt"),
+            os.path.join(base, f"nu{obsid}A01_cl_goes.fits"),
+            # spectra
+            os.path.join(products, f"nu{obsid}A01_sr.pha"),
+        ]
+
+    def test_nothing_the_reduction_builds_is_longer(self):
+        longest = nu_longest_output_name(OBSID, self.CONFIG)
+
+        for name in self.other_names_the_reduction_builds(OBSID, self.CONFIG):
+            assert len(name) <= len(longest), f"{name} is longer than {longest}"
+
+    def test_it_is_the_nusplitsc_merge_file(self):
+        longest = nu_longest_output_name(OBSID, self.CONFIG)
+
+        assert longest.startswith(split_path(OBSID, self.CONFIG))
+        assert "_chu123_merge_" in longest
+        assert longest.endswith(".fits")
+
+    def test_it_allows_for_a_seven_digit_process_id(self):
+        """Linux PIDs run to 4194304 by default; the cluster log showed five digits."""
+        longest = nu_longest_output_name(OBSID, self.CONFIG)
+        with_five_digits = longest.replace("9999999", "99999")
+
+        assert len(longest) == len(with_five_digits) + 2
+
+    def test_it_grows_with_the_output_root(self):
+        short = nu_longest_output_name(OBSID, {"out_data_path": "/a"})
+        long = nu_longest_output_name(OBSID, {"out_data_path": "/aaaaaaaaaa"})
+
+        assert len(long) == len(short) + 9
+
+    def test_the_pipeline_adds_58_characters_after_the_output_root(self):
+        """The number quoted in the docs and in the commit messages: an output root of
+        more than 69 characters cannot work against a 128-character limit."""
+        root = "/scratch/out"
+        longest = nu_longest_output_name(OBSID, {"out_data_path": root})
+
+        assert len(longest) - len(root) == 58
