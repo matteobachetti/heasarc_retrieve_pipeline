@@ -870,7 +870,7 @@ rather than a mystery.
 
 
 38. Every worker starts its own Prefect server on one SQLite file
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Reported from a real 56-observation run at ``n_workers=4``::
 
