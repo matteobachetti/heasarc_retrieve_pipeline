@@ -39,7 +39,7 @@ from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
 
-from .utils import absolute_config, get_logger
+from .utils import absolute_config, get_logger, short_workspace
 
 
 def _download_pysmartdl(url: str, dest: str):
@@ -1113,7 +1113,10 @@ def prepare_worker(root):
     Parameters
     ----------
     root : str
-        Directory to create the per-worker directories under.
+        Directory to create the per-worker directories under. The flow passes the local
+        scratch directory of :func:`heasarc_retrieve_pipeline.utils.short_workspace`: this
+        state is written to on every HEASOFT call and kept by nobody, so it has no business
+        on a shared filesystem.
 
     Returns
     -------
@@ -1239,11 +1242,15 @@ def download_and_process_observation(
         Position to barycentre at.
     outdir : str
         Absolute output directory, shared by all observations. Each writes into its own
-        ``<outdir>/<obsid>`` subtree.
+        ``<outdir>/<obsid>`` subtree. This is normally the short symbolic link made by
+        :func:`heasarc_retrieve_pipeline.utils.short_workspace`, not the directory itself,
+        so that HEASOFT never sees a file name long enough to be truncated.
     mission : str
         One of the keys of ``MISSION_CONFIG``.
     worker_root : str
-        Where this process's private directory goes; see :func:`prepare_worker`.
+        Where this process's private directory goes; see :func:`prepare_worker`. It is on
+        local disk, off the shared filesystem, because nothing in it is worth keeping and
+        every HEASOFT call rewrites a parameter file there.
     flags : dict, optional
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
@@ -1288,7 +1295,8 @@ def process_observations(items, outdir, mission, worker_root, flags=None, test=F
     mission : str
         One of the keys of ``MISSION_CONFIG``.
     worker_root : str
-        Where the workers' private directories go; see :func:`prepare_worker`.
+        Where the workers' private directories go; see :func:`prepare_worker`. On local
+        disk, not under ``outdir``.
     flags : dict, optional
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
@@ -1416,17 +1424,20 @@ def retrieve_and_process_data(
     if test:
         items = items[:1]
 
-    worker_root = os.path.join(outdir, ".workers")
-    runner = ProcessPoolTaskRunner(max_workers=n_workers)
-    logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
-    process_observations.with_options(task_runner=runner)(
-        items,
-        outdir=outdir,
-        mission=mission,
-        worker_root=worker_root,
-        flags=flags,
-        test=test,
-    )
+    # The workers are given a short name for outdir, not outdir itself: some HEASOFT
+    # builds truncate file names at 128 characters, and the pipeline adds 58 of its own
+    # after the output root. Their scratch state goes to local disk in the same place.
+    with short_workspace(outdir) as workspace:
+        runner = ProcessPoolTaskRunner(max_workers=n_workers)
+        logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
+        process_observations.with_options(task_runner=runner)(
+            items,
+            outdir=workspace.data,
+            mission=mission,
+            worker_root=workspace.scratch,
+            flags=flags,
+            test=test,
+        )
 
     return result_table
 

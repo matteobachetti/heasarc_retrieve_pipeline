@@ -283,3 +283,87 @@ class TestOneFailureDoesNotStopTheRest:
 
         assert failed == []
         assert sorted(processed) == ["obs0", "obs1", "obs2"]
+
+
+class TestTheFlowUsesAShortWorkspace:
+    """The reduction runs under a short name, and the workers' scratch is off the output.
+
+    A HEASOFT build that truncates file names at 128 characters -- measured on the user's
+    cluster, 2376 truncations, every one at exactly 128 -- makes an output root longer
+    than 69 characters unusable, because the pipeline adds 58 characters of its own after
+    it. The flow hands the workers a symbolic link instead of the real directory, and the
+    workers' parameter files go to local disk rather than the shared filesystem. See
+    :func:`heasarc_retrieve_pipeline.utils.short_workspace` and issue 39 in
+    ``docs/known_issues.rst``.
+    """
+
+    def run(self, monkeypatch, outdir):
+        """Run the flow with everything but the workspace stubbed out."""
+        seen = {}
+
+        class Recorder:
+            def with_options(self, **kwargs):
+                return self
+
+            def __call__(self, items, outdir, mission, worker_root, flags=None, test=False):
+                seen["outdir"] = outdir
+                seen["worker_root"] = worker_root
+                # A worker writes its results through the name it was given.
+                open(os.path.join(outdir, "a_result.txt"), "w").close()
+                os.makedirs(os.path.join(worker_root, "worker_1"), exist_ok=True)
+                return []
+
+        monkeypatch.setattr(core, "locate_data", lambda table, catalog_name=None: table)
+        monkeypatch.setattr(
+            core,
+            "observation_work_items",
+            lambda table, links, column, position: [
+                dict(obsid="obs0", url="https://example.invalid/", ra=1.0, dec=2.0)
+            ],
+        )
+        monkeypatch.setattr(core, "process_observations", Recorder())
+
+        core.retrieve_and_process_data(Table({"__row": [0]}), outdir=str(outdir))
+        return seen
+
+    def long_outdir(self, tmp_path):
+        outdir = tmp_path / ("d" * 120)
+        outdir.mkdir()
+        return outdir
+
+    def test_the_workers_get_a_shorter_name_than_the_real_directory(
+        self, tmp_path, monkeypatch
+    ):
+        outdir = self.long_outdir(tmp_path)
+
+        seen = self.run(monkeypatch, outdir)
+
+        assert len(seen["outdir"]) < len(str(outdir))
+
+    def test_what_a_worker_writes_lands_in_the_real_directory(self, tmp_path, monkeypatch):
+        outdir = self.long_outdir(tmp_path)
+
+        self.run(monkeypatch, outdir)
+
+        assert (outdir / "a_result.txt").is_file()
+
+    def test_the_worker_scratch_is_not_inside_the_output_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """It used to be ``<outdir>/.workers``, on the shared filesystem."""
+        outdir = self.long_outdir(tmp_path)
+
+        seen = self.run(monkeypatch, outdir)
+
+        assert not os.path.realpath(seen["worker_root"]).startswith(
+            os.path.realpath(str(outdir))
+        )
+
+    def test_the_workspace_is_cleaned_up_but_the_output_is_not(self, tmp_path, monkeypatch):
+        outdir = self.long_outdir(tmp_path)
+
+        seen = self.run(monkeypatch, outdir)
+
+        assert not os.path.lexists(seen["outdir"])
+        assert not os.path.exists(seen["worker_root"])
+        assert (outdir / "a_result.txt").is_file()
