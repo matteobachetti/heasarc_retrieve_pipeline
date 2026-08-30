@@ -2,8 +2,12 @@
 Small helpers shared across the package.
 """
 
+import contextlib
 import logging
 import os
+import shutil
+import tempfile
+from collections import namedtuple
 
 import numpy as np
 from prefect import get_run_logger
@@ -21,6 +25,7 @@ __all__ = [
     "merge_intervals",
     "mask_from_gti",
     "read_gti",
+    "short_workspace",
     "splitext_improved",
 ]
 
@@ -81,6 +86,104 @@ def absolute_config(config, default):
         if key in config:
             config[key] = os.path.abspath(config[key])
     return config
+
+
+#: What :func:`short_workspace` hands back: a short name for the output directory, and a
+#: scratch directory for state that must not live on a shared filesystem.
+Workspace = namedtuple("Workspace", "data scratch")
+
+
+@contextlib.contextmanager
+def short_workspace(outdir, tmpdir=None):
+    """
+    A short name for the output directory, and scratch space off the shared disk.
+
+    Two problems with one answer, both measured on the user's cluster.
+
+    **File names.** Some HEASOFT builds truncate file names at 128 characters. Measured in
+    a 56-observation run: 2376 messages of the form ``Error determining file type for
+    <path>``, and every single one of the 2376 was exactly 128 characters long, against a
+    real path of 130. ``xselect`` then reported "The file was not found", and its
+    ``save events`` shell command lost its closing quote. The pipeline adds 58 characters
+    of its own after the output root (``/<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits``,
+    with a seven-digit Linux PID), so an output root longer than 69 characters cannot work
+    on such a build. A symbolic link in a temporary directory gives the same tree a name
+    about fifteen characters long, and the bytes never move.
+
+    Measured, with the tool that was failing: a real output tree 80 characters deep,
+    reached through a 15-character link, ran ``nusplitsc`` to ``Exit with success``, and
+    the files appeared in the real tree. Every path the sub-tools printed on the *output*
+    side stayed short, which is to say none of them resolves the link. ``xselect`` does
+    resolve the directory it *reads* from -- it prints the real path in ``Data Directory
+    is:`` -- but that is the code path measured good to 247 characters, so it is not the
+    constraint.
+
+    **Scratch space.** The workers' private HEASOFT parameter files and working
+    directories used to sit under the output directory, on the shared filesystem. One
+    ``nupipeline`` run spawns at least 44 sub-tools, and ``heasoftpy`` reads and rewrites
+    ``<PFILES>/<tool>.par`` around every one of them, so each was a network round trip for
+    a file nobody wants to keep. ``scratch`` is a directory on the same local temporary
+    filesystem, and it is deleted at the end of the run.
+
+    Nothing in the package writes an output to a bare relative name, so moving the
+    workers' working directory off the shared disk cannot strand a result there.
+
+    Parameters
+    ----------
+    outdir : str
+        The real output directory. Created if it does not exist, and made absolute.
+    tmpdir : str, optional
+        Where to put the workspace. Defaults to the system temporary directory, which on a
+        compute node is local disk.
+
+    Yields
+    ------
+    Workspace
+        ``data`` is the name to use as the output directory -- the short link, or
+        ``outdir`` itself when a link would be no shorter or cannot be made. ``scratch``
+        is a directory for throwaway per-worker state.
+
+    Notes
+    -----
+    The link lives in a directory made by :func:`tempfile.mkdtemp`, so its name is
+    unpredictable and it is readable only by its owner: on a shared node nobody else can
+    plant something at that path first. Cleanup unlinks symbolic links and nothing else,
+    so the output tree cannot be removed by this function even if something replaces the
+    link with a real directory.
+
+    All workers must see the same ``data`` name, which they do while they are processes on
+    one node. A task runner that spread them across nodes would need the link made on each.
+    """
+    outdir = os.path.abspath(outdir)
+    os.makedirs(outdir, exist_ok=True)
+
+    base = tempfile.mkdtemp(prefix="hrp", dir=tmpdir)
+    alias = os.path.join(base, "d")
+    scratch = os.path.join(base, "w")
+    os.makedirs(scratch, exist_ok=True)
+
+    data = outdir
+    if len(alias) < len(outdir):
+        try:
+            os.symlink(outdir, alias)
+            data = alias
+        except OSError as exc:
+            get_logger().warning(
+                f"Could not give {outdir} a shorter name at {alias} ({exc}). "
+                "HEASOFT tools that truncate long file names may fail."
+            )
+
+    try:
+        yield Workspace(data=data, scratch=scratch)
+    finally:
+        if os.path.islink(alias):
+            os.unlink(alias)
+        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            os.rmdir(base)
+        except OSError:
+            # Something else is in there; leave it rather than delete what we did not make.
+            pass
 
 
 def splitext_improved(path):

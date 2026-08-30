@@ -5,6 +5,7 @@ pure: it takes arrays and headers in, and gives arrays and headers back.
 """
 
 import os
+import shutil
 
 import numpy as np
 import pytest
@@ -22,6 +23,7 @@ from heasarc_retrieve_pipeline.utils import (
     mask_from_gti,
     merge_intervals,
     read_gti,
+    short_workspace,
 )
 
 
@@ -589,3 +591,136 @@ class TestAbsoluteConfig:
         monkeypatch.chdir(elsewhere)
 
         assert config["out_data_path"] == str(tmp_path)
+
+
+class TestShortWorkspace:
+    """A short name for a long output directory, and scratch space off the shared disk.
+
+    Two separate problems, one answer. HEASOFT's ``xselect`` truncates file names at 128
+    characters on some builds -- measured on the user's cluster, 2376 truncations, every
+    one at exactly 128 -- and the pipeline adds 58 characters of its own after the output
+    root, so a root longer than 69 characters cannot work. Separately, the workers' HEASOFT
+    parameter files were living on the shared filesystem, where every one of the 44-plus
+    tool invocations in a single ``nupipeline`` run paid a network round trip to read and
+    rewrite a ``.par`` file.
+
+    See issues 37 and 39 in ``docs/known_issues.rst``.
+    """
+
+    def test_the_alias_is_shorter_than_the_directory_it_stands_for(self, tmp_path):
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert len(workspace.data) < len(str(outdir))
+
+    def test_a_file_written_through_the_alias_lands_in_the_real_directory(self, tmp_path):
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            with open(os.path.join(workspace.data, "hello.txt"), "w") as f:
+                f.write("written through the alias")
+
+        assert (outdir / "hello.txt").read_text() == "written through the alias"
+
+    def test_the_scratch_directory_exists_and_is_not_inside_the_output(self, tmp_path):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert os.path.isdir(workspace.scratch)
+            assert not os.path.realpath(workspace.scratch).startswith(
+                os.path.realpath(str(outdir))
+            )
+
+    def test_the_output_directory_survives_the_cleanup(self, tmp_path):
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+        (outdir / "precious.txt").write_text("keep me")
+
+        with short_workspace(str(outdir)) as workspace:
+            alias = workspace.data
+
+        assert not os.path.lexists(alias)
+        assert (outdir / "precious.txt").read_text() == "keep me"
+
+    def test_the_scratch_directory_is_removed_with_its_contents(self, tmp_path):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            scratch = workspace.scratch
+            os.makedirs(os.path.join(scratch, "worker_1234"))
+            open(os.path.join(scratch, "worker_1234", "ftlist.par"), "w").close()
+
+        assert not os.path.exists(scratch)
+
+    def test_an_exception_inside_the_block_still_cleans_up(self, tmp_path):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        with pytest.raises(ValueError):
+            with short_workspace(str(outdir)) as workspace:
+                alias, scratch = workspace.data, workspace.scratch
+                raise ValueError("something went wrong in the middle of a run")
+
+        assert not os.path.lexists(alias)
+        assert not os.path.exists(scratch)
+        assert outdir.is_dir()
+
+    def test_the_directory_is_used_as_is_when_the_alias_would_be_longer(self, tmp_path):
+        """No point aliasing ``/data/out`` to something under a deeply nested TMPDIR."""
+        outdir = tmp_path / "o"
+        outdir.mkdir()
+        long_tmp = tmp_path / ("t" * 150)
+        long_tmp.mkdir()
+
+        with short_workspace(str(outdir), tmpdir=str(long_tmp)) as workspace:
+            assert workspace.data == str(outdir)
+
+    def test_a_real_directory_left_where_the_alias_was_is_not_deleted(self, tmp_path):
+        """Cleanup unlinks symbolic links and nothing else, whatever it finds."""
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            alias = workspace.data
+            os.unlink(alias)
+            os.makedirs(alias)
+            open(os.path.join(alias, "someone_elses_file"), "w").close()
+
+        assert os.path.isfile(os.path.join(alias, "someone_elses_file"))
+        shutil.rmtree(os.path.dirname(alias))
+
+    def test_the_output_directory_is_created_if_it_does_not_exist(self, tmp_path):
+        outdir = tmp_path / "not_yet"
+
+        with short_workspace(str(outdir)) as workspace:
+            open(os.path.join(workspace.data, "f"), "w").close()
+
+        assert (outdir / "f").is_file()
+
+    def test_a_relative_output_directory_is_made_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        with short_workspace("out") as workspace:
+            open(os.path.join(workspace.data, "f"), "w").close()
+
+        assert (tmp_path / "out" / "f").is_file()
+
+    def test_it_falls_back_to_the_plain_directory_when_the_link_cannot_be_made(
+        self, tmp_path, monkeypatch
+    ):
+        """A filesystem without symbolic links must not stop the run."""
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        def no_symlinks(*args, **kwargs):
+            raise OSError("symbolic links are not supported here")
+
+        monkeypatch.setattr(os, "symlink", no_symlinks)
+
+        with short_workspace(str(outdir)) as workspace:
+            assert workspace.data == str(outdir)
+            assert os.path.isdir(workspace.scratch)
