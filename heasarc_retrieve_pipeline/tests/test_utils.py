@@ -7,12 +7,14 @@ pure: it takes arrays and headers in, and gives arrays and headers back.
 import os
 import re
 import shutil
+import tempfile
 
 import numpy as np
 import pytest
 
 from astropy.io import fits
 
+from heasarc_retrieve_pipeline import utils
 from heasarc_retrieve_pipeline.utils import (
     absolute_config,
     apply_gti,
@@ -757,3 +759,49 @@ class TestCheckNameLength:
 
         with pytest.raises(ValueError, match=re.escape(name)):
             check_name_length(name, limit=128)
+
+
+class TestWhereTheWorkspaceGoes:
+    """The workspace picks the shortest temporary directory it can write to.
+
+    ``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is a 48-character path
+    under ``/var/folders``. Taking it would spend most of a 128-character budget before the
+    pipeline had written a single character of its own.
+    """
+
+    def test_the_shortest_writable_candidate_wins(self, tmp_path, monkeypatch):
+        long_one = tmp_path / ("t" * 60)
+        short_one = tmp_path / "s"
+        long_one.mkdir()
+        short_one.mkdir()
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(long_one))
+        monkeypatch.setattr(
+            utils, "_TEMPORARY_DIRECTORY_CANDIDATES", (str(short_one),)
+        )
+
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert workspace.data.startswith(str(short_one))
+
+    def test_a_candidate_that_does_not_exist_is_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            utils, "_TEMPORARY_DIRECTORY_CANDIDATES", ("/no/such/directory/anywhere",)
+        )
+
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir)) as workspace:
+            assert workspace.data.startswith(str(tmp_path))
+
+    def test_an_explicit_tmpdir_overrides_the_choice(self, tmp_path):
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+        outdir = tmp_path / ("a" * 120)
+        outdir.mkdir()
+
+        with short_workspace(str(outdir), tmpdir=str(chosen)) as workspace:
+            assert workspace.data.startswith(str(chosen))

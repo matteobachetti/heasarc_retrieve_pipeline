@@ -1254,7 +1254,17 @@ cleanup unlinks symbolic links and nothing else, so it cannot delete an output t
 
 Measured with the tool that was failing: a real output tree 80 characters deep, reached
 through a 15-character link, ran ``nusplitsc`` to ``Exit with success``, and the files
-appeared in the real tree.
+appeared in the real tree. Then end to end, on NuSTAR observation 80202020006 in a real
+output tree 73 characters deep: the reduction saw an 18-character root, the longest name
+it built was 76 characters against 131 without the link, ``nusplitsc`` and the merging
+step (``ftmerge``, ``ftmgtime``, ``ftsort``, ``fappend``) both succeeded, and the six
+per-CHU event files came out with the same event counts and the same exposure, to the
+microsecond, as a reduction of the same observation through the real path.
+
+The workspace also has to survive being where the temporary directory is long.
+``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is 48 characters under
+``/var/folders``; ``short_workspace`` therefore takes the shortest writable choice among
+that and ``/tmp``, and accepts an explicit ``tmpdir`` when neither is suitable.
 
 The budget, if the link cannot be made and the real path is used: the reduction adds **58
 characters** after the output root, the longest being ``nusplitsc``'s

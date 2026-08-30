@@ -89,6 +89,23 @@ def absolute_config(config, default):
     return config
 
 
+#: Places to look for a short temporary directory, besides whatever ``TMPDIR`` says.
+#: ``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is a 48-character path
+#: under ``/var/folders`` -- most of a 128-character budget spent before the pipeline
+#: writes a character of its own. On a compute node ``/tmp`` is four characters and local
+#: disk, which is what is wanted on both counts.
+_TEMPORARY_DIRECTORY_CANDIDATES = ("/tmp",)
+
+
+def _shortest_temporary_directory():
+    """The shortest directory this process can write a workspace into."""
+    candidates = [tempfile.gettempdir(), *_TEMPORARY_DIRECTORY_CANDIDATES]
+    writable = [
+        c for c in candidates if os.path.isdir(c) and os.access(c, os.W_OK | os.X_OK)
+    ]
+    return min(writable, key=len) if writable else tempfile.gettempdir()
+
+
 #: What :func:`short_workspace` hands back: a short name for the output directory, and a
 #: scratch directory for state that must not live on a shared filesystem.
 Workspace = namedtuple("Workspace", "data scratch")
@@ -134,8 +151,12 @@ def short_workspace(outdir, tmpdir=None):
     outdir : str
         The real output directory. Created if it does not exist, and made absolute.
     tmpdir : str, optional
-        Where to put the workspace. Defaults to the system temporary directory, which on a
-        compute node is local disk.
+        Where to put the workspace. By default the shortest writable choice among
+        ``tempfile.gettempdir()`` and ``/tmp``, both of which are local disk on a compute
+        node. The scratch directory holds HEASOFT's own temporaries as well as the
+        parameter files -- ``nuscreen`` writes a ``<pid>_tmp_nuscreen/`` tree into the
+        working directory -- so the filesystem chosen needs room for them; pass ``tmpdir``
+        explicitly if the default is a small one.
 
     Yields
     ------
@@ -158,6 +179,8 @@ def short_workspace(outdir, tmpdir=None):
     outdir = os.path.abspath(outdir)
     os.makedirs(outdir, exist_ok=True)
 
+    if tmpdir is None:
+        tmpdir = _shortest_temporary_directory()
     base = tempfile.mkdtemp(prefix="hrp", dir=tmpdir)
     alias = os.path.join(base, "d")
     scratch = os.path.join(base, "w")
