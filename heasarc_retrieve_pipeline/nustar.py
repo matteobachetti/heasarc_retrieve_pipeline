@@ -65,6 +65,13 @@ from .heasoft import HAS_HEASOFT
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./", max_radius=80)
 
+#: Energy band, in keV, in which :func:`get_best_source_region` images the field. These
+#: live here rather than only in that function's signature because ``nustar_gen``'s
+#: ``make_image`` names its output ``<stem>_<elow>to<ehigh>keV.fits``, which makes them
+#: part of the longest file name the reduction builds -- see
+#: :func:`nu_longest_output_name`. A test pins the two together.
+IMAGE_ELOW, IMAGE_EHIGH = 3, 80
+
 valid_re = re.compile(r"nu[0-9]{11}[AB]0[16].*")
 
 
@@ -120,9 +127,12 @@ def nu_pipeline_output_path(obsid, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_pipe/``.
+        ``<out_data_path>/<OBSID>/event_pipe``. No trailing slash: measured in a
+        ``nuproducts`` log, the tool given ``.../event_pipe/`` as ``indir`` went on to
+        build ``.../event_pipe//nu<OBSID>A_fpm.hk``, wasting a character of a budget that
+        is only 128 wide on some HEASOFT builds.
     """
-    return os.path.join(config["out_data_path"], obsid + "/event_pipe/")
+    return os.path.join(config["out_data_path"], obsid, "event_pipe")
 
 
 def nu_product_output_path(obsid, config):
@@ -139,9 +149,10 @@ def nu_product_output_path(obsid, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/products/``, where spectra, ARFs and RMFs go.
+        ``<out_data_path>/<OBSID>/products``, where spectra, ARFs and RMFs go. No
+        trailing slash, for the reason given in :func:`nu_pipeline_output_path`.
     """
-    return os.path.join(config["out_data_path"], obsid + "/products/")
+    return os.path.join(config["out_data_path"], obsid, "products")
 
 
 def nu_pipeline_done_file(obsid, config):
@@ -196,11 +207,27 @@ def nu_longest_output_name(obsid, config):
     :func:`heasarc_retrieve_pipeline.utils.check_name_length`. The flow refuses to start
     when this name does not fit, which is cheap and happens before any download.
 
-    The winner is one of ``nusplitsc``'s temporaries: it merges the three star-tracker
-    housekeeping extensions into ``nu<OBSID>_chu123_merge_<pid>.fits`` under ``split``,
-    which beats every event file, GTI file, spectrum and barycentred product the pipeline
-    makes. ``tests/test_nustar.py`` checks that against the full list. Seven digits are
-    allowed for the process identifier, which is as long as a Linux PID gets.
+    The winner is the sky image ``nustar_gen``'s ``make_image`` writes when it measures an
+    extraction region for a mode-06 (``SCIENCE_SC``) event file. Three things stack up in
+    it: ``nusplitsc`` splits mode-06 data by star-tracker combination, and ``chu123`` is
+    the longest of those; the split file keeps the ``_cl`` of the file it came from; and
+    ``make_image`` appends the energy band. It is also the name most worth protecting,
+    because ``make_image`` passes it to ``xselect`` as a ``save image`` argument -- the
+    write side, which is the side that truncates.
+
+    Found by walking two finished output trees rather than by reading the code, which is
+    how the earlier answer -- one of ``nusplitsc``'s own temporaries, three characters
+    shorter -- turned out to be wrong. ``tests/test_nustar.py`` now checks this against
+    the full list of names those trees contained.
+
+    One other name ties it exactly, which is worth knowing before shortening anything:
+    :func:`merge_gtis` re-sorts its output in place with ``ftsort``, and CFITSIO's clobber
+    prefix makes ``!<split>/nu<OBSID>A06_chu123_N_cl_noflares.gti`` 61 characters too.
+
+    One name in a finished tree is longer still: the GOES solar-flare light curve
+    ``sci_xrsf-l2-avg1m_g15_d<DATE>_v2-2-1.nc``, at 60 characters after the output root.
+    It is downloaded by ``sunpy`` and never passed to a HEASOFT tool, so it is not what
+    the limit applies to, and it is shorter than this one anyway.
 
     Parameters
     ----------
@@ -218,11 +245,14 @@ def nu_longest_output_name(obsid, config):
     --------
     >>> name = nu_longest_output_name("80002092008", {"out_data_path": "/scratch/out"})
     >>> len(name) - len("/scratch/out")
-    58
-    >>> name.endswith("80002092008/split/nu80002092008_chu123_merge_9999999.fits")
+    61
+    >>> name.endswith("80002092008/split/nu80002092008A06_chu123_N_cl_3to80keV.fits")
     True
     """
-    return os.path.join(split_path(obsid, config), f"nu{obsid}_chu123_merge_{'9' * 7}.fits")
+    band = f"{IMAGE_ELOW}to{IMAGE_EHIGH}keV"
+    return os.path.join(
+        split_path(obsid, config), f"nu{obsid}A06_chu123_N_cl_{band}.fits"
+    )
 
 
 def _cl_event_files(directory, pattern):
@@ -1454,8 +1484,8 @@ def barycenter_data(obsid, ra, dec, config, src=1):
 def get_best_source_region(
     infile,
     pair=None,
-    elow=3,
-    ehigh=80,
+    elow=IMAGE_ELOW,
+    ehigh=IMAGE_EHIGH,
     out_rootname=None,
     config=None,
     reference=None,
@@ -1573,7 +1603,7 @@ def get_best_source_region(
     # Now the radial image parts.
 
     # Make the radial image for the full energy range (or whatever is the best SNR)
-    full_range = make_image(infile, elow=3, ehigh=80, clobber=True)
+    full_range = make_image(infile, elow=IMAGE_ELOW, ehigh=IMAGE_EHIGH, clobber=True)
     rind, rad_profile, radial_err, psf_profile = make_radial_profile(
         full_range, show_image=False, coordinates=coordinates
     )

@@ -122,10 +122,11 @@ def short_workspace(outdir, tmpdir=None, scratch_dir=None):
     a 56-observation run: 2376 messages of the form ``Error determining file type for
     <path>``, and every single one of the 2376 was exactly 128 characters long, against a
     real path of 130. ``xselect`` then reported "The file was not found", and its
-    ``save events`` shell command lost its closing quote. The pipeline adds 58 characters
-    of its own after the output root (``/<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits``,
-    with a seven-digit Linux PID), so an output root longer than 69 characters cannot work
-    on such a build. A symbolic link in a temporary directory gives the same tree a name
+    ``save events`` shell command lost its closing quote. The pipeline adds 61 characters
+    of its own after the output root -- the longest is the sky image made while measuring
+    an extraction region for a mode-06 event file,
+    ``/<OBSID>/split/nu<OBSID>A06_chu123_N_cl_3to80keV.fits`` -- so an output root longer
+    than 67 characters cannot work on such a build. A symbolic link in a temporary directory gives the same tree a name
     about fifteen characters long, and the bytes never move.
 
     Measured, with the tool that was failing: a real output tree 80 characters deep,

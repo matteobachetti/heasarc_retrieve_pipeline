@@ -591,10 +591,25 @@ class TestNustarPaths:
         assert nu_base_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID)
 
     def test_the_level_2_products_go_in_event_pipe(self):
-        assert nu_pipeline_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/event_pipe/")
+        assert nu_pipeline_output_path(OBSID, self.CONFIG) == os.path.join(
+            "out", OBSID, "event_pipe"
+        )
 
     def test_the_spectral_products_go_in_products(self):
-        assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID + "/products/")
+        assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join(
+            "out", OBSID, "products"
+        )
+
+    def test_no_directory_ends_in_a_slash(self):
+        """Measured in a nuproducts log: given ``.../event_pipe/`` as ``indir``, the tool
+        built ``.../event_pipe//nu<OBSID>A_fpm.hk``, one character wasted out of 128."""
+        for path in (
+            nu_pipeline_output_path(OBSID, self.CONFIG),
+            nu_product_output_path(OBSID, self.CONFIG),
+            split_path(OBSID, self.CONFIG),
+            nu_base_output_path(OBSID, self.CONFIG),
+        ):
+            assert not path.endswith("/")
 
     def test_the_per_chu_files_go_in_split(self):
         """No trailing slash: nusplitsc adds one, and "split//" wastes a character of a
@@ -770,17 +785,37 @@ class TestLongestOutputName:
     CONFIG = {"out_data_path": "/scratch/out", "input_data_path": "/scratch/raw"}
 
     def other_names_the_reduction_builds(self, obsid, config):
-        """Every long name any step constructs, for comparison."""
+        """Every long name any step constructs, for comparison.
+
+        Taken from two complete reductions on disk, not from reading the code: the walk
+        of a finished output tree is what showed that the mode-06 image beats the
+        ``nusplitsc`` temporary this function used to return.
+        """
         pid = "9" * 7
         split = split_path(obsid, config)
         events = nu_pipeline_output_path(obsid, config)
         base = nu_base_output_path(obsid, config)
         products = nu_product_output_path(obsid, config)
+        # The worst case for a mode-06 stem: all three star trackers in the solution.
+        stem6 = f"nu{obsid}A06_chu123_N"
         return [
             # nusplitsc, per CHU combination
+            os.path.join(split, f"nu{obsid}_chu123_merge_{pid}.fits"),
             os.path.join(split, f"nu{obsid}_chu123_gti_{pid}.fits"),
-            os.path.join(split, f"nu{obsid}A06_chu123_N_cl.evt"),
+            os.path.join(split, stem6 + "_cl.evt"),
             os.path.join(split, f"xselect_chu123_{pid}.xco"),
+            # nustar_gen's make_image, which is xselect: the mode-06 case is the longest
+            # name the whole reduction builds
+            os.path.join(split, stem6 + "_cl_3to80keV.log"),
+            os.path.join(events, f"nu{obsid}A01_cl_3to80keV.fits"),
+            # regions, flare filtering and its GTIs
+            os.path.join(split, stem6 + "_cl_src.reg"),
+            os.path.join(split, stem6 + "_cl_noflares.gti"),
+            # merge_gtis re-sorts in place, and CFITSIO's clobber prefix is a character
+            # of the name as the tool sees it
+            "!" + os.path.join(split, stem6 + "_cl_noflares.gti"),
+            os.path.join(split, stem6 + "_cl_goes.fits"),
+            os.path.join(split, stem6 + "_cl_src1.evt"),
             # nupipeline and nuscreen
             os.path.join(events, f"nu{obsid}A01_gti.fits"),
             os.path.join(events, f"nu{obsid}A01_cl.evt"),
@@ -789,8 +824,11 @@ class TestLongestOutputName:
             os.path.join(base, f"nu{obsid}A01_cl_noflares_bary.evt"),
             os.path.join(base, f"nu{obsid}_src1_noflares_bary.evt"),
             os.path.join(base, f"nu{obsid}A01_cl_goes.fits"),
-            # spectra
+            # nuproducts, including its per-CHU mode-06 products
             os.path.join(products, f"nu{obsid}A01_sr.pha"),
+            os.path.join(products, stem6 + "_grp.pha"),
+            os.path.join(products, stem6 + "_sr.rmf"),
+            os.path.join(products, f"{pid}_skymap_vign.img"),
         ]
 
     def test_nothing_the_reduction_builds_is_longer(self):
@@ -799,19 +837,32 @@ class TestLongestOutputName:
         for name in self.other_names_the_reduction_builds(OBSID, self.CONFIG):
             assert len(name) <= len(longest), f"{name} is longer than {longest}"
 
-    def test_it_is_the_nusplitsc_merge_file(self):
+    def test_it_is_the_mode_06_image(self):
+        """An xselect ``save image`` output, which is the write side that truncates."""
         longest = nu_longest_output_name(OBSID, self.CONFIG)
 
         assert longest.startswith(split_path(OBSID, self.CONFIG))
-        assert "_chu123_merge_" in longest
-        assert longest.endswith(".fits")
+        assert "A06_chu123_N_cl_" in longest
+        assert longest.endswith("keV.fits")
 
-    def test_it_allows_for_a_seven_digit_process_id(self):
-        """Linux PIDs run to 4194304 by default; the cluster log showed five digits."""
+    def test_it_allows_for_all_three_star_trackers(self):
+        """``nusplitsc`` splits by CHU combination; ``chu123`` is the longest of them."""
         longest = nu_longest_output_name(OBSID, self.CONFIG)
-        with_five_digits = longest.replace("9999999", "99999")
 
-        assert len(longest) == len(with_five_digits) + 2
+        assert "chu123" in longest
+
+    def test_the_band_is_the_one_the_image_step_actually_uses(self):
+        """``make_image`` names its output ``<stem>_<elow>to<ehigh>keV.fits``, so a change
+        to the default band changes the longest file name the reduction builds."""
+        import inspect
+
+        defaults = inspect.signature(nustar.get_best_source_region).parameters
+
+        assert defaults["elow"].default == nustar.IMAGE_ELOW
+        assert defaults["ehigh"].default == nustar.IMAGE_EHIGH
+        assert f"{nustar.IMAGE_ELOW}to{nustar.IMAGE_EHIGH}keV" in nu_longest_output_name(
+            OBSID, self.CONFIG
+        )
 
     def test_it_grows_with_the_output_root(self):
         short = nu_longest_output_name(OBSID, {"out_data_path": "/a"})
@@ -819,10 +870,10 @@ class TestLongestOutputName:
 
         assert len(long) == len(short) + 9
 
-    def test_the_pipeline_adds_58_characters_after_the_output_root(self):
+    def test_the_pipeline_adds_61_characters_after_the_output_root(self):
         """The number quoted in the docs and in the commit messages: an output root of
-        more than 69 characters cannot work against a 128-character limit."""
+        more than 67 characters cannot work against a 128-character limit."""
         root = "/scratch/out"
         longest = nu_longest_output_name(OBSID, {"out_data_path": root})
 
-        assert len(longest) - len(root) == 58
+        assert len(longest) - len(root) == 61

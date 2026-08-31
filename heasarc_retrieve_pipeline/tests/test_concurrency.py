@@ -320,7 +320,7 @@ class TestTheFlowUsesAShortWorkspace:
 
     A HEASOFT build that truncates file names at 128 characters -- measured on the user's
     cluster, 2376 truncations, every one at exactly 128 -- makes an output root longer
-    than 69 characters unusable, because the pipeline adds 58 characters of its own after
+    than 67 characters unusable, because the pipeline adds 61 characters of its own after
     it. The flow hands the workers a symbolic link instead of the real directory, and the
     workers' parameter files go to local disk rather than the shared filesystem. Their
     working directories do not: those were measured at 182.5 MB apiece. See
@@ -495,7 +495,7 @@ class TestTheFlowRefusesNamesHeasoftCannotHandle:
         no_shorter = tmp_path / ("t" * 150)
         no_shorter.mkdir()
 
-        with pytest.raises(ValueError, match="_chu123_merge_"):
+        with pytest.raises(ValueError, match="A06_chu123_N_cl_"):
             self.run(monkeypatch, outdir, tmpdir=str(no_shorter))
 
     def test_the_short_name_is_what_saves_a_long_output_directory(

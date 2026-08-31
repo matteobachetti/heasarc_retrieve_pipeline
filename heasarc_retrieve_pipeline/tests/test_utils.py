@@ -602,8 +602,8 @@ class TestShortWorkspace:
 
     Two separate problems, one answer. HEASOFT's ``xselect`` truncates file names at 128
     characters on some builds -- measured on the user's cluster, 2376 truncations, every
-    one at exactly 128 -- and the pipeline adds 58 characters of its own after the output
-    root, so a root longer than 69 characters cannot work. Separately, the workers' HEASOFT
+    one at exactly 128 -- and the pipeline adds 61 characters of its own after the output
+    root, so a root longer than 67 characters cannot work. Separately, the workers' HEASOFT
     parameter files were living on the shared filesystem, where every one of the 44-plus
     tool invocations in a single ``nupipeline`` run paid a network round trip to read and
     rewrite a ``.par`` file.

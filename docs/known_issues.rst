@@ -935,11 +935,17 @@ impossible path before anything is downloaded. Measured with the tool that was f
 real output tree 80 characters deep, reached through a 15-character link, ran ``nusplitsc``
 to ``Exit with success`` with the files appearing in the real tree.
 
-The budget, for reference: the reduction adds **58 characters** after the output root
-(``/<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits``, seven-digit PID), so against a
-128-character limit an output root has to be 69 characters or fewer if it is used
-directly. The user's was 77. Through the link it is about 73 characters in total whatever
-the root is called.
+The budget, for reference: the reduction adds **61 characters** after the output root, so
+against a 128-character limit an output root has to be 67 characters or fewer if it is
+used directly. The user's was 77. Through the link it is about 76 characters in total
+whatever the root is called.
+
+The longest name is ``<OBSID>/split/nu<OBSID>A06_chu123_N_cl_3to80keV.fits``, the sky
+image ``nustar_gen``'s ``make_image`` writes -- through ``xselect``'s ``save image``, the
+write side -- while measuring an extraction region for a mode-06 (``SCIENCE_SC``) event
+file. It was found by walking two finished output trees; the first answer, one of
+``nusplitsc``'s own temporaries at 58 characters, came from reading the code and was three
+characters short. See :ref:`technical_details` for the full table.
 
 **What went to local disk with it, and what did not.** ``short_workspace`` also moves the
 workers' private state off the shared filesystem, but only half of it. The HEASOFT

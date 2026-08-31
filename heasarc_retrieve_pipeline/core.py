@@ -1458,7 +1458,7 @@ def retrieve_and_process_data(
         items = items[:1]
 
     # The workers are given a short name for outdir, not outdir itself: some HEASOFT
-    # builds truncate file names at 128 characters, and the pipeline adds 58 of its own
+    # builds truncate file names at 128 characters, and the pipeline adds 61 of its own
     # after the output root. Their parameter files go to local disk in the same place;
     # their working directories stay where there is room for them.
     with short_workspace(outdir, scratch_dir=scratch_dir) as workspace:

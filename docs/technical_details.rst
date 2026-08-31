@@ -1267,13 +1267,42 @@ The workspace also has to survive being where the temporary directory is long.
 ``/var/folders``; ``short_workspace`` therefore takes the shortest writable choice among
 that and ``/tmp``, and accepts an explicit ``tmpdir`` when neither is suitable.
 
-The budget, if the link cannot be made and the real path is used: the reduction adds **58
-characters** after the output root, the longest being ``nusplitsc``'s
-``<OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits`` with a seven-digit PID. Against the
-128-character limit that leaves 69 characters for the root.
-``utils.check_name_length`` raises before anything is downloaded when it does not fit,
-naming the path and both lengths; ``nustar.nu_longest_output_name`` is what it checks, and
-a test pins that as longer than every other name any step builds.
+The budget, if the link cannot be made and the real path is used: the reduction adds **61
+characters** after the output root, so against the 128-character limit 67 characters are
+left for the root. ``utils.check_name_length`` raises before anything is downloaded when
+it does not fit, naming the path and both lengths; ``nustar.nu_longest_output_name`` is
+what it checks, and a test pins that as longer than every other name any step builds.
+
+The longest name is the mode-06 one, and it was found by walking two finished output
+trees rather than by reading the code:
+
+.. code-block:: text
+
+    61  <OBSID>/split/nu<OBSID>A06_chu123_N_cl_3to80keV.fits   xselect, via make_image
+    60  <OBSID>/split/nu<OBSID>A06_chu123_N_cl_3to80keV.log    the same call's log
+    60  <OBSID>/split/nu<OBSID>A06_chu123_N_cl_noflares.gti    mgtime
+    60  <OBSID>/split/sci_xrsf-l2-avg1m_g15_d<DATE>_v2-2-1.nc  sunpy, not HEASOFT
+    58  <OBSID>/split/nu<OBSID>_chu123_merge_<pid>.fits        nusplitsc
+
+Three things stack up in the winner. ``nusplitsc`` splits ``SCIENCE_SC`` data by
+star-tracker combination and ``chu123`` is the longest of those; the split file keeps the
+``_cl`` of the file it came from; and ``nustar_gen``'s ``make_image`` appends
+``_<elow>to<ehigh>keV``. It is also the name most worth protecting, because ``make_image``
+hands it to ``xselect`` as a ``save image`` argument -- the write side, which is the side
+that truncates. The energy band lives in ``nustar.IMAGE_ELOW`` and ``nustar.IMAGE_EHIGH``
+so that the default and the length check cannot drift apart; a test asserts they are the
+same numbers ``get_best_source_region`` defaults to.
+
+The GOES light curve in that table is longer than the ``nusplitsc`` temporary but is a
+``sunpy`` download that no HEASOFT tool ever sees, so the limit does not apply to it.
+
+One thing the guard does **not** cover, because it is not a file name: ``merge_gtis``
+hands ``ftmgtime`` an ``ingtis`` parameter that is a comma-separated list of two paths
+with ``[GTI]`` filters on them. Measured in a real run through the link, that string is
+**152 characters**. It worked, and the limits documented here are per file name rather
+than per parameter, so there is no reason to think it is a problem -- but it is the first
+place to look if a run through a longer root fails in ``merge_gtis`` rather than in
+``xselect``.
 
 **Two kinds of scratch state, in two places.** A worker keeps two things nobody wants
 afterwards, and they want opposite filesystems, so ``short_workspace`` hands back a
@@ -1304,6 +1333,21 @@ relative name, and the HEASOFT tools address files inside the working directory 
 name, so the working directory needs neither a short path nor a durable one. Both
 directories are removed at the end of the run, and cleanup removes only directories
 ``short_workspace`` created -- a ``scratch_dir`` shared with another run survives.
+
+**Deciding where to point** ``scratch_dir``. ``tools/fs_benchmark.sh`` measures candidate
+filesystems on the profile HEASOFT actually produces -- many small files and many metadata
+operations -- rather than on bandwidth, which is not the binding constraint here::
+
+    srun -n1 bash tools/fs_benchmark.sh /scratch/your/project /tmp
+
+It times creating, looking up and deleting 2000 files and writing and reading 400 files of
+32 kB, the measured median size in a reduced observation. The per-file microsecond figures
+are the ones to compare. All the per-file loops use shell builtins, and the two steps with
+no portable builtin fork once for the whole batch: a fork costs about a millisecond, which
+is longer than most of the operations being timed and would otherwise make every
+filesystem look identical. On the local APFS disk this was written on: 62 us to create,
+9 us to look up, 59 us to delete. If a shared filesystem is within a factor of a few of
+that, leaving the working directories where they are costs little.
 Whether it is worth copying whole observations to local disk and back is a separate
 question, and one to settle by measuring the two filesystems rather than by argument.
 
