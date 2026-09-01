@@ -36,7 +36,7 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     get_best_source_regions,
     goes_class_to_flux,
     join_source_data,
-    plot_flare_filtering,
+    record_flare_filtering,
     mode_01_input_files,
     nu_goes_gti_file,
     nu_goes_lc_file,
@@ -697,26 +697,33 @@ class TestRequireGoesCoverage:
         assert OBSID in str(excinfo.value)
 
 
-class TestPlotFlareFiltering:
-    """The diagnostic figure. A smoke test, not a rendering test.
+class TestRecordFlareFiltering:
+    """The flare diagnostic, which used to be a JPEG next to the event file.
 
-    What is checked is that it runs headless, writes a non-empty file, and leaves no
-    figure behind in pyplot's registry -- the leak that issue 31 is about.
+    It returns what it records, so these can check the numbers without a diagnostics
+    directory. What the record itself looks like is in
+    ``TestTheFlareFilteringRecordsItself``.
     """
 
-    def test_it_writes_a_figure_and_leaks_none(self, tmp_path):
-        plt = pytest.importorskip("matplotlib.pyplot")
+    def test_it_measures_both_bands_before_and_after(self, tmp_path):
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
-        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
+        arrays = record_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
 
-        assert outfile == str(tmp_path / f"nu{OBSID}_src1_flares.jpg")
-        assert os.path.getsize(outfile) > 0
-        assert len(plt.get_fignums()) == 0, "a figure was left open"
+        for band in ("3_10", "10_79"):
+            for when in ("before", "after"):
+                assert arrays[f"lc_{band}_{when}_rate"].size > 0
+        assert np.allclose(arrays["removed"], [[400.0, 600.0]])
 
-    def test_the_goes_panel_is_used_when_the_light_curve_is_there(self, tmp_path):
-        """The panel is filled from the observation's light curve, no second download."""
-        pytest.importorskip("matplotlib")
+    def test_no_figure_is_written_next_to_the_event_file(self, tmp_path):
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+
+        record_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
+
+        assert glob.glob(str(tmp_path / "*.jpg")) == []
+
+    def test_the_goes_curve_is_read_when_the_light_curve_is_there(self, tmp_path):
+        """From the observation's own light curve; there is no second download."""
         from astropy.table import Table
 
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
@@ -726,38 +733,35 @@ class TestPlotFlareFiltering:
         goes_lc_file = str(tmp_path / f"nu{OBSID}_goes.fits")
         Table({"TIME": times, "XRSA": flux / 10, "XRSB": flux}).write(goes_lc_file)
 
-        outfile = plot_flare_filtering.fn(
+        arrays = record_flare_filtering.fn(
             event_file, [[0, 1000]], [[0, 400], [600, 1000]], goes_lc_file=goes_lc_file
         )
 
-        assert os.path.getsize(outfile) > 0
+        assert arrays["goes_xrsb"].max() == pytest.approx(1e-5)
 
     def test_it_works_without_a_goes_light_curve(self, tmp_path):
         """A rerun skips the download, so the file may legitimately be missing."""
-        pytest.importorskip("matplotlib")
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
-        outfile = plot_flare_filtering.fn(
+        arrays = record_flare_filtering.fn(
             event_file, [[0, 1000]], [[0, 1000]], goes_lc_file=str(tmp_path / "gone.fits")
         )
 
-        assert os.path.getsize(outfile) > 0
+        assert "goes_time" not in arrays
 
     def test_it_works_when_no_light_curve_was_named_at_all(self, tmp_path):
-        pytest.importorskip("matplotlib")
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
-        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
+        assert "goes_time" not in record_flare_filtering.fn(
+            event_file, [[0, 1000]], [[0, 1000]]
+        )
 
-        assert os.path.getsize(outfile) > 0
-
-    def test_nothing_removed_still_draws(self, tmp_path):
-        pytest.importorskip("matplotlib")
+    def test_nothing_removed_is_still_recorded(self, tmp_path):
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_back.evt")
 
-        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
+        arrays = record_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
 
-        assert os.path.exists(outfile)
+        assert arrays["removed"].shape == (0, 2)
 
 
 class TestChi2DofAgainstAConstant:
@@ -810,10 +814,9 @@ class TestGoesClassToFlux:
         assert goes_class_to_flux("C5.0") > 1.5e-6  # Feb 2014 quiescent level
 
 
-class TestPlotFlareFilteringWithoutTheFluxCut:
-    def test_flux_class_none_still_draws(self, tmp_path):
-        """The flux criterion can be turned off; the figure must still be produced."""
-        pytest.importorskip("matplotlib")
+class TestRecordFlareFilteringWithoutTheFluxCut:
+    def test_flux_class_none_is_still_recorded(self, tmp_path):
+        """The flux criterion can be turned off; the diagnostic must still be produced."""
         from astropy.table import Table
 
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
@@ -823,7 +826,7 @@ class TestPlotFlareFilteringWithoutTheFluxCut:
             goes_lc_file
         )
 
-        outfile = plot_flare_filtering.fn(
+        arrays = record_flare_filtering.fn(
             event_file,
             [[0, 1000]],
             [[0, 400], [600, 1000]],
@@ -831,7 +834,7 @@ class TestPlotFlareFilteringWithoutTheFluxCut:
             flux_class=None,
         )
 
-        assert os.path.getsize(outfile) > 0
+        assert arrays["goes_time"].size == 100
 
 
 class TestNustarPaths:
@@ -1354,7 +1357,6 @@ class TestTheFlareFilteringRecordsItself:
 
     def filtered(self, tmp_path, monkeypatch, after=((0, 400), (600, 1000)), goes=False):
         """Filter one synthetic event file, with the HEASOFT GTI merge stubbed out."""
-        pytest.importorskip("matplotlib")
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
         def fake_merge(files, outfile, gti_operation="OR"):
@@ -1440,13 +1442,15 @@ class TestTheFlareFilteringRecordsItself:
         assert record["status"] == "skipped"
         assert "already there" in record["reason"]
 
-    def test_a_figure_that_fails_does_not_lose_the_filtering(self, tmp_path, monkeypatch):
+    def test_a_diagnostic_that_fails_does_not_lose_the_filtering(
+        self, tmp_path, monkeypatch
+    ):
         """The science product is written by then, and so are the numbers that matter."""
 
         def explode(*args, **kwargs):
-            raise RuntimeError("no display, no disk, no luck")
+            raise RuntimeError("no disk, no luck")
 
-        monkeypatch.setattr(nustar, "plot_flare_filtering", explode)
+        monkeypatch.setattr(nustar, "record_flare_filtering", explode)
         record, _, _ = self.filtered(tmp_path, monkeypatch)
 
         assert record["status"] == "done"

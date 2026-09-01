@@ -48,8 +48,6 @@ import numpy as np
 import copy
 from astropy.table import Table
 from astropy.io import fits
-from astropy.visualization import hist
-from matplotlib.figure import Figure
 from skimage.feature import peak_local_max
 from scipy.ndimage import gaussian_filter
 from statsmodels.robust import mad
@@ -303,7 +301,9 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
        ``_src1`` is always the brightest. Each gets its own event file; the background file
        holds everything outside ``back_region_size`` of *every* detected peak.
 
-    A diagnostic JPEG is written next to each output file.
+    What was found is recorded through ``rec``, and drawn on the observation's page by
+    :mod:`heasarc_retrieve_pipeline.report`. This used to write three JPEGs next to every
+    event file as well.
 
     Parameters
     ----------
@@ -399,14 +399,6 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
         peaks=np.asarray(coordinates, dtype=float),
     )
 
-    # ``Figure`` rather than ``pyplot``: a worker process reducing an observation should
-    # not touch pyplot's global figure registry, or make it choose a display backend.
-    fig = Figure()
-    ax = fig.subplots()
-    ax.pcolormesh(xbins, ybins, img, vmin=np.median(img))
-    ax.plot(coordinates[:, 1], coordinates[:, 0], "r.")
-    fig.savefig(eventfile.replace(".gz", "").replace(".evt", ".jpg"))
-
     region_fluxes = []
     for i, coord in enumerate(coordinates):
         table_filt = filter_table(table, coord, region_size=region_size)
@@ -434,12 +426,6 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
             overwrite=True,
         )
 
-        x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
-        fig = Figure()
-        ax = fig.subplots()
-        ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
-        fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
-
     rec.value(sources=accepted, n_sources=len(accepted))
 
     table_filt = filter_table_outside_regions(table, coordinates, region_size=back_region_size)
@@ -450,11 +436,6 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
         eventfile.replace(".gz", "").replace(".evt", f"_back.evt"),
         overwrite=True,
     )
-    x_filt, y_filt, img_filt = image_from_table(table_filt, bins, gaussian_filter_sigma=0)
-    fig = Figure()
-    ax = fig.subplots()
-    ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
-    fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
     rec.value(n_events_background=int(len(table_filt)))
     hdul.close()
     return True

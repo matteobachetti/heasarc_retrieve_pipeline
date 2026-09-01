@@ -143,7 +143,7 @@ def nu_goes_lc_file(obsid, config):
     -----
     The ``TIME`` column is in the mission elapsed time of the observation -- not the GOES
     time scale -- so the solar X-ray flux can be plotted straight against the event times.
-    See :func:`plot_flare_filtering`.
+    See :func:`record_flare_filtering`.
     """
     return os.path.join(nu_base_output_path(obsid, config=config), f"nu{obsid}_goes.fits")
 
@@ -1345,7 +1345,7 @@ def get_goes_gtis(obsid, config, minimum_class="C5.0", flux_class="C5.0"):
         not silently destroy the observation.
 
     The GOES X-ray light curve is also written to :func:`nu_goes_lc_file`, on the
-    observation's own time scale, so that :func:`plot_flare_filtering` can show what the
+    observation's own time scale, so that :func:`record_flare_filtering` can show what the
     Sun was doing without downloading anything a second time.
 
     Returns
@@ -1533,11 +1533,10 @@ def chi2_dof_against_a_constant(lightcurve):
 
 
 @task(task_run_name="nu_flare_diagnostic_{event_file}")
-def plot_flare_filtering(
+def record_flare_filtering(
     event_file,
     gti_before,
     gti_after,
-    outfile=None,
     goes_lc_file=None,
     dt=100.0,
     minimum_class="C5.0",
@@ -1545,27 +1544,25 @@ def plot_flare_filtering(
     rec=None,
 ):
     """
-    Show what the solar-flare filtering removed, and what it left alone.
+    Measure what the solar-flare filtering removed, and what it left alone.
 
     Cleaning an event file is easy to get wrong in ways that leave no trace in the output:
-    too little is removed, or too much, and either way the file looks fine. This draws the
-    evidence instead, as three panels on one shared time axis:
+    too little is removed, or too much, and either way the file looks fine. This records
+    the evidence, as three curves on one time axis:
 
-    1. the GOES X-ray flux, with the flare-class thresholds marked, so the cut is visible
-       where it acts;
+    1. the GOES X-ray flux, so the cut is visible where it acts;
     2. the event file's 3--10 keV light curve, the band in which solar stray light lands;
     3. the same in 10--79 keV, as a control. Solar flares do not produce hard X-rays at
-       NuSTAR's aperture, so this panel should look the same before and after. If it
-       does not, the cut is removing more than solar flares.
+       NuSTAR's aperture, so this one should look the same before and after. If it does
+       not, the cut is removing more than solar flares -- which is why the chi-squared per
+       degree of freedom against a constant is recorded for both bands, before and after.
 
-    In panels 2 and 3 the light curve before filtering is drawn in grey and the one after
-    in colour, and the removed intervals are shaded, so what went away is the difference
-    between the two.
+    Each light curve is recorded before and after the filtering, with the removed
+    intervals, so the report can draw the difference between the two.
 
-    The figure is built through ``matplotlib.figure.Figure`` rather than ``pyplot``. That
-    is headless by construction -- no backend to force, no window to open on a pipeline
-    machine -- and it cannot leak a figure into pyplot's global registry, which is the
-    defect issue 31 records elsewhere in this package.
+    This used to write a JPEG next to the event file. The observation's page now draws the
+    same three panels from these numbers, zoomable, with the rest of the reduction around
+    them; see :mod:`heasarc_retrieve_pipeline.report`.
 
     Parameters
     ----------
@@ -1573,35 +1570,29 @@ def plot_flare_filtering(
         The **unfiltered** event file. Read, never written.
     gti_before, gti_after : array-like or table
         Good time intervals before and after the flare filtering.
-    outfile : str, optional
-        Where to write the figure. Defaults to ``<root>_flares.jpg``, next to the event
-        file, following the convention of :mod:`heasarc_retrieve_pipeline.image_utils`.
     goes_lc_file : str, optional
-        The observation's GOES light curve, :func:`nu_goes_lc_file`, drawn in the top
-        panel. One per observation, so the caller passes it rather than deriving it from
-        the event file. Omitting it, or naming a file that is not there, leaves the panel
-        empty -- a rerun skips the download, so its absence is not an error.
+        The observation's GOES light curve, :func:`nu_goes_lc_file`. One per observation,
+        so the caller passes it rather than deriving it from the event file. Omitting it,
+        or naming a file that is not there, records no GOES curve -- a rerun skips the
+        download, so its absence is not an error.
     dt : float, optional
         Light-curve bin width in seconds.
     minimum_class : str, optional
-        The catalogued-flare class cut used, named in the GOES panel's legend.
+        The catalogued-flare class cut used. Recorded, not applied here.
     flux_class : str or None, optional
-        The flux cut used. This one acts directly on the curve in the top panel, so it is
-        drawn there as a horizontal line.
+        The flux cut used. Recorded, not applied here.
     rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
-        Where to record the same three panels as numbers: the GOES curve, the two light
-        curves before and after, the removed intervals and what they cost. ``None``
-        records nothing. The caller opens it, because this function is handed one event
-        file and knows no observation.
+        Where the numbers go. ``None`` records nothing, which makes this function a
+        somewhat expensive way to do nothing; the caller always passes one.
 
     Returns
     -------
-    str
-        Path of the figure.
+    dict
+        The light curves and the intervals, keyed as they were recorded. Returned as well
+        as recorded so that this is testable without a diagnostics directory.
     """
     from astropy.io import fits
     from astropy.table import Table
-    from matplotlib.figure import Figure
 
     logger = get_logger()
     if rec is None:
@@ -1609,8 +1600,6 @@ def plot_flare_filtering(
 
     gti_before = gti_to_array(gti_before)
     gti_after = gti_to_array(gti_after)
-    if outfile is None:
-        outfile = rootname(event_file) + "_flares.jpg"
 
     with fits.open(event_file) as hdul:
         events = hdul["EVENTS"]
@@ -1619,150 +1608,60 @@ def plot_flare_filtering(
         )
         # NuSTAR's pulse-invariant channels are linear in energy: E = 0.04 * PI + 1.6 keV.
         energy = 0.04 * np.asarray(events.data["PI"], dtype=float) + 1.6
-        livetime_before = float(events.header.get("LIVETIME", np.nan))
-
-    ontime_before = float(np.sum(gti_before[:, 1] - gti_before[:, 0]))
-    ontime_after = float(np.sum(gti_after[:, 1] - gti_after[:, 0]))
-    livetime_after = livetime_before * ontime_after / ontime_before if ontime_before else 0.0
 
     kept = mask_from_gti(times, gti_after)
     removed = intervals_removed(gti_before, gti_after)
 
+    arrays = dict(
+        gti_before=np.asarray(gti_before, dtype=float),
+        gti_after=np.asarray(gti_after, dtype=float),
+        removed=np.asarray(removed, dtype=float).reshape(-1, 2),
+    )
     rec.value(
         n_intervals_removed=len(removed),
         bin_seconds=dt,
         minimum_class=minimum_class,
         flux_class=flux_class,
     )
-    rec.array(
-        gti_before=np.asarray(gti_before, dtype=float),
-        gti_after=np.asarray(gti_after, dtype=float),
-        removed=np.asarray(removed, dtype=float).reshape(-1, 2),
-    )
-
-    fig = Figure(figsize=(11, 9))
-    axes = fig.subplots(3, 1, sharex=True)
 
     if goes_lc_file is not None and os.path.exists(goes_lc_file):
         goes = Table.read(goes_lc_file)
-        for column, label, colour in (
-            ("XRSB", "GOES 1--8 $\\AA$", "tab:red"),
-            ("XRSA", "GOES 0.5--4 $\\AA$", "tab:blue"),
-        ):
+        arrays["goes_time"] = np.asarray(goes["TIME"], dtype=float)
+        for column in ("XRSA", "XRSB"):
             if column in goes.colnames:
-                axes[0].plot(goes["TIME"], goes[column], color=colour, lw=1, label=label)
-                rec.array(
-                    **{
-                        f"goes_{column.lower()}": np.asarray(goes[column], dtype=float),
-                        "goes_time": np.asarray(goes["TIME"], dtype=float),
-                    }
-                )
+                arrays[f"goes_{column.lower()}"] = np.asarray(goes[column], dtype=float)
         rec.value(goes_light_curve=os.path.basename(goes_lc_file))
-        axes[0].set_yscale("log")
-        axes[0].set_ylim(1e-9, 1e-3)
-        for letter, flux in GOES_CLASS_FLUX.items():
-            axes[0].axhline(flux, color="k", ls=":", lw=0.5)
-            axes[0].text(
-                0.004,
-                flux * 1.3,
-                letter,
-                transform=axes[0].get_yaxis_transform(),
-                fontsize="small",
-                color="0.4",
-            )
-        if flux_class is not None:
-            axes[0].axhline(
-                goes_class_to_flux(flux_class),
-                color="tab:orange",
-                lw=1.2,
-                label=f"flux cut {flux_class}",
-            )
-        axes[0].plot([], [], " ", label=f"HEK catalogue $\\geq$ {minimum_class}")
-        axes[0].legend(loc="upper right", fontsize="small", ncol=4)
     else:
-        logger.warning(f"No GOES light curve at {goes_lc_file}; leaving that panel empty")
+        logger.warning(f"No GOES light curve at {goes_lc_file}; recording none")
         rec.value(goes_light_curve=None)
-        axes[0].text(
-            0.5,
-            0.5,
-            f"no GOES light curve at {os.path.basename(goes_lc_file or '')}",
-            ha="center",
-            transform=axes[0].transAxes,
-            color="0.4",
-        )
-    axes[0].set_ylabel("Solar X-ray flux (W m$^{-2}$)")
 
-    bands = [
-        (3.0, 10.0, "3--10 keV: where solar stray light lands"),
-        (10.0, 79.0, "10--79 keV: control, flares should not contribute here"),
-    ]
-    chi2 = {}
-    for axis, (emin, emax, title) in zip(axes[1:], bands):
+    for emin, emax in ((3.0, 10.0), (10.0, 79.0)):
         in_band = (energy >= emin) & (energy < emax)
         before = binned_lightcurve(times[in_band], gti_before, dt)
         after = binned_lightcurve(times[in_band & kept], gti_after, dt)
-        chi2[emin] = (
-            chi2_dof_against_a_constant(before),
-            chi2_dof_against_a_constant(after),
-        )
 
         band = f"{emin:.0f}_{emax:.0f}"
-        rec.value(**{f"chi2_dof_{band}": list(chi2[emin])})
+        rec.value(
+            **{
+                f"chi2_dof_{band}": [
+                    chi2_dof_against_a_constant(before),
+                    chi2_dof_against_a_constant(after),
+                ]
+            }
+        )
         for when, curve in (("before", before), ("after", after)):
-            rec.array(
-                **{
-                    f"lc_{band}_{when}_{column}": np.asarray(curve[column], dtype=float)
-                    for column in ("time", "rate", "rate_err")
-                }
-            )
+            for column in ("time", "rate", "rate_err"):
+                arrays[f"lc_{band}_{when}_{column}"] = np.asarray(
+                    curve[column], dtype=float
+                )
 
-        axis.errorbar(
-            before["time"],
-            before["rate"],
-            before["rate_err"],
-            fmt=".",
-            color="0.65",
-            ms=4,
-            lw=0.8,
-            label="before filtering",
-            zorder=2,
-        )
-        axis.errorbar(
-            after["time"],
-            after["rate"],
-            after["rate_err"],
-            fmt=".",
-            color="tab:blue",
-            ms=4,
-            lw=0.8,
-            label="after filtering",
-            zorder=3,
-        )
-        axis.set_ylabel(f"{emin:.0f}--{emax:.0f} keV rate (s$^{{-1}}$)")
-        axis.set_title(
-            f"{title}   ($\\chi^2$/dof {chi2[emin][0]:.2f} $\\rightarrow$ " f"{chi2[emin][1]:.2f})",
-            fontsize="small",
-            loc="left",
-        )
-        axis.legend(loc="upper right", fontsize="small", ncol=2)
-
-    for axis in axes:
-        for start, stop in removed:
-            axis.axvspan(start, stop, color="tab:orange", alpha=0.18, lw=0, zorder=1)
-
-    axes[-1].set_xlabel(f"NuSTAR mission elapsed time (s), {dt:.0f} s bins")
-    fig.suptitle(
-        f"{os.path.basename(event_file)}: solar-flare filtering\n"
-        f"{times.size - int(kept.sum())} of {times.size} events removed"
-        f"   |   live time {livetime_before:.0f} $\\rightarrow$ {livetime_after:.0f} s"
-        f"   |   {len(removed)} interval(s) excluded",
-        fontsize="medium",
+    rec.array(**arrays)
+    logger.info(
+        f"{os.path.basename(event_file)}: recorded the flare filtering, "
+        f"{times.size - int(kept.sum())} of {times.size} events removed in "
+        f"{len(removed)} interval(s)"
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(outfile, dpi=110)
-
-    logger.info(f"Wrote the flare-filtering diagnostic to {outfile}")
-    return outfile
+    return arrays
 
 
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
@@ -1799,16 +1698,16 @@ def filter_from_solar_flares(
         rather than looked up so that the fetch happens once per observation and the
         dependency is visible at the call site.
     goes_lc_file : str, optional
-        The observation's GOES light curve, for the diagnostic figure.
+        The observation's GOES light curve, for the diagnostic.
     minimum_class : str, optional
-        Smallest catalogued flare class that was excluded. Used only to label the figure.
+        Smallest catalogued flare class that was excluded. Recorded, not applied here.
     flux_class : str or None, optional
-        The flux cut that was applied, likewise only for the figure. See
-        :func:`get_goes_gtis` for why this is separate from ``minimum_class``.
+        The flux cut that was applied, likewise only recorded. See :func:`get_goes_gtis`
+        for why this is separate from ``minimum_class``.
 
-    A diagnostic figure, ``<root>_flares.jpg``, is written alongside by
-    :func:`plot_flare_filtering`. Failing to draw it is logged, not raised: the science
-    product is already on disk by then.
+    What the cut removed is measured by :func:`record_flare_filtering` and drawn on the
+    observation's page. Failing to record it is logged, not raised: the science product is
+    already on disk by then.
 
     Returns
     -------
@@ -1860,12 +1759,11 @@ def _filter_from_solar_flares(
     # What the filtering cost, in apply_gti's own words: it is the function that did it.
     rec.value(**stats)
 
-    # The science product is already written. A diagnostic figure failing -- a missing
-    # GOES file, a matplotlib problem on a headless machine -- must not take the
-    # observation down with it, so it is logged rather than raised. The record shares
-    # that rule: everything above is already on disk.
+    # The science product is already written. The diagnostic failing -- a missing GOES
+    # file, an unreadable light curve -- must not take the observation down with it, so
+    # it is logged rather than raised. Everything above is already on disk.
     try:
-        plot_flare_filtering(
+        record_flare_filtering(
             event_file,
             gti_before,
             gti_after,

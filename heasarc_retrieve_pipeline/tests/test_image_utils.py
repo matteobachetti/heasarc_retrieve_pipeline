@@ -1,10 +1,9 @@
 """
 Offline tests for the image-based source separation.
 
-The diagnostic figures these draw used to go through ``pyplot``, whose figure registry is
-one global object per process. That is the same class of shared state as the working
-directory and the HEASOFT parameter files -- see issue 26 in ``docs/known_issues.rst`` --
-and the figures were the last of it left in the package.
+The separation used to write three JPEGs next to every event file, and those were the
+last matplotlib in the package. What it found is recorded instead, and the observation's
+page draws it; these tests check both the science products and the record.
 """
 
 import glob
@@ -31,11 +30,6 @@ from heasarc_retrieve_pipeline.image_utils import (
 
 pytest.importorskip("skimage")
 pytest.importorskip("statsmodels")
-
-import matplotlib  # noqa: E402
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 
 
 def _add_unplaced(x, y, n_unplaced, rng):
@@ -109,25 +103,13 @@ class TestFilterSourcesInImages:
             assert np.median(hdul[1].data["X"]) == pytest.approx(500, abs=10)
             assert np.median(hdul[1].data["Y"]) == pytest.approx(500, abs=10)
 
-    def test_the_diagnostic_images_are_drawn(self, tmp_path):
+    def test_no_loose_figures_are_written_next_to_the_data(self, tmp_path):
+        """This used to draw three JPEGs per event file, 32 files per observation."""
         path = event_file(tmp_path / "nu123A01_cl.evt")
 
         filter_sources_in_images(path)
 
-        assert sorted(os.path.basename(f) for f in glob.glob(str(tmp_path / "*.jpg"))) == [
-            "nu123A01_cl.jpg",
-            "nu123A01_cl_back.jpg",
-            "nu123A01_cl_src1.jpg",
-        ]
-
-    def test_nothing_is_left_in_the_global_figure_registry(self, tmp_path):
-        """A figure held by pyplot is shared process state, and a leak besides."""
-        plt.close("all")
-        path = event_file(tmp_path / "nu123A01_cl.evt")
-
-        filter_sources_in_images(path)
-
-        assert plt.get_fignums() == []
+        assert glob.glob(str(tmp_path / "*.jpg")) == []
 
     def test_no_unplaced_event_reaches_any_output(self, tmp_path):
         """The whole point: a pile-up at the origin must not survive into a product."""
