@@ -239,10 +239,11 @@ def separation_figure(record, arrays):
     if not arrays or "image" not in arrays:
         return None
 
-    image = np.asarray(arrays["image"], dtype=float)
-    # The image is smoothed counts. Two decimals is more than the eye or the colour bar
-    # can use, and the difference is a third of the bytes in the page.
-    image = np.round(image, 2)
+    # The image is smoothed counts read off a colour bar. Two decimals is more than the
+    # eye can use, and single precision is more than two decimals needs -- plotly encodes
+    # a float64 array as twice the base64 of a float32 one, and a real observation puts
+    # sixteen of these on one page.
+    image = np.round(np.asarray(arrays["image"], dtype=float), 2).astype(np.float32)
     x = _centres(arrays.get("image_x"), image.shape[1])
     y = _centres(arrays.get("image_y"), image.shape[0])
 
@@ -406,23 +407,33 @@ def gti_figure(record, arrays):
 
     origin = min(float(np.min(gti[:, 0])) for _, gti, _ in rows)
 
+    # One bar per good time interval, and a real observation has a few thousand of them
+    # per row. The row is identified by its number and named once, in the tick labels:
+    # repeating a thirty-character file name once per interval, as a categorical y axis
+    # would, was three quarters of a megabyte on the first page this drew.
     fig = go.Figure()
-    for name, gti, colour in rows:
+    for index, (name, gti, colour) in enumerate(rows):
         fig.add_trace(
             go.Bar(
-                y=[name] * len(gti),
-                x=gti[:, 1] - gti[:, 0],
-                base=gti[:, 0] - origin,
+                y=np.full(len(gti), index, dtype=np.int16),
+                x=np.round(gti[:, 1] - gti[:, 0], 3).astype(np.float32),
+                base=np.round(gti[:, 0] - origin, 3),
                 orientation="h",
                 marker_color=colour,
                 showlegend=False,
-                hovertemplate="%{y}<br>%{x:.0f} s<extra></extra>",
+                hovertemplate=f"{name}<br>%{{x:.0f}} s<extra></extra>",
             )
         )
 
     fig.update_layout(barmode="overlay",
                       xaxis_title="seconds since the earliest good time interval")
-    fig.update_yaxes(autorange="reversed", automargin=True)
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=list(range(len(rows))),
+        ticktext=[name for name, _, _ in rows],
+        autorange="reversed",
+        automargin=True,
+    )
     return _blank(fig, height=max(200, 30 * len(rows) + 90))
 
 
@@ -860,7 +871,9 @@ def run_timeline_figure(summaries):
     fig.update_layout(barmode="overlay",
                       xaxis_title="seconds since the first observation started",
                       legend=dict(orientation="h", y=1.06, x=0))
-    fig.update_yaxes(autorange="reversed", automargin=True)
+    # An OBSID is a number as far as a plotting library is concerned, and 30702012004 on a
+    # numeric axis comes out labelled 30.702012004B. It is a name.
+    fig.update_yaxes(type="category", autorange="reversed", automargin=True)
     return _blank(fig, height=max(220, 26 * len(rows) + 100))
 
 

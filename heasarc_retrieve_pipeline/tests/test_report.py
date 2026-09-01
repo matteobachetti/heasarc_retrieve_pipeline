@@ -306,14 +306,32 @@ class TestWhatTheFiguresContain:
 
         fig = report.gti_figure(record, arrays)
 
-        rows = [trace.y[0] for trace in fig.data]
-        assert rows == [
+        assert list(fig.layout.yaxis.ticktext) == [
             f"nu{OBSID}A01_src1.evt",
             "FPMA merged (OR)",
             f"nu{OBSID}B01_src1.evt",
             "FPMB merged (OR)",
             f"nu{OBSID}_src1.evt",
         ]
+
+    def test_the_row_label_is_not_repeated_once_per_interval(self, tmp_path):
+        """A real observation has ~1500 intervals per row. The name is 30 characters."""
+        a_join(tmp_path)
+        record, arrays = self.records(tmp_path, "join_source_data")
+
+        fig = report.gti_figure(record, arrays)
+
+        for index, trace in enumerate(fig.data):
+            assert set(np.asarray(trace.y).tolist()) == {index}, "y must be the row number"
+
+    def test_the_image_is_not_sent_at_full_precision(self, tmp_path):
+        """float64 doubles the page, and the image is smoothed counts for a colour bar."""
+        a_separation(tmp_path)
+        record, arrays = self.records(tmp_path, "separate_sources")
+
+        fig = report.separation_figure(record, arrays)
+
+        assert fig.data[0].z.dtype == np.float32
 
     def test_the_flare_figure_shades_what_was_removed(self, tmp_path):
         a_flare_filtering(tmp_path)
@@ -531,6 +549,15 @@ class TestTheRunIndex:
 
         assert sum(len(trace.y) for trace in fig.data) == 2, "the third never started"
         assert {trace.name for trace in fig.data} == {"done", "failed"}
+
+    def test_an_obsid_is_a_name_and_not_a_number(self, tmp_path):
+        """30702012004 read as a number is labelled 30.702012004B on the axis."""
+        obsids = self.a_run(tmp_path)
+        summaries = [report.observation_summary(obsid, str(tmp_path)) for obsid in obsids]
+
+        fig = report.run_timeline_figure(summaries)
+
+        assert fig.layout.yaxis.type == "category"
 
     def test_a_run_where_nothing_started_has_no_timeline_but_still_lists(self, tmp_path):
         a_manifest(tmp_path, obsid="30202022003")
