@@ -166,7 +166,7 @@ The cone search (``retrieve_heasarc_table_by_position``, ``core.py:308``) is::
     FROM public.<catalogue> as cat
     WHERE contains(point('ICRS', cat.ra, cat.dec),
                    circle('ICRS', <ra>, <dec>, <radius>)) = 1
-      AND cat.<exposure> >= 0
+      AND <exposure condition>
     ORDER BY cat.time
 
 Notes on the astronomy encoded here:
@@ -177,8 +177,15 @@ Notes on the astronomy encoded here:
   source can be well inside the field while the pointing is further than 6' away, so the
   default radius is conservative and will miss serendipitous coverage. Widen
   ``radius_deg`` when that matters.
-* ``exposure >= 0`` excludes catalogue rows for observations that were planned but never
-  executed (these carry a null or negative exposure).
+* The exposure condition comes from ``exposure_condition(mission)``. A null or negative
+  exposure is a plan, not an observation, and is excluded for every mission. Zero is the
+  interesting case, and the catalogues do not agree on what it means: ``numaster`` means
+  it, so NuSTAR uses ``> 0`` and never downloads a zero-exposure observation; ``nicermastr``
+  sometimes reports zero because NICER's own pipeline filtered the data wrongly, and the
+  data are fine, so NICER keeps ``>= 0``. RXTE has not been checked and gets the cautious
+  answer. The per-mission switch is ``MISSION_CONFIG[...]["zero_exposure_may_be_wrong"]``.
+  The single-OBSID query keeps ``>= 0`` for every mission: when an OBSID has been named
+  explicitly, returning nothing at all is more confusing than returning the row.
 * ``public_date`` is selected for NuSTAR and NICER but not for RXTE, because ``xtemaster``
   has no such column -- all RXTE data are public.
 * ``__row`` is astroquery's internal row identifier. It is what ``Heasarc.locate_data``
@@ -327,6 +334,33 @@ accepts only modes **01** and **06**, which is the scientifically meaningful cho
 
 Modes 02-05 are engineering/calibration modes with no usable science content.
 
+**Slews.** Some catalogue entries are not observations at all but the satellite moving
+between targets. They have an OBSID, a ``numaster`` row and real downloadable files, and
+Level 2 produces only modes 02 and 03, sometimes 04. Nothing in the FITS headers marks
+them. ``numaster`` does carry an observation-mode column that reads ``SLEW``, but it is
+set for only a handful of the observations that really are slews; the SOC identifies the
+rest by their exposure being far shorter than the observation immediately after, which is
+a judgement rather than a flag -- and the pattern that a slew's OBSID ends in an odd digit
+just before a much longer even-numbered one is neither necessary nor sufficient
+(80002092007 ends odd and is a long, real observation).
+
+So the pipeline decides from the data. ``observing_modes_present`` lists the modes Level 2
+produced cleaned event files for, and ``has_science_data`` asks whether any of them is in
+``SCIENCE_MODES = ("01", "06")``. ``process_nustar_obsid`` stops there when the answer is
+no, logs the modes it did find, and returns ``utils.NO_SCIENCE_DATA``, which
+``process_observations`` counts apart from the failures. It is deliberately a returned
+value and not an exception: nothing went wrong, so the flow run must not end ``Failed``.
+
+The data are left on disk. A slew's exposure sitting next to a long observation may yet be
+worth joining to it for the extra hundreds of seconds, and skipping the download to save a
+few minutes of computation would throw that away.
+
+Not every observation without mode 06 is a slew, and the two must not be confused. Mode 06
+exists only when CHU4 was blinded, so plenty of ordinary observations have good mode-01
+science and no mode-06 at all. ``recover_spacecraft_science_data`` creates the ``split``
+directory and writes its sentinel whether or not ``nusplitsc`` had anything to do, so those
+observations carry on normally.
+
 ``recover_spacecraft_science_data`` (``nustar.py:231``) is where the "squeezing every
 photon" comment in the code comes from: it runs ``nusplitsc`` on every mode-06 cleaned
 event file, splitting it by which combination of star trackers was active (CHU1, CHU2,
@@ -436,7 +470,17 @@ delegating to the ``nustar_gen`` package:
 3. ``make_radial_profile`` builds the radial profile of the source together with the
    expected PSF profile.
 4. ``optimize_radius_snr`` returns the extraction radius that maximises the
-   signal-to-noise ratio for that profile.
+   signal-to-noise ratio for that profile, through the wrapper ``snr_optimised_radius``.
+
+Step 4 goes through a wrapper because ``optimize_radius_snr`` steps outwards in radius and
+binds its ``best_radius`` only inside ``if snr > old_snr``, with ``old_snr`` starting at
+zero. On a file with no source the condition never holds and the return statement raises
+``UnboundLocalError``. Reproduced directly against ``nustar_gen`` 0.8.dev9: a flat radial
+profile raises it every time, with counts or without. ``snr_optimised_radius`` turns that
+one exception into ``None`` -- "this file is too faint to place a region on" -- and lets
+every other exception through. ``None`` is a case the callers already handle:
+``get_best_source_regions`` skips the file and averages the rest, ``calculate_spectra``
+logs it and moves on. It is the same path the position-consistency check uses.
 
 The radius is capped at ``config["max_radius"]`` (default 80 arcsec). Two DS9 region files
 are written next to the event file:
@@ -1142,10 +1186,10 @@ the file another is in the middle of reading.
 **What a worker sets up.** ``core.prepare_worker(pfiles_root, work_root)`` runs once per
 worker process, at the top of ``download_and_process_observation``, and is idempotent (a
 module-level ``_WORKER_DIRECTORY`` guard) because Prefect 3.7 has no pool ``initializer``.
-It points ``PFILES`` at ``<pfiles_root>/worker_<pid>/pfiles``
-(``"<private>;$HEADAS/syspfiles"`` -- the semicolon separates the writable copy from the
-read-only system one), creates ``<work_root>/worker_<pid>/``, and ``chdir``-s into
-it. The two roots are on different filesystems by design; see `How long a file name may
+It claims ``<pfiles_root>/worker_<pid>/pfiles`` through ``heasoft.use_private_pfiles``,
+which sets ``PFILES`` to ``"<private>;$HEADAS/syspfiles"`` -- the semicolon separates the
+writable copy from the read-only system one -- creates ``<work_root>/worker_<pid>/``, and
+``chdir``-s into it. The two roots are on different filesystems by design; see `How long a file name may
 be`_. The ``chdir`` is the **only** one in the package, and a test asserts it stays that
 way: the working directory is a property of the whole process, so using it to steer where a step writes is what made concurrent
 observations impossible before. Every path a step is given is absolute --
@@ -1154,6 +1198,24 @@ and the process working directory exists to catch the scratch files HEASOFT tool
 around themselves. Most carry the tool subprocess's PID -- ``86758tmp_gti.fits``,
 ``87340_tmp_nuexpomap`` -- but not all: ``xselect`` writes ``xsel_timefile.asc``, and two
 workers sharing a directory destroy each other's.
+
+**And keeps hold of it.** Setting ``PFILES`` once turned out not to be enough. In the 2026
+reprocessing of 56 NuSTAR observations of M82, of 1016 ``fthedit`` calls a handful resolved
+their parameter file to the shared ``$HOME/pfiles`` instead of the worker's private one, and
+lost ``heasoftpy``'s own check-then-open race in ``HSPTask.find_pfile`` -- the file existed
+when it was looked for and was gone when it was opened. Seven observations died that way,
+five on ``fthedit.par`` and two on ``nuproducts``' ``extractor.par``. The messages appear
+under all four worker PIDs, so this is not one worker that started without an environment.
+
+What puts ``$HOME/pfiles`` back has not been pinned down. ``$HEADAS/BUILD_DIR/headas-setup``
+forces it to the front of ``PFILES`` whenever HEASOFT is initialised, and ``heasoftpy``
+splits ``PFILES`` on ``:`` as well as ``;``, so anything re-initialising HEASOFT inside the
+process would do it. Rather than guess, ``heasoft.run`` and ``heasoft.run_task`` call
+``_hold_on_to_private_pfiles`` inside the lock, immediately before invoking the tool:
+``heasoftpy`` re-reads ``os.environ["PFILES"]`` on every call, so restoring it there is
+early enough. The cost is a string comparison against a subprocess that runs for seconds.
+The first repair in each process is logged with the value that was found, so the next run
+says what did it.
 
 **Inside one observation, one HEASOFT tool at a time.** The steps of a single reduction
 still run in threads of the worker process, and they share that process's ``PFILES``. So

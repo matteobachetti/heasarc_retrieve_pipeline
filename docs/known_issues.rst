@@ -964,6 +964,135 @@ local disk where one has the room.
 
 
 
+40. The 2026 M82 reprocessing, and what it found
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Issues 41 to 44 all come out of one run, so the run is recorded here once. 56 NuSTAR
+observations of M82 X-2 on an Italian SLURM cluster, four worker processes, with the fixes
+for issue 39 in place.
+
+Before those fixes, **all 56 failed**. After them, **32 completed**. Every path-length
+symptom was gone:
+
+============================================  ==============  =============
+Symptom                                       Before          After
+============================================  ==============  =============
+``Error determining file type``               2376            0
+``nusplitsc`` failures                        1050            0
+``The file was not found``                    many            0
+``unexpected EOF``                            present         0
+Segmentation faults                           2               0
+============================================  ==============  =============
+
+The two observations that had segfaulted, 80002092002 and 80002092004, both ran
+``nupipeline`` from scratch and completed -- 13 m 43 s and 22 m 12 s, so they were not
+skipped on a sentinel. That is the controlled comparison for the buffer-overrun explanation
+in issue 39: the same raised stack limit, the same data, only the names shortened.
+
+The 24 remaining failures, none of them path length:
+
+============================================================  ===  ===========
+Cause                                                          n   Issue
+============================================================  ===  ===========
+``FileNotFoundError`` on ``split/RECOVER_DONE.TXT``            8   41
+Parameter file under ``$HOME/pfiles``                          7   42
+``UnboundLocalError: best_radius``                             3   43
+``IndexError: index 0 is out of bounds ... size 0``            2   not triaged
+``ValueError: cannot guess format ... zero-size array``        2   not triaged
+``RuntimeError: nusplitsc failed with return code 1``          1   not triaged
+Solar flares cover the whole observation                       1   arguably right
+============================================================  ===  ===========
+
+The last one is 30901038001, 491 s of data entirely inside a flare interval. The pipeline
+raising there is defensible; whether it should be a failure rather than a skip has not been
+decided.
+
+41. A slew is not a failure, and neither is a missing mode 06 -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``recover_spacecraft_science_data`` wrote its ``RECOVER_DONE.TXT`` sentinel into the split
+directory, but ``nusplitsc`` is what creates that directory and ``nusplitsc`` only runs when
+there is mode-06 data. An observation without any failed on ``FileNotFoundError``. Eight of
+the 56.
+
+**Measured**, from the modes ``nupipeline`` produced cleaned event files for, they were two
+different things:
+
+===============  ==========================  ==================================
+OBSID            Cleaned modes produced      What it is
+===============  ==========================  ==================================
+30202022001      03                          slew
+30502020001      02, 03                      slew
+30502020003      02, 03                      slew
+30502022001      02, 03                      slew
+30202022003      01, 02, 03                  real science, no mode 06
+30202022007      01, 02, 03                  real science, no mode 06
+90202038001      01, 02, 03, 04              real science, no mode 06
+90901332001      01, 03                      real science, no mode 06
+===============  ==========================  ==================================
+
+All 32 observations that completed produced both 01 and 06.
+
+**Fixed** in two places. ``recover_spacecraft_science_data`` creates the split directory
+before writing the sentinel, which is all the four real observations ever needed. And
+``process_nustar_obsid`` stops after Level 2 when ``has_science_data`` is false, returning
+``utils.NO_SCIENCE_DATA``, which ``process_observations`` counts separately from the
+failures. See :ref:`technical_details` for why a slew cannot be recognised before Level 2
+has run, and why its data are downloaded and kept anyway.
+
+42. A worker's private parameter directory did not stay private -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Seven observations failed with a HEASOFT parameter file resolving to the shared
+``$HOME/pfiles`` -- five on ``fthedit.par``, two on ``nuproducts``' ``extractor.par`` --
+in three wordings that are all the same race::
+
+    FileNotFoundError: [Errno 2] No such file or directory: '/home/.../pfiles/fthedit.par'
+    OSError: parameter file /home/.../pfiles/fthedit.par not found
+    Can't stat user parameter file /home/.../pfiles/extractor.par
+
+**Measured.** 1016 ``fthedit`` calls ran in that job and a handful failed, and the messages
+appear under all four worker PIDs rather than one. So it is intermittent contention, not a
+worker that started without an environment. ``heasoftpy``'s ``HSPTask.find_pfile`` checks
+that the file exists and then opens it; between those two the other workers had deleted and
+rewritten it.
+
+Note that this also disproves the obvious remedy. Creating ``$HOME/pfiles`` would not have
+helped and the directory must already exist: if it did not, ``find_pfile`` would fall back
+to ``$HEADAS/syspfiles`` and report nothing at all.
+
+**Fixed** by repairing ``PFILES`` where the damage shows -- see :ref:`technical_details`.
+What restores ``$HOME/pfiles`` is still unidentified; the guard logs the value it found, so
+the next run will say.
+
+43. A faint file took down the whole observation -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nustar_gen``'s ``optimize_radius_snr`` binds ``best_radius`` only inside
+``if snr > old_snr``, and ``old_snr`` starts at zero, so a file with no source never binds
+it and the return statement raises ``UnboundLocalError``. Three observations lost:
+30202022008, 30702012004, 90101005002.
+
+**Reproduced** directly against ``nustar_gen`` 0.8.dev9 -- a flat radial profile raises it
+every time, with counts or without. This is a bug in the dependency; surviving it is ours.
+``snr_optimised_radius`` turns it into ``None``, which the callers already handle.
+
+44. Zero-exposure NuSTAR observations were downloaded -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both catalogue queries said ``exposure >= 0``, which correctly drops
+planned-but-not-executed observations but keeps the ones the catalogue reports as having no
+exposure at all.
+
+``numaster`` means it: a NuSTAR observation with ``exposure_a`` of zero has no data.
+``nicermastr`` does not always -- NICER's own pipeline sometimes filters an observation away
+and records zero exposure for data that are perfectly usable -- so the filter must be
+per-mission, not global. **Fixed** by ``core.exposure_condition``, driven by
+``MISSION_CONFIG[...]["zero_exposure_may_be_wrong"]``: ``> 0`` for NuSTAR, ``>= 0`` for
+NICER and for RXTE, which has not been checked. The single-OBSID query keeps ``>= 0``
+everywhere.
+
+
 Science caveats
 ---------------
 
