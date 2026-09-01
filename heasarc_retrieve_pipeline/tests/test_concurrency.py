@@ -550,3 +550,31 @@ class TestObservationsWithNoScienceData:
 
         assert failed == ["obs0"]
         assert processed == ["obs2"]
+
+
+class TestExposureCondition:
+    """Zero exposure means different things in different master catalogues.
+
+    numaster means it: a NuSTAR observation with exposure_a of zero has no data, and
+    downloading it wastes time and disk. nicermastr does not always mean it: NICER's own
+    pipeline sometimes filters an observation away and records zero exposure for data that
+    are perfectly usable.
+    """
+
+    def test_nustar_drops_zero_exposure(self):
+        assert core.exposure_condition("nustar") == "cat.exposure_a > 0"
+
+    def test_nicer_keeps_zero_exposure(self):
+        assert core.exposure_condition("nicer") == "cat.exposure >= 0"
+
+    def test_rxte_keeps_zero_exposure(self):
+        assert core.exposure_condition("rxte") == "cat.exposure >= 0"
+
+    def test_every_mission_drops_planned_but_unexecuted_observations(self):
+        """A null or negative exposure is a plan, not an observation, for all of them."""
+        for mission in core.MISSION_CONFIG:
+            assert core.exposure_condition(mission).endswith(("> 0", ">= 0"))
+
+    def test_naming_an_obsid_keeps_it_whatever_its_exposure(self):
+        """An explicit OBSID must come back, even for NuSTAR, even at zero exposure."""
+        assert "cat.exposure_a >= 0" in obsid_query("30502022001", "nustar")

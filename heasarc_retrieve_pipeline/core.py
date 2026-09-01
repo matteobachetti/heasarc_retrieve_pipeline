@@ -778,6 +778,9 @@ MISSION_CONFIG = {
     "nustar": {
         "table": "numaster",
         "expo_column": "exposure_a",
+        # numaster means it: zero exposure_a is an observation with no data, and there is
+        # no point downloading it.
+        "zero_exposure_may_be_wrong": False,
         "additional": "solar_activity",
         "obsid_processing": process_nustar_obsid,
         "default_config": NUSTAR_DEFAULT_CONFIG,
@@ -787,6 +790,9 @@ MISSION_CONFIG = {
     "nicer": {
         "table": "nicermastr",
         "expo_column": "exposure",
+        # nicermastr does not: it sometimes reports zero because NICER's own pipeline
+        # filtered the data wrongly, and the data are fine. Download them and look.
+        "zero_exposure_may_be_wrong": True,
         "additional": "",
         "obsid_processing": process_nicer_obsid,
         "default_config": NICER_DEFAULT_CONFIG,
@@ -795,6 +801,8 @@ MISSION_CONFIG = {
     "rxte": {
         "table": "xtemaster",
         "expo_column": "exposure",
+        # Untested against xtemaster; assume the catalogue may be wrong, as for NICER.
+        "zero_exposure_may_be_wrong": True,
         "additional": "cycle, prnb",
         "obsid_processing": process_rxte_obsid,
         "default_config": RXTE_DEFAULT_CONFIG,
@@ -839,8 +847,9 @@ def retrieve_heasarc_table_by_position(
 
     Builds and runs an ADQL query against the mission's HEASARC master catalogue,
     selecting every observation whose *pointing* falls within ``radius_deg`` of the
-    given position and whose exposure is non-negative (planned-but-not-executed
-    observations carry a null or negative exposure).
+    given position and whose exposure passes :func:`exposure_condition` -- which drops
+    planned-but-not-executed observations everywhere, and zero-exposure ones for NuSTAR
+    only.
 
     Parameters
     ----------
@@ -891,12 +900,49 @@ def retrieve_heasarc_table_by_position(
         where
         contains(point('ICRS',cat.ra,cat.dec),circle('ICRS',{ra_deg},{dec_deg},{radius_deg}))=1
         and
-        cat.{expo_name} >= 0 order by cat.time
+        {exposure_condition(mission)} order by cat.time
         """
 
     results = Heasarc.query_tap(query).to_table()
 
     return results
+
+
+def exposure_condition(mission):
+    """
+    The ADQL condition that keeps observations worth downloading.
+
+    Every mission's master catalogue carries planned-but-not-executed observations with a
+    null or negative exposure, and those are never wanted. Zero is the interesting case,
+    and the missions do not agree on what it means:
+
+    * ``numaster`` means it. A NuSTAR observation with ``exposure_a`` of zero has no data,
+      and downloading it wastes time and disk.
+    * ``nicermastr`` sometimes does not. NICER's own pipeline occasionally filters an
+      observation away and records zero exposure for data that are perfectly usable, so a
+      zero there is a reason to look, not a reason to skip.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of ``MISSION_CONFIG``.
+
+    Returns
+    -------
+    str
+        An ADQL boolean expression over ``cat``.
+
+    Examples
+    --------
+    >>> exposure_condition("nustar")
+    'cat.exposure_a > 0'
+    >>> exposure_condition("nicer")
+    'cat.exposure >= 0'
+    """
+    expo_name = MISSION_CONFIG[mission]["expo_column"]
+    if MISSION_CONFIG[mission]["zero_exposure_may_be_wrong"]:
+        return f"cat.{expo_name} >= 0"
+    return f"cat.{expo_name} > 0"
 
 
 #: What an OBSID may look like. They go into the query text, so nothing else is allowed.
@@ -918,6 +964,12 @@ def obsid_query(obsid, mission: str = "nustar"):
     -------
     str
         An ADQL query.
+
+    Notes
+    -----
+    Unlike the cone search, this keeps zero-exposure observations for every mission: when
+    an OBSID has been named explicitly, returning nothing at all is more confusing than
+    returning the row and letting the reduction say what it found.
 
     Raises
     ------
