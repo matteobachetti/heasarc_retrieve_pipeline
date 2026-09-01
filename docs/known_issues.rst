@@ -775,7 +775,9 @@ to open a window. Converting those three plots to ``Figure`` as well would close
 * ``image_utils.py:132`` prints the detection threshold and flux to stdout on every
   candidate; library code should log, not print.
 * ``nustar.py:734``: unused local ``basedir``.
-* ``image_from_table`` takes a ``correct_zeros`` argument that is never used.
+* ``image_from_table`` took a ``correct_zeros`` argument that was never used. Removed
+  -- and it was not merely dead, it was the vestige of a fix that had never been
+  finished; see issue 50.
 
 33. The documentation did not build with a current Sphinx -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1196,6 +1198,58 @@ there was nothing to join. On 90901332001 the ``_back`` file was produced for FP
 events and nothing to merge raises ``NoSourceInScienceData`` naming the module; a module
 with no mode-01 data at all is skipped with a warning, and the FPMA+FPMB merge takes only
 the modules that produced something.
+
+
+50. Three definitions of a valid sky position -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+NuSTAR sets ``X`` and ``Y`` to zero for an event the aspect reconstruction could not place
+on the sky, and many observations carry a large pile-up of them at the origin.
+``image_utils`` decided what that meant in three different ways, and in a fourth place did
+not ask at all:
+
+.. list-table::
+   :header-rows: 1
+
+   * - function
+     - predicate
+     - an event at (0, 0) was
+   * - ``valid_table``
+     - ``(X > 0) | (Y > 0)``
+     - dropped -- but an event with only *one* coordinate set was kept
+   * - ``filter_table_outside_regions``
+     - ``(X < 0) | (Y < 0)``
+     - **kept**, so the whole pile-up went into the background events
+   * - ``filter_sources_in_images``
+     - ``(X > 0) & (Y > 0)``
+     - dropped; the only one that was right
+   * - ``get_random_fluxes_in_img``
+     - none
+     - included in the bounding box the random apertures are thrown into
+
+``valid_table``'s OR contradicted its own docstring, which said that zero and negative are
+both the null marker. ``get_random_fluxes_in_img``'s docstring likewise already promised
+apertures "inside the bounding box of the valid events", which is not what it computed: a
+pile-up at the origin stretched the box from the field down to (0, 0), so most apertures
+landed on empty sky, the median aperture count collapsed towards zero, and the ``median +
+MAD`` acceptance threshold with it.
+
+No output was actually wrong, because ``filter_sources_in_images`` applies the correct
+predicate to the whole table before anything else runs, and every other helper sees only
+what it passes on. The defects were latent, one reordering away from being live, and none
+of the four helpers had a single test.
+
+**Fixed** by ``has_sky_position``, one predicate used in all four places: both coordinates
+must be positive. ``valid_table``, ``filter_table_outside_regions`` and
+``filter_sources_in_images`` call it; ``get_random_fluxes_in_img`` takes its bounding box
+from ``valid_table`` and so now does what it says. The dead ``correct_zeros`` argument of
+``image_from_table`` (issue 32), which was an unfinished attempt at exactly this, is gone.
+
+The four helpers now have tests, driven by an event table seeded with a pile-up at the
+origin plus events with only one coordinate set. Each of the three old predicates was put
+back in turn to confirm the tests fail with it: the OR breaks two ``valid_table`` tests and
+the aperture test, ``< 0`` breaks the background test, and the raw bounding box breaks both
+aperture tests.
 
 
 Science caveats

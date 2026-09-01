@@ -55,7 +55,7 @@ from scipy.ndimage import gaussian_filter
 from statsmodels.robust import mad
 
 
-def image_from_table(table, bins, gaussian_filter_sigma=1.0, correct_zeros=True):
+def image_from_table(table, bins, gaussian_filter_sigma=1.0):
     """
     Build a smoothed sky image from an event table.
 
@@ -68,8 +68,6 @@ def image_from_table(table, bins, gaussian_filter_sigma=1.0, correct_zeros=True)
     gaussian_filter_sigma : float, optional
         Standard deviation, in bins, of the Gaussian smoothing kernel. Use 0 for no
         smoothing.
-    correct_zeros : bool, optional
-        Unused.
 
     Returns
     -------
@@ -91,6 +89,36 @@ def image_from_table(table, bins, gaussian_filter_sigma=1.0, correct_zeros=True)
     return xbins, ybins, img.T
 
 
+def has_sky_position(table):
+    """
+    Mask of the events that were assigned a sky position.
+
+    ``X`` and ``Y`` are zero -- or, rarely, negative -- for an event the aspect
+    reconstruction could not place on the sky. Many NuSTAR observations contain a large
+    pile-up of these at the origin, and every one of them has to be dropped before the
+    field is imaged, before apertures are thrown at it, and before the background file is
+    written. Both coordinates must be positive: an event with only one of them set is
+    just as unplaced as one with neither.
+
+    Parameters
+    ----------
+    table : astropy.table.Table, numpy.recarray or dict
+        Event table with ``X`` and ``Y`` columns.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        True for the events with a usable sky position.
+
+    Examples
+    --------
+    >>> table = {"X": np.array([0, 5, 0, 7]), "Y": np.array([0, 6, 3, 0])}
+    >>> has_sky_position(table)
+    array([False,  True, False, False])
+    """
+    return (table["X"] > 0) & (table["Y"] > 0)
+
+
 def valid_table(table):
     """
     Drop events without a valid sky position.
@@ -103,10 +131,9 @@ def valid_table(table):
     Returns
     -------
     Same type as ``table``
-        The events with a positive ``X`` or ``Y``. Zero and negative values are the null
-        marker used for events that could not be assigned a sky position.
+        The events :func:`has_sky_position` accepts.
     """
-    return table[(table["X"] > 0) | (table["Y"] > 0)]
+    return table[has_sky_position(table)]
 
 
 def mask_around_region(table, coord, region_size=30):
@@ -194,7 +221,7 @@ def filter_table_outside_regions(table, coord_list, region_size=100):
         coord_list = np.array([coord_list])
     if not isinstance(region_size, Iterable):
         region_size = np.ones(len(coord_list)) * region_size
-    bad = (table["X"] < 0) | (table["Y"] < 0)
+    bad = ~has_sky_position(table)
 
     for i, coord in enumerate(coord_list):
         bad = bad | mask_around_region(table, coord, region_size[i])
@@ -234,10 +261,11 @@ def get_random_fluxes_in_img(table, region_size=30, n_rand=100):
     bounding box, which does not account for vignetting or for the position dependence of
     the NuSTAR background.
     """
-    xmin = np.min(table["X"])
-    ymin = np.min(table["Y"])
-    xmax = np.max(table["X"])
-    ymax = np.max(table["Y"])
+    placed = valid_table(table)
+    xmin = np.min(placed["X"])
+    ymin = np.min(placed["Y"])
+    xmax = np.max(placed["X"])
+    ymax = np.max(placed["Y"])
 
     fluxes = []
     for n in range(n_rand):
@@ -303,7 +331,7 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     table = copy.deepcopy(hdul[1].data)
 
     energy = table["PI"] * 0.04 + 1.6
-    good = (energy >= 3.0) & (energy < 79.0) & (table["X"] > 0) & (table["Y"] > 0)
+    good = (energy >= 3.0) & (energy < 79.0) & has_sky_position(table)
 
     if np.count_nonzero(good) < 20:
         hdul.close()
