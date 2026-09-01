@@ -672,6 +672,13 @@ def segment_bounds(tstart, tstop, split_times):
 
     >>> segment_bounds(0, 100, [120]).tolist()
     [[0.0, 100.0], [100.0, 100.0]]
+
+    Infinite bounds leave the first and last segment open, which is what to use when the
+    segments will be intersected with each file's own good time and the files do not all
+    cover the same stretch of the observation:
+
+    >>> segment_bounds(-np.inf, np.inf, [40]).tolist()
+    [[-inf, 40.0], [40.0, inf]]
     """
     tstart = float(tstart)
     tstop = float(tstop)

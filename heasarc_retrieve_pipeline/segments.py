@@ -561,7 +561,12 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
     logger = get_logger()
     mets, utc, timesys = resolve_split_times(obsid, config, split_mjds, scale=scale)
     tstart, tstop, _, _ = observation_time_span(obsid, config)
-    bounds = segment_bounds(tstart, tstop, mets)
+    # Open at both ends on purpose. Only the cut times the caller asked for carry any
+    # information; where the data begin and end is a different answer for every file, and
+    # each one is intersected with its own GTI below. Closing these on the observation
+    # span -- which comes from the mode-01 file -- clipped the mode-06 CHU files, whose
+    # good time reaches past both ends of it, and silently lost up to 720 s of exposure.
+    bounds = segment_bounds(-np.inf, np.inf, mets)
 
     for mjd, met, as_utc in zip(split_mjds, mets, utc):
         logger.info(
@@ -578,7 +583,13 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
             split_mets=mets,
             split_mjds_utc=utc,
             timesys=timesys,
-            bounds=np.asarray(bounds, dtype=float).tolist(),
+            # JSON has no infinity -- json.dumps would write a bare ``Infinity``, which
+            # Python reads back but nothing else does. ``null`` says "open end", which is
+            # what the outer edges of the first and last segment mean.
+            bounds=[
+                [None if not np.isfinite(edge) else float(edge) for edge in segment]
+                for segment in np.asarray(bounds, dtype=float)
+            ],
         )
         written_spectra = split_spectra(obsid, config, bounds) if spectra else []
         written_events = split_event_files(obsid, config, bounds) if events else []

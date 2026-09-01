@@ -7,6 +7,7 @@ HEASOFT does the extraction itself. The event-list split is exercised for real o
 synthetic files.
 """
 
+import glob
 import os
 
 import numpy as np
@@ -422,3 +423,93 @@ class TestCommandLine:
 
         assert status == 0
         assert "2 segment(s)" in capsys.readouterr().out
+
+
+class TestSegmentsSpanEachFile:
+    """
+    A mode-06 file may run past the ends of the mode-01 observation span.
+
+    ``nusplitsc`` writes the per-CHU files from the whole of the mode-06 data, and on a real
+    observation (90901333002) those reach both before the first mode-01 event and after the
+    last: 150 s early on one CHU combination, 800 s late on two others. Clamping every
+    file's segments to one file's span silently threw that good time away -- 720 s of it on
+    the worst file -- so the first and last segment are open-ended and each file's own GTI
+    decides where its data start and stop.
+    """
+
+    @staticmethod
+    def _overrunning_mode_06(base, tstart, tstop):
+        """A CHU file whose good time reaches past both ends of the mode-01 span."""
+        splitdir = os.path.join(base, OBSID, "split")
+        root = f"nu{OBSID}A06_chu13_N_cl"
+        path = os.path.join(splitdir, root + ".evt")
+        make_synthetic_event_file(path, tstart - 200.0, tstop + 300.0, 200, seed=7)
+        for suffix in ("_src.reg", "_bkg.reg"):
+            with open(os.path.join(splitdir, root + suffix), "w") as fobj:
+                fobj.write("circle(500,500,30)\n")
+        gti = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="START", format="D", array=np.array([tstart - 200.0, 600.0])),
+                fits.Column(name="STOP", format="D", array=np.array([400.0, tstop + 300.0])),
+            ],
+            name="GTI",
+        )
+        gti.header["TIMEZERO"] = 0.0
+        gti.header["MJDREFI"] = 55197
+        gti.header["MJDREFF"] = 0.00076601852
+        gti.header["TIMESYS"] = "TT"
+        fits.HDUList([fits.PrimaryHDU(), gti]).writeto(
+            os.path.join(splitdir, root + "_noflares.gti"), overwrite=True
+        )
+        return os.path.join(splitdir, root)
+
+    def test_good_time_outside_the_observation_span_survives(self, tree, stub):
+        from heasarc_retrieve_pipeline.utils import mjd_from_met
+
+        root = self._overrunning_mode_06(tree["out_data_path"], 0.0, 1000.0)
+
+        path = os.path.join(tree["out_data_path"], OBSID, "event_pipe", f"nu{OBSID}A01_cl.evt")
+        with fits.open(path) as hdul:
+            mjd = mjd_from_met(500.0, hdul)
+
+        segments.split_obsid(OBSID, tree, [mjd], events=False)
+
+        def ontime(name):
+            with fits.open(name) as hdul:
+                data = hdul["GTI"].data
+                return float(np.sum(data["STOP"] - data["START"]))
+
+        parent = ontime(root + "_noflares.gti")
+        pieces = sum(ontime(root + f"_seg{n}.gti") for n in (1, 2))
+        assert pieces == pytest.approx(parent, abs=1e-6)
+
+    def test_the_open_edges_are_recorded_as_json_null(self, tree, stub):
+        """
+        ``json.dumps`` writes a bare ``Infinity`` for an infinite float. Python reads that
+        back without complaint, so a broken diagnostics file would only show up in
+        something else -- ``jq``, a browser, any other language. ``null`` is both valid and
+        the honest word for an open end.
+        """
+        import json
+
+        from heasarc_retrieve_pipeline.diagnostics import diagnostics_path
+        from heasarc_retrieve_pipeline.utils import mjd_from_met
+
+        path = os.path.join(tree["out_data_path"], OBSID, "event_pipe", f"nu{OBSID}A01_cl.evt")
+        with fits.open(path) as hdul:
+            mjd = mjd_from_met(500.0, hdul)
+
+        segments.split_obsid(OBSID, tree, [mjd], spectra=False, events=False)
+
+        def strict(name):
+            raise AssertionError(f"{name} is not valid JSON")
+
+        written = glob.glob(os.path.join(diagnostics_path(OBSID, tree), "*.json"))
+        bounds = None
+        for name in written:
+            with open(name) as fobj:
+                payload = json.loads(fobj.read(), parse_constant=strict)
+            for record in payload if isinstance(payload, list) else [payload]:
+                if record.get("step") == "split_obsid":
+                    bounds = record["values"]["bounds"]
+        assert bounds == [[None, pytest.approx(500.0, abs=1e-3)], [pytest.approx(500.0, abs=1e-3), None]]

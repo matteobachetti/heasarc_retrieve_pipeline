@@ -1012,8 +1012,8 @@ Splitting and merging observations
 ----------------------------------
 
 Two post-processing tools work on a tree the pipeline has already finished. Neither
-re-runs ``nupipeline`` and neither regenerates responses, which is what makes them take
-seconds rather than the 50 minutes a reduction costs::
+re-runs ``nupipeline`` and neither regenerates the 68 MB responses, so neither costs
+anything like the 50 minutes a reduction does::
 
     hrp-split-obsid  <out_data_path> <OBSID> <MJD> [<MJD> ...]
     hrp-merge-obsids <out_data_path> <OBSID> <OBSID> [...] [--name NAME]
@@ -1021,6 +1021,18 @@ seconds rather than the 50 minutes a reduction costs::
 The first cuts one observation into time segments -- for a source that changes state
 part-way through. The second co-adds several observations that are each too faint to fit
 on their own.
+
+They are not equally quick, and it is worth knowing which is which before you start one.
+The merge is seconds: ``addspec`` and ``grppha`` do arithmetic on files that already
+exist. The split is minutes, because each ``nuproducts`` call runs ``nuexpomap`` and
+``nubackscale`` -- ``runbackscale`` defaults to ``yes`` and there is no reason to turn it
+off, since ``BACKSCAL`` genuinely has to be recomputed over each segment's own good time.
+Measured on 90901333002, which has eight spectral input files (mode 01 and three CHU
+combinations per module), one cut cost **16 minutes** for the sixteen resulting spectra:
+about 90 s per mode-01 file per segment and about 35 s per mode-06 file per segment. It
+scales with the number of cuts, so a three-way split of the same observation is about
+three quarters of an hour. Still far short of a reduction, but not something to fire off
+casually in a loop.
 
 Time conventions
 ~~~~~~~~~~~~~~~~
@@ -1120,6 +1132,25 @@ its table rows replaced, by ``intersect_intervals`` of that GTI with the segment
 Copying rather than building one from scratch keeps ``MJDREFI``, ``TIMESYS``, ``TIMEUNIT``
 and everything else exactly as HEASOFT wrote it. A segment whose intersection is empty is
 skipped and recorded.
+
+**The first and last segment are open-ended, and that matters.** ``segment_bounds`` is
+called with ``-inf`` and ``+inf`` rather than with the observation's ``TSTART`` and
+``TSTOP``. Only the cut times the caller asked for carry information; where the data begin
+and end is a different answer for every file, and each file's bounds are intersected with
+its own GTI anyway, so an open outer edge and that file's real edge give the same result.
+Closing them on the observation span does *not*. ``observation_time_span`` comes from the
+mode-01 event file, and the mode-06 per-CHU files that ``nusplitsc`` writes are not
+confined to it: on 90901333002 one CHU combination starts 150 s before the first mode-01
+event and two others run 800 s past the last. Clamping every file to the mode-01 span
+quietly deleted that good time -- 720 s of exposure on the worst file, with the segments'
+counts failing to add up to the parent's -- while the mode-01 spectra themselves
+partitioned perfectly, so nothing looked wrong unless you checked mode 06. The regression
+test in ``TestSegmentsSpanEachFile`` builds a CHU file that overruns both ends and asserts
+its segments' good time adds back up.
+
+One consequence: the recorded ``bounds`` in the diagnostics carry ``null`` for those open
+edges. JSON has no infinity, and ``json.dumps`` would otherwise write a bare ``Infinity``
+that Python reads back happily and nothing else does.
 
 Regions are the parent's, looked up next to the event file. If they are missing the file
 is skipped and the reason recorded -- deliberately, rather than re-measuring: a segment
