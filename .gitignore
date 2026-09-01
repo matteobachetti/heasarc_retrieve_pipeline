@@ -28,7 +28,6 @@ out_e2e/
 out_test/
 out_flares/
 test_dload/
-*.jpg
 *.log
 
 # HEASOFT leftovers (xselect writes its command file into the working directory)

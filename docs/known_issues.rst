@@ -314,8 +314,8 @@ with a clear message instead of writing an unusable GTI file.
 The measured GOES X-ray light curve is now used for the filtering as well, not just the
 catalogue: ``get_goes_gtis`` excludes the union of the catalogued flares and the times when
 the 1--8 A flux reaches ``flux_class``. It also writes the light curve to
-``<root>_goes.fits`` on the event file's own time scale, and ``plot_flare_filtering`` plots
-it above the NuSTAR light curves so the cut can be checked by eye. The two criteria catch
+``<root>_goes.fits`` on the event file's own time scale, and the observation's page shows it
+above the NuSTAR light curves so the cut can be checked by eye. The two criteria catch
 different things, and adding the flux cut takes the background chi2/dof on 80002092008 from
 3.62 to 1.83. See "Solar flare filtering" in ``technical_details.rst``, which also records
 the one hazard of the flux threshold: set below the Sun's quiescent flux for the epoch, it
@@ -676,8 +676,9 @@ a ``path``, so two observations from the same day wrote the same file, and a red
 could be handed a file another was still writing. Each observation now keeps its own copy
 beside its event file.
 
-**The diagnostic images went through pyplot**, whose figure registry is a global. They are
-built with ``matplotlib.figure.Figure`` now, as the flare diagnostic already was.
+**The diagnostic images went through pyplot**, whose figure registry is a global. There
+are no diagnostic images any more: what they showed is recorded per observation, one file
+per writer, and drawn on the observation's page. See issue 51.
 
 ``n_workers`` on the three entry flows says how many observations to reduce at once, and
 ``retrieve_heasarc_data_by_obsid`` takes a list of OBSIDs so that there is something to
@@ -740,22 +741,25 @@ high-risk injection surface -- it is a read-only public TAP service -- but a quo
 OBSID produces a confusing service error rather than a clear validation message. Validate
 the OBSID against a per-mission pattern before interpolating.
 
-31. Matplotlib figures are never closed, and no backend is forced -- PARTLY FIXED
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+31. Matplotlib figures are never closed, and no backend is forced -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``image_utils.py`` created a figure whose ``plt.close(fig)`` was commented out. Looping
 over observations therefore leaked one figure per event file and triggered matplotlib's
-"more than 20 figures have been opened" warning.
+"more than 20 figures have been opened" warning. It also imported ``pyplot`` at import
+time without selecting a non-interactive backend, so importing the package on a machine
+with a display could try to open a window.
 
-**Half fixed.** That ``plt.close(fig)`` is uncommented, so nothing leaks any more. The new
-diagnostic ``plot_flare_filtering`` sidesteps the problem entirely by building its figure
-with ``matplotlib.figure.Figure`` instead of ``pyplot``: that is headless by construction
-and never enters pyplot's global figure registry, so there is nothing to close and no
-backend to force. Its test asserts ``len(plt.get_fignums()) == 0`` afterwards.
+This was fixed in stages. The ``plt.close(fig)`` was uncommented, which stopped the leak;
+the figures were then rebuilt with ``matplotlib.figure.Figure`` instead of ``pyplot``,
+which is headless by construction and never enters the global registry, so there was
+nothing left to close and no backend to force.
 
-**Still open**: ``image_utils.py`` imports ``pyplot`` at import time without selecting a
-non-interactive backend, so importing the package on a machine with a display can still try
-to open a window. Converting those three plots to ``Figure`` as well would close this.
+**Closed** by issue 51: the figures themselves are gone. Nothing under
+``heasarc_retrieve_pipeline`` imports matplotlib any more, and it is no longer a declared
+dependency. Dropping it does not uninstall it -- ``nustar_gen`` requires it outright and
+``sunpy``'s timeseries extra pulls it in -- but a machine that only reads the reports no
+longer needs it.
 
 32. Dead code and unused imports
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -763,7 +767,10 @@ to open a window. Converting those three plots to ``Figure`` as well would close
 * Unused imports: ``sys``, ``glob``, ``traceback``, ``pytest``, ``warnings``, ``hstack``
   (``core.py``); ``re``, ``boto3``, ``UNSIGNED``, ``Config`` (``rxte.py``); ``glob``
   (``nicer.py``); ``Table``, and ``astropy.visualization.hist`` which is shadowed by a
-  local variable (``image_utils.py``); ``getdata``, ``Table`` (``nustar.py``).
+  local variable (``image_utils.py``); ``getdata``, ``Table`` (``nustar.py``). The
+  shadowed ``hist`` is gone -- it was not merely dead, it pulled matplotlib into the
+  module by itself, so removing the figures would not have made ``image_utils``
+  matplotlib-free without it.
 * ``nustar.py:584``: ``sep = target.separation(obj_j2000)`` is computed, the comment says
   "if <15 arcsec, all is okay", and nothing checks it. This is exactly the guard that would
   catch the wrong-source detection described in issue 4 -- it should be implemented, not
@@ -772,8 +779,10 @@ to open a window. Converting those three plots to ``Figure`` as well would close
   used; ``hsp.nuproducts`` is called separately.
 * ``nustar.py:571`` and ``nustar.py:596``: ``make_image`` is called three times and
   ``make_radial_profile`` twice, with the first results discarded.
-* ``image_utils.py:132`` prints the detection threshold and flux to stdout on every
-  candidate; library code should log, not print.
+* ``image_utils.py:132`` printed the detection threshold and flux to stdout on every
+  candidate, and ``get_best_source_region`` printed the radius it chose; library code
+  should log, not print. **Fixed**: both are recorded values now, shown on the
+  observation's page. See issue 51.
 * ``nustar.py:734``: unused local ``basedir``.
 * ``image_from_table`` took a ``correct_zeros`` argument that was never used. Removed
   -- and it was not merely dead, it was the vestige of a fix that had never been
@@ -1250,6 +1259,36 @@ origin plus events with only one coordinate set. Each of the three old predicate
 back in turn to confirm the tests fail with it: the OR breaks two ``valid_table`` tests and
 the aperture test, ``< 0`` breaks the background test, and the raw bounding box breaks both
 aperture tests.
+
+
+51. Diagnostics were 1800 loose JPEGs and three log lines -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One reduced observation left 32 JPEGs across three directories, a ``skipped_inputs.txt``,
+several ``*_DONE.TXT`` markers and a log. A run of 56 left about 1800 images, named by a
+convention you had to know to find them, none of them zoomable, and none of them next to
+the numbers that produced them. The run itself was summarised by three ``logger.info``
+lines. ``get_best_source_region`` computed a radial profile and an SNR-optimised radius,
+drew nothing at all, and printed one number to stdout.
+
+The observation's own parameters never even reached the reduction: ``observation_work_items``
+kept ``obsid``, ``url``, ``ra`` and ``dec`` and threw away the target name, exposure, dates,
+observing cycle and solar activity that the catalogue query had already fetched.
+
+**Fixed.** Every step records its status, timing and numbers under
+``<OBSID>/diagnostics/``, and the run builds one self-contained ``diagnostics.html`` per
+observation plus an ``index.html`` over all of them. The JPEGs are gone, and with them the
+last matplotlib import in the package -- which is what finally closed issue 31. The design,
+the record schema, and how it relates to ``skipped_inputs.txt`` and the step stamps are in
+:ref:`diagnostics_and_reporting`.
+
+Three properties are worth stating here, because they are what the design was for. A run
+killed mid-step leaves a ``running`` record naming the step it died in. A page is written in
+a ``finally``, so an observation that *failed* still gets one, with the error and its
+traceback -- and a page that cannot be written is logged, never raised, so reporting can
+never turn a good observation into a failed one. And ``python -m
+heasarc_retrieve_pipeline.report <outdir>`` rebuilds everything from what is on disk,
+finding the observations by looking rather than from a list of what the run meant to do.
 
 
 Science caveats

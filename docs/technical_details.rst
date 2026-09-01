@@ -453,7 +453,9 @@ sky pixels, about 74 arcsec) of the peak are written to
 the ones that failed the flux cut -- so sub-threshold sources contaminate neither the source
 files nor the background file.
 
-A diagnostic JPEG is written next to each output.
+What the separation found -- the image, the threshold, the peaks and which of them
+were accepted -- is recorded rather than drawn, and the observation's page draws it; see
+:ref:`diagnostics_and_reporting`.
 
 **What these products are good for.** Timing. The source event files are plain circular
 extractions with no PSF or aperture correction, no ARF, and no exposure map, and the
@@ -682,10 +684,9 @@ The filtering diagnostic
 
 Cleaning an event file is easy to get wrong in ways that leave no trace in the output: too
 little is removed, or too much, and the file looks fine either way. That is exactly how the
-two problems above survived. So every filtered product now comes with a figure,
-``<root>_flares.jpg``, written by ``plot_flare_filtering`` next to the event file --  the
-same convention ``image_utils`` already uses for its image cut-outs. Three panels share one
-time axis:
+two problems above survived. So every filtered product is measured by
+``record_flare_filtering`` and drawn on the observation's page (see
+:ref:`diagnostics_and_reporting`). Three panels share one time axis:
 
 1. the GOES X-ray flux in the 1--8 A and 0.5--4 A channels, on a log scale, with the
    A/B/C/M/X class thresholds drawn as horizontal lines and the ``flux_class`` cut marked on
@@ -702,19 +703,15 @@ actually removed. ``utils.intervals_removed`` subtracts the two GTIs rather than
 complement of the surviving one, so Earth occultations and orbit gaps, which were never good
 time to begin with, are not shaded as though the flare filter had caused them.
 
-The figure is annotated with what the filtering cost and bought: events removed, live time
-before and after, and reduced chi-squared against a constant before and after, for each
-band. Light curves are built with ``utils.binned_lightcurve``, which gives every bin its real
-exposure -- the overlap between the bin and the GTIs -- rather than assuming a full bin
-width. Without that, every GTI edge produces a spurious dip that looks like source
+Alongside the panels the page states what the filtering cost and bought: events removed,
+live time before and after, and reduced chi-squared against a constant before and after,
+for each band. Light curves are built with ``utils.binned_lightcurve``, which gives every
+bin its real exposure -- the overlap between the bin and the GTIs -- rather than assuming a
+full bin width. Without that, every GTI edge produces a spurious dip that looks like source
 variability.
 
-``plot_flare_filtering`` builds its figure with ``matplotlib.figure.Figure`` rather than
-``pyplot``. That is headless by construction, so there is no backend to force on a pipeline
-machine, and it cannot leak a figure into pyplot's global registry -- which is the defect
-issue 31 in ``known_issues.rst`` records for ``image_utils``. A failure to draw is logged
-rather than raised: the science product is already on disk by that point, and a diagnostic
-must not take an observation down with it.
+A failure to record is logged rather than raised: the science product is already on disk by
+that point, and a diagnostic must not take an observation down with it.
 
 What the filtering measurably does
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -770,8 +767,8 @@ filtering costs 1.7% of the live time (33646 -> 33063 s) and 1830 of 63936 backg
 and a brightest bin seven times the median. Other backgrounds, sub-threshold flares and
 Earth-limb effects are untouched by this work.
 
-Two things the diagnostic figure showed that the numbers did not, both visible on
-``nu80002092008_back_flares.jpg`` as the catalogue-only cut left it:
+Two things the diagnostic showed that the numbers did not, both visible in the background
+panels of 80002092008 as the catalogue-only cut left them:
 
 * **The excluded window ended too early.** The 3--10 keV background peaks at 4.6 c/s, more
   than ten times its 0.35 c/s baseline, inside the shaded window -- but it was still at
@@ -1336,9 +1333,11 @@ every single run of ``merge_gtis``, unnoticed, for as long as the code existed.
 **What each observation gets to itself.** GOES solar X-ray files are fetched into the
 observation's own directory (``goes_download_path``) rather than sunpy's shared download
 directory, where two observations from the same day would ask for the same file and one
-could be handed it while the other was still writing it. Plotting uses
-``matplotlib.figure.Figure`` directly instead of ``pyplot``, which keeps a process-wide
-figure registry and a global backend.
+could be handed it while the other was still writing it. Diagnostics go to
+``<OBSID>/diagnostics/``, one file per writer, so no two of them ever touch the same path;
+the plotting library that used to be the other piece of shared state here -- ``pyplot``,
+with its process-wide figure registry and global backend -- is gone from the package
+altogether.
 
 **What is still shared, and what to do about it.** By default each worker process starts a
 temporary Prefect server of its own, and all of them write one SQLite file. Measured with
@@ -1510,6 +1509,176 @@ filesystem look identical. On the local APFS disk this was written on: 62 us to 
 that, leaving the working directories where they are costs little.
 Whether it is worth copying whole observations to local disk and back is a separate
 question, and one to settle by measuring the two filesystems rather than by argument.
+
+
+.. _diagnostics_and_reporting:
+
+Diagnostics and reporting
+-------------------------
+
+Every reduction step records what it did, and the run turns those records into one HTML
+page per observation plus an index over the whole run. The pages are self-contained files
+you open from disk; there is no server, and nothing has to be running for them to work.
+
+Before this there was no way to *see* an observation. One reduction left 32 loose JPEGs
+across three directories, a ``skipped_inputs.txt``, several ``*_DONE.TXT`` markers and a
+log; a run of 56 left about 1800 of those images, none of them next to the numbers that
+produced them, and three ``logger.info`` lines to summarise everything.
+
+What is on disk
+~~~~~~~~~~~~~~~
+
+::
+
+    <out_data_path>/index.html                            the run
+    <out_data_path>/plotly.min.js                         4.9 MB, written once
+    <out_data_path>/<OBSID>/diagnostics.html              the observation
+    <out_data_path>/<OBSID>/diagnostics/manifest.json     the catalogue row
+    <out_data_path>/<OBSID>/diagnostics/observation.json  the overall outcome
+    <out_data_path>/<OBSID>/diagnostics/<step>__<key>.json
+    <out_data_path>/<OBSID>/diagnostics/<step>__<key>.npz
+
+``heasarc_retrieve_pipeline.diagnostics`` writes the records; ``report`` reads them and
+builds the pages. The record layer imports nothing from the rest of the package beyond
+``utils.get_logger`` -- ``image_utils`` imports *it* -- and carries no Prefect decorators,
+because it has to be callable from a ``finally`` block after a task has already failed.
+
+A record is a JSON file and, when there are arrays, an ``.npz`` sibling::
+
+    with record_step(directory, obsid, "separate_sources", key=root) as rec:
+        rec.value(threshold=..., n_peaks=...)       # JSON scalars
+        rec.array(image=img, xbins=..., ybins=...)  # numpy -> the .npz
+        rec.skip("fewer than 20 events passed the energy and position filter")
+
+with fields ``obsid``, ``step``, ``key``, ``status``, ``reason``, ``error``,
+``traceback``, ``started``, ``started_iso``, ``duration_s``, ``values`` and ``arrays``.
+
+There are four statuses. ``running`` is written on entry and replaced on exit, so a run
+killed mid-step still names the step it died in. ``done`` and ``skipped`` -- with a
+human-readable ``reason`` -- are the two ordinary outcomes; ``rec.skip`` does not raise.
+``failed`` carries the error and its traceback, and the exception is **re-raised**:
+``process_observations`` still has to count the failure.
+
+Why files, and why one file per writer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Observations are reduced in separate processes, so no in-memory accumulator can span
+them, and nothing a task returns may change type -- it has to pickle. Files on disk are
+the only collection point that works.
+
+Inside one observation the steps are threads, and two ``join_source_data`` tasks run at
+once. The invariant that makes that safe is **one file name per writer**: every record is
+``<step>__<key>``, unique to the thing being recorded, so there is never a read-modify-write
+and never a lock. (``record_skipped_input`` needs a lock precisely because it rewrites one
+shared file.) Both files are written to a temporary name and moved into place with
+``os.replace``, so a reader never sees half a record.
+
+There is no process-global "current observation". That would be another
+``_WORKER_DIRECTORY``, and it would be wrong under the thread pool the tests use, where
+several observations share a process. The directory is passed explicitly as
+``diagnostics_dir``, and ``None`` means record nothing -- which is what every direct call
+from a test does. A function that is handed one *file* rather than an observation --
+``get_best_source_region``, ``filter_sources_in_images``, ``record_flare_filtering`` --
+takes a ``rec`` instead, defaulting to ``no_record()``.
+
+Three records, not one
+~~~~~~~~~~~~~~~~~~~~~~
+
+Three things on disk describe what a run did, and they do not overlap:
+
+.. list-table::
+   :header-rows: 1
+
+   * - record
+     - where
+     - what it owns
+   * - ``skipped_inputs.txt``
+     - ``<OBSID>/``
+     - which *inputs* were skipped, and why
+   * - step stamps
+     - ``<OBSID>/.steps/``
+     - what a step *produced*, with its CALDB and version provenance
+   * - diagnostics
+     - ``<OBSID>/diagnostics/``
+     - a step's *status*, timing and numbers
+
+The step stamp cannot absorb the diagnostics record, and the reason is its own design.
+It is written only on success -- that invariant is what lets a rerun walk backwards
+through the stamps -- so it can never carry a failure or a traceback. And it is read on
+the hot path of every rerun, so it must stay small rather than hold a 50 kB light curve.
+The report reads all three and degrades gracefully: the stamps are optional, and an
+observation with a manifest and nothing else is listed as never having started.
+
+What the pages show
+~~~~~~~~~~~~~~~~~~~
+
+The observation page opens with the catalogue row -- target, position, exposure, dates,
+observing cycle -- then a timeline of every step with its status, duration and skip
+reason, then a section per step:
+
+* the **sky image** the separation worked on, with the detected peaks and the acceptance
+  and exclusion circles drawn on it, in sky ``X``/``Y`` pixels;
+* the **radial profile** with the PSF profile beside it and the chosen ``rlimit`` marked;
+* a **GTI chart** for the join: one row per input file, then the OR-merged row per
+  telescope, the AND-merged A+B row, and the flare-filtered row, so it is visible which
+  input cost which good time;
+* the **flare panels** described under "Solar flare filtering" above.
+
+The sky image and the region files are in different frames -- pixels with no WCS on one
+side, ICRS degrees on the other -- and come from different steps, so they are two figures
+rather than one overlay.
+
+The index lists every observation with its outcome, target, exposure, wall-clock time,
+how many steps it skipped or failed and how many inputs it had to skip, each row linking
+to its page; above the table, the run as one timeline, showing which observations actually
+overlapped and where the failures fell.
+
+The two named failures are first-class: ``NoSourceInScienceData`` names the telescope and
+file that had no source in it, and ``NoGoesCoverage`` is a distinct outcome rather than a
+generic crash.
+
+How it is hooked in
+~~~~~~~~~~~~~~~~~~~
+
+The manifest is written in ``process_observations`` before anything is submitted, so a run
+killed after the first observation still has a manifest for every one.
+``download_and_process_observation`` wraps its whole body in an ``observation`` record and
+writes the page in a ``finally``, which is the only place that knows both the OBSID and
+the output directory *and* still runs when the observation raises. That write has its own
+``try/except`` that logs: a reporting failure must never turn a good observation into a
+failed one, or replace the exception that was already on its way up. The index and the
+plotly bundle are written at the head and tail of ``process_observations``, inside
+``short_workspace``, so the bytes land in the real tree while the symlink is still alive.
+
+And everything can be rebuilt from what is on disk::
+
+    python -m heasarc_retrieve_pipeline.report <out_data_path>
+
+That needs no list of what the run meant to do -- it finds the observations by looking --
+which is the difference between a crashed run leaving forty unreachable pages and one you
+can browse.
+
+Building the pages
+~~~~~~~~~~~~~~~~~~
+
+Plotly, with a hand-written ``string.Template`` shell rather than jinja2, and imported
+inside the figure builders so that ``import heasarc_retrieve_pipeline`` still works
+without it. Four measurements shaped the rest:
+
+* ``to_html(..., include_plotlyjs="directory")`` emits a **bare** ``src="plotly.min.js"``
+  with no directory part, and ``to_html`` never copies the bundle -- only ``write_html``
+  does. A page at ``<OBSID>/diagnostics.html`` would point at a file nothing creates. So
+  each figure is rendered with ``include_plotlyjs=False`` and the shell carries one
+  ``<script src>`` with the relative path we compute.
+* The bundle is 4.9 MB. It is written once at the run root and shared, never inlined.
+* ``template="none"`` takes an empty figure from 7224 characters to 644 -- about 100 kB of
+  theme boilerplate saved per page.
+* dtype drives page size linearly, so arrays are cast before they reach plotly: a
+  100x100 image is 110.7 kB as float64, 55.9 as float32 and 27.1 as uint16.
+
+The figure data is inline in the page, deliberately. Moving it to sidecar files the page
+fetched would be smaller, but ``fetch()`` against ``file://`` is blocked, and these pages
+are opened as files.
 
 
 Configuration and environment
