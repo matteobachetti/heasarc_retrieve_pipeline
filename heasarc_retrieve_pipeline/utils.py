@@ -13,6 +13,8 @@ import numpy as np
 from prefect import get_run_logger
 
 __all__ = [
+    "NoGoesCoverage",
+    "NoSourceInScienceData",
     "absolute_config",
     "apply_gti",
     "binned_lightcurve",
@@ -37,6 +39,28 @@ __all__ = [
 #: an exception: nothing went wrong, so the flow run must not end Failed, and the caller
 #: counts these apart from the observations that genuinely broke.
 NO_SCIENCE_DATA = "NO_SCIENCE_DATA"
+
+
+class NoGoesCoverage(Exception):
+    """
+    GOES has no solar X-ray measurements covering an observation.
+
+    Deliberately fatal. Keeping all the good time instead would silently turn the
+    flare filtering off, and whether an observation may be analysed without it is a
+    scientific decision the pipeline must not make on its own.
+    """
+
+
+class NoSourceInScienceData(Exception):
+    """
+    A normal-science (mode 01) module yielded no source at all.
+
+    Mode 01 is the ordinary observing mode with the full aspect solution. A target that
+    the pipeline was pointed at should be there; if it is not, something is wrong with
+    the observation or with the reduction, and the run must say so rather than quietly
+    delivering half an observation. An unusable *mode-06* CHU subset is a different
+    matter -- that one is skipped and recorded, see :func:`record_skipped_input`.
+    """
 
 
 def get_logger():

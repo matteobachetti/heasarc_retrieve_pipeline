@@ -21,8 +21,6 @@ from heasarc_retrieve_pipeline import heasoft, nustar  # noqa: E402
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     chi2_dof_against_a_constant,
     flare_filtered_event_file_name,
-    goes_gti_file_name,
-    goes_lc_file_name,
     nu_base_output_path,
     nu_local_raw_data_path,
     nu_pipeline_done_file,
@@ -35,6 +33,8 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     join_source_data,
     plot_flare_filtering,
     mode_01_input_files,
+    nu_goes_gti_file,
+    nu_goes_lc_file,
     position_is_consistent,
     spectral_input_files,
 )
@@ -442,6 +442,11 @@ def make_synthetic_event_file(path, tstart=0.0, tstop=1000.0, nevents=500, seed=
         name="EVENTS",
     )
     events.header["TIMEZERO"] = 0.0
+    events.header["TSTART"] = tstart
+    events.header["TSTOP"] = tstop
+    # NuSTAR's reference epoch, 2010-01-01 00:00:00 UTC.
+    events.header["MJDREFI"] = 55197
+    events.header["MJDREFF"] = 0.00076601852
     events.header["ONTIME"] = tstop - tstart
     events.header["LIVETIME"] = 0.9 * (tstop - tstart)
     events.header["EXPOSURE"] = 0.9 * (tstop - tstart)
@@ -455,6 +460,86 @@ def make_synthetic_event_file(path, tstart=0.0, tstop=1000.0, nevents=500, seed=
     )
     fits.HDUList([fits.PrimaryHDU(), events, gti]).writeto(path, overwrite=True)
     return str(path)
+
+
+class TestObservationTimeSpan:
+    """The interval GOES is asked about.
+
+    It has to be the whole observation. A mode-06 CHU subset can be a few minutes long,
+    and GOES samples once a minute with gaps: 90201037002 asked about ``A06_chu3`` alone,
+    got a time series with no rows, and died in astropy with "cannot guess format from
+    input values with zero-size array".
+    """
+
+    def observation(self, tmp_path, spans, modes=("A01", "B01")):
+        config = make_obsid_tree(tmp_path)
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        for mode, (tstart, tstop) in zip(modes, spans):
+            make_synthetic_event_file(
+                os.path.join(pipedir, f"nu{OBSID}{mode}_cl.evt"), tstart=tstart, tstop=tstop
+            )
+        return config
+
+    def test_it_covers_every_mode_01_file(self, tmp_path):
+        config = self.observation(tmp_path, [(100.0, 900.0), (300.0, 1500.0)])
+
+        tstart, tstop, gti, mjdref = nustar.observation_time_span(OBSID, config)
+
+        assert tstart == pytest.approx(100.0)
+        assert tstop == pytest.approx(1500.0)
+        assert mjdref == pytest.approx(55197.00076601852)
+
+    def test_the_gti_is_the_union_of_the_files(self, tmp_path):
+        config = self.observation(tmp_path, [(0.0, 400.0), (600.0, 1000.0)])
+
+        _, _, gti, _ = nustar.observation_time_span(OBSID, config)
+
+        assert gti.tolist() == [[0.0, 400.0], [600.0, 1000.0]]
+
+    def test_a_gti_wider_than_the_header_wins(self, tmp_path):
+        """ftmerge copies TSTART/TSTOP from its first input, so on a merged file the
+        header can be narrower than the data. Issue 35 in known_issues.rst."""
+        config = self.observation(tmp_path, [(0.0, 1000.0)], modes=("A01",))
+        path = os.path.join(tmp_path, OBSID, "event_pipe", f"nu{OBSID}A01_cl.evt")
+        from astropy.io import fits
+
+        with fits.open(path, mode="update") as hdul:
+            hdul[1].header["TSTART"] = 400.0
+            hdul[1].header["TSTOP"] = 600.0
+
+        tstart, tstop, _, _ = nustar.observation_time_span(OBSID, config)
+
+        assert tstart == pytest.approx(0.0)
+        assert tstop == pytest.approx(1000.0)
+
+    def test_without_mode_01_every_cleaned_file_is_used(self, tmp_path):
+        """80002092003 has no mode-01 data at all, and still has to be asked about."""
+        config = self.observation(tmp_path, [(50.0, 800.0)], modes=("A06",))
+
+        tstart, tstop, _, _ = nustar.observation_time_span(OBSID, config)
+
+        assert tstart == pytest.approx(50.0)
+        assert tstop == pytest.approx(800.0)
+
+    def test_an_observation_with_no_event_file_says_so(self, tmp_path):
+        config = make_obsid_tree(tmp_path)
+
+        with pytest.raises(ValueError, match=OBSID):
+            nustar.observation_time_span(OBSID, config)
+
+
+class TestRequireGoesCoverage:
+    """Fatal on purpose: keeping all the good time would turn the flare filtering off
+    without saying so, which is not the pipeline's decision to make."""
+
+    def test_one_measurement_is_enough(self):
+        assert nustar.require_goes_coverage(1, OBSID, 0.0, 100.0) is None
+
+    def test_no_measurement_raises_naming_the_observation(self):
+        with pytest.raises(nustar.NoGoesCoverage) as excinfo:
+            nustar.require_goes_coverage(0, OBSID, 0.0, 100.0)
+
+        assert OBSID in str(excinfo.value)
 
 
 class TestPlotFlareFiltering:
@@ -475,7 +560,7 @@ class TestPlotFlareFiltering:
         assert len(plt.get_fignums()) == 0, "a figure was left open"
 
     def test_the_goes_panel_is_used_when_the_light_curve_is_there(self, tmp_path):
-        """The panel is filled from ``<root>_goes.fits``, with no second download."""
+        """The panel is filled from the observation's light curve, no second download."""
         pytest.importorskip("matplotlib")
         from astropy.table import Table
 
@@ -483,16 +568,27 @@ class TestPlotFlareFiltering:
         times = np.linspace(0, 1000, 100)
         flux = np.full_like(times, 1e-7)
         flux[40:60] = 1e-5  # an M-class flare in the middle
-        Table({"TIME": times, "XRSA": flux / 10, "XRSB": flux}).write(
-            tmp_path / f"nu{OBSID}_src1_goes.fits"
-        )
+        goes_lc_file = str(tmp_path / f"nu{OBSID}_goes.fits")
+        Table({"TIME": times, "XRSA": flux / 10, "XRSB": flux}).write(goes_lc_file)
 
-        outfile = plot_flare_filtering.fn(event_file, [[0, 1000]], [[0, 400], [600, 1000]])
+        outfile = plot_flare_filtering.fn(
+            event_file, [[0, 1000]], [[0, 400], [600, 1000]], goes_lc_file=goes_lc_file
+        )
 
         assert os.path.getsize(outfile) > 0
 
     def test_it_works_without_a_goes_light_curve(self, tmp_path):
         """A rerun skips the download, so the file may legitimately be missing."""
+        pytest.importorskip("matplotlib")
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+
+        outfile = plot_flare_filtering.fn(
+            event_file, [[0, 1000]], [[0, 1000]], goes_lc_file=str(tmp_path / "gone.fits")
+        )
+
+        assert os.path.getsize(outfile) > 0
+
+    def test_it_works_when_no_light_curve_was_named_at_all(self, tmp_path):
         pytest.importorskip("matplotlib")
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
@@ -567,12 +663,17 @@ class TestPlotFlareFilteringWithoutTheFluxCut:
 
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
         times = np.linspace(0, 1000, 100)
+        goes_lc_file = str(tmp_path / f"nu{OBSID}_goes.fits")
         Table({"TIME": times, "XRSA": np.full(100, 1e-8), "XRSB": np.full(100, 1e-7)}).write(
-            tmp_path / f"nu{OBSID}_src1_goes.fits"
+            goes_lc_file
         )
 
         outfile = plot_flare_filtering.fn(
-            event_file, [[0, 1000]], [[0, 400], [600, 1000]], flux_class=None
+            event_file,
+            [[0, 1000]],
+            [[0, 400], [600, 1000]],
+            goes_lc_file=goes_lc_file,
+            flux_class=None,
         )
 
         assert os.path.getsize(outfile) > 0
@@ -627,16 +728,32 @@ class TestNustarPaths:
     def test_the_derived_names_hang_off_the_event_file_root(self):
         event_file = "out/x/nu123A01_cl.evt"
 
-        assert goes_lc_file_name(event_file) == "out/x/nu123A01_cl_goes.fits"
-        assert goes_gti_file_name(event_file) == "out/x/nu123A01_cl_goes.gti"
         assert flare_filtered_event_file_name(event_file) == "out/x/nu123A01_cl_noflares.evt"
 
-    def test_a_compression_suffix_does_not_end_up_in_the_middle(self):
-        assert goes_lc_file_name("nu123A01_cl.evt.gz") == "nu123A01_cl_goes.fits"
+    def test_the_goes_files_are_per_observation_not_per_event_file(self):
+        """The Sun does not care which module or CHU subset the events came from, and a
+        CHU subset a few minutes long can fall entirely inside a gap in GOES sampling."""
+        assert nu_goes_lc_file(OBSID, self.CONFIG) == os.path.join(
+            "out", OBSID, f"nu{OBSID}_goes.fits"
+        )
+        assert nu_goes_gti_file(OBSID, self.CONFIG) == os.path.join(
+            "out", OBSID, f"nu{OBSID}_goes.gti"
+        )
+
+    def test_the_goes_files_sit_in_the_observation_directory(self):
+        for path in (
+            nu_goes_lc_file(OBSID, self.CONFIG),
+            nu_goes_gti_file(OBSID, self.CONFIG),
+        ):
+            assert os.path.dirname(path) == nu_base_output_path(OBSID, self.CONFIG)
 
 
 class StubHeasoft:
-    """The three HEASOFT calls ``merge_event_files`` makes, recorded, not run."""
+    """The three HEASOFT calls ``merge_event_files`` makes, recorded, not run.
+
+    The files it leaves behind are not empty: ``heasoft.run`` now checks that each tool
+    produced what it said it would, and a real ``ftmerge`` writes a real event file.
+    """
 
     def __init__(self, fail_on=None):
         self.calls = []
@@ -647,7 +764,8 @@ class StubHeasoft:
         if name == self.fail_on:
             raise RuntimeError(f"{name} failed")
         if name == "ftmerge":
-            open(kwargs["outfile"].lstrip("!"), "w").close()
+            with open(kwargs["outfile"].lstrip("!"), "w") as fobj:
+                fobj.write("not a real event file, but not an empty one either")
 
     def ftmerge(self, **kwargs):
         self._record("ftmerge", **kwargs)
@@ -713,7 +831,8 @@ class TestMergeEventFilesTemporary:
 
         def stub_merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
             gti_names.append(outfile_gti)
-            open(outfile_gti, "w").close()
+            with open(outfile_gti, "w") as fobj:
+                fobj.write("not a real GTI file, but not an empty one either")
 
         monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
         monkeypatch.setattr(heasoft, "hsp", StubHeasoft(fail_on=fail_on), raising=False)
@@ -756,19 +875,16 @@ class TestGoesDownloadPath:
     handed a file the other is still writing. See issue 26 in ``docs/known_issues.rst``.
     """
 
-    def test_the_files_land_beside_the_event_file(self):
-        path = nustar.goes_download_path("/data/90901333002/nu123A01_cl.evt")
+    CONFIG = {"out_data_path": "/data"}
 
-        assert path == "/data/90901333002/{file}"
+    def test_the_files_land_in_the_observation_directory(self):
+        path = nustar.goes_download_path("90901333002", self.CONFIG)
 
-    def test_a_bare_file_name_gets_a_real_directory(self):
-        path = nustar.goes_download_path("nu123A01_cl.evt")
-
-        assert os.path.dirname(path) == os.getcwd()
+        assert path == os.path.join("/data", "90901333002", "{file}")
 
     def test_two_observations_do_not_share_a_directory(self):
-        first = nustar.goes_download_path("/data/90901333002/nu1A01_cl.evt")
-        second = nustar.goes_download_path("/data/80002092008/nu2A01_cl.evt")
+        first = nustar.goes_download_path("90901333002", self.CONFIG)
+        second = nustar.goes_download_path("80002092008", self.CONFIG)
 
         assert first != second
 

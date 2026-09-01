@@ -46,6 +46,7 @@ from .barycenter import barycenter_file
 from .image_utils import filter_sources_in_images
 from .utils import (
     NO_SCIENCE_DATA,
+    NoGoesCoverage,
     absolute_config,
     apply_gti,
     binned_lightcurve,
@@ -56,6 +57,7 @@ from .utils import (
     intervals_above_threshold,
     intervals_removed,
     mask_from_gti,
+    merge_intervals,
     read_gti,
     rootname,
     splitext_improved,
@@ -112,6 +114,54 @@ def nu_base_output_path(obsid, config):
         ``<out_data_path>/<OBSID>``, where the merged and barycentred event files go.
     """
     return os.path.join(config["out_data_path"], obsid)
+
+
+def nu_goes_lc_file(obsid, config):
+    """
+    Path of an observation's GOES X-ray light curve.
+
+    One per observation, not one per event file: the Sun does not care which module or
+    which CHU subset the data came from, and fetching it once is the difference between
+    52 downloads and 91.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/nu<OBSID>_goes.fits``.
+
+    Notes
+    -----
+    The ``TIME`` column is in the mission elapsed time of the observation -- not the GOES
+    time scale -- so the solar X-ray flux can be plotted straight against the event times.
+    See :func:`plot_flare_filtering`.
+    """
+    return os.path.join(nu_base_output_path(obsid, config=config), f"nu{obsid}_goes.fits")
+
+
+def nu_goes_gti_file(obsid, config):
+    """
+    Path of an observation's flare-free GTI file.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/nu<OBSID>_goes.gti``.
+    """
+    return os.path.join(nu_base_output_path(obsid, config=config), f"nu{obsid}_goes.gti")
 
 
 def nu_pipeline_output_path(obsid, config):
@@ -452,30 +502,7 @@ def position_is_consistent(position, reference, max_offset):
     return position.separation(reference) <= max_offset
 
 
-def goes_lc_file_name(event_file):
-    """
-    Name of the GOES light-curve file associated with an event file.
-
-    Parameters
-    ----------
-    event_file : str
-        Event file path.
-
-    Returns
-    -------
-    str
-        ``<root>_goes.fits``.
-
-    The file :func:`get_goes_gtis` writes there has a ``TIME`` column in the mission
-    elapsed time of the event file -- not the GOES time scale -- so that the solar X-ray
-    flux can be plotted directly against the event times. See
-    :func:`plot_flare_filtering`.
-    """
-    root = rootname(event_file)
-    return root + "_goes.fits"
-
-
-def goes_download_path(event_file):
+def goes_download_path(obsid, config):
     """
     Where the raw GOES files of an observation are downloaded to.
 
@@ -483,38 +510,22 @@ def goes_download_path(event_file):
     same day want the same GOES file, and when they are reduced at the same time one can
     be handed a file the other is still writing -- the shared directory offers no way to
     tell a finished download from a running one. Each observation therefore keeps its own
-    copy, next to the event file it was fetched for. They are a couple of megabytes each,
-    and having them beside the data is worth more than the duplicate download costs.
+    copy, in its own output directory. They are a couple of megabytes each, and having
+    them beside the data is worth more than the duplicate download costs.
 
     Parameters
     ----------
-    event_file : str
-        Event file path.
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
 
     Returns
     -------
     str
-        A sunpy path template: the event file's directory, plus ``{file}``.
+        A sunpy path template: the observation's output directory, plus ``{file}``.
     """
-    return os.path.join(os.path.dirname(os.path.abspath(event_file)), "{file}")
-
-
-def goes_gti_file_name(event_file):
-    """
-    Name of the solar-flare GTI file associated with an event file.
-
-    Parameters
-    ----------
-    event_file : str
-        Event file path.
-
-    Returns
-    -------
-    str
-        ``<root>_goes.gti``.
-    """
-    root = rootname(event_file)
-    return root + "_goes.gti"
+    return os.path.join(nu_base_output_path(obsid, config=config), "{file}")
 
 
 def flare_filtered_event_file_name(event_file):
@@ -1026,8 +1037,116 @@ def goes_class_to_flux(goes_class):
     return GOES_CLASS_FLUX[goes_class[0].upper()] * float(goes_class[1:])
 
 
-@task(task_run_name="goes_lightcurve_{event_file}_mincat_{minimum_class}")
-def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
+def observation_time_span(obsid, config):
+    """
+    When an observation started and stopped, and the union of its good time intervals.
+
+    Taken from the normal-science (mode 01) cleaned event files, which is what the whole
+    observation looks like: a mode-06 CHU subset covers a few minutes of it, and asking
+    GOES only about those minutes is how a short slice ends up with no solar data at all.
+    When there is no mode-01 file, every cleaned event file in the ``nupipeline`` output
+    directory is used instead.
+
+    ``TSTART``/``TSTOP`` are not trustworthy on their own -- ``ftmerge`` copies them from
+    its first input, so they can be narrower than the merged GTI, issue 35 in
+    ``known_issues.rst``. Since the flare GTI is later ANDed with each file's own, a
+    narrow range would silently delete good time at the edges of the observation: 791 s
+    of the 80002092008 background product. The widest of the header bounds and the GTI
+    extent is taken.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    tstart, tstop : float
+        Mission elapsed time bounds of the observation.
+    gti : numpy.ndarray
+        Shape ``(N, 2)``: the union of the files' good time intervals.
+    mjdref : float
+        The files' reference MJD, for converting to and from civil time.
+
+    Raises
+    ------
+    ValueError
+        If the observation has no cleaned event file to read a time from.
+    """
+    from astropy.io import fits
+
+    files = [infile for _, infile in mode_01_input_files(obsid, config)]
+    if not files:
+        files = _cl_event_files(
+            nu_pipeline_output_path(obsid, config=config), f"nu{obsid}[AB]*_cl.evt*"
+        )
+    if not files:
+        raise ValueError(f"No cleaned event file to take a time span from in {obsid}")
+
+    starts = []
+    stops = []
+    gtis = []
+    mjdref = None
+    for path in files:
+        with fits.open(path) as hdul:
+            header = hdul[1].header
+            gti = read_gti(hdul)
+        starts.append(float(header["TSTART"]))
+        stops.append(float(header["TSTOP"]))
+        mjdref = header["MJDREFI"] + header["MJDREFF"]
+        if len(gti):
+            starts.append(float(gti[:, 0].min()))
+            stops.append(float(gti[:, 1].max()))
+            gtis.append(gti)
+
+    gti = merge_intervals(np.vstack(gtis)) if gtis else np.zeros((0, 2))
+    return min(starts), max(stops), gti, mjdref
+
+
+def require_goes_coverage(npoints, obsid, tstart, tstop):
+    """
+    Raise unless GOES has at least one measurement inside an observation.
+
+    Fatal on purpose. Keeping all the good time when there is no solar data would turn
+    the flare filtering off without saying so, and whether an observation may be analysed
+    that way is a scientific decision the pipeline must not make on its own.
+
+    Takes a count rather than the time series itself, so that it can be tested without
+    ``sunpy`` -- an optional dependency.
+
+    Parameters
+    ----------
+    npoints : int
+        Number of GOES samples left after truncating to the observation.
+    obsid : str
+        Observation identifier, for the message.
+    tstart, tstop : float
+        Mission elapsed time bounds that were asked for, for the message.
+
+    Raises
+    ------
+    heasarc_retrieve_pipeline.utils.NoGoesCoverage
+        If ``npoints`` is zero.
+
+    Examples
+    --------
+    >>> require_goes_coverage(1, "90201037002", 0.0, 100.0)
+    >>> require_goes_coverage(0, "90201037002", 0.0, 100.0)
+    Traceback (most recent call last):
+        ...
+    heasarc_retrieve_pipeline.utils.NoGoesCoverage: No GOES ...
+    """
+    if npoints == 0:
+        raise NoGoesCoverage(
+            f"No GOES X-ray measurement covers {obsid} (MET {tstart} -- {tstop}). "
+            "Solar flares cannot be filtered out without them."
+        )
+
+
+@task(task_run_name="goes_lightcurve_{obsid}_mincat_{minimum_class}")
+def get_goes_gtis(obsid, config, minimum_class="C5.0", flux_class="C5.0"):
     """
     Build good time intervals that exclude solar flares.
 
@@ -1035,7 +1154,14 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     flares raise its background substantially. This task looks up the flares that occurred
     during an observation and produces the complementary GTIs.
 
-    The steps are: convert the observation's ``TSTART``/``TSTOP`` from NuSTAR
+    **Once per observation, not once per event file.** The Sun does not care which module
+    or which CHU subset the data came from, and a mode-06 CHU slice a few minutes long can
+    fall entirely inside a gap in the GOES sampling -- which is how 90201037002 died with
+    ``cannot guess format from input values with zero-size array``. Asking about the whole
+    observation also cut the 2026 M82 run from 91 fetches to 52, and every fetch is a
+    chance to meet a VSO mirror that is down.
+
+    The steps are: convert the observation's time span from NuSTAR
     mission-elapsed time to civil time; ask ``sunpy``'s ``Fido`` for the GOES XRS data of
     that interval, picking the highest-numbered (most recent) satellite that covers it;
     retrieve the HEK flare catalogue entries flagged by SWPC; and cut out every catalogued
@@ -1058,16 +1184,18 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     A, B, C, M, X, which is alphabetical, so comparing the letters as characters gives the
     correct ordering.
 
-    The time range searched is the wider of the header's ``TSTART``/``TSTOP`` and the
-    event file's own GTI extent. On a merged file those disagree, and the GTI is the
-    honest one.
+    The time range searched comes from :func:`observation_time_span`: the wider of the
+    mode-01 headers' ``TSTART``/``TSTOP`` and those files' own GTI extent. On a merged
+    file those disagree, and the GTI is the honest one.
 
     Returns the existing file unchanged if it is already present.
 
     Parameters
     ----------
-    event_file : str
-        Event file whose time range defines the search interval.
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
     minimum_class : str, optional
         Smallest **catalogued** flare class to exclude, e.g. ``"C5.0"``.
     flux_class : str or None, optional
@@ -1082,25 +1210,30 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         which catalogued flares are excluded is a reasonable thing to want, and it must
         not silently destroy the observation.
 
-    The GOES X-ray light curve is also written to :func:`goes_lc_file_name`, on the event
-    file's own time scale, so that :func:`plot_flare_filtering` can show what the Sun was
-    doing without downloading anything a second time.
+    The GOES X-ray light curve is also written to :func:`nu_goes_lc_file`, on the
+    observation's own time scale, so that :func:`plot_flare_filtering` can show what the
+    Sun was doing without downloading anything a second time.
 
     Returns
     -------
     str
-        Path of the GTI file, ``<root>_goes.gti``.
+        Path of the GTI file, :func:`nu_goes_gti_file`.
+
+    Raises
+    ------
+    heasarc_retrieve_pipeline.utils.NoGoesCoverage
+        If GOES has no measurement inside the observation.
+    RuntimeError
+        If solar flares cover the whole observation.
     """
     from sunpy import timeseries as ts
     from sunpy.net import Fido
     from sunpy.net import attrs as a
     from sunpy.time import parse_time
-    from astropy.io import fits
-    from astropy.io.fits import getheader
     from astropy.table import Table
     from nustar_gen import info, utils
 
-    outfile_gti = goes_gti_file_name(event_file)
+    outfile_gti = nu_goes_gti_file(obsid, config)
 
     if os.path.exists(outfile_gti):
         logger = get_run_logger()
@@ -1111,23 +1244,13 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     min_num = float(minimum_class[1:])
 
     logger = get_run_logger()
-    logger.info(f"Creating GOES light curve and GTIs for {event_file}")
+    logger.info(f"Creating GOES light curve and GTIs for {obsid}")
 
     ns = info.NuSTAR()
-    hdr = getheader(event_file, ext=1)
-    with fits.open(event_file) as hdul:
-        file_gti = read_gti(hdul)
-
-    # TSTART/TSTOP are not trustworthy on a merged file: ftmerge copies them from its
-    # first input, so they can be narrower than the merged GTI (issue 35 in
-    # known_issues.rst). Since this GTI is later ANDed with the event file's own, a
-    # narrow range would silently delete good time at the edges of the observation --
-    # 791 s of the 80002092008 background product. Take whichever bound is wider.
-    tstart = min(hdr["TSTART"], file_gti[:, 0].min()) if len(file_gti) else hdr["TSTART"]
-    tstop = max(hdr["TSTOP"], file_gti[:, 1].max()) if len(file_gti) else hdr["TSTOP"]
+    tstart, tstop, file_gti, mjdref = observation_time_span(obsid, config)
+    os.makedirs(nu_base_output_path(obsid, config=config), exist_ok=True)
     datestart = ns.met_to_time(tstart)
     dateend = ns.met_to_time(tstop)
-    mjdref = hdr["MJDREFI"] + hdr["MJDREFF"]
 
     result = Fido.search(
         a.Time(datestart.fits, dateend.fits), a.Resolution("avg1m"), a.Instrument("XRS")
@@ -1139,14 +1262,18 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
         a.Instrument.xrs & a.goes.SatelliteNumber(sat_id) & a.Resolution("avg1m")
         | a.hek.FL & (a.hek.FRM.Name == "SWPC"),
     )
-    files = Fido.fetch(result3, progress=False, path=goes_download_path(event_file))
+    files = Fido.fetch(result3, progress=False, path=goes_download_path(obsid, config))
     goes_all = ts.TimeSeries(files, concatenate=True)
     goes = goes_all.truncate(datestart.iso, dateend.iso)
+    # Before anything asks for goes.time: building a Time from an empty index raises
+    # "cannot guess format from input values with zero-size array", which says nothing
+    # about what actually went wrong.
+    require_goes_coverage(len(goes.to_dataframe()), obsid, tstart, tstop)
 
     hek_results = result3["hek"]
     flares_hek = hek_results
 
-    outfile_lc = goes_lc_file_name(event_file)
+    outfile_lc = nu_goes_lc_file(obsid, config)
     goes_table = goes.to_table()
     # sunpy names the time column after the source file's own index -- "date" for XRS --
     # and gives it as datetime64, so take the times from the TimeSeries itself instead.
@@ -1198,7 +1325,7 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     good = good_intervals(bad, tstart, tstop)
     if len(good) == 0:
         raise RuntimeError(
-            f"Solar flares cover the whole of {event_file} (MET {tstart} -- {tstop}); no "
+            f"Solar flares cover the whole of {obsid} (MET {tstart} -- {tstop}); no "
             f"good time is left. If flux_class={flux_class} is below the Sun's quiescent "
             f"1-8 A flux, raise it: that alone will exclude everything."
         )
@@ -1216,7 +1343,7 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     if before > 0 and after < 0.5 * before:
         logger.warning(
             f"Flare filtering would remove {100 * (1 - after / before):.0f}% of the good "
-            f"time in {event_file} ({before:.0f} -> {after:.0f} s). If that is not a "
+            f"time in {obsid} ({before:.0f} -> {after:.0f} s). If that is not a "
             f"genuinely flare-dominated observation, flux_class={flux_class} is probably "
             f"below the Sun's quiescent 1-8 A flux for this epoch. Check the diagnostic "
             f"figure written next to the filtered file."
@@ -1277,6 +1404,7 @@ def plot_flare_filtering(
     gti_before,
     gti_after,
     outfile=None,
+    goes_lc_file=None,
     dt=100.0,
     minimum_class="C5.0",
     flux_class="C5.0",
@@ -1313,6 +1441,11 @@ def plot_flare_filtering(
     outfile : str, optional
         Where to write the figure. Defaults to ``<root>_flares.jpg``, next to the event
         file, following the convention of :mod:`heasarc_retrieve_pipeline.image_utils`.
+    goes_lc_file : str, optional
+        The observation's GOES light curve, :func:`nu_goes_lc_file`, drawn in the top
+        panel. One per observation, so the caller passes it rather than deriving it from
+        the event file. Omitting it, or naming a file that is not there, leaves the panel
+        empty -- a rerun skips the download, so its absence is not an error.
     dt : float, optional
         Light-curve bin width in seconds.
     minimum_class : str, optional
@@ -1356,9 +1489,8 @@ def plot_flare_filtering(
     fig = Figure(figsize=(11, 9))
     axes = fig.subplots(3, 1, sharex=True)
 
-    goes_file = goes_lc_file_name(event_file)
-    if os.path.exists(goes_file):
-        goes = Table.read(goes_file)
+    if goes_lc_file is not None and os.path.exists(goes_lc_file):
+        goes = Table.read(goes_lc_file)
         for column, label, colour in (
             ("XRSB", "GOES 1--8 $\\AA$", "tab:red"),
             ("XRSA", "GOES 0.5--4 $\\AA$", "tab:blue"),
@@ -1387,11 +1519,11 @@ def plot_flare_filtering(
         axes[0].plot([], [], " ", label=f"HEK catalogue $\\geq$ {minimum_class}")
         axes[0].legend(loc="upper right", fontsize="small", ncol=4)
     else:
-        logger.warning(f"No GOES light curve at {goes_file}; leaving that panel empty")
+        logger.warning(f"No GOES light curve at {goes_lc_file}; leaving that panel empty")
         axes[0].text(
             0.5,
             0.5,
-            f"no GOES light curve at {os.path.basename(goes_file)}",
+            f"no GOES light curve at {os.path.basename(goes_lc_file or '')}",
             ha="center",
             transform=axes[0].transAxes,
             color="0.4",
@@ -1462,13 +1594,15 @@ def plot_flare_filtering(
 
 
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
-def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"):
+def filter_from_solar_flares(
+    event_file, goes_gti_file, goes_lc_file=None, minimum_class="C5.0", flux_class="C5.0"
+):
     """
     Write a flare-free copy of an event file.
 
-    Combines the event file's own GTIs with the flare-free intervals from
-    :func:`get_goes_gtis` using a logical AND, and writes the result as
-    ``<root>_noflares.evt``.
+    Combines the event file's own GTIs with the observation's flare-free intervals, which
+    :func:`get_goes_gtis` worked out once for the whole observation, using a logical AND,
+    and writes the result as ``<root>_noflares.evt``.
 
     The events recorded during the excluded intervals are removed from the event table and
     the exposure keywords are corrected, by
@@ -1482,11 +1616,17 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"
     ----------
     event_file : str
         Event file to filter.
+    goes_gti_file : str
+        The observation's flare-free GTI file, from :func:`get_goes_gtis`. Passed in
+        rather than looked up so that the fetch happens once per observation and the
+        dependency is visible at the call site.
+    goes_lc_file : str, optional
+        The observation's GOES light curve, for the diagnostic figure.
     minimum_class : str, optional
-        Smallest catalogued flare class to exclude.
+        Smallest catalogued flare class that was excluded. Used only to label the figure.
     flux_class : str or None, optional
-        Also exclude every minute in which the measured GOES 1--8 A flux reaches this
-        class. See :func:`get_goes_gtis` for why this is separate from ``minimum_class``.
+        The flux cut that was applied, likewise only for the figure. See
+        :func:`get_goes_gtis` for why this is separate from ``minimum_class``.
 
     A diagnostic figure, ``<root>_flares.jpg``, is written alongside by
     :func:`plot_flare_filtering`. Failing to draw it is logged, not raised: the science
@@ -1509,9 +1649,7 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"
         logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
         return outfile_filtered
 
-    outfile_gti_goes = get_goes_gtis(event_file, minimum_class=minimum_class, flux_class=flux_class)
-
-    merge_gtis([event_file, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+    merge_gtis([event_file, goes_gti_file], outfile_gti_temp, gti_operation="AND")
 
     with fits.open(event_file) as hdul, fits.open(outfile_gti_temp) as gti_hdul:
         gti_before = read_gti(hdul)
@@ -1536,6 +1674,7 @@ def filter_from_solar_flares(event_file, minimum_class="C5.0", flux_class="C5.0"
             event_file,
             gti_before,
             gti_after,
+            goes_lc_file=goes_lc_file,
             minimum_class=minimum_class,
             flux_class=flux_class,
         )
@@ -1855,7 +1994,9 @@ def get_best_source_regions(obsid, config):
 @task(
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
-def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=None):
+def calculate_spectra(
+    obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=None, goes_gti_file=None
+):
     """
     Extract calibrated spectra with HEASOFT ``nuproducts``.
 
@@ -1888,6 +2029,10 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
     ra, dec : float, optional
         Mode-01 source position, in degrees. Mode-06 detections are required to fall within
         ``config["max_source_offset_arcmin"]`` of it.
+    goes_gti_file : str, optional
+        The observation's flare-free GTI file. ``None`` asks :func:`get_goes_gtis` for it,
+        which is what makes this function usable on its own; the flow passes the one it
+        already has, so the GOES data are fetched once per observation.
 
     Notes
     -----
@@ -1904,6 +2049,10 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
         logger.info(f"Spectra for {obsid} already calculated")
         return
     os.makedirs(outdir, exist_ok=True)
+
+    if goes_gti_file is None:
+        goes_gti_file = get_goes_gtis(obsid, config)
+
     logger.info(f"Calculating spectra in directory {outdir}")
 
     reference = None
@@ -1937,9 +2086,8 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
             logger.warning(f"No usable extraction region for {infile}, skipping")
             continue
 
-        outfile_gti_goes = get_goes_gtis(infile)
         outfile_gti_temp = os.path.join(filedir, root_name + "_noflares.gti")
-        merge_gtis([infile, outfile_gti_goes], outfile_gti_temp, gti_operation="AND")
+        merge_gtis([infile, goes_gti_file], outfile_gti_temp, gti_operation="AND")
         if not os.path.exists(outfile_gti_temp):
             logger.warning(f"Flare-free GTI file missing for {infile}, skipping")
             problems += 1
@@ -2077,12 +2225,19 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     source_files = source_future.result()
     background_files = background_future.result()
 
+    # One GOES fetch for the whole observation. Doing it per file made 91 downloads out of
+    # 52 observations in the 2026 run, each one a chance to meet a VSO mirror that is down,
+    # and asked GOES about CHU subsets too short to be covered at all.
+    goes_gti_file = get_goes_gtis(obsid, config)
+
     # Source and background go through the same flare filter, so that they share one GTI.
     # Subtracting an unfiltered background from a filtered source over-subtracts: flare
     # stray light is diffuse, so it lands mostly in the large background region. On
     # 80002092008 the unfiltered background is 3.7% too high in 3--10 keV.
     for fname in source_files + background_files:
-        filter_from_solar_flares(fname)
+        filter_from_solar_flares(
+            fname, goes_gti_file, goes_lc_file=nu_goes_lc_file(obsid, config)
+        )
 
     # barycenter_data globs the output directory rather than taking the file list, so the
     # join is a real dependency that no argument expresses.
@@ -2092,4 +2247,4 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
 
     # ra and dec come from get_best_source_regions, and filter_from_solar_flares is a
     # subflow, which runs synchronously and raises: both dependencies already hold.
-    calculate_spectra(obsid, config, ra=ra, dec=dec)
+    calculate_spectra(obsid, config, ra=ra, dec=dec, goes_gti_file=goes_gti_file)
