@@ -877,3 +877,67 @@ class TestLongestOutputName:
         longest = nu_longest_output_name(OBSID, {"out_data_path": root})
 
         assert len(longest) - len(root) == 61
+
+
+class TestRecoverSpacecraftScienceWithoutMode06:
+    """An observation with no mode-06 data must still finish the step.
+
+    Not every observation has spacecraft-science data: CHU4, the star tracker on the
+    optics bench, only loses its solution when the Sun or the Moon blinds it. Four of the
+    56 M82 observations reprocessed in 2026 had good mode-01 science and no mode-06 at
+    all -- 30202022003, 30202022007, 90202038001 and 90901332001 -- and every one of them
+    failed the whole observation on ``FileNotFoundError`` for the sentinel, because
+    ``nusplitsc`` never ran and so never created the directory it was to be written in.
+    """
+
+    def config(self, tmp_path):
+        return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+    def raw_and_pipeline_dirs(self, tmp_path, modes=()):
+        """Lay out the input tree, with a cleaned event file for each mode given."""
+        config = self.config(tmp_path)
+        ev_dir = nu_pipeline_output_path(OBSID, config)
+        hk_dir = os.path.join(nu_local_raw_data_path(OBSID, config), "hk")
+        os.makedirs(ev_dir, exist_ok=True)
+        os.makedirs(hk_dir, exist_ok=True)
+        for mode in modes:
+            for fpm in "AB":
+                open(os.path.join(ev_dir, f"nu{OBSID}{fpm}{mode}_cl.evt"), "w").close()
+                open(os.path.join(ev_dir, f"nu{OBSID}{fpm}_fpm.hk"), "w").close()
+        open(os.path.join(hk_dir, f"nu{OBSID}_chu123.fits"), "w").close()
+        return config
+
+    def run(self, tmp_path, monkeypatch, modes=()):
+        called = []
+
+        def stub_run(name, *args, **kwargs):
+            called.append((name, kwargs))
+            os.makedirs(kwargs["outdir"], exist_ok=True)
+            return None
+
+        monkeypatch.setattr(nustar.heasoft, "run", stub_run)
+        config = self.raw_and_pipeline_dirs(tmp_path, modes=modes)
+        splitdir = nustar.recover_spacecraft_science_data.fn(OBSID, config)
+        return splitdir, called
+
+    def test_it_does_not_raise_when_there_is_no_mode_06(self, tmp_path, monkeypatch):
+        splitdir, called = self.run(tmp_path, monkeypatch, modes=("01", "02", "03"))
+
+        assert splitdir == split_path(OBSID, self.config(tmp_path))
+        assert called == []
+
+    def test_the_sentinel_is_written_even_with_nothing_to_split(self, tmp_path, monkeypatch):
+        splitdir, _ = self.run(tmp_path, monkeypatch, modes=("01",))
+
+        assert os.path.exists(os.path.join(splitdir, "RECOVER_DONE.TXT"))
+
+    def test_a_second_run_skips_the_work(self, tmp_path, monkeypatch):
+        self.run(tmp_path, monkeypatch, modes=("01",))
+        _, called_again = self.run(tmp_path, monkeypatch, modes=("01", "06"))
+
+        assert called_again == [], "the sentinel should have stopped it"
+
+    def test_mode_06_still_gets_split(self, tmp_path, monkeypatch):
+        _, called = self.run(tmp_path, monkeypatch, modes=("01", "06"))
+
+        assert [name for name, _ in called] == ["nusplitsc", "nusplitsc"]

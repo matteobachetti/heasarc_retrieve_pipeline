@@ -636,6 +636,12 @@ def recover_spacecraft_science_data(obsid, config):
     offset and they must be treated as separate sub-observations. The result typically adds
     of order 10-20 per cent more exposure, at the cost of degraded pointing accuracy.
 
+    Not every observation has mode-06 data: CHU4 only loses its solution when the Sun or
+    the Moon blinds it, and an observation that never happened to point that way has
+    nothing to recover. That is not a failure, and neither is a slew, which has no science
+    data of any mode. Both leave ``nusplitsc`` with nothing to do, and the step still
+    creates the split directory and writes its sentinel, so the observation carries on.
+
     Writes a ``RECOVER_DONE.TXT`` sentinel in the split directory and returns early if it
     already exists.
 
@@ -651,7 +657,7 @@ def recover_spacecraft_science_data(obsid, config):
     str
         The ``split`` directory.
     """
-    logger = get_run_logger()
+    logger = get_logger()
     logger.info(f"Squeezing every photon from spacecraft science data in {obsid}")
     datadir = nu_local_raw_data_path(obsid, config)
     ev_dir = nu_pipeline_output_path(obsid, config)
@@ -664,6 +670,13 @@ def recover_spacecraft_science_data(obsid, config):
     if os.path.exists(recover_done_file):
         logger.info("Processing done")
         return splitdir
+
+    if not evfiles_06:
+        logger.info(f"No spacecraft science (mode 06) data in {obsid}; nothing to split")
+
+    # nusplitsc makes this directory itself, but only if it has something to split. The
+    # sentinel below has to land somewhere either way.
+    os.makedirs(splitdir, exist_ok=True)
 
     for evfile in evfiles_06:
         evfile_base = os.path.split(evfile)[1]
