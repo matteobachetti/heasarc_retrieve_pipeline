@@ -679,7 +679,7 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
 
     # No return-code check here: heasoft.run_task raises on a non-zero code, with the
     # tool's own output in the message.
-    heasoft.run_task("nupipeline", **params)
+    heasoft.run_task("nupipeline", produces=ev_dir, **params)
 
     open(pipe_done_file, "a").close()
 
@@ -758,6 +758,7 @@ def recover_spacecraft_science_data(obsid, config):
 
         heasoft.run(
             "nusplitsc",
+            produces=splitdir,
             infile=evfile,
             chu123hkfile=chu123hkfile,
             hkfile=hkfile,
@@ -796,6 +797,7 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
 
     heasoft.run(
         "ftmgtime",
+        produces=outfile_gti,
         ingtis=",".join([f + "[GTI]" for f in files_to_join]),
         outgti=outfile_gti,
         merge=gti_operation,
@@ -805,13 +807,22 @@ def merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
     # "[1]" is not decoration: ftmgtime writes an empty primary header, and ftsort with a
     # bare file name lands on it and dies with CFITSIO ERROR NOT_TABLE (return code 235).
     heasoft.run(
-        "ftsort", infile=outfile_gti + "[1]", outfile="!" + outfile_gti, columns="START"
+        "ftsort",
+        produces="!" + outfile_gti,
+        infile=outfile_gti + "[1]",
+        outfile="!" + outfile_gti,
+        columns="START",
     )
 
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
     heasoft.run(
-        "fthedit", infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
+        "fthedit",
+        produces=heasoft.IN_PLACE(outfile_gti),
+        infile=outfile_gti + "+1",
+        keyword="EXTNAME",
+        operation="a",
+        value="GTI",
     )
 
 
@@ -854,18 +865,33 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
         logger.info(f"Creating event file {outfile} from {files_to_join}")
 
         heasoft.run(
-            "ftmerge", infile=",".join(files_to_join), outfile=outfile, copyall="NO"
+            "ftmerge",
+            produces=outfile,
+            infile=",".join(files_to_join),
+            outfile=outfile,
+            copyall="NO",
         )
 
         logger.info(f"Sorting event file {outfile}")
 
-        heasoft.run("ftsort", infile=outfile, outfile="!" + outfile, columns="TIME")
+        heasoft.run(
+            "ftsort",
+            produces="!" + outfile,
+            infile=outfile,
+            outfile="!" + outfile,
+            columns="TIME",
+        )
 
         logger.info(
             f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
         )
 
-        heasoft.run("fappend", infile=f"{outfile_gti}[1]", outfile=outfile)
+        heasoft.run(
+            "fappend",
+            produces=heasoft.IN_PLACE(outfile),
+            infile=f"{outfile_gti}[1]",
+            outfile=outfile,
+        )
     finally:
         if os.path.exists(outfile_gti):
             logger.info(f"Removing {outfile_gti}")
@@ -1202,11 +1228,13 @@ def get_goes_gtis(event_file, minimum_class="C5.0", flux_class="C5.0"):
     logger.info(f"Changing extension name to GTI in {outfile_gti}")
 
     heasoft.run(
-        "fthedit", infile=outfile_gti + "+1", keyword="EXTNAME", operation="a", value="GTI"
+        "fthedit",
+        produces=heasoft.IN_PLACE(outfile_gti),
+        infile=outfile_gti + "+1",
+        keyword="EXTNAME",
+        operation="a",
+        value="GTI",
     )
-
-    if not os.path.exists(outfile_gti):
-        raise RuntimeError(f"Failed to create GTI file {outfile_gti}")
 
     return outfile_gti
 
@@ -1939,7 +1967,14 @@ def calculate_spectra(obsid, config, src_reg=None, bkg_reg=None, ra=None, dec=No
             grpphafile=os.path.join(outdir, stem + "_grp.pha"),
         )
         logger.debug("nuproducts " + " ".join(f"{k}={v}" for k, v in params.items()))
-        heasoft.run("nuproducts", params, noprompt=True, clobber=True, verbose=True)
+        heasoft.run(
+            "nuproducts",
+            params,
+            produces=params["grpphafile"],
+            noprompt=True,
+            clobber=True,
+            verbose=True,
+        )
 
     if problems > 0:
         logger.warning(

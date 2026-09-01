@@ -6,6 +6,7 @@ parameter file about one time in ten. See :mod:`heasarc_retrieve_pipeline.heasof
 """
 
 import ast
+import inspect
 import os
 import pathlib
 import threading
@@ -52,7 +53,7 @@ class TestOneToolAtATime:
         monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(ftmerge=tool), raising=False)
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        call_from_threads(lambda: heasoft.run("ftmerge", infile="a", outfile="b"))
+        call_from_threads(lambda: heasoft.run("ftmerge", produces=[], infile="a", outfile="b"))
 
         assert tool.calls == 8
         assert tool.most_at_once == 1
@@ -66,7 +67,10 @@ class TestOneToolAtATime:
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         names = ["ftmerge", "ftsort"] * 4
-        threads = [threading.Thread(target=heasoft.run, args=(name,)) for name in names]
+        threads = [
+            threading.Thread(target=heasoft.run, args=(name,), kwargs={"produces": []})
+            for name in names
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -82,7 +86,7 @@ class TestOneToolAtATime:
         )
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        call_from_threads(lambda: heasoft.run_task("nupipeline", indir="x"))
+        call_from_threads(lambda: heasoft.run_task("nupipeline", produces=[], indir="x"))
 
         assert tool.most_at_once == 1
 
@@ -92,13 +96,13 @@ class TestOneToolAtATime:
         )
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft.run("ftlist", infile="x") == {"infile": "x"}
+        assert heasoft.run("ftlist", produces=[], infile="x") == {"infile": "x"}
 
     def test_without_heasoftpy_the_error_says_so(self, monkeypatch):
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", False)
 
         with pytest.raises(ImportError, match="heasoftpy"):
-            heasoft.run("ftlist", infile="x")
+            heasoft.run("ftlist", produces=[], infile="x")
 
 
 class TestFailuresAreNoticed:
@@ -121,7 +125,7 @@ class TestFailuresAreNoticed:
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         with pytest.raises(RuntimeError) as excinfo:
-            heasoft.run("fappend", infile="a[1]", outfile="b")
+            heasoft.run("fappend", produces=[], infile="a[1]", outfile="b")
 
         assert "fappend" in str(excinfo.value)
         assert "no such extension" in str(excinfo.value)
@@ -133,7 +137,7 @@ class TestFailuresAreNoticed:
         )
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft.run("ftlist", infile="a") is good
+        assert heasoft.run("ftlist", produces=[], infile="a") is good
 
     def test_the_task_interface_checks_too(self, monkeypatch):
         monkeypatch.setattr(
@@ -145,7 +149,7 @@ class TestFailuresAreNoticed:
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         with pytest.raises(RuntimeError, match="nupipeline"):
-            heasoft.run_task("nupipeline", indir="x")
+            heasoft.run_task("nupipeline", produces=[], indir="x")
 
     def test_a_result_without_a_return_code_is_left_alone(self, monkeypatch):
         """Not every tool wrapper returns an ``HSPResult``; do not invent a failure."""
@@ -154,7 +158,111 @@ class TestFailuresAreNoticed:
         )
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft.run("ftlist", infile="a") is None
+        assert heasoft.run("ftlist", produces=[], infile="a") is None
+
+
+class TestAToolMustProduceWhatItPromised:
+    """A zero return code is not evidence that a file was written.
+
+    Measured on a real run: ``ftmgtime`` was handed an empty list of input GTIs, returned
+    0, wrote nothing at all, and the failure only surfaced one step later as ``ftsort
+    failed with return code 33`` -- pointing at the wrong tool entirely.
+    """
+
+    def written(self, path, content="something"):
+        path.write_text(content)
+        return str(path)
+
+    def test_an_existing_non_empty_file_passes(self, tmp_path):
+        heasoft._check_outputs("ftmerge", self.written(tmp_path / "a.fits"))
+
+    def test_a_list_of_files_all_have_to_be_there(self, tmp_path):
+        first = self.written(tmp_path / "a.fits")
+        heasoft._check_outputs("ftmerge", [first, self.written(tmp_path / "b.fits")])
+
+        with pytest.raises(RuntimeError, match="missing.fits"):
+            heasoft._check_outputs("ftmerge", [first, str(tmp_path / "missing.fits")])
+
+    def test_a_missing_file_raises_naming_the_tool_and_the_path(self, tmp_path):
+        with pytest.raises(RuntimeError) as excinfo:
+            heasoft._check_outputs("ftmgtime", str(tmp_path / "nowhere.gti"))
+
+        assert "ftmgtime" in str(excinfo.value)
+        assert "nowhere.gti" in str(excinfo.value)
+
+    def test_an_empty_file_raises(self, tmp_path):
+        empty = self.written(tmp_path / "empty.gti", content="")
+
+        with pytest.raises(RuntimeError, match="empty.gti"):
+            heasoft._check_outputs("ftmgtime", empty)
+
+    def test_a_directory_with_something_in_it_passes(self, tmp_path):
+        splitdir = tmp_path / "split"
+        splitdir.mkdir()
+        self.written(splitdir / "chu1.evt")
+
+        heasoft._check_outputs("nusplitsc", str(splitdir))
+
+    def test_an_empty_directory_raises(self, tmp_path):
+        splitdir = tmp_path / "split"
+        splitdir.mkdir()
+
+        with pytest.raises(RuntimeError, match="split"):
+            heasoft._check_outputs("nusplitsc", str(splitdir))
+
+    def test_in_place_checks_the_file_is_still_there(self, tmp_path):
+        edited = self.written(tmp_path / "merged.gti")
+
+        heasoft._check_outputs("fthedit", heasoft.IN_PLACE(edited))
+
+        with pytest.raises(RuntimeError, match="gone.gti"):
+            heasoft._check_outputs("fthedit", heasoft.IN_PLACE(str(tmp_path / "gone.gti")))
+
+    def test_the_clobber_marker_is_not_part_of_the_name(self, tmp_path):
+        """HEASOFT reads a leading ``!`` as "overwrite this"; the file on disk has no ``!``."""
+        self.written(tmp_path / "sorted.evt")
+
+        heasoft._check_outputs("ftsort", "!" + str(tmp_path / "sorted.evt"))
+
+    def test_a_tool_that_returns_zero_and_writes_nothing_still_raises(
+        self, monkeypatch, tmp_path
+    ):
+        """The whole point: the check runs after the return code has already said fine."""
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(ftmgtime=lambda **kw: SimpleNamespace(returncode=0)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        with pytest.raises(RuntimeError, match="ftmgtime"):
+            heasoft.run("ftmgtime", produces=str(tmp_path / "never.gti"), ingtis="")
+
+    def test_run_task_checks_its_outputs_too(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(
+                HSPTask=lambda name: lambda **kw: SimpleNamespace(returncode=0)
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        with pytest.raises(RuntimeError, match="nupipeline"):
+            heasoft.run_task("nupipeline", produces=str(tmp_path / "no_such_dir"), indir="x")
+
+
+def test_produces_is_a_required_argument():
+    """Keep it mandatory. A caller who has to write the output down cannot forget that a
+    zero return code proves nothing."""
+    for function in (heasoft.run, heasoft.run_task):
+        parameters = inspect.signature(function).parameters
+
+        assert "produces" in parameters, f"{function.__name__} lost its produces argument"
+        assert parameters["produces"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters["produces"].default is inspect.Parameter.empty
 
 
 MODULES = sorted(
@@ -234,7 +342,7 @@ class TestPrivatePfilesAreHeldOnTo:
         seen = self.seen_by_the_tool(monkeypatch)
         monkeypatch.setenv("PFILES", "/home/someone/pfiles;/opt/heasoft/syspfiles")
 
-        heasoft.run("ftlist", infile="a")
+        heasoft.run("ftlist", produces=[], infile="a")
 
         assert seen == [expected]
 
@@ -242,7 +350,7 @@ class TestPrivatePfilesAreHeldOnTo:
         expected = self.worker(monkeypatch, tmp_path)
         seen = self.seen_by_the_tool(monkeypatch)
 
-        heasoft.run("ftlist", infile="a")
+        heasoft.run("ftlist", produces=[], infile="a")
 
         assert seen == [expected]
 
@@ -252,7 +360,7 @@ class TestPrivatePfilesAreHeldOnTo:
         seen = self.seen_by_the_tool(monkeypatch)
         monkeypatch.setenv("PFILES", "/whatever;/else")
 
-        heasoft.run("ftlist", infile="a")
+        heasoft.run("ftlist", produces=[], infile="a")
 
         assert seen == ["/whatever;/else"]
 
@@ -274,6 +382,6 @@ class TestPrivatePfilesAreHeldOnTo:
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
         monkeypatch.setenv("PFILES", "/home/someone/pfiles;/opt/heasoft/syspfiles")
 
-        heasoft.run_task("nupipeline", indir="a")
+        heasoft.run_task("nupipeline", produces=[], indir="a")
 
         assert seen == [expected]

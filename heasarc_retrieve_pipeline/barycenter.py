@@ -98,6 +98,7 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=
 
     heasoft.run(
         "barycorr",
+        produces=outfile,
         infile=infile,
         outfile=outfile,
         ra=ra,

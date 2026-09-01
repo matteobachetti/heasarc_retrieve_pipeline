@@ -144,6 +144,46 @@ def test_run_name_templates_only_name_real_parameters(path):
             )
 
 
+def heasoft_calls_without_produces(source):
+    """
+    ``heasoft.run``/``heasoft.run_task`` calls that do not say what they produce.
+
+    A zero return code is not evidence that a file was written, so the wrapper checks --
+    but only if the call site names the output.
+
+    Examples
+    --------
+    >>> heasoft_calls_without_produces('heasoft.run("ftsort", infile="a")')
+    ['ftsort']
+    >>> heasoft_calls_without_produces('heasoft.run("ftsort", produces="b", infile="a")')
+    []
+    """
+    tree = ast.parse(source)
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in ("run", "run_task")):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "heasoft"):
+            continue
+        if any(keyword.arg == "produces" for keyword in node.keywords):
+            continue
+        first = node.args[0] if node.args else None
+        offenders.append(first.value if isinstance(first, ast.Constant) else "?")
+    return offenders
+
+
+@pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
+def test_every_heasoft_call_says_what_it_produces(path):
+    """Measured on a real run: ftmgtime with no input GTIs exits 0 and writes nothing, and
+    the next tool takes the blame."""
+    offenders = heasoft_calls_without_produces(path.read_text())
+
+    assert offenders == [], f"{path.name}: no produces= on {offenders}"
+
+
 def enclosing_function(tree, target):
     """Name of the function a node sits in, or ``None`` at module level."""
     for node in ast.walk(tree):

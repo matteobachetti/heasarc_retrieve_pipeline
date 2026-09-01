@@ -14,6 +14,10 @@ sets up. Parallelism therefore lives between observations, not inside one.
 
 The lock costs nothing real: a HEASOFT tool is an external subprocess doing seconds to
 minutes of work, and two of them in one observation have nothing to gain from overlapping.
+
+Every call here also has to say what it produces, and the file is checked before the call
+returns. A zero return code is not evidence that anything was written: ``ftmgtime`` handed
+an empty list of input GTIs exits 0, writes nothing, and lets the next tool take the blame.
 """
 
 import os
@@ -143,7 +147,97 @@ def _checked(name, result):
     return result
 
 
-def run(name, *args, **kwargs):
+class IN_PLACE:
+    """
+    Marker for an output a tool edits rather than creates.
+
+    ``fthedit`` and ``fappend`` rewrite a file that is already there, so "the file exists
+    and is not empty" is still the right check -- but the file existed before the call
+    too, and saying so at the call site keeps the intent readable.
+
+    Parameters
+    ----------
+    path : str
+        The file the tool edits.
+
+    Examples
+    --------
+    >>> IN_PLACE("/tmp/some.gti").path
+    '/tmp/some.gti'
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+    def __repr__(self):
+        return f"IN_PLACE({self.path!r})"
+
+
+def _outputs_to_check(produces):
+    """
+    Normalise ``produces`` to a list of paths, stripping HEASOFT's clobber marker.
+
+    A leading ``!`` means "overwrite this" to a HEASOFT tool; it is not part of the name.
+
+    Examples
+    --------
+    >>> _outputs_to_check("a.fits")
+    ['a.fits']
+    >>> _outputs_to_check(["!a.fits", IN_PLACE("b.gti")])
+    ['a.fits', 'b.gti']
+    >>> _outputs_to_check([])
+    []
+    """
+    items = produces if isinstance(produces, (list, tuple)) else [produces]
+    paths = []
+    for item in items:
+        path = str(item.path if isinstance(item, IN_PLACE) else item)
+        paths.append(path[1:] if path.startswith("!") else path)
+    return paths
+
+
+def _check_outputs(name, produces):
+    """
+    Raise unless every file the tool promised is there and has something in it.
+
+    A zero return code is not evidence that a file was written. Measured on a real run:
+    ``ftmgtime`` was handed an empty list of input GTIs, returned 0, wrote nothing at all,
+    and the failure only surfaced one step later as ``ftsort failed with return code 33``
+    -- a message that says nothing about where the trouble started. Checking here names
+    the tool that actually failed.
+
+    Parameters
+    ----------
+    name : str
+        Tool name, for the message.
+    produces : str or IN_PLACE or list
+        What the call was supposed to leave behind: a file that must exist and be
+        non-empty, a directory that must exist and hold at least one entry, or an
+        :class:`IN_PLACE` file the tool only edited. An empty list checks nothing, which
+        is what a test double wants.
+
+    Raises
+    ------
+    RuntimeError
+        Naming the tool and the path that is missing or empty.
+    """
+    for path in _outputs_to_check(produces):
+        if not os.path.exists(path):
+            raise RuntimeError(
+                f"{name} returned success but did not create {path}"
+            )
+        if os.path.isdir(path):
+            if not os.listdir(path):
+                raise RuntimeError(
+                    f"{name} returned success but left {path} empty"
+                )
+        elif os.path.getsize(path) == 0:
+            raise RuntimeError(
+                f"{name} returned success but {path} is empty"
+            )
+
+
+def run(name, *args, produces, **kwargs):
     """
     Run one HEASOFT tool through ``heasoftpy``, one at a time in this process.
 
@@ -153,6 +247,10 @@ def run(name, *args, **kwargs):
         Tool name, as ``heasoftpy`` exposes it -- ``"ftmerge"``, ``"barycorr"``.
     *args, **kwargs
         Passed to the tool unchanged.
+    produces : str or IN_PLACE or list, keyword-only, required
+        What the call must leave behind -- see :func:`_check_outputs`. Mandatory on
+        purpose: every tool in this package has a nameable output, and a caller that has
+        to write it down cannot forget that a zero return code proves nothing.
 
     Returns
     -------
@@ -164,16 +262,19 @@ def run(name, *args, **kwargs):
     ImportError
         If ``heasoftpy`` is not installed.
     RuntimeError
-        If the tool exits with a non-zero return code.
+        If the tool exits with a non-zero return code, or does not produce what it said
+        it would.
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
-        return _checked(name, getattr(hsp, name)(*args, **kwargs))
+        result = _checked(name, getattr(hsp, name)(*args, **kwargs))
+        _check_outputs(name, produces)
+        return result
 
 
-def run_task(name, **params):
+def run_task(name, *, produces, **params):
     """
     Run a HEASOFT tool through ``heasoftpy``'s ``HSPTask``, one at a time in this process.
 
@@ -184,6 +285,8 @@ def run_task(name, **params):
     ----------
     name : str
         Tool name, for example ``"nupipeline"``.
+    produces : str or IN_PLACE or list, keyword-only, required
+        What the call must leave behind -- see :func:`_check_outputs`.
     **params
         Tool parameters.
 
@@ -197,10 +300,13 @@ def run_task(name, **params):
     ImportError
         If ``heasoftpy`` is not installed.
     RuntimeError
-        If the tool exits with a non-zero return code.
+        If the tool exits with a non-zero return code, or does not produce what it said
+        it would.
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
-        return _checked(name, hsp.HSPTask(name)(**params))
+        result = _checked(name, hsp.HSPTask(name)(**params))
+        _check_outputs(name, produces)
+        return result
