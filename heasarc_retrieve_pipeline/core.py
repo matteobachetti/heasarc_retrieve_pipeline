@@ -44,6 +44,7 @@ from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
 
+from .diagnostics import catalogue_row, diagnostics_path, write_manifest
 from .utils import (
     NO_SCIENCE_DATA,
     absolute_config,
@@ -1265,7 +1266,9 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
     Returns
     -------
     list of dict
-        ``obsid``, ``url``, ``ra`` and ``dec`` for each observation with public products.
+        ``obsid``, ``url``, ``ra``, ``dec`` and ``catalogue`` for each observation with
+        public products. ``catalogue`` is every column the query returned, kept for the
+        report; nothing in the reduction reads it.
 
     Notes
     -----
@@ -1292,7 +1295,18 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
         else:
             ra, dec = row["ra"], row["dec"]
 
-        items.append(dict(obsid=obsid, url=link[link_col_name], ra=ra, dec=dec))
+        # The reduction needs only the position, but the report needs the target's
+        # name, its exposure and when it was taken -- all of which the query already
+        # fetched and this function used to throw away.
+        items.append(
+            dict(
+                obsid=obsid,
+                url=link[link_col_name],
+                ra=ra,
+                dec=dec,
+                catalogue=catalogue_row(row),
+            )
+        )
 
     return items
 
@@ -1387,6 +1401,23 @@ def process_observations(
         instance -- are counted and logged separately, and are *not* in this list.
     """
     logger = get_run_logger()
+
+    # Before anything is submitted, so that a run killed part way through still has one
+    # of these for every observation it meant to do, and the index can say so.
+    for item in items:
+        try:
+            write_manifest(
+                diagnostics_path(item["obsid"], dict(out_data_path=outdir)),
+                item["obsid"],
+                item.get("catalogue"),
+                url=item["url"],
+                mission=mission,
+                ra=item["ra"],
+                dec=item["dec"],
+            )
+        except OSError as error:
+            logger.warning(f"Could not record the manifest for {item['obsid']}: {error}")
+
     futures = [
         download_and_process_observation.submit(
             item["obsid"],

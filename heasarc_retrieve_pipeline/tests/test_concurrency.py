@@ -26,6 +26,7 @@ from heasarc_retrieve_pipeline.core import (
     observation_work_items,
     prepare_worker,
 )
+from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, read_manifest
 
 
 def worker_state(roots):
@@ -241,6 +242,59 @@ class TestObsidQuery:
             obsid_query([], "nustar")
 
 
+class TestTheCatalogueMetadataIsKept:
+    """The query already knows the target, the exposure and the date. Keep them.
+
+    Every column is kept verbatim rather than a chosen few, because the same quantity
+    arrives under three different names depending on the mission and on which of the two
+    queries answered -- see ``canonical_metadata``.
+    """
+
+    LINKS = datalink(("http://x/?1", "s3://bucket/90901333002", "https://h/90901333002"))
+
+    def test_every_catalogue_column_survives(self):
+        table = Table(
+            rows=[("90901333002", "1", 148.9, 69.6, "M82", 12345.0)],
+            names=("obsid", "__row", "ra", "dec", "name", "exposure_a"),
+        )
+
+        items = observation_work_items(table, self.LINKS, "aws")
+
+        assert items[0]["catalogue"]["name"] == "M82"
+        assert items[0]["catalogue"]["exposure_a"] == 12345.0
+
+    def test_the_astroquery_row_id_is_not_kept(self):
+        """It is meaningless outside the query that produced it."""
+        items = observation_work_items(
+            catalogue(("90901333002", "1", 148.9, 69.6)), self.LINKS, "aws"
+        )
+
+        assert "__row" not in items[0]["catalogue"]
+
+    def test_a_masked_cell_does_not_stop_the_run(self):
+        """``public_date`` is routinely masked, and masked is not JSON."""
+        table = Table(
+            rows=[("90901333002", "1", 148.9, 69.6, 0.0)],
+            names=("obsid", "__row", "ra", "dec", "public_date"),
+            masked=True,
+        )
+        table["public_date"].mask = [True]
+
+        items = observation_work_items(table, self.LINKS, "aws")
+
+        assert items[0]["catalogue"]["public_date"] is None
+
+    def test_the_reduction_still_gets_what_it_always_got(self):
+        """Nothing downstream reads ``catalogue``; the four old keys must be untouched."""
+        items = observation_work_items(
+            catalogue(("90901333002", "1", 148.9, 69.6)), self.LINKS, "aws"
+        )
+
+        assert items[0]["obsid"] == "90901333002"
+        assert items[0]["url"] == "s3://bucket/90901333002"
+        assert (items[0]["ra"], items[0]["dec"]) == (148.9, 69.6)
+
+
 class TestOneFailureDoesNotStopTheRest:
     """A bad observation must cost only that observation.
 
@@ -251,7 +305,13 @@ class TestOneFailureDoesNotStopTheRest:
 
     def items(self, n=3):
         return [
-            dict(obsid=f"obs{i}", url=f"https://example.invalid/obs{i}/", ra=1.0, dec=2.0)
+            dict(
+                obsid=f"obs{i}",
+                url=f"https://example.invalid/obs{i}/",
+                ra=1.0,
+                dec=2.0,
+                catalogue={"name": f"target{i}", "exposure_a": 1000.0 * i},
+            )
             for i in range(n)
         ]
 
@@ -286,6 +346,39 @@ class TestOneFailureDoesNotStopTheRest:
             work_root=str(tmp_path / ".workers"),
         )
         return failed, processed
+
+
+    def test_every_observation_gets_a_manifest_even_the_failing_one(
+        self, tmp_path, monkeypatch
+    ):
+        self.run(monkeypatch, tmp_path, failing={"obs1"})
+
+        for obsid in "obs0", "obs1", "obs2":
+            manifest = read_manifest(
+                diagnostics_path(obsid, dict(out_data_path=str(tmp_path)))
+            )
+            assert manifest is not None, obsid
+            assert manifest["obsid"] == obsid
+
+    def test_the_manifest_names_the_target_and_the_exposure(self, tmp_path, monkeypatch):
+        self.run(monkeypatch, tmp_path, failing=set())
+
+        manifest = read_manifest(
+            diagnostics_path("obs1", dict(out_data_path=str(tmp_path)))
+        )
+
+        assert manifest["metadata"]["source_name"] == "target1"
+        assert manifest["metadata"]["exposure"] == 1000.0
+
+    def test_the_manifest_records_where_the_data_came_from(self, tmp_path, monkeypatch):
+        self.run(monkeypatch, tmp_path, failing=set())
+
+        manifest = read_manifest(
+            diagnostics_path("obs0", dict(out_data_path=str(tmp_path)))
+        )
+
+        assert manifest["url"] == "https://example.invalid/obs0/"
+        assert manifest["mission"] == "nustar"
 
     def test_the_good_ones_all_run(self, tmp_path, monkeypatch):
         _, processed = self.run(monkeypatch, tmp_path, failing={"obs1"})
