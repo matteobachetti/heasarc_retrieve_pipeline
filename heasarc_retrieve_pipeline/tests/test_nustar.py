@@ -1329,6 +1329,108 @@ class TestSnrOptimisedRadius:
             nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])
 
 
+class TestFindingTheSourceRecordsItself:
+    """The region step is where an observation most often quietly goes wrong.
+
+    A source that was not found, one found two arcminutes from where the telescope was
+    pointed, and one too faint to place a radius on are all ordinary outcomes that used to
+    leave nothing behind but a line in the log -- and the radius that was finally chosen
+    was written to standard output with ``print``, which in a run of 56 observations under
+    a process pool goes nowhere anybody reads.
+
+    The paths that actually measure a region need ``nustar_gen`` and a real image, so what
+    can be tested offline is the observation-level record and the read-back-from-disk one.
+    """
+
+    def records(self, tmp_path, step, obsid=OBSID):
+        found = read_records(diagnostics_path(obsid, dict(out_data_path=str(tmp_path))))
+        return [record for record in found if record["step"] == step]
+
+    def test_the_mean_position_is_recorded(self, tmp_path):
+        pytest.importorskip("regions")
+        config = make_obsid_tree(
+            tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+        )
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
+        write_region_files(pipedir, f"nu{OBSID}B01_cl", 149.10, 69.70, 40.0)
+
+        get_best_source_regions.fn(OBSID, config)
+
+        (record,) = self.records(tmp_path, "source_position")
+        assert record["status"] == "done"
+        assert record["values"]["n_files"] == 2
+        assert record["values"]["mean_ra"] == pytest.approx(149.0)
+        assert record["values"]["mean_rlimit"] == pytest.approx(35.0)
+
+    def test_each_file_gets_its_own_record(self, tmp_path):
+        """Two modules, two records: the report shows the radius chosen for each."""
+        pytest.importorskip("regions")
+        config = make_obsid_tree(
+            tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+        )
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
+        write_region_files(pipedir, f"nu{OBSID}B01_cl", 149.10, 69.70, 40.0)
+
+        get_best_source_regions.fn(OBSID, config)
+
+        found = {r["key"]: r for r in self.records(tmp_path, "source_region")}
+        assert set(found) == {f"nu{OBSID}A01_cl", f"nu{OBSID}B01_cl"}
+        assert found[f"nu{OBSID}A01_cl"]["values"]["rlimit"] == pytest.approx(30.0)
+        assert found[f"nu{OBSID}B01_cl"]["values"]["ra"] == pytest.approx(149.10)
+
+    def test_a_region_read_back_from_disk_says_it_was_not_measured(self, tmp_path):
+        """A rerun measures nothing. The report must not show it as work done again."""
+        pytest.importorskip("regions")
+        config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt"])
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
+
+        get_best_source_regions.fn(OBSID, config)
+
+        (record,) = self.records(tmp_path, "source_region")
+        assert record["status"] == "skipped"
+        assert record["values"]["read_back"] is True
+
+    def test_a_mode_01_file_with_no_source_is_recorded_as_a_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """The exception is recorded and re-raised: the run still has to count it."""
+        config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt"])
+        monkeypatch.setattr(nustar, "get_best_source_region", lambda *a, **k: None)
+
+        with pytest.raises(nustar.NoSourceInScienceData):
+            get_best_source_regions.fn(OBSID, config)
+
+        (record,) = self.records(tmp_path, "source_position")
+        assert record["status"] == "failed"
+        assert "FPMA" in record["error"]
+
+    def test_an_observation_with_no_mode_01_data_says_why(self, tmp_path):
+        """80002092003 has no mode-01 file at all. That is a clean outcome, not a failure."""
+        config = make_obsid_tree(tmp_path)
+
+        get_best_source_regions.fn(OBSID, config)
+
+        (record,) = self.records(tmp_path, "source_position")
+        assert record["status"] == "skipped"
+        assert "mode-01" in record["reason"]
+
+    def test_a_function_given_no_record_still_works(self, tmp_path):
+        """``get_best_source_region`` is called directly, from scripts and from tests."""
+        pytest.importorskip("regions")
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        os.makedirs(pipedir)
+        write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
+
+        result = nustar.get_best_source_region(
+            os.path.join(pipedir, f"nu{OBSID}A01_cl.evt")
+        )
+
+        assert result[2] == pytest.approx(30.0)
+
+
 class TestTheGoodTimeIntervalsOfAFile:
     """``gti_of`` feeds the joining figure, so it must never take a reduction down.
 

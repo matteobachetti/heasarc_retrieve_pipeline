@@ -43,7 +43,7 @@ from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .barycenter import barycenter_file
-from .diagnostics import diagnostics_path, record_step
+from .diagnostics import diagnostics_path, no_record, record_step
 from .image_utils import filter_sources_in_images
 from .utils import (
     NO_SCIENCE_DATA,
@@ -1918,6 +1918,7 @@ def get_best_source_region(
     config=None,
     reference=None,
     max_offset=None,
+    rec=None,
 ):
     """
     Find the source and choose the extraction radius that maximises its signal-to-noise.
@@ -1954,6 +1955,10 @@ def get_best_source_region(
     max_offset : :class:`astropy.units.Quantity`, optional
         Largest acceptable separation from ``reference``. Defaults to
         ``config["max_source_offset_arcmin"]`` arcmin, or 3 arcmin.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where to write the radial profile and the chosen radius. This function has no
+        ``obsid``, so the caller -- which does -- opens the record and hands it in.
+        ``None`` records nothing.
 
     Returns
     -------
@@ -1976,6 +1981,8 @@ def get_best_source_region(
     ``docs/known_issues.rst``.
     """
     logger = get_logger()
+    if rec is None:
+        rec = no_record()
     if config is None:
         config = DEFAULT_CONFIG
     indir, fname = os.path.split(infile)
@@ -1989,6 +1996,13 @@ def get_best_source_region(
 
         region_src = Regions.read(src_out, format="ds9")[0]
         logger.info(f"Source and background region files already exist for {infile}")
+        rec.value(
+            ra=region_src.center.ra.deg,
+            dec=region_src.center.dec.deg,
+            rlimit=region_src.radius.to(u.arcsec).value,
+            read_back=True,
+        )
+        rec.skip("the region files were already there")
         return (
             region_src.center.ra.deg,
             region_src.center.dec.deg,
@@ -2018,15 +2032,27 @@ def get_best_source_region(
             f"No source found in the {elow}-{ehigh} keV image of {infile}: there are too "
             "few counts in it to hold a peak. Writing no region file for it."
         )
+        rec.skip(f"no source in the {elow}-{ehigh} keV image; too few counts to hold a peak")
         return None
 
     if max_offset is None:
         max_offset = config.get("max_source_offset_arcmin", 3) * u.arcmin
     if not position_is_consistent(target, reference, max_offset):
+        separation = target.separation(reference).to(u.arcmin)
         logger.warning(
             f"Source found in {infile} is "
-            f"{target.separation(reference).to(u.arcmin):.2f} from the expected position, "
+            f"{separation:.2f} from the expected position, "
             f"more than {max_offset}. Writing no region file for it."
+        )
+        rec.value(
+            ra=target.icrs.ra.deg,
+            dec=target.icrs.dec.deg,
+            separation_arcmin=separation.value,
+            max_offset_arcmin=max_offset.to(u.arcmin).value,
+        )
+        rec.skip(
+            f"the source found is {separation:.2f} from the expected position, "
+            f"more than {max_offset}"
         )
         return None
 
@@ -2043,6 +2069,16 @@ def get_best_source_region(
     rind, rad_profile, radial_err, psf_profile = make_radial_profile(
         test_file, show_image=False, coordinates=coordinates
     )
+    # The profile is recorded whatever happens next: a source too faint for a radius is
+    # exactly the case somebody will want to look at.
+    rec.array(
+        radius=np.asarray(rind, dtype=float),
+        profile=np.asarray(rad_profile, dtype=float),
+        profile_error=np.asarray(radial_err, dtype=float),
+        psf_profile=np.asarray(psf_profile, dtype=float),
+    )
+    rec.value(band_kev=[pair[0], pair[1]], image_band_kev=[elow, ehigh])
+
     rlimit = snr_optimised_radius(
         optimize_radius_snr, rind, rad_profile, radial_err, psf_profile
     )
@@ -2051,10 +2087,18 @@ def get_best_source_region(
             f"No radius maximises the signal-to-noise in {infile}: the source is too "
             "faint to place an extraction region on. Writing no region file for it."
         )
+        rec.skip("no radius maximises the signal-to-noise; the source is too faint")
         return None
 
     max_radius = config.get("max_radius", 80)
-    print("Radius of peak SNR for {} to {} keV: {}".format(pair[0], pair[1], rlimit))
+    logger.info(
+        f"Radius of peak SNR for {pair[0]} to {pair[1]} keV in {fname}: {rlimit} arcsec"
+    )
+    rec.value(
+        rlimit_snr=float(rlimit),
+        max_radius=max_radius,
+        capped_at_max_radius=rlimit > max_radius,
+    )
     if rlimit > max_radius:
         logger.warning(
             f"Calculated source region radius {rlimit} exceeds maximum allowed {max_radius}, using maximum"
@@ -2076,6 +2120,7 @@ circle({icrs.ra.deg}, {icrs.dec.deg}, {max(rlimit * 2, 250)}")
     with open(bkg_out, "w") as fobj:
         print(bkg_reg, file=fobj)
 
+    rec.value(ra=icrs.ra.deg, dec=icrs.dec.deg, rlimit=rlimit, read_back=False)
     return icrs.ra.deg, icrs.dec.deg, rlimit, src_out, bkg_out
 
 
@@ -2120,7 +2165,14 @@ def get_best_source_regions(obsid, config):
     none. That is a different case from a mode-01 file with no source in it, and stays a
     clean outcome.
     """
+    with record_step(diagnostics_path(obsid, config), obsid, "source_position") as rec:
+        return _get_best_source_regions(obsid, config, rec)
+
+
+def _get_best_source_regions(obsid, config, rec):
+    """The body of :func:`get_best_source_regions`, with its diagnostics record open."""
     logger = get_logger()
+    directory = diagnostics_path(obsid, config)
     outdir = nu_pipeline_output_path(obsid, config=config)
     os.makedirs(outdir, exist_ok=True)
 
@@ -2129,7 +2181,12 @@ def get_best_source_regions(obsid, config):
     for fpm, infile in mode_01_input_files(obsid, config):
         # get_best_source_region returns early when the region files already exist,
         # reading the position and radius back out of them, so every file counts.
-        result = get_best_source_region(infile, config=config)
+        # Each file gets its own record, keyed by its root name: this loop and
+        # calculate_spectra between them measure a region for every event file there is.
+        with record_step(
+            directory, obsid, "source_region", key=rootname(os.path.basename(infile))
+        ) as file_rec:
+            result = get_best_source_region(infile, config=config, rec=file_rec)
         if result is None:
             # Mode 01 is ordinary science with the full aspect solution. A target the
             # pipeline was pointed at has to be in it, and half an observation is not an
@@ -2146,8 +2203,15 @@ def get_best_source_regions(obsid, config):
 
     if count == 0:
         logger.warning(f"No cleaned event file to locate a source in for {obsid}")
+        rec.skip("no mode-01 cleaned event file to locate a source in")
         return 0.0, 0.0, 0.0
 
+    rec.value(
+        n_files=count,
+        mean_ra=mean_ra / count,
+        mean_dec=mean_dec / count,
+        mean_rlimit=mean_rlimit / count,
+    )
     return mean_ra / count, mean_dec / count, mean_rlimit / count
 
 
@@ -2247,12 +2311,16 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
         if not os.path.exists(this_src) or not os.path.exists(this_bkg):
             # Every CHU combination has its own aspect solution, so it needs its own
             # region; the mode-01 position is the reference it has to agree with.
-            get_best_source_region(
-                infile,
-                config=config,
-                reference=reference if is_mode_06 else None,
-                max_offset=max_offset,
-            )
+            with record_step(
+                diagnostics_path(obsid, config), obsid, "source_region", key=root_name
+            ) as file_rec:
+                get_best_source_region(
+                    infile,
+                    config=config,
+                    reference=reference if is_mode_06 else None,
+                    max_offset=max_offset,
+                    rec=file_rec,
+                )
         if not os.path.exists(this_src) or not os.path.exists(this_bkg):
             # Determinate: either no source was found, or it was too faint to place a
             # radius on, or it was too far from the mode-01 position. Rerunning would

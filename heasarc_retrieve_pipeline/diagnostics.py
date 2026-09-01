@@ -385,6 +385,27 @@ def record_step(directory, obsid, step, key=""):
     return StepRecord(directory, obsid, step, key=key)
 
 
+def no_record():
+    """
+    A record that goes nowhere.
+
+    For a function that takes a record from its caller and has to work when it is given
+    none -- called from a test, or from a context that has no output directory.
+
+    Returns
+    -------
+    _NoRecord
+        Accepts every recording call and does nothing with it.
+
+    Examples
+    --------
+    >>> rec = no_record()
+    >>> rec.value(radius=42)
+    >>> rec.skip("nothing to do")
+    """
+    return _NoRecord()
+
+
 def read_records(directory):
     """
     Every step record in a diagnostics directory, oldest first.
