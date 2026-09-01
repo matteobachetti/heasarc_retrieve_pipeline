@@ -462,6 +462,48 @@ def make_synthetic_event_file(path, tstart=0.0, tstop=1000.0, nevents=500, seed=
     return str(path)
 
 
+class TestFirstSourcePosition:
+    """An image with no peak in it is an answer, not an IndexError.
+
+    ``find_source`` returns an empty array when there are too few counts, and indexing it
+    raised ``index 0 is out of bounds for axis 0 with size 0``. Three observations of the
+    2026 M82 run died that way, every one of them on a single-CHU mode-06 subset.
+    """
+
+    def wcs(self, ra=149.0, dec=69.68):
+        """A tangent-plane WCS with the given position at pixel (10, 10)."""
+        from astropy.wcs import WCS
+
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [10, 10]
+        wcs.wcs.crval = [ra, dec]
+        wcs.wcs.cdelt = [-0.001, 0.001]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        return wcs
+
+    def test_an_empty_coordinate_array_gives_nothing(self):
+        assert nustar.first_source_position(np.zeros((0, 2)), self.wcs()) is None
+
+    def test_a_single_peak_gives_its_position(self):
+        wcs = self.wcs()
+
+        # find_source reports [Y, X]; the reference pixel is (10, 10), so both are 9
+        # in the zero-based convention all_pix2world is called with.
+        position = nustar.first_source_position(np.array([[9.0, 9.0]]), wcs)
+
+        assert position.ra.deg == pytest.approx(149.0, abs=1e-6)
+        assert position.dec.deg == pytest.approx(69.68, abs=1e-6)
+
+    def test_it_agrees_with_the_wcs_on_an_off_centre_peak(self):
+        wcs = self.wcs()
+        expected = wcs.all_pix2world(np.array([[12.0, 7.0]]), 0)
+
+        position = nustar.first_source_position(np.array([[7.0, 12.0]]), wcs)
+
+        assert position.ra.deg == pytest.approx(expected[0][0], abs=1e-9)
+        assert position.dec.deg == pytest.approx(expected[0][1], abs=1e-9)
+
+
 class TestObservationTimeSpan:
     """The interval GOES is asked about.
 

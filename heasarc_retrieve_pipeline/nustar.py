@@ -1762,6 +1762,42 @@ def snr_optimised_radius(optimize, rind, rad_profile, radial_err, psf_profile):
         return None
 
 
+def first_source_position(coordinates, wcs):
+    """
+    Sky position of the brightest peak, or ``None`` if ``find_source`` found nothing.
+
+    ``nustar_gen.radial_profile.find_source`` returns an array of pixel coordinates. On an
+    image with too few counts to hold a peak it returns an empty one, and indexing it
+    raises ``IndexError: index 0 is out of bounds for axis 0 with size 0``. That took down
+    three observations of the 2026 M82 run -- 90202038002, 30502021004 and 30702012004 --
+    and never on a mode-01 file: every one was a single-CHU subset of the mode-06 data,
+    where a few minutes of exposure can genuinely hold no detectable source.
+
+    A file with no source in it is an answer, not a failure. The callers already know what
+    to do with ``None``: :func:`calculate_spectra` records the skip and moves on, and
+    :func:`get_best_source_regions` treats it as fatal, because a mode-01 module with no
+    source means something else is wrong.
+
+    Parameters
+    ----------
+    coordinates : array-like
+        Pixel coordinates as ``find_source`` returns them, in the native ``[Y, X]`` order.
+    wcs : astropy.wcs.WCS
+        World coordinate system of the image the peak was found in.
+
+    Returns
+    -------
+    astropy.coordinates.SkyCoord or None
+        The position in FK5, or ``None`` if there was no peak.
+    """
+    coordinates = np.asarray(coordinates)
+    if coordinates.size == 0:
+        return None
+    # The flip goes from find_source's native [Y, X] to the [X, Y] that wcs wants.
+    world = wcs.all_pix2world(np.flip(coordinates), 0)
+    return SkyCoord(world[0][0], world[0][1], unit="deg", frame="fk5")
+
+
 @task(
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
@@ -1868,11 +1904,13 @@ def get_best_source_region(
     hdu = fits.open(full_range, uint=True)[0]
     wcs = WCS(hdu.header)
 
-    # The "flip" is necessary to go to [X, Y] ordering from native [Y, X] ordering, which wcs seems to require
-    world = wcs.all_pix2world(np.flip(coordinates), 0)
-    ra = world[0][0]
-    dec = world[0][1]
-    target = SkyCoord(ra, dec, unit="deg", frame="fk5")
+    target = first_source_position(coordinates, wcs)
+    if target is None:
+        logger.warning(
+            f"No source found in the {elow}-{ehigh} keV image of {infile}: there are too "
+            "few counts in it to hold a peak. Writing no region file for it."
+        )
+        return None
 
     if max_offset is None:
         max_offset = config.get("max_source_offset_arcmin", 3) * u.arcmin
