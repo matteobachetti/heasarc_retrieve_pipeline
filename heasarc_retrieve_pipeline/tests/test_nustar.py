@@ -18,6 +18,11 @@ from astropy.coordinates import SkyCoord  # noqa: E402
 import astropy.units as u  # noqa: E402
 
 from heasarc_retrieve_pipeline import heasoft, nustar  # noqa: E402
+from heasarc_retrieve_pipeline.diagnostics import (  # noqa: E402
+    diagnostics_path,
+    read_arrays,
+    read_records,
+)
 from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     chi2_dof_against_a_constant,
     flare_filtered_event_file_name,
@@ -1322,3 +1327,251 @@ class TestSnrOptimisedRadius:
 
         with pytest.raises(ValueError, match="nonsense"):
             nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])
+
+
+class TestTheGoodTimeIntervalsOfAFile:
+    """``gti_of`` feeds the joining figure, so it must never take a reduction down.
+
+    Every input it is handed comes from a glob, and the pipeline runs it on files HEASOFT
+    has just written. A missing extension or a truncated file is a picture with a gap in
+    it, not a reason to lose the observation.
+    """
+
+    def test_it_reads_the_intervals_of_a_real_event_file(self, tmp_path):
+        path = make_synthetic_event_file(
+            os.path.join(tmp_path, "ev.evt"), tstart=100.0, tstop=350.0
+        )
+
+        assert np.allclose(nustar.gti_of(path), [[100.0, 350.0]])
+
+    def test_a_missing_file_has_no_intervals(self, tmp_path):
+        gti = nustar.gti_of(os.path.join(tmp_path, "not_here.evt"))
+
+        assert gti.shape == (0, 2)
+
+    def test_a_file_that_is_not_fits_has_no_intervals(self, tmp_path):
+        path = os.path.join(tmp_path, "empty.evt")
+        open(path, "w").close()
+
+        assert nustar.gti_of(path).shape == (0, 2)
+
+
+class TestTheStepsRecordThemselves:
+    """Every reduction step leaves a record of how it went, next to the data.
+
+    The records are what the report is drawn from. They are written whatever happens: a
+    step that was skipped says why, and a step that raised says what it raised and still
+    lets the exception through, because ``process_observations`` has to count the failure.
+
+    These check the recording only. That each step does the right thing is the business of
+    the classes above.
+    """
+
+    def records(self, tmp_path, obsid=OBSID, step=None):
+        found = read_records(diagnostics_path(obsid, dict(out_data_path=str(tmp_path))))
+        if step is not None:
+            found = [record for record in found if record["step"] == step]
+        return found
+
+    def only(self, tmp_path, step, obsid=OBSID):
+        found = self.records(tmp_path, obsid=obsid, step=step)
+        assert len(found) == 1, f"expected one {step} record, got {len(found)}"
+        return found[0]
+
+    # ------------------------------------------------------------------ the L2 pipeline
+
+    def test_a_pipeline_that_had_already_run_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nustar, "HAS_HEASOFT", True)
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        done = nu_pipeline_done_file(OBSID, config=config)
+        os.makedirs(os.path.dirname(done), exist_ok=True)
+        open(done, "w").close()
+
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+
+        record = self.only(tmp_path, "l2_pipeline")
+        assert record["status"] == "skipped"
+        assert "PIPELINE_DONE" in record["reason"]
+
+    # --------------------------------------------------- the spacecraft science recovery
+
+    def test_an_observation_with_no_mode_06_data_says_why_it_did_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        ev_dir = nu_pipeline_output_path(OBSID, config)
+        os.makedirs(os.path.join(nu_local_raw_data_path(OBSID, config), "hk"))
+        os.makedirs(ev_dir)
+        for fpm in "AB":
+            open(os.path.join(ev_dir, f"nu{OBSID}{fpm}01_cl.evt"), "w").close()
+
+        nustar.recover_spacecraft_science_data.fn(OBSID, config)
+
+        record = self.only(tmp_path, "recover_spacecraft_science")
+        assert record["status"] == "skipped"
+        assert "mode 06" in record["reason"]
+
+    # ------------------------------------------------------------------- the source join
+
+    def joinable(self, tmp_path, monkeypatch, names):
+        """A pipeline directory with the given files, and ``merge_event_files`` stubbed."""
+
+        def fake_merge(files, outfile, gti_operation="OR"):
+            open(outfile, "w").close()
+
+        monkeypatch.setattr(nustar, "merge_event_files", fake_merge)
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        os.makedirs(pipedir, exist_ok=True)
+        for name in names:
+            open(os.path.join(pipedir, name), "w").close()
+        return pipedir, dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+
+    def test_the_join_records_what_went_into_each_module(self, tmp_path, monkeypatch):
+        """One mode-01 file and one CHU combination per module, as an observation has."""
+        pipedir, config = self.joinable(
+            tmp_path,
+            monkeypatch,
+            [f"nu{OBSID}{fpm}01_src1.evt" for fpm in "AB"]
+            + [f"nu{OBSID}{fpm}06_chu13_src1.evt" for fpm in "AB"],
+        )
+
+        join_source_data.fn(OBSID, [pipedir], config)
+
+        record = self.only(tmp_path, "join_source_data")
+        assert record["status"] == "done"
+        assert record["key"] == "src1"
+        assert record["values"]["inputs_A"] == [
+            f"nu{OBSID}A01_src1.evt",
+            f"nu{OBSID}A06_chu13_src1.evt",
+        ]
+        assert record["values"]["combined"] == f"nu{OBSID}_src1.evt"
+
+    def test_the_source_and_the_background_do_not_overwrite_each_other(
+        self, tmp_path, monkeypatch
+    ):
+        """Both run at once in the flow, so they must not share a file name."""
+        names = [f"nu{OBSID}A01{label}.evt" for label in ("_src1", "_back")]
+        pipedir, config = self.joinable(tmp_path, monkeypatch, names)
+
+        join_source_data.fn(OBSID, [pipedir], config, src_num=1)
+        join_source_data.fn(OBSID, [pipedir], config, src_num=0)
+
+        keys = {record["key"] for record in self.records(tmp_path, step="join_source_data")}
+        assert keys == {"src1", "back"}
+
+    def test_the_join_records_the_good_time_intervals_it_merged(
+        self, tmp_path, monkeypatch
+    ):
+        """The Gantt chart of the joining is drawn from these."""
+        pipedir, config = self.joinable(tmp_path, monkeypatch, [f"nu{OBSID}A01_src1.evt"])
+        monkeypatch.setattr(nustar, "gti_of", lambda path: np.array([[0.0, 10.0]]))
+
+        join_source_data.fn(OBSID, [pipedir], config)
+
+        record = self.only(tmp_path, "join_source_data")
+        arrays = read_arrays(
+            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))), record
+        )
+        assert set(arrays) == {"gti_A_in_0", "gti_A_out", "gti_combined"}
+        assert np.allclose(arrays["gti_combined"], [[0.0, 10.0]])
+
+    def test_a_module_with_nothing_to_join_is_recorded_as_a_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """``NoSourceInScienceData`` is recorded and then re-raised, not swallowed."""
+        pipedir, config = self.joinable(
+            tmp_path,
+            monkeypatch,
+            [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt", f"nu{OBSID}B01_src1.evt"],
+        )
+
+        with pytest.raises(nustar.NoSourceInScienceData):
+            join_source_data.fn(OBSID, [pipedir], config)
+
+        record = self.only(tmp_path, "join_source_data")
+        assert record["status"] == "failed"
+        assert "FPMA" in record["error"]
+        assert "join_source_data" in record["traceback"]
+
+    def test_a_rerun_of_the_join_says_the_sentinel_stopped_it(self, tmp_path):
+        outdir = os.path.join(tmp_path, OBSID)
+        os.makedirs(outdir)
+        open(os.path.join(outdir, "JOIN_DONE_SRC1.TXT"), "w").close()
+
+        join_source_data.fn(OBSID, [], dict(out_data_path=str(tmp_path)))
+
+        assert self.only(tmp_path, "join_source_data")["status"] == "skipped"
+
+    # ----------------------------------------------------------------------- the spectra
+
+    def spectral_tree(self, tmp_path, monkeypatch, with_regions=False):
+        """Two input files, with or without the regions ``nuproducts`` needs."""
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        indir = nu_pipeline_output_path(OBSID, config=config)
+        os.makedirs(indir, exist_ok=True)
+        inputs = []
+        for fpm in "AB":
+            infile = os.path.join(indir, f"nu{OBSID}{fpm}01_cl.evt")
+            open(infile, "w").close()
+            inputs.append((fpm, infile))
+            if with_regions:
+                for kind in ("src", "bkg"):
+                    open(infile.replace(".evt", f"_{kind}.reg"), "w").close()
+
+        monkeypatch.setattr(nustar, "spectral_input_files", lambda *a, **k: inputs)
+        monkeypatch.setattr(nustar, "get_best_source_region", lambda *a, **k: None)
+        monkeypatch.setattr(
+            nustar, "merge_gtis", lambda files, outfile, **k: open(outfile, "w").close()
+        )
+        monkeypatch.setattr(nustar.heasoft, "run", lambda *a, **k: None)
+        return config
+
+    def test_the_spectra_step_names_the_files_it_produced(self, tmp_path, monkeypatch):
+        config = self.spectral_tree(tmp_path, monkeypatch, with_regions=True)
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["status"] == "done"
+        assert record["values"]["spectra"] == [
+            f"nu{OBSID}A01_grp.pha",
+            f"nu{OBSID}B01_grp.pha",
+        ]
+        assert record["values"]["without_region"] == []
+
+    def test_a_file_with_no_extraction_region_is_named_in_the_record(
+        self, tmp_path, monkeypatch
+    ):
+        config = self.spectral_tree(tmp_path, monkeypatch, with_regions=False)
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["values"]["without_region"] == [
+            f"nu{OBSID}A01_cl.evt",
+            f"nu{OBSID}B01_cl.evt",
+        ]
+        assert record["values"]["spectra"] == []
+
+    def test_a_rerun_of_the_spectra_says_the_sentinel_stopped_it(self, tmp_path):
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        outdir = nu_product_output_path(OBSID, config=config)
+        os.makedirs(outdir)
+        open(os.path.join(outdir, "PRODUCTS_DONE.TXT"), "w").close()
+
+        nustar.calculate_spectra.fn(OBSID, config)
+
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["status"] == "skipped"
+        assert "PRODUCTS_DONE" in record["reason"]
+
+    # ------------------------------------------------------------------------- the shape
+
+    def test_every_record_says_how_long_the_step_took(self, tmp_path, monkeypatch):
+        pipedir, config = self.joinable(tmp_path, monkeypatch, [f"nu{OBSID}A01_src1.evt"])
+
+        join_source_data.fn(OBSID, [pipedir], config)
+
+        record = self.only(tmp_path, "join_source_data")
+        assert record["duration_s"] >= 0.0
+        assert record["obsid"] == OBSID

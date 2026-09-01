@@ -43,6 +43,7 @@ from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .barycenter import barycenter_file
+from .diagnostics import diagnostics_path, record_step
 from .image_utils import filter_sources_in_images
 from .utils import (
     NO_SCIENCE_DATA,
@@ -666,12 +667,19 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
+    with record_step(diagnostics_path(obsid, config), obsid, "l2_pipeline") as rec:
+        return _run_l2_pipeline(obsid, config, flags, rec)
+
+
+def _run_l2_pipeline(obsid, config, flags, rec):
+    """The body of :func:`nu_run_l2_pipeline`, with its diagnostics record open."""
     pipe_done_file = nu_pipeline_done_file(obsid, config=config)
     if os.path.exists(pipe_done_file):
-        logger = get_run_logger()
+        logger = get_logger()
         logger.info(f"Data for {obsid} already preprocessed")
+        rec.skip("PIPELINE_DONE.TXT already exists")
         return
-    logger = get_run_logger()
+    logger = get_logger()
     logger.info("Running NuSTAR L2 pipeline")
     datadir = nu_local_raw_data_path(obsid, config=config)
     ev_dir = nu_pipeline_output_path(obsid, config=config)
@@ -696,6 +704,12 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
 
     open(pipe_done_file, "a").close()
 
+    rec.value(
+        flags=flags or {},
+        cleaned_event_files=sorted(
+            os.path.basename(f) for f in glob.glob(os.path.join(ev_dir, "*_cl.evt*"))
+        ),
+    )
     return ev_dir
 
 
@@ -737,6 +751,14 @@ def recover_spacecraft_science_data(obsid, config):
     str
         The ``split`` directory.
     """
+    with record_step(
+        diagnostics_path(obsid, config), obsid, "recover_spacecraft_science"
+    ) as rec:
+        return _recover_spacecraft_science_data(obsid, config, rec)
+
+
+def _recover_spacecraft_science_data(obsid, config, rec):
+    """The body of :func:`recover_spacecraft_science_data`, with its record open."""
     logger = get_logger()
     logger.info(f"Squeezing every photon from spacecraft science data in {obsid}")
     datadir = nu_local_raw_data_path(obsid, config)
@@ -749,10 +771,12 @@ def recover_spacecraft_science_data(obsid, config):
 
     if os.path.exists(recover_done_file):
         logger.info("Processing done")
+        rec.skip("RECOVER_DONE.TXT already exists")
         return splitdir
 
     if not evfiles_06:
         logger.info(f"No spacecraft science (mode 06) data in {obsid}; nothing to split")
+        rec.skip("no spacecraft science (mode 06) data to split")
 
     # nusplitsc makes this directory itself, but only if it has something to split. The
     # sentinel below has to land somewhere either way.
@@ -779,7 +803,32 @@ def recover_spacecraft_science_data(obsid, config):
             clobber="yes",
         )
     open(recover_done_file, "a").close()
+    rec.value(
+        mode_06_files=sorted(os.path.basename(f) for f in evfiles_06),
+        split_files=sorted(
+            os.path.basename(f) for f in glob.glob(os.path.join(splitdir, "*_cl.evt*"))
+        ),
+    )
     return splitdir
+
+
+def gti_of(path):
+    """
+    The good time intervals of an event file, as an ``(N, 2)`` array.
+
+    An empty array when the file is missing or has no readable GTI extension: this is
+    only ever called to draw a picture, and a picture must not take down a reduction.
+    """
+    from astropy.io import fits
+
+    if not os.path.exists(path):
+        return np.zeros((0, 2))
+    try:
+        with fits.open(path) as hdul:
+            return np.asarray(read_gti(hdul), dtype=float)
+    except Exception as error:
+        get_logger().warning(f"Could not read the GTIs of {path}: {error}")
+        return np.zeros((0, 2))
 
 
 @task(task_run_name="nu_merge_gtis_into_{outfile_gti}_gti_{gti_operation}")
@@ -973,19 +1022,31 @@ def join_source_data(obsid, directories, config, src_num=1):
     whatever this returns, a rerun did five times the work of a fresh run, on files that
     are not meant to be science products. See issue 6 in ``docs/known_issues.rst``.
     """
+    label = f"_src{src_num}" if src_num > 0 else "_back"
+    with record_step(
+        diagnostics_path(obsid, config), obsid, "join_source_data", key=label.lstrip("_")
+    ) as rec:
+        return _join_source_data(obsid, directories, config, src_num, label, rec)
+
+
+def _join_source_data(obsid, directories, config, src_num, label, rec):
+    """The body of :func:`join_source_data`, with its diagnostics record open.
+
+    The GTIs of every input and of every merge are recorded here rather than inside
+    ``merge_event_files``, which knows neither the observation nor the configuration and
+    so has nowhere to write. They are what the joining figure is drawn from: one row per
+    input file, then the OR-merged row for each module, then the AND-merged row for the
+    pair.
+    """
     logger = get_logger()
     outdir = nu_base_output_path(obsid, config=config)
-
-    if src_num > 0:
-        label = f"_src{src_num}"
-    else:
-        label = "_back"
 
     combined_file = os.path.join(outdir, f"nu{obsid}{label}.evt")
 
     join_done_file = os.path.join(outdir, f"JOIN_DONE_SRC{src_num}.TXT")
     if os.path.exists(join_done_file):
         logger.info(f"Source data for {obsid} already joined")
+        rec.skip(f"JOIN_DONE_SRC{src_num}.TXT already exists")
         return [combined_file] if os.path.exists(combined_file) else []
 
     # Both module file names are known, so they are built rather than globbed for FPMA and
@@ -1033,11 +1094,23 @@ def join_source_data(obsid, directories, config, src_num=1):
         merge_event_files(files_to_join, outfile)
         module_files.append(outfile)
 
+        for i, joined in enumerate(sorted(files_to_join)):
+            rec.array(**{f"gti_{fpm}_in_{i}": gti_of(joined)})
+        rec.array(**{f"gti_{fpm}_out": gti_of(outfile)})
+        rec.value(**{f"inputs_{fpm}": sorted(os.path.basename(f) for f in files_to_join)})
+
     if not module_files:
         logger.warning(f"No module of {obsid} produced anything to join for {label}")
+        rec.skip(f"no module produced anything to join for {label}")
         return []
 
     merge_event_files(module_files, combined_file, gti_operation="AND")
+
+    rec.array(gti_combined=gti_of(combined_file))
+    rec.value(
+        modules=sorted(os.path.basename(f) for f in module_files),
+        combined=os.path.basename(combined_file),
+    )
 
     open(join_done_file, "a").close()
     return [combined_file]
@@ -2128,12 +2201,21 @@ def calculate_spectra(
     is marked done; a missing region or GTI file that should have been there is not, so the
     next run retries instead of the observation being marked done forever.
     """
-    logger = get_run_logger()
+    with record_step(diagnostics_path(obsid, config), obsid, "calculate_spectra") as rec:
+        return _calculate_spectra(
+            obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, rec
+        )
+
+
+def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, rec):
+    """The body of :func:`calculate_spectra`, with its diagnostics record open."""
+    logger = get_logger()
     indir = nu_pipeline_output_path(obsid, config=config)
     outdir = nu_product_output_path(obsid, config=config)
     product_done_file = os.path.join(outdir, "PRODUCTS_DONE.TXT")
     if os.path.exists(product_done_file):
         logger.info(f"Spectra for {obsid} already calculated")
+        rec.skip("PRODUCTS_DONE.TXT already exists")
         return
     os.makedirs(outdir, exist_ok=True)
 
@@ -2148,7 +2230,11 @@ def calculate_spectra(
     max_offset = config.get("max_source_offset_arcmin", 3) * u.arcmin
 
     problems = 0
+    inputs = []
+    without_region = []
+    spectra = []
     for fpm, infile in spectral_input_files(obsid, config):
+        inputs.append(os.path.basename(infile))
         root_name = rootname(os.path.basename(infile))
         stem = root_name[: -len("_cl")] if root_name.endswith("_cl") else root_name
         filedir = os.path.dirname(infile)
@@ -2176,6 +2262,7 @@ def calculate_spectra(
             record_skipped_input(
                 obsid, config, infile, "no usable extraction region could be measured"
             )
+            without_region.append(os.path.basename(infile))
             continue
 
         outfile_gti_temp = os.path.join(filedir, root_name + "_noflares.gti")
@@ -2215,11 +2302,24 @@ def calculate_spectra(
             clobber=True,
             verbose=True,
         )
+        spectra.append(os.path.basename(params["grpphafile"]))
+
+    rec.value(
+        inputs=inputs,
+        without_region=without_region,
+        spectra=spectra,
+        missing_flare_free_gti=problems,
+    )
 
     if problems > 0:
         logger.warning(
             f"{problems} file(s) could not be processed for {obsid}; "
             "not marking the observation as done"
+        )
+        # Not a failure -- the spectra that could be made were made -- but not a clean
+        # finish either, and the report has to be able to tell the two apart.
+        rec.skip(
+            f"{problems} file(s) had no flare-free GTI; not marking the observation as done"
         )
         return
 
