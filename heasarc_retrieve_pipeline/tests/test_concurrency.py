@@ -434,7 +434,33 @@ class TestOneFailureDoesNotStopTheRest:
         failed, processed = self.run(monkeypatch, tmp_path, failing=set())
 
         assert failed == []
-        assert processed == ["obs0", "obs1", "obs2"]
+        assert sorted(processed) == ["obs0", "obs1", "obs2"]
+
+
+    def test_the_run_leaves_an_index_of_every_observation(self, tmp_path, monkeypatch):
+        pytest.importorskip("plotly")
+        self.run(monkeypatch, tmp_path, failing={"obs1"}, no_science={"obs2"})
+
+        with open(os.path.join(tmp_path, "index.html")) as fobj:
+            index = fobj.read()
+
+        for obsid in "obs0", "obs1", "obs2":
+            assert f'href="{obsid}/diagnostics.html"' in index
+        assert "obs1 is no good" in index
+
+    def test_there_is_exactly_one_copy_of_the_plotly_bundle(self, tmp_path, monkeypatch):
+        """4.8 MB. One per page would be the size of the run."""
+        pytest.importorskip("plotly")
+        self.run(monkeypatch, tmp_path, failing=set())
+
+        found = [
+            os.path.join(root, name)
+            for root, _, names in os.walk(tmp_path)
+            for name in names
+            if name == "plotly.min.js"
+        ]
+
+        assert found == [os.path.join(str(tmp_path), "plotly.min.js")]
 
     def test_the_good_ones_all_run(self, tmp_path, monkeypatch):
         _, processed = self.run(monkeypatch, tmp_path, failing={"obs1"})

@@ -810,6 +810,185 @@ def _safe(builder, *args):
         return None
 
 
+
+def run_timeline_figure(summaries):
+    """
+    When each observation ran and how long it took, coloured by how it ended.
+
+    The whole run in one picture: how much of it was actually parallel, which observations
+    took the time, and where the failures fell. It is drawn from the ``observation``
+    record, so an observation that never started simply has no bar.
+
+    Parameters
+    ----------
+    summaries : list of dict
+        From :func:`observation_summary`.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if no observation recorded when it ran.
+    """
+    go, _ = _plotly()
+
+    rows = []
+    for summary in summaries:
+        for record in _records_of(summary["records"], "observation"):
+            if record.get("started") is not None:
+                rows.append((summary["obsid"], record))
+    if not rows:
+        return None
+
+    origin = min(record["started"] for _, record in rows)
+    fig = go.Figure()
+    for status in ("done", "skipped", "failed", "running"):
+        chosen = [(obsid, r) for obsid, r in rows if r.get("status") == status]
+        if not chosen:
+            continue
+        fig.add_trace(
+            go.Bar(
+                y=[obsid for obsid, _ in chosen],
+                x=[max(r.get("duration_s") or 0.0, 1.0) for _, r in chosen],
+                base=[r["started"] - origin for _, r in chosen],
+                orientation="h",
+                name=status,
+                marker_color=STATUS_COLOURS.get(status, "#999"),
+                hovertemplate="%{y}<br>%{x:.0f} s<extra></extra>",
+            )
+        )
+
+    fig.update_layout(barmode="overlay",
+                      xaxis_title="seconds since the first observation started",
+                      legend=dict(orientation="h", y=1.06, x=0))
+    fig.update_yaxes(autorange="reversed", automargin=True)
+    return _blank(fig, height=max(220, 26 * len(rows) + 100))
+
+
+def _index_rows(summaries):
+    """One row per observation for the index table, in the order given."""
+    rows = []
+    for summary in summaries:
+        records = summary["records"]
+        statuses = [record.get("status") for record in records]
+        observation = _records_of(records, "observation")
+        rows.append(
+            dict(
+                obsid=summary["obsid"],
+                target=summary["metadata"].get("source_name") or "",
+                outcome=summary["outcome"],
+                reason=(observation[0].get("reason") or observation[0].get("error") or "")
+                if observation
+                else "",
+                exposure=summary["metadata"].get("exposure"),
+                duration=observation[0].get("duration_s") if observation else None,
+                steps=len(records),
+                skipped_steps=statuses.count("skipped"),
+                failed_steps=statuses.count("failed"),
+                skipped_inputs=len(summary["skipped"]),
+            )
+        )
+    return rows
+
+
+def index_body(summaries):
+    """
+    The body of the run index.
+
+    Parameters
+    ----------
+    summaries : list of dict
+        From :func:`observation_summary`, in the order they should be listed.
+
+    Returns
+    -------
+    str
+        HTML, with the figure already spliced in.
+    """
+    rows = _index_rows(summaries)
+    counts = {}
+    for row in rows:
+        counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+    tally = ", ".join(f"{n} {name}" for name, n in sorted(counts.items()))
+
+    parts = [
+        "<h1>Reduction run</h1>",
+        f'<p class="subtitle">{len(rows)} observation(s): {html.escape(tally)}</p>',
+    ]
+
+    figures = []
+    fig = _safe(run_timeline_figure, summaries)
+    if fig is not None:
+        parts.append("$FIGURE")
+        figures.append(fig)
+
+    header = ("OBSID", "target", "outcome", "exposure (s)", "took (s)", "steps",
+              "skipped steps", "failed steps", "skipped inputs", "")
+    out = ["<h2>Observations</h2>", "<table>",
+           "<tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in header) + "</tr>"]
+    for row in rows:
+        link = f"{row['obsid']}/diagnostics.html"
+        out.append(
+            "<tr>"
+            f'<td><a href="{html.escape(link)}">{html.escape(row["obsid"])}</a></td>'
+            f"<td>{html.escape(str(row['target']))}</td>"
+            f"<td>{_badge(row['outcome'])}</td>"
+            f"<td>{_number(row['exposure'], 0)}</td>"
+            f"<td>{_number(row['duration'], 1)}</td>"
+            f"<td>{row['steps']}</td>"
+            f"<td>{row['skipped_steps']}</td>"
+            f"<td>{row['failed_steps']}</td>"
+            f"<td>{row['skipped_inputs']}</td>"
+            f"<td>{html.escape(str(row['reason'])[:80])}</td>"
+            "</tr>"
+        )
+    out.append("</table>")
+    parts.extend(out)
+
+    return _splice("\n".join(parts), figures)
+
+
+def _number(value, digits):
+    """A number for a table cell, or an empty cell when there is none."""
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def write_index(outdir, obsids=None):
+    """
+    Write ``<outdir>/index.html``, one row per observation, linking every page.
+
+    Built from whatever is on disk, so it works on a run that was killed: an observation
+    that has a manifest and nothing else is listed with no records, which is itself the
+    statement that it never started.
+
+    Parameters
+    ----------
+    outdir : str
+        Run output directory.
+    obsids : list of str, optional
+        Which observations to list, in order. Defaults to every observation directory
+        found under ``outdir``.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    if obsids is None:
+        obsids = observation_directories(outdir)
+    summaries = [observation_summary(obsid, outdir) for obsid in obsids]
+
+    path = os.path.join(outdir, "index.html")
+    os.makedirs(outdir, exist_ok=True)
+    _write(path, PAGE.substitute(title="Reduction run", bundle=PLOTLY_BUNDLE,
+                                 body=index_body(summaries)))
+    return path
+
+
 def write_observation_page(obsid, outdir):
     """
     Write ``<outdir>/<OBSID>/diagnostics.html``.
@@ -912,8 +1091,9 @@ def main(argv=None):
     obsids = observation_directories(outdir)
     for obsid in obsids:
         write_observation_page(obsid, outdir)
+    index = write_index(outdir, obsids)
     write_plotly_bundle(outdir)
-    print(f"{len(obsids)} observation page(s) under {outdir}")
+    print(f"{len(obsids)} observation page(s); open {index}")
     return 0
 
 

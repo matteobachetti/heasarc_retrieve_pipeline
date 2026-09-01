@@ -1453,6 +1453,10 @@ def process_observations(
     """
     logger = get_run_logger()
 
+    # The bundle before anything else: the workers write their pages as they finish, and
+    # a page whose <script src> points at a file that is not there yet has no plots in it.
+    write_shared_report_files(outdir)
+
     # Before anything is submitted, so that a run killed part way through still has one
     # of these for every observation it meant to do, and the index can say so.
     for item in items:
@@ -1519,7 +1523,52 @@ def process_observations(
             f"{len(with_skips)} observation(s) had to skip an input; see "
             f"skipped_inputs.txt in each of {with_skips}"
         )
+
+    index = write_shared_report_files(outdir, [item["obsid"] for item in items])
+    if index is not None:
+        logger.info(f"Open {index} to see the run")
     return failed
+
+
+def write_shared_report_files(outdir, obsids=None):
+    """
+    Write the plotly bundle, and the index once the run has something to index.
+
+    Called twice: at the head of the run for the bundle alone, so that the pages the
+    workers write as they finish already resolve it, and at the tail for the index.
+
+    Everything is caught and logged, for the same reason the per-observation page is: a
+    report is worth less than a reduction. When the whole run is inside
+    :func:`heasarc_retrieve_pipeline.utils.short_workspace`, ``outdir`` is the short
+    symbolic link, and writing through it lands the bytes in the real tree while the link
+    is still there.
+
+    Parameters
+    ----------
+    outdir : str
+        Run output directory.
+    obsids : list of str, optional
+        The observations of this run, in the order to list them. ``None`` writes only the
+        bundle.
+
+    Returns
+    -------
+    str or None
+        The index path, when one was written.
+    """
+    try:
+        from .report import write_index, write_plotly_bundle
+
+        write_plotly_bundle(outdir)
+        if obsids is None:
+            return None
+        return write_index(outdir, obsids)
+    except Exception as error:
+        get_logger().warning(
+            f"Could not write the run report in {outdir}: "
+            f"{type(error).__name__}: {error}"
+        )
+        return None
 
 
 @flow

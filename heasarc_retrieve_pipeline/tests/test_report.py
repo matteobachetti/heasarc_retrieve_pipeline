@@ -464,3 +464,113 @@ class TestJoiningTheOtherTwoRecords:
             "80002092008",
             "90901333002",
         ]
+
+
+class TestTheRunIndex:
+    """One page for the run, one row per observation, every link resolving."""
+
+    def a_run(self, tmp_path):
+        """Three observations: one finished, one failed, one that never started."""
+        a_full_observation(tmp_path, obsid="90901333002")
+        with record_step(
+            observation(tmp_path, "90901333002"), "90901333002", "observation"
+        ) as rec:
+            rec.value(mission="nustar")
+
+        a_manifest(tmp_path, obsid="80002092008", name="NGC 253")
+        try:
+            with record_step(
+                observation(tmp_path, "80002092008"), "80002092008", "observation"
+            ):
+                raise ValueError("nupipeline died")
+        except ValueError:
+            pass
+
+        a_manifest(tmp_path, obsid="30202022003", name="M82")
+        return ["30202022003", "80002092008", "90901333002"]
+
+    def test_every_observation_is_listed_with_its_outcome(self, tmp_path):
+        obsids = self.a_run(tmp_path)
+
+        path = report.write_index(str(tmp_path), obsids)
+        text = soup(path).get_text()
+
+        assert path == os.path.join(str(tmp_path), "index.html")
+        for obsid in obsids:
+            assert obsid in text
+        assert "no records" in text, "the one that never started"
+        assert "failed" in text
+        assert "nupipeline died" in text
+
+    def test_every_link_resolves_to_a_page_that_exists(self, tmp_path):
+        obsids = self.a_run(tmp_path)
+        for obsid in obsids:
+            report.write_observation_page(obsid, str(tmp_path))
+
+        path = report.write_index(str(tmp_path), obsids)
+
+        links = [tag["href"] for tag in soup(path).find_all("a")]
+        assert links == [f"{obsid}/diagnostics.html" for obsid in obsids]
+        for link in links:
+            assert os.path.exists(os.path.join(str(tmp_path), link))
+
+    def test_the_index_loads_the_bundle_from_its_own_directory(self, tmp_path):
+        """The index is at the root, the observation pages one level down."""
+        obsids = self.a_run(tmp_path)
+
+        path = report.write_index(str(tmp_path), obsids)
+
+        scripts = [tag for tag in soup(path).find_all("script") if tag.get("src")]
+        assert [tag["src"] for tag in scripts] == ["plotly.min.js"]
+
+    def test_the_run_timeline_has_a_bar_per_observation_that_ran(self, tmp_path):
+        obsids = self.a_run(tmp_path)
+        summaries = [report.observation_summary(o, str(tmp_path)) for o in obsids]
+
+        fig = report.run_timeline_figure(summaries)
+
+        assert sum(len(trace.y) for trace in fig.data) == 2, "the third never started"
+        assert {trace.name for trace in fig.data} == {"done", "failed"}
+
+    def test_a_run_where_nothing_started_has_no_timeline_but_still_lists(self, tmp_path):
+        a_manifest(tmp_path, obsid="30202022003")
+
+        path = report.write_index(str(tmp_path), ["30202022003"])
+
+        assert not soup(path).find_all("div", class_="plotly-graph-div")
+        assert "30202022003" in soup(path).get_text()
+
+    def test_the_index_finds_the_observations_by_itself(self, tmp_path):
+        """A crashed run is rebuilt from disk with no list of what it meant to do."""
+        obsids = self.a_run(tmp_path)
+
+        path = report.write_index(str(tmp_path))
+
+        assert [tag["href"] for tag in soup(path).find_all("a")] == [
+            f"{obsid}/diagnostics.html" for obsid in obsids
+        ]
+
+    def test_the_target_and_the_exposure_are_in_the_row(self, tmp_path):
+        obsids = self.a_run(tmp_path)
+
+        path = report.write_index(str(tmp_path), obsids)
+        text = soup(path).get_text()
+
+        assert "NGC 253" in text
+        assert "42350" in text
+
+    def test_the_command_line_rebuilds_everything(self, tmp_path):
+        """python -m heasarc_retrieve_pipeline.report <outdir>, after a crashed run."""
+        self.a_run(tmp_path)
+
+        assert report.main([str(tmp_path)]) == 0
+
+        assert os.path.exists(os.path.join(tmp_path, "index.html"))
+        assert os.path.exists(os.path.join(tmp_path, "plotly.min.js"))
+        assert os.path.exists(
+            os.path.join(tmp_path, "90901333002", "diagnostics.html")
+        )
+
+    def test_the_command_line_says_how_to_use_it(self, tmp_path, capsys):
+        assert report.main([]) == 2
+        assert "usage" in capsys.readouterr().out
