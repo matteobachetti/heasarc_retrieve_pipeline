@@ -1008,3 +1008,51 @@ class TestObservingModesPresent:
 
         assert nustar.observing_modes_present(OBSID, config) == []
         assert not nustar.has_science_data(OBSID, config)
+
+
+class TestSnrOptimisedRadius:
+    """A file too faint to place a region on must not take the observation down.
+
+    ``nustar_gen``'s ``optimize_radius_snr`` binds ``best_radius`` only inside
+    ``if snr > old_snr``, and ``old_snr`` starts at zero. On a flat radial profile the
+    condition never holds and the return statement raises ``UnboundLocalError``.
+
+    Reproduced against nustar_gen 0.8.dev9 with a flat profile, with and without counts.
+    It cost three of the 56 M82 observations reprocessed in 2026: 30202022008, 30702012004
+    and 90101005002.
+    """
+
+    def test_a_radius_comes_straight_back(self):
+        def optimize(rind, rad_profile, radial_err, psf_profile, show=True):
+            return 42.0
+
+        assert nustar.snr_optimised_radius(optimize, [1], [1], [1], [1]) == 42.0
+
+    def test_the_optimisation_is_asked_not_to_plot(self):
+        seen = {}
+
+        def optimize(rind, rad_profile, radial_err, psf_profile, show=True):
+            seen["show"] = show
+            return 1.0
+
+        nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])
+
+        assert seen["show"] is False
+
+    def test_no_best_radius_becomes_none(self):
+        def optimize(rind, rad_profile, radial_err, psf_profile, show=True):
+            """Exactly what nustar_gen does when the SNR never rises above zero."""
+            if False:
+                best_radius = 1
+            return best_radius  # noqa: F821
+
+        assert nustar.snr_optimised_radius(optimize, [1], [1], [1], [1]) is None
+
+    def test_other_failures_are_not_swallowed(self):
+        """Only the missing best_radius is tolerated; a real error must still be seen."""
+
+        def optimize(rind, rad_profile, radial_err, psf_profile, show=True):
+            raise ValueError("the profile is nonsense")
+
+        with pytest.raises(ValueError, match="nonsense"):
+            nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])

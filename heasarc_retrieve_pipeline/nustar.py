@@ -1558,6 +1558,43 @@ def barycenter_data(obsid, ra, dec, config, src=1):
         )
 
 
+def snr_optimised_radius(optimize, rind, rad_profile, radial_err, psf_profile):
+    """
+    The SNR-optimised extraction radius, or ``None`` when there is no source to optimise.
+
+    ``nustar_gen.radial_profile.optimize_radius_snr`` steps outwards in radius keeping the
+    radius at which the signal-to-noise was highest, and assigns that radius only inside
+    ``if snr > old_snr``. ``old_snr`` starts at zero, so on a file with no source the
+    condition never holds, ``best_radius`` is never bound, and the return statement raises
+    ``UnboundLocalError``.
+
+    Measured against nustar_gen 0.8.dev9: a flat radial profile, with or without counts,
+    raises it every time. Three of the 56 M82 observations reprocessed in 2026 --
+    30202022008, 30702012004 and 90101005002 -- lost the whole observation to it.
+
+    A file too faint to place a region in is not a failure, and the caller already knows
+    what to do with a file that has no region: :func:`get_best_source_regions` skips it and
+    averages the others, and :func:`calculate_spectra` logs it and moves on.
+
+    Parameters
+    ----------
+    optimize : callable
+        ``nustar_gen``'s ``optimize_radius_snr``. Passed in rather than imported so this
+        can be exercised without the optional dependency installed.
+    rind, rad_profile, radial_err, psf_profile : array-like
+        As returned by ``nustar_gen``'s ``make_radial_profile``.
+
+    Returns
+    -------
+    float or None
+        The radius in arcsec, or ``None`` if no radius maximises the signal-to-noise.
+    """
+    try:
+        return optimize(rind, rad_profile, radial_err, psf_profile, show=False)
+    except UnboundLocalError:
+        return None
+
+
 @task(
     task_run_name="nu_best_source_reg_{infile}_pair_{pair}_elow_{elow}_ehigh_{ehigh}",
 )
@@ -1693,7 +1730,15 @@ def get_best_source_region(
     rind, rad_profile, radial_err, psf_profile = make_radial_profile(
         test_file, show_image=False, coordinates=coordinates
     )
-    rlimit = optimize_radius_snr(rind, rad_profile, radial_err, psf_profile, show=False)
+    rlimit = snr_optimised_radius(
+        optimize_radius_snr, rind, rad_profile, radial_err, psf_profile
+    )
+    if rlimit is None:
+        logger.warning(
+            f"No radius maximises the signal-to-noise in {infile}: the source is too "
+            "faint to place an extraction region on. Writing no region file for it."
+        )
+        return None
 
     max_radius = config.get("max_radius", 80)
     print("Radius of peak SNR for {} to {} keV: {}".format(pair[0], pair[1], rlimit))
