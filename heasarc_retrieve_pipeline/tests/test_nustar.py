@@ -1329,6 +1329,66 @@ class TestSnrOptimisedRadius:
             nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])
 
 
+class TestTheSeparationIsToldWhereToRecord:
+    """``separate_sources`` is handed directories, not an observation.
+
+    The record has to go somewhere, so the observation is passed in explicitly and an
+    absent one means record nothing -- which is what every caller that is not the flow
+    does. The separation itself is tested in ``test_image_utils.py``; what matters here is
+    that the directory arrives and that nothing is recorded for a file that was never a
+    candidate.
+    """
+
+    def separated(self, tmp_path, monkeypatch, names, obsid=""):
+        """Run the separation over a directory of files, with the image work stubbed."""
+        seen = []
+
+        def fake_filter(eventfile, region_size=30, back_region_size=50, rec=None):
+            seen.append(eventfile)
+            rec.value(stubbed=True)
+            return True
+
+        monkeypatch.setattr(nustar, "filter_sources_in_images", fake_filter)
+        directory = os.path.join(tmp_path, OBSID, "event_pipe")
+        os.makedirs(directory, exist_ok=True)
+        for name in names:
+            open(os.path.join(directory, name), "w").close()
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        nustar.separate_sources.fn([directory], config, obsid=obsid)
+        return seen
+
+    def test_each_event_file_gets_its_own_record(self, tmp_path, monkeypatch):
+        self.separated(
+            tmp_path,
+            monkeypatch,
+            [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"],
+            obsid=OBSID,
+        )
+
+        records = read_records(
+            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        )
+        assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl", f"nu{OBSID}B01_cl"}
+        assert all(r["step"] == "separate_sources" for r in records)
+        assert all(r["values"]["stubbed"] for r in records)
+
+    def test_an_encrypted_file_leaves_no_record(self, tmp_path, monkeypatch):
+        """It was never processed, so it is not a separation that went wrong."""
+        seen = self.separated(
+            tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt.gpg"], obsid=OBSID
+        )
+
+        assert seen == []
+        assert read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))) == []
+
+    def test_without_an_observation_nothing_is_recorded(self, tmp_path, monkeypatch):
+        """Every caller that is not the flow passes no obsid, and must keep working."""
+        seen = self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt"])
+
+        assert len(seen) == 1
+        assert not os.path.exists(os.path.join(tmp_path, OBSID, "diagnostics"))
+
+
 class TestFindingTheSourceRecordsItself:
     """The region step is where an observation most often quietly goes wrong.
 

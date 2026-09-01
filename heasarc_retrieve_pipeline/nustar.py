@@ -552,7 +552,9 @@ def flare_filtered_event_file_name(event_file):
 @task(
     task_run_name="nu_separate_sources_{event_file}_region_{region_size}",
 )
-def separate_sources_in_event_file(event_file, region_size=30, back_region_size=55):
+def separate_sources_in_event_file(
+    event_file, region_size=30, back_region_size=55, diagnostics_dir=None, obsid=""
+):
     """
     Split one cleaned event file into per-source and background event files.
 
@@ -569,6 +571,12 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
     back_region_size : float, optional
         Radius, in sky pixels, of the region excluded around every detected peak when
         building the background file.
+    diagnostics_dir : str, optional
+        Where to record what the separation found, normally
+        :func:`heasarc_retrieve_pipeline.diagnostics.diagnostics_path`. ``None`` records
+        nothing.
+    obsid : str, optional
+        Observation the file belongs to. Only used in the record.
 
     Returns
     -------
@@ -576,18 +584,27 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
         ``True`` if files were written, ``None`` if the input was skipped or contained too
         few events.
     """
-    logger = get_run_logger()
+    logger = get_logger()
+    # Neither of these is a separation that went wrong, so neither leaves a record: an
+    # encrypted file is one nobody can process, and a name that does not match is not an
+    # event file at all.
     if event_file.endswith(".gpg"):
         return None
     if not valid_re.search(event_file):
         return None
     logger.info(f"Processing {event_file}")
-    # if os.path.exists(event_file.replace(".evt", "_back.evt")):
-    #     logger.info("Older processing exists")
-    #     return None
-    return filter_sources_in_images(
-        event_file, region_size=region_size, back_region_size=back_region_size
-    )
+    with record_step(
+        diagnostics_dir,
+        obsid,
+        "separate_sources",
+        key=rootname(os.path.basename(event_file)),
+    ) as rec:
+        return filter_sources_in_images(
+            event_file,
+            region_size=region_size,
+            back_region_size=back_region_size,
+            rec=rec,
+        )
 
 
 @task(
@@ -595,7 +612,7 @@ def separate_sources_in_event_file(event_file, region_size=30, back_region_size=
     cache_expiration=timedelta(days=1000),
     task_run_name="nu_separate_sources_in_{directories[0]}_region_{region_size}",
 )
-def separate_sources(directories, config, region_size=30, back_region_size=55):
+def separate_sources(directories, config, region_size=30, back_region_size=55, obsid=""):
     """
     Run the image-based source separation over every cleaned event file in some directories.
 
@@ -613,18 +630,27 @@ def separate_sources(directories, config, region_size=30, back_region_size=55):
         Source extraction radius in sky pixels.
     back_region_size : float, optional
         Background exclusion radius in sky pixels.
+    obsid : str, optional
+        Observation these directories belong to. Without it nothing is recorded: this
+        step is handed directories, not an observation, and the record has to go
+        somewhere.
     """
+    directory = diagnostics_path(obsid, config) if obsid else None
     for d in directories:
         separate_done_file = os.path.join(d, "SEPARATE_DONE.TXT")
         if os.path.exists(separate_done_file):
-            logger = get_run_logger()
+            logger = get_logger()
             logger.info(f"Source separation already done in {d}")
             continue
-        logger = get_run_logger()
+        logger = get_logger()
         logger.info(f"Separating sources in {d}")
         for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
             separate_sources_in_event_file(
-                event_file, region_size=region_size, back_region_size=back_region_size
+                event_file,
+                region_size=region_size,
+                back_region_size=back_region_size,
+                diagnostics_dir=directory,
+                obsid=obsid,
             )
         with open(separate_done_file, "w") as f:
             f.write("")
@@ -2473,6 +2499,7 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         config,
         region_size=region_size,
         back_region_size=region_size + 25,
+        obsid=obsid,
     )
     separated.result()
 

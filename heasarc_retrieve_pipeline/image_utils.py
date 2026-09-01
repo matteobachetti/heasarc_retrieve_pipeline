@@ -54,6 +54,8 @@ from skimage.feature import peak_local_max
 from scipy.ndimage import gaussian_filter
 from statsmodels.robust import mad
 
+from .diagnostics import no_record
+
 
 def image_from_table(table, bins, gaussian_filter_sigma=1.0):
     """
@@ -278,7 +280,7 @@ def get_random_fluxes_in_img(table, region_size=30, n_rand=100):
     return fluxes
 
 
-def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
+def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec=None):
     """
     Split a NuSTAR event file into per-source and background event files.
 
@@ -312,6 +314,10 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     back_region_size : float, optional
         Radius, in sky pixels, of the region excluded around every detected peak when
         building the background file.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where to write the image, the detected peaks and the acceptance threshold. This
+        function is handed one event file and knows no observation, so the caller opens
+        the record. ``None`` records nothing.
 
     Returns
     -------
@@ -326,6 +332,8 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     refers to a different aperture than the extraction does. The energy conversion is
     NuSTAR-specific. See the science caveats in ``docs/known_issues.rst``.
     """
+    if rec is None:
+        rec = no_record()
     hdul = fits.open(eventfile)
 
     table = copy.deepcopy(hdul[1].data)
@@ -333,8 +341,19 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     energy = table["PI"] * 0.04 + 1.6
     good = (energy >= 3.0) & (energy < 79.0) & has_sky_position(table)
 
+    # How many events never got a sky position is a quality indicator in its own right:
+    # a file that is mostly (0, 0) had an attitude problem, and nothing else counts them.
+    rec.value(
+        n_events=int(len(table)),
+        n_events_no_sky_position=int(np.count_nonzero(~has_sky_position(table))),
+        n_events_used=int(np.count_nonzero(good)),
+        region_size=region_size,
+        back_region_size=back_region_size,
+    )
+
     if np.count_nonzero(good) < 20:
         hdul.close()
+        rec.skip("fewer than 20 events passed the energy and sky-position filter")
         return
 
     table = table[good]
@@ -365,6 +384,21 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     coordinates[:, 1] = coordinates[:, 1] * dx + dx + xmin
     coordinates[:, 0] = coordinates[:, 0] * dy + dy + ymin
 
+    rec.value(
+        background_median=float(median),
+        background_mad=float(std),
+        acceptance_threshold=float(median + std),
+        n_peaks=int(len(coordinates)),
+    )
+    # float32 rather than float64: the image is smoothed counts, and it has to travel to
+    # a browser. The peaks are in sky pixels, the same frame as the image axes.
+    rec.array(
+        image=np.asarray(img, dtype=np.float32),
+        image_x=np.asarray(xbins, dtype=np.float32),
+        image_y=np.asarray(ybins, dtype=np.float32),
+        peaks=np.asarray(coordinates, dtype=float),
+    )
+
     # ``Figure`` rather than ``pyplot``: a worker process reducing an observation should
     # not touch pyplot's global figure registry, or make it choose a display backend.
     fig = Figure()
@@ -383,12 +417,15 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     order = np.argsort(region_fluxes)
     coordinates = coordinates[order[::-1]]
 
+    rec.array(peak_fluxes=np.asarray(region_fluxes[order[::-1]], dtype=float))
+
+    accepted = []
     for i, coord in enumerate(coordinates):
         table_filt = filter_table(table, coord, region_size=region_size)
         flux = len(table_filt)
-        print(median - std, flux, median + std)
         if flux < median + std:
             continue
+        accepted.append(dict(source=i + 1, x=float(coord[1]), y=float(coord[0]), flux=flux))
 
         hdul[1].data = fits.BinTableHDU(table_filt).data
         # hdul[1].header = header
@@ -403,6 +440,8 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
         ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
         fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_src{i + 1}.jpg"))
 
+    rec.value(sources=accepted, n_sources=len(accepted))
+
     table_filt = filter_table_outside_regions(table, coordinates, region_size=back_region_size)
 
     hdul[1].data = fits.BinTableHDU(table_filt).data
@@ -416,5 +455,6 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50):
     ax = fig.subplots()
     ax.pcolormesh(x_filt, y_filt, img_filt, vmin=np.median(img))
     fig.savefig(eventfile.replace(".gz", "").replace(".evt", f"_back.jpg"))
+    rec.value(n_events_background=int(len(table_filt)))
     hdul.close()
     return True

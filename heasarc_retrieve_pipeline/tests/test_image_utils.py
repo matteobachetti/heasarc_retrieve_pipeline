@@ -15,6 +15,12 @@ import pytest
 
 from astropy.io import fits
 
+from heasarc_retrieve_pipeline.diagnostics import (
+    diagnostics_path,
+    read_arrays,
+    read_records,
+    record_step,
+)
 from heasarc_retrieve_pipeline.image_utils import (
     filter_sources_in_images,
     filter_table_outside_regions,
@@ -227,3 +233,83 @@ class TestGetRandomFluxesInImg:
         fluxes = get_random_fluxes_in_img(table, region_size=30, n_rand=100)
 
         assert np.median(fluxes) > 0
+
+
+class TestTheSeparationRecordsWhatItFound:
+    """What the separation decided, written down where the report can read it.
+
+    The acceptance threshold and the counts in each aperture used to go to standard
+    output with ``print``, three numbers a line with no file name and no units, from
+    however many worker processes were running at the time.
+    """
+
+    def run(self, tmp_path, path, obsid="90901333002"):
+        """Separate the sources in ``path``, recording into ``tmp_path``, and read back."""
+        config = dict(out_data_path=str(tmp_path))
+        directory = diagnostics_path(obsid, config)
+        with record_step(directory, obsid, "separate_sources", key="nu123A01_cl") as rec:
+            filter_sources_in_images(path, rec=rec)
+        (record,) = read_records(directory)
+        return record, read_arrays(directory, record)
+
+    def test_it_records_the_threshold_and_the_source_it_accepted(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+
+        record, _ = self.run(tmp_path, path)
+
+        assert record["status"] == "done"
+        assert record["values"]["n_sources"] == 1
+        assert record["values"]["acceptance_threshold"] == pytest.approx(
+            record["values"]["background_median"] + record["values"]["background_mad"]
+        )
+        (source,) = record["values"]["sources"]
+        assert source["x"] == pytest.approx(500, abs=10)
+        assert source["flux"] > record["values"]["acceptance_threshold"]
+
+    def test_it_counts_the_events_that_never_got_a_sky_position(self, tmp_path):
+        """A file that is mostly (0, 0) had an attitude problem. Nothing else counts them."""
+        path = event_file(tmp_path / "nu123A01_cl.evt", n_unplaced=200)
+
+        record, _ = self.run(tmp_path, path)
+
+        assert record["values"]["n_events_no_sky_position"] == 206
+        assert record["values"]["n_events"] == 6206
+        assert record["values"]["n_events_used"] < record["values"]["n_events"]
+
+    def test_it_records_the_image_and_the_peaks_it_found(self, tmp_path):
+        """These are the sky figure. The peaks are in the same frame as the image axes."""
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+
+        _, arrays = self.run(tmp_path, path)
+
+        assert arrays["image"].shape == (99, 99)
+        assert arrays["image"].dtype == np.float32
+        assert arrays["peaks"].shape[1] == 2
+        assert arrays["peaks"][0][1] == pytest.approx(500, abs=20)
+        assert len(arrays["peak_fluxes"]) == len(arrays["peaks"])
+
+    def test_a_file_with_too_few_events_says_so(self, tmp_path):
+        path = tmp_path / "nu123A01_cl.evt"
+        rng = np.random.default_rng(3)
+        hdu = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="X", format="E", array=rng.uniform(300, 700, 10)),
+                fits.Column(name="Y", format="E", array=rng.uniform(300, 700, 10)),
+                fits.Column(name="PI", format="J", array=rng.integers(40, 1900, 10)),
+            ],
+            name="EVENTS",
+        )
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+        record, arrays = self.run(tmp_path, str(path))
+
+        assert record["status"] == "skipped"
+        assert "fewer than 20 events" in record["reason"]
+        assert record["values"]["n_events"] == 10
+        assert arrays is None
+
+    def test_separating_without_a_record_still_works(self, tmp_path):
+        """Every test written before any of this existed calls it with no record."""
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+
+        assert filter_sources_in_images(path) is True
