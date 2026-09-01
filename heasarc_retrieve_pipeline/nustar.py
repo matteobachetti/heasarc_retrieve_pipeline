@@ -1542,6 +1542,7 @@ def plot_flare_filtering(
     dt=100.0,
     minimum_class="C5.0",
     flux_class="C5.0",
+    rec=None,
 ):
     """
     Show what the solar-flare filtering removed, and what it left alone.
@@ -1587,6 +1588,11 @@ def plot_flare_filtering(
     flux_class : str or None, optional
         The flux cut used. This one acts directly on the curve in the top panel, so it is
         drawn there as a horizontal line.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where to record the same three panels as numbers: the GOES curve, the two light
+        curves before and after, the removed intervals and what they cost. ``None``
+        records nothing. The caller opens it, because this function is handed one event
+        file and knows no observation.
 
     Returns
     -------
@@ -1598,6 +1604,8 @@ def plot_flare_filtering(
     from matplotlib.figure import Figure
 
     logger = get_logger()
+    if rec is None:
+        rec = no_record()
 
     gti_before = gti_to_array(gti_before)
     gti_after = gti_to_array(gti_after)
@@ -1620,6 +1628,18 @@ def plot_flare_filtering(
     kept = mask_from_gti(times, gti_after)
     removed = intervals_removed(gti_before, gti_after)
 
+    rec.value(
+        n_intervals_removed=len(removed),
+        bin_seconds=dt,
+        minimum_class=minimum_class,
+        flux_class=flux_class,
+    )
+    rec.array(
+        gti_before=np.asarray(gti_before, dtype=float),
+        gti_after=np.asarray(gti_after, dtype=float),
+        removed=np.asarray(removed, dtype=float).reshape(-1, 2),
+    )
+
     fig = Figure(figsize=(11, 9))
     axes = fig.subplots(3, 1, sharex=True)
 
@@ -1631,6 +1651,13 @@ def plot_flare_filtering(
         ):
             if column in goes.colnames:
                 axes[0].plot(goes["TIME"], goes[column], color=colour, lw=1, label=label)
+                rec.array(
+                    **{
+                        f"goes_{column.lower()}": np.asarray(goes[column], dtype=float),
+                        "goes_time": np.asarray(goes["TIME"], dtype=float),
+                    }
+                )
+        rec.value(goes_light_curve=os.path.basename(goes_lc_file))
         axes[0].set_yscale("log")
         axes[0].set_ylim(1e-9, 1e-3)
         for letter, flux in GOES_CLASS_FLUX.items():
@@ -1654,6 +1681,7 @@ def plot_flare_filtering(
         axes[0].legend(loc="upper right", fontsize="small", ncol=4)
     else:
         logger.warning(f"No GOES light curve at {goes_lc_file}; leaving that panel empty")
+        rec.value(goes_light_curve=None)
         axes[0].text(
             0.5,
             0.5,
@@ -1677,6 +1705,16 @@ def plot_flare_filtering(
             chi2_dof_against_a_constant(before),
             chi2_dof_against_a_constant(after),
         )
+
+        band = f"{emin:.0f}_{emax:.0f}"
+        rec.value(**{f"chi2_dof_{band}": list(chi2[emin])})
+        for when, curve in (("before", before), ("after", after)):
+            rec.array(
+                **{
+                    f"lc_{band}_{when}_{column}": np.asarray(curve[column], dtype=float)
+                    for column in ("time", "rate", "rate_err")
+                }
+            )
 
         axis.errorbar(
             before["time"],
@@ -1729,7 +1767,13 @@ def plot_flare_filtering(
 
 @flow(flow_run_name="nu_filter_solar_flares_{event_file}_mincat_{minimum_class}")
 def filter_from_solar_flares(
-    event_file, goes_gti_file, goes_lc_file=None, minimum_class="C5.0", flux_class="C5.0"
+    event_file,
+    goes_gti_file,
+    goes_lc_file=None,
+    minimum_class="C5.0",
+    flux_class="C5.0",
+    diagnostics_dir=None,
+    obsid="",
 ):
     """
     Write a flare-free copy of an event file.
@@ -1771,6 +1815,18 @@ def filter_from_solar_flares(
     str
         Path of the filtered file.
     """
+    with record_step(
+        diagnostics_dir, obsid, "flare_filtering", key=rootname(os.path.basename(event_file))
+    ) as rec:
+        return _filter_from_solar_flares(
+            event_file, goes_gti_file, goes_lc_file, minimum_class, flux_class, rec
+        )
+
+
+def _filter_from_solar_flares(
+    event_file, goes_gti_file, goes_lc_file, minimum_class, flux_class, rec
+):
+    """The body of :func:`filter_from_solar_flares`, with its record open."""
     from astropy.io import fits
 
     root = rootname(event_file)
@@ -1781,6 +1837,7 @@ def filter_from_solar_flares(
 
     if os.path.exists(outfile_filtered):
         logger.info(f"Filtered event file {outfile_filtered} already exists, skipping")
+        rec.skip("the flare-filtered file was already there")
         return outfile_filtered
 
     merge_gtis([event_file, goes_gti_file], outfile_gti_temp, gti_operation="AND")
@@ -1800,9 +1857,13 @@ def filter_from_solar_flares(
 
     os.unlink(outfile_gti_temp)
 
+    # What the filtering cost, in apply_gti's own words: it is the function that did it.
+    rec.value(**stats)
+
     # The science product is already written. A diagnostic figure failing -- a missing
     # GOES file, a matplotlib problem on a headless machine -- must not take the
-    # observation down with it, so it is logged rather than raised.
+    # observation down with it, so it is logged rather than raised. The record shares
+    # that rule: everything above is already on disk.
     try:
         plot_flare_filtering(
             event_file,
@@ -1811,6 +1872,7 @@ def filter_from_solar_flares(
             goes_lc_file=goes_lc_file,
             minimum_class=minimum_class,
             flux_class=flux_class,
+            rec=rec,
         )
     except Exception as error:
         logger.warning(f"Could not plot the flare filtering for {event_file}: {error}")
@@ -2523,7 +2585,11 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     # 80002092008 the unfiltered background is 3.7% too high in 3--10 keV.
     for fname in source_files + background_files:
         filter_from_solar_flares(
-            fname, goes_gti_file, goes_lc_file=nu_goes_lc_file(obsid, config)
+            fname,
+            goes_gti_file,
+            goes_lc_file=nu_goes_lc_file(obsid, config),
+            diagnostics_dir=diagnostics_path(obsid, config),
+            obsid=obsid,
         )
 
     # barycenter_data globs the output directory rather than taking the file list, so the

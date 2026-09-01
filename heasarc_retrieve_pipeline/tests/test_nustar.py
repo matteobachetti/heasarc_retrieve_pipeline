@@ -1329,6 +1329,130 @@ class TestSnrOptimisedRadius:
             nustar.snr_optimised_radius(optimize, [1], [1], [1], [1])
 
 
+class TestTheFlareFilteringRecordsItself:
+    """The flare cut is the step whose result is hardest to check by looking at the file.
+
+    Too little removed and the flare is still in the data; too much and good exposure is
+    gone. Either way the output looks like an event file. The three panels of the figure
+    are recorded as numbers so the report can draw them, together with what the cut
+    actually cost -- which is ``apply_gti``'s answer, not an estimate.
+    """
+
+    def write_gti(self, path, intervals):
+        """A GTI file as ``ftmgtime`` would have written it."""
+        from astropy.io import fits
+
+        intervals = np.asarray(intervals, dtype=float)
+        hdu = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="START", format="D", array=intervals[:, 0]),
+                fits.Column(name="STOP", format="D", array=intervals[:, 1]),
+            ],
+            name="GTI",
+        )
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+    def filtered(self, tmp_path, monkeypatch, after=((0, 400), (600, 1000)), goes=False):
+        """Filter one synthetic event file, with the HEASOFT GTI merge stubbed out."""
+        pytest.importorskip("matplotlib")
+        event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
+
+        def fake_merge(files, outfile, gti_operation="OR"):
+            self.write_gti(outfile, after)
+
+        monkeypatch.setattr(nustar, "merge_gtis", fake_merge)
+
+        goes_lc_file = str(tmp_path / f"nu{OBSID}_goes.fits")
+        if goes:
+            from astropy.table import Table
+
+            times = np.linspace(0, 1000, 100)
+            flux = np.full_like(times, 1e-7)
+            flux[40:60] = 1e-5  # an M-class flare in the middle
+            Table({"TIME": times, "XRSA": flux / 10, "XRSB": flux}).write(goes_lc_file)
+
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        nustar.filter_from_solar_flares.fn(
+            event_file,
+            str(tmp_path / "goes.gti"),
+            goes_lc_file=goes_lc_file,
+            diagnostics_dir=directory,
+            obsid=OBSID,
+        )
+        (record,) = read_records(directory)
+        return record, read_arrays(directory, record), event_file
+
+    def test_it_records_what_the_cut_cost(self, tmp_path, monkeypatch):
+        record, _, _ = self.filtered(tmp_path, monkeypatch)
+
+        assert record["status"] == "done"
+        assert record["key"] == f"nu{OBSID}_src1"
+        assert record["values"]["nevents_after"] < record["values"]["nevents_before"]
+        assert record["values"]["livetime_after"] < record["values"]["livetime_before"]
+        assert record["values"]["n_intervals_removed"] == 1
+
+    def test_it_records_the_intervals_it_removed(self, tmp_path, monkeypatch):
+        """These are the shaded bands in the figure."""
+        _, arrays, _ = self.filtered(tmp_path, monkeypatch)
+
+        assert np.allclose(arrays["removed"], [[400.0, 600.0]])
+        assert np.allclose(arrays["gti_after"], [[0.0, 400.0], [600.0, 1000.0]])
+
+    def test_it_records_both_light_curves_in_both_bands(self, tmp_path, monkeypatch):
+        """3--10 keV is where solar stray light lands; 10--79 keV is the control."""
+        _, arrays, _ = self.filtered(tmp_path, monkeypatch)
+
+        for band in ("3_10", "10_79"):
+            for when in ("before", "after"):
+                for column in ("time", "rate", "rate_err"):
+                    assert f"lc_{band}_{when}_{column}" in arrays
+
+    def test_the_control_band_chi_squared_is_recorded_for_both(self, tmp_path, monkeypatch):
+        """A hard band that changed is the sign that the cut removed more than flares."""
+        record, _, _ = self.filtered(tmp_path, monkeypatch)
+
+        assert len(record["values"]["chi2_dof_10_79"]) == 2
+        assert len(record["values"]["chi2_dof_3_10"]) == 2
+
+    def test_the_goes_curve_is_recorded_when_there_is_one(self, tmp_path, monkeypatch):
+        record, arrays, _ = self.filtered(tmp_path, monkeypatch, goes=True)
+
+        assert record["values"]["goes_light_curve"] == f"nu{OBSID}_goes.fits"
+        assert len(arrays["goes_xrsb"]) == 100
+        assert len(arrays["goes_time"]) == 100
+
+    def test_a_missing_goes_curve_is_recorded_as_missing(self, tmp_path, monkeypatch):
+        """A rerun skips the download, so its absence is not an error."""
+        record, arrays, _ = self.filtered(tmp_path, monkeypatch, goes=False)
+
+        assert record["values"]["goes_light_curve"] is None
+        assert "goes_time" not in arrays
+
+    def test_a_rerun_says_the_filtered_file_was_already_there(self, tmp_path, monkeypatch):
+        _, _, event_file = self.filtered(tmp_path, monkeypatch)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        nustar.filter_from_solar_flares.fn(
+            event_file, str(tmp_path / "goes.gti"), diagnostics_dir=directory, obsid=OBSID
+        )
+
+        (record,) = read_records(directory)
+        assert record["status"] == "skipped"
+        assert "already there" in record["reason"]
+
+    def test_a_figure_that_fails_does_not_lose_the_filtering(self, tmp_path, monkeypatch):
+        """The science product is written by then, and so are the numbers that matter."""
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("no display, no disk, no luck")
+
+        monkeypatch.setattr(nustar, "plot_flare_filtering", explode)
+        record, _, _ = self.filtered(tmp_path, monkeypatch)
+
+        assert record["status"] == "done"
+        assert record["values"]["nevents_before"] > 0
+
+
 class TestTheSeparationIsToldWhereToRecord:
     """``separate_sources`` is handed directories, not an observation.
 
