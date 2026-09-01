@@ -314,6 +314,12 @@ Output layout::
     <out_data_path>/<OBSID>/split/         nusplitsc output (mode 06 sub-observations)
     <out_data_path>/<OBSID>/products/      nuproducts spectra, ARFs, RMFs
 
+and, one of each per observation, in ``<out_data_path>/<OBSID>/``::
+
+    nu<OBSID>_goes.fits                    the observation's GOES X-ray light curve
+    nu<OBSID>_goes.gti                     the flare-free intervals derived from it
+    skipped_inputs.txt                     the inputs the reduction had to skip
+
 Observing modes 01 and 06
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -478,9 +484,11 @@ zero. On a file with no source the condition never holds and the return statemen
 ``UnboundLocalError``. Reproduced directly against ``nustar_gen`` 0.8.dev9: a flat radial
 profile raises it every time, with counts or without. ``snr_optimised_radius`` turns that
 one exception into ``None`` -- "this file is too faint to place a region on" -- and lets
-every other exception through. ``None`` is a case the callers already handle:
-``get_best_source_regions`` skips the file and averages the rest, ``calculate_spectra``
-logs it and moves on. It is the same path the position-consistency check uses.
+every other exception through. ``None`` is a case the callers already handle, and
+they handle it differently by observing mode: ``get_best_source_regions``, which sees only
+mode-01 files, raises ``NoSourceInScienceData``; ``calculate_spectra`` records the skip and
+moves on. It is the same path the position-consistency check uses, and the same path
+``first_source_position`` takes when ``find_source`` returns no peak at all.
 
 The radius is capped at ``config["max_radius"]`` (default 80 arcsec). Two DS9 region files
 are written next to the event file:
@@ -526,11 +534,11 @@ Solar flare filtering
 ~~~~~~~~~~~~~~~~~~~~~
 
 NuSTAR observes at low Earth orbit with an open detector aperture, and large solar flares
-raise its background substantially. ``get_goes_gtis`` (``nustar.py:373``) builds GTIs that
-exclude flare intervals:
+raise its background substantially. ``get_goes_gtis`` builds GTIs that exclude flare
+intervals, **once per observation**:
 
-1. The observation's ``TSTART``/``TSTOP`` (NuSTAR mission-elapsed time) are converted to
-   civil time with ``nustar_gen.info.NuSTAR.met_to_time``.
+1. The observation's time span (NuSTAR mission-elapsed time) is converted to civil time
+   with ``nustar_gen.info.NuSTAR.met_to_time``.
 2. ``sunpy``'s ``Fido`` queries the GOES XRS instrument for that interval, choosing the
    highest-numbered (i.e. most recent) GOES satellite that covers it.
 3. The same query retrieves the **HEK flare catalogue** entries flagged by SWPC.
@@ -573,9 +581,36 @@ tens of nanoseconds wide. ``merge_intervals`` therefore takes a ``tolerance``, a
 above the jitter, three below any gap that could mean anything. Without it the flux cut on
 that observation produced six intervals where there are physically two.
 
-The light curve is written to ``<root>_goes.fits``, with its ``TIME`` column converted to
-the event file's mission elapsed time, so the diagnostic below plots against the same data
-the cut was made on, at no extra network cost.
+The light curve is written to ``<OBSID>/nu<OBSID>_goes.fits``, with its ``TIME`` column
+converted to the observation's mission elapsed time, so the diagnostic below plots against
+the same data the cut was made on, at no extra network cost.
+
+**One fetch per observation, not one per file.** This step used to be keyed on an event
+file, so every module and every CHU subset repeated the whole lookup: 91 ``goes_lightcurve``
+task runs across the 52 observations of the 2026 M82 run, up to eleven for one observation,
+each performing its own ``Fido.search`` and ``Fido.fetch`` and writing its own copy of the
+downloaded files. Two of the eleven failures in that run were ``No online VSO mirrors could
+be found``, and every extra attempt is another chance to meet a mirror that is down.
+
+It was also wrong on its own terms. The Sun does not care which module or which CHU subset
+the events came from, and a mode-06 CHU slice a few minutes long can fall entirely inside a
+gap in the GOES sampling: asking about ``A06_chu3`` alone on 90201037002 returned a time
+series with no rows, and astropy raised ``cannot guess format from input values with
+zero-size array`` -- a message about nothing that matters.
+
+The interval now comes from ``observation_time_span``, which reads the **mode-01** cleaned
+event files and takes the widest of their ``TSTART``/``TSTOP`` and their own GTI extents,
+for the reason in issue 35: ``ftmerge`` copies those keywords from its first input, so on a
+merged file the header can be narrower than the data, and this GTI is later ANDed with each
+file's own. An observation with no mode-01 file falls back to every cleaned event file in
+the ``nupipeline`` output directory.
+
+One guard remains for the case where GOES genuinely has nothing: ``require_goes_coverage``
+raises ``NoGoesCoverage`` when the truncated series has no samples at all. That is fatal on
+purpose. Keeping all the good time instead would turn the flare filtering off without
+saying so, and whether an observation may be analysed that way is a scientific decision the
+pipeline must not make on its own. It takes a count rather than a time series so that it is
+testable without ``sunpy``, which is an optional dependency.
 
 **The hazard of a flux threshold, and what the code does about it.** The Sun's quiescent
 1--8 A flux is not a fixed number: it rises and falls with the eleven-year cycle. Near solar
@@ -589,7 +624,9 @@ writing anything: if the cut would remove more than half of the file's existing 
 it logs a prominent warning naming the percentage. It still writes the GTI. A genuinely
 flare-dominated observation really can lose most of its exposure, and nothing the code can
 inspect distinguishes that from a threshold set too low -- only the person analysing the
-observation can. Passing ``flux_class=None`` falls back to the catalogue alone.
+observation can. Passing ``flux_class=None`` falls back to the catalogue alone. Both that
+warning and the "Solar flares cover the whole of" error are now per observation, which is
+what they always meant.
 
 ``filter_from_solar_flares`` then ANDs the flare GTIs with the event file's existing GTIs
 and writes ``*_noflares.evt`` through ``utils.apply_gti``, which does the whole job: events
@@ -1148,6 +1185,67 @@ The sentinels record only *that* a step ran, not with which parameters. Re-runni
 observation with different ``flags``, a different ``minimum_class`` or a different region
 size will not invalidate them; the output directory has to be deleted by hand.
 
+
+What a HEASOFT tool says it produces
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A zero return code is not evidence that a file was written. ``ftmgtime`` handed an empty
+list of input GTIs exits 0 and writes nothing at all; ``ftsort``, told to sort a file that
+was never created, then fails with ``PIL ERROR PIL_BAD_FILE_ACCESS`` and return code 33.
+The message names the wrong tool, and two observations of the 2026 run were lost with it.
+
+So ``heasoft.run`` and ``heasoft.run_task`` take a **required keyword-only** ``produces``,
+and check it inside the lock as soon as the return code has been accepted:
+
+* a path, or a list of paths -- each must exist and be non-empty;
+* a directory path -- must exist and hold at least one entry;
+* ``heasoft.IN_PLACE(path)`` -- for a tool that edits a file that was already there
+  (``fthedit``, ``fappend``): the file must still exist and still not be empty.
+
+A leading ``!``, HEASOFT's clobber marker, is not part of the name and is stripped before
+checking. Failure raises ``RuntimeError`` naming the tool and the path, in the same voice
+as the return-code error next to it.
+
+It is required rather than optional on purpose: every one of the twelve call sites has a
+nameable output, and a caller who has to write it down cannot forget the lesson above. An
+AST guard in ``tests/test_prefect_wiring.py`` keeps it that way, and a signature check in
+``tests/test_heasoft.py`` keeps the argument mandatory.
+
+The one place this can newly fail is ``nuproducts``. If a spectrum has too few counts for
+``rungrppha`` to write the grouped file, an observation that used to pass in silence now
+raises. That is the intent, and it is the thing to watch in the next cluster run.
+
+Inputs the reduction had to skip
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two outcomes are deliberately different:
+
+* **A mode-01 module with no usable source fails the observation.** Mode 01 is ordinary
+  science with the full aspect solution from CHU4. A target the pipeline was pointed at
+  has to be in it, and half an observation delivered quietly is worse than a failure that
+  says why. ``get_best_source_regions`` raises ``NoSourceInScienceData`` when a mode-01
+  file yields no region, and ``join_source_data`` raises it when a module has mode-01
+  cleaned events and yet nothing to merge. An observation with no mode-01 file *at all* is
+  a different case -- 80002092003 is one -- and stays a clean zero.
+* **An unusable mode-06 CHU subset is skipped, and the observation still counts as
+  reduced.** Each CHU combination is a few minutes of exposure with its own reconstructed
+  aspect, and some of them genuinely hold no detectable source.
+
+Every skip of the second kind is recorded in ``<out_data_path>/<OBSID>/skipped_inputs.txt``
+by ``utils.record_skipped_input``, so that a run can be audited without reading a 40 MB
+cluster log::
+
+    # Inputs skipped while reducing 90202038002
+    nu90202038002A06_chu1_N_cl.evt  no usable extraction region could be measured
+
+Only the **base name** is recorded, never a full path: worker processes see the output tree
+through a ``short_workspace`` symbolic link under ``/tmp`` whose name is different on every
+run, so an absolute path recorded today means nothing tomorrow. The file is read, added to
+and replaced whole -- ``tempfile.mkstemp`` in the same directory, then ``os.replace``,
+under a module-level lock -- so a reader never sees it half written and two tasks skipping
+at the same time cannot lose one of the two records. Recording the same pair twice leaves
+one line, which makes a resumed run idempotent. ``process_observations`` names the
+observations whose report is not empty at the end of its tally.
 
 Running several observations at once
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

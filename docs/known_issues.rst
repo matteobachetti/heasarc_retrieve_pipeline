@@ -997,8 +997,8 @@ Cause                                                          n   Issue
 ``FileNotFoundError`` on ``split/RECOVER_DONE.TXT``            8   41
 Parameter file under ``$HOME/pfiles``                          7   42
 ``UnboundLocalError: best_radius``                             3   43
-``IndexError: index 0 is out of bounds ... size 0``            2   not triaged
-``ValueError: cannot guess format ... zero-size array``        2   not triaged
+``IndexError: index 0 is out of bounds ... size 0``            2   47
+``ValueError: cannot guess format ... zero-size array``        2   48
 ``RuntimeError: nusplitsc failed with return code 1``          1   not triaged
 Solar flares cover the whole observation                       1   arguably right
 ============================================================  ===  ===========
@@ -1091,6 +1091,111 @@ per-mission, not global. **Fixed** by ``core.exposure_condition``, driven by
 ``MISSION_CONFIG[...]["zero_exposure_may_be_wrong"]``: ``> 0`` for NuSTAR, ``>= 0`` for
 NICER and for RXTE, which has not been checked. The single-OBSID query keeps ``>= 0``
 everywhere.
+
+
+45. An empty intermediate took down a good observation -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The 2026 M82 run was repeated with the fixes for issues 41 to 44 in place: 52
+observations, four workers, 41 reduced, 0 held as no science data, 11 failed. Classifying
+those eleven showed that **nine are the same defect wearing different clothes**. An empty
+intermediate product -- an image with no counts, a GOES time series with no rows, an empty
+list of files to merge -- reaches a step that assumes it is not empty, the step raises
+instead of skipping, and the exception travels out of the task, out of the observation
+flow, and marks the whole observation failed.
+
+======================================================  ===  ==============
+Cause                                                    n   Issue
+======================================================  ===  ==============
+``IndexError`` after ``find_source``                     3   47
+``ftsort failed with return code 33``                    2   46
+``ftmgtime failed with return code 45``                  1   46
+``ValueError`` on a zero-size GOES series                1   48
+``ConnectionError``: no online VSO mirrors               2   48
+``nusplitsc failed with return code 1``                  1   not triaged
+Solar flares cover the whole observation                 1   arguably right
+======================================================  ===  ==============
+
+Issues 46 to 49 record the individual mechanisms. The decision that shapes all four is a
+scientific one: **a mode-01 module with no usable source fails the observation, and an
+unusable mode-06 CHU subset is skipped**. M82 X-2 should never be undetectable in normal
+science mode, so if it is, the run must say so rather than quietly deliver half an
+observation; a single-CHU slice a few minutes long genuinely can hold nothing. Every skip
+of the second kind goes into a per-observation ``skipped_inputs.txt``, so a run can be
+audited without reading a 40 MB log. See :ref:`technical_details`.
+
+46. A HEASOFT tool returned 0 and wrote nothing -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``ftmgtime`` handed an empty list of input GTIs exits with return code 0 and writes no
+file at all. ``ftsort``, told to sort the file that was never created, then fails with
+``PIL ERROR PIL_BAD_FILE_ACCESS`` and return code 33 -- naming the wrong tool, one step
+away from where the trouble started. Two observations were lost that way, 30202022007 and
+90901332001, and a third, 30202022004, to ``ftmgtime failed with return code 45`` choking
+on its second input.
+
+Issue 35 fixed the case of a tool that *reports* failure. This is the case of a tool that
+does not. **Fixed** by making ``produces`` a required argument of ``heasoft.run`` and
+``heasoft.run_task``: every call declares the file, directory or in-place edit it must
+leave behind, and the wrapper checks it before returning. An AST guard keeps all twelve
+call sites declaring one.
+
+The one place this can newly fail is ``nuproducts``: a spectrum with too few counts for
+``rungrppha`` to write the grouped file will now raise where it used to pass in silence.
+That is the intent, and it is what to watch in the next run.
+
+47. No source in the image raised ``IndexError`` -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nustar_gen``'s ``find_source`` returns an empty array when an image holds too few counts
+to have a peak, and ``get_best_source_region`` indexed it immediately: ``IndexError: index
+0 is out of bounds for axis 0 with size 0``.
+
+Three observations were lost -- 90202038002 ``A06_chu1``, 30502021004 ``A06_chu1`` and
+30702012004 ``B06_chu2`` -- and **never on a mode-01 file**. Every one was a single-CHU
+subset of the spacecraft-science data. Every mode-01 file in those observations completed,
+and in 30702012004 five of the six CHU subsets did too. The first two failed identically in
+the previous run with a different worker layout and a different temporary directory, so it
+is deterministic: those images really do hold too few counts.
+
+**Fixed** by ``first_source_position``, which returns ``None`` instead, in the same shape
+as ``snr_optimised_radius`` next to it. For a mode-06 subset that is a recorded skip; for a
+mode-01 file ``get_best_source_regions`` raises ``NoSourceInScienceData``.
+
+48. The GOES light curve was fetched once per event file -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``get_goes_gtis`` was a task keyed on an event file, so every module and every CHU subset
+repeated the whole lookup: 91 ``goes_lightcurve`` task runs across 52 observations, up to
+eleven for 31001019002 alone, each with its own ``Fido.search``, its own ``Fido.fetch`` and
+its own copy of the downloaded files. Two failures were ``ConnectionError: No online VSO
+mirrors could be found``, and every extra attempt is another chance to meet a mirror that
+is down.
+
+It was also wrong on its own terms. A mode-06 CHU slice a few minutes long can fall
+entirely inside a gap in the once-a-minute GOES sampling. On 90201037002 ``A06_chu3`` the
+truncated series had no rows, and astropy raised ``ValueError: cannot guess format from
+input values with zero-size array``.
+
+**Fixed** by fetching once per observation, over a span taken from the mode-01 cleaned
+event files. ``require_goes_coverage`` still raises ``NoGoesCoverage`` when GOES genuinely
+has nothing for an observation -- deliberately fatal, since silently keeping all the good
+time would disable the flare filtering without saying so.
+
+49. Merging an empty list of files -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``join_source_data`` called ``merge_event_files`` unconditionally, so a module for which
+the source separation produced nothing reached ``ftmgtime`` with an empty input list --
+issue 46's mechanism, one layer up. On 30202022007 this was a consequence of issue 43's
+fix: FPMA's mode-01 file was too faint for a region, so nothing was extracted for FPMA, so
+there was nothing to join. On 90901332001 the ``_back`` file was produced for FPMB and the
+``_src1`` file was not.
+
+**Fixed** by deciding it where the reason is still known. A module with mode-01 cleaned
+events and nothing to merge raises ``NoSourceInScienceData`` naming the module; a module
+with no mode-01 data at all is skipped with a warning, and the FPMA+FPMB merge takes only
+the modules that produced something.
 
 
 Science caveats
