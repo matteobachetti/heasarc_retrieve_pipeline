@@ -47,6 +47,7 @@ from .image_utils import filter_sources_in_images
 from .utils import (
     NO_SCIENCE_DATA,
     NoGoesCoverage,
+    NoSourceInScienceData,
     absolute_config,
     apply_gti,
     binned_lightcurve,
@@ -949,7 +950,18 @@ def join_source_data(obsid, directories, config, src_num=1):
     Returns
     -------
     list of str
-        The combined FPMA+FPMB event file, or an empty list if it is missing.
+        The combined FPMA+FPMB event file, or an empty list if it is missing or if neither
+        module had anything to join.
+
+    Raises
+    ------
+    heasarc_retrieve_pipeline.utils.NoSourceInScienceData
+        If a module has mode-01 cleaned events and yet the source separation left nothing
+        to merge for it. That is 30202022007 FPMA, whose mode-01 file got no region under
+        the too-faint rule, and 90901332001 FPMB, which produced a ``_back`` file and no
+        ``_src1``. Both used to reach ``ftmgtime`` with an empty input list, which exits 0
+        and writes nothing, and surfaced one step later as ``ftsort failed with return
+        code 33``. A module with no mode-01 data at all is skipped with a warning instead.
 
     Notes
     -----
@@ -975,6 +987,11 @@ def join_source_data(obsid, directories, config, src_num=1):
         logger.info(f"Source data for {obsid} already joined")
         return [combined_file] if os.path.exists(combined_file) else []
 
+    # Both module file names are known, so they are built rather than globbed for FPMA and
+    # derived from it with str.replace: an output path containing a capital A --
+    # /Users/.../ARCHIVE/, say -- would have had that A rewritten too. Only the modules
+    # that actually produced something end up in this list.
+    module_files = []
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
         if os.path.exists(outfile):
@@ -996,12 +1013,29 @@ def join_source_data(obsid, directories, config, src_num=1):
             for nf in to_be_removed:
                 new_files.remove(nf)
             files_to_join.extend(new_files)
-        merge_event_files(files_to_join, outfile)
 
-    # Both module file names are known, so build them rather than globbing for FPMA and
-    # deriving FPMB from it with str.replace: an output path containing a capital A --
-    # /Users/.../ARCHIVE/, say -- would have had that A rewritten too.
-    module_files = [os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt") for fpm in "AB"]
+        if not files_to_join:
+            # ftmgtime handed an empty list exits 0 and writes nothing, and ftsort then
+            # fails with return code 33 on a file that was never created -- which is how
+            # 30202022007 and 90901332001 were lost. Decide it here instead, where the
+            # reason is still known.
+            if any(module == fpm for module, _ in mode_01_input_files(obsid, config)):
+                raise NoSourceInScienceData(
+                    obsid, outfile, f"source separation produced nothing for FPM{fpm}"
+                )
+            logger.warning(
+                f"Nothing to join for FPM{fpm} in {obsid}, and no mode-01 data either; "
+                "skipping the module"
+            )
+            continue
+
+        merge_event_files(files_to_join, outfile)
+        module_files.append(outfile)
+
+    if not module_files:
+        logger.warning(f"No module of {obsid} produced anything to join for {label}")
+        return []
+
     merge_event_files(module_files, combined_file, gti_operation="AND")
 
     open(join_done_file, "a").close()
@@ -1997,12 +2031,20 @@ def get_best_source_regions(obsid, config):
     mean_rlimit : float
         Mean extraction radius, in arcsec.
 
+    Raises
+    ------
+    heasarc_retrieve_pipeline.utils.NoSourceInScienceData
+        If a mode-01 file yields no region. Mode 01 is ordinary science with the full
+        aspect solution, so a target the pipeline was pointed at has to be in it; half an
+        observation delivered quietly is worse than a failure that says why.
+
     Notes
     -----
     Files whose region files already exist still contribute: :func:`get_best_source_region`
     reads the position and radius back out of them. ``(0.0, 0.0, 0.0)`` is returned only
     when there is no mode-01 cleaned event file at all -- which happens: 80002092003 has
-    none.
+    none. That is a different case from a mode-01 file with no source in it, and stays a
+    clean outcome.
     """
     logger = get_logger()
     outdir = nu_pipeline_output_path(obsid, config=config)
@@ -2010,12 +2052,18 @@ def get_best_source_regions(obsid, config):
 
     mean_ra = mean_dec = mean_rlimit = 0.0
     count = 0
-    for _, infile in mode_01_input_files(obsid, config):
+    for fpm, infile in mode_01_input_files(obsid, config):
         # get_best_source_region returns early when the region files already exist,
         # reading the position and radius back out of them, so every file counts.
         result = get_best_source_region(infile, config=config)
         if result is None:
-            continue
+            # Mode 01 is ordinary science with the full aspect solution. A target the
+            # pipeline was pointed at has to be in it, and half an observation is not an
+            # outcome to deliver quietly. An unusable mode-06 CHU subset is different --
+            # calculate_spectra records that one and carries on.
+            raise NoSourceInScienceData(
+                obsid, infile, f"FPM{fpm} produced no usable extraction region"
+            )
         ra, dec, rlimit, _, _ = result
         mean_ra += ra
         mean_dec += dec

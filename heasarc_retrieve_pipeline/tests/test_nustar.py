@@ -425,6 +425,114 @@ class TestJoinSourceData:
         ]
 
 
+class TestJoiningNothing:
+    """An empty list of files to merge is a decision, not a HEASOFT failure.
+
+    ``ftmgtime`` handed no input GTIs exits 0 and writes nothing, and ``ftsort`` then dies
+    with return code 33 on a file that was never created. That is how 30202022007 and
+    90901332001 were lost in the 2026 run, with a message naming the wrong tool. The check
+    happens before any HEASOFT call, so these run against a fake tree.
+    """
+
+    def observation(self, tmp_path, monkeypatch, pipe_files):
+        merged = []
+
+        def fake_merge(files, outfile, gti_operation="OR"):
+            merged.append((list(files), outfile, gti_operation))
+            open(outfile, "w").close()
+
+        monkeypatch.setattr(nustar, "merge_event_files", fake_merge)
+        pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
+        os.makedirs(pipedir, exist_ok=True)
+        for name in pipe_files:
+            open(os.path.join(pipedir, name), "w").close()
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        return pipedir, config, merged
+
+    def test_a_module_with_mode_01_data_and_nothing_to_join_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """30202022007: FPMA's mode-01 file got no region, so nothing was extracted."""
+        pipedir, config, _ = self.observation(
+            tmp_path,
+            monkeypatch,
+            [
+                f"nu{OBSID}A01_cl.evt",  # FPMA has mode-01 data
+                f"nu{OBSID}B01_cl.evt",
+                f"nu{OBSID}B01_src1.evt",  # but only FPMB produced a source file
+            ],
+        )
+
+        with pytest.raises(nustar.NoSourceInScienceData) as excinfo:
+            join_source_data.fn(OBSID, [pipedir], config)
+
+        assert "FPMA" in str(excinfo.value)
+        assert OBSID in str(excinfo.value)
+
+    def test_the_background_is_checked_the_same_way(self, tmp_path, monkeypatch):
+        """90901332001: the _back file was produced for FPMB and the _src1 was not."""
+        pipedir, config, _ = self.observation(
+            tmp_path,
+            monkeypatch,
+            [
+                f"nu{OBSID}A01_cl.evt",
+                f"nu{OBSID}B01_cl.evt",
+                f"nu{OBSID}A01_src1.evt",
+            ],
+        )
+
+        with pytest.raises(nustar.NoSourceInScienceData, match="FPMB"):
+            join_source_data.fn(OBSID, [pipedir], config)
+
+    def test_a_module_with_no_mode_01_data_is_skipped_quietly(self, tmp_path, monkeypatch):
+        """Nothing to join and nothing that should have been joined is not a failure."""
+        pipedir, config, merged = self.observation(
+            tmp_path,
+            monkeypatch,
+            [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}A01_src1.evt"],  # FPMB has no data at all
+        )
+
+        files = join_source_data.fn(OBSID, [pipedir], config)
+
+        assert files == [os.path.join(tmp_path, OBSID, f"nu{OBSID}_src1.evt")]
+        combined = [call for call in merged if call[2] == "AND"]
+        assert combined[0][0] == [os.path.join(tmp_path, OBSID, f"nu{OBSID}A_src1.evt")]
+
+    def test_no_heasoft_call_is_made_with_an_empty_list(self, tmp_path, monkeypatch):
+        pipedir, config, merged = self.observation(
+            tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}A01_src1.evt"]
+        )
+
+        join_source_data.fn(OBSID, [pipedir], config)
+
+        assert all(files for files, _, _ in merged)
+
+
+class TestModeOneWithoutASourceIsFatal:
+    """M82 X-2 is never undetectable in normal science mode. If it is, something is wrong
+    with the observation or the reduction, and half an observation delivered quietly is
+    worse than a failure that says why."""
+
+    def test_a_mode_01_file_with_no_region_fails_the_observation(
+        self, tmp_path, monkeypatch
+    ):
+        config = make_obsid_tree(
+            tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+        )
+        monkeypatch.setattr(nustar, "get_best_source_region", lambda *a, **kw: None)
+
+        with pytest.raises(nustar.NoSourceInScienceData) as excinfo:
+            get_best_source_regions.fn(OBSID, config)
+
+        assert "FPMA" in str(excinfo.value)
+
+    def test_an_observation_with_no_mode_01_file_is_still_a_clean_zero(self, tmp_path):
+        """80002092003 has no mode-01 data at all. That is a different case."""
+        config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A06_cl.evt"])
+
+        assert get_best_source_regions.fn(OBSID, config) == (0.0, 0.0, 0.0)
+
+
 def make_synthetic_event_file(path, tstart=0.0, tstop=1000.0, nevents=500, seed=42):
     """A NuSTAR-shaped event file: EVENTS with TIME and PI, plus a GTI extension."""
     from astropy.io import fits

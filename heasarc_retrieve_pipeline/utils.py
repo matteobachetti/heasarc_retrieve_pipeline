@@ -60,7 +60,37 @@ class NoSourceInScienceData(Exception):
     the observation or with the reduction, and the run must say so rather than quietly
     delivering half an observation. An unusable *mode-06* CHU subset is a different
     matter -- that one is skipped and recorded, see :func:`record_skipped_input`.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    filename : str
+        The input, or the output that could not be built. Only its base name is shown:
+        worker processes see the output tree through a symbolic link whose name changes
+        every run.
+    reason : str
+        What went missing, naming the focal-plane module.
+
+    Examples
+    --------
+    >>> error = NoSourceInScienceData(
+    ...     "30202022007", "/tmp/hrpxyz/nu30202022007A_src1.evt", "FPMA found nothing"
+    ... )
+    >>> str(error)
+    '30202022007 has normal-science data with no usable source: FPMA found nothing (nu30202022007A_src1.evt)'
+    >>> error.obsid
+    '30202022007'
     """
+
+    def __init__(self, obsid, filename, reason):
+        self.obsid = obsid
+        self.filename = filename
+        self.reason = reason
+        super().__init__(
+            f"{obsid} has normal-science data with no usable source: {reason} "
+            f"({os.path.basename(filename)})"
+        )
 
 
 def get_logger():
