@@ -933,19 +933,42 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
     gti_operation : {"OR", "AND"}, optional
         How to combine the GTIs; see :func:`merge_gtis`.
 
+    Raises
+    ------
+    ValueError
+        If ``outfile`` is one of ``files_to_join``. The output is deleted before the merge
+        starts, so merging a file into itself would destroy it.
+
     Notes
     -----
+    ``outfile`` is deleted first if it is there, as :func:`merge_gtis` does with its own
+    output. ``ftmerge`` is called without CFITSIO's ``!`` clobber prefix and will not
+    create a file that exists -- return code 105, ``failed to create new file (already
+    exists?)`` -- which is how a rerun with the ``JOIN_DONE_SRC<n>.TXT`` markers removed
+    used to lose a whole observation. The prefix is not used instead because it adds a
+    character to a path that already has to fit in 128; see :func:`nu_longest_output_name`.
+
     The merged GTIs go to an intermediate file named after ``outfile``, so the name is the
     same on every run of the same merge -- it used to carry ``np.random.randint(1000000)``,
     which made the task's inputs different every time and left a stray file behind whenever
     a HEASOFT call raised. One output file means one intermediate, so the deterministic name
     cannot collide, and it is removed in a ``finally``.
     """
+    if outfile in files_to_join:
+        raise ValueError(
+            f"{outfile} is both an input and the output of the same merge, and the "
+            "output is deleted before the merge starts"
+        )
+
     outdir, fname = os.path.split(outfile)
     root = splitext_improved(fname)[0]
     logger = get_logger()
 
     outfile_gti = os.path.join(outdir, f"{root}_tmp.gti")
+
+    if os.path.exists(outfile):
+        logger.info(f"Removing the {outfile} left by an earlier run")
+        os.unlink(outfile)
 
     try:
         merge_gtis(files_to_join, outfile_gti, gti_operation=gti_operation)
@@ -1082,8 +1105,6 @@ def _join_source_data(obsid, directories, config, src_num, label, rec):
     module_files = []
     for fpm in "A", "B":
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
-        if os.path.exists(outfile):
-            os.unlink(outfile)
 
         logger.info(f"Joining source data for fpm {fpm} into {outfile}")
         files_to_join = []

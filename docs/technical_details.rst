@@ -532,6 +532,16 @@ The combined A+B file roughly doubles the counting statistics, which is exactly 
 timing analysis wants. It is again unusable for spectroscopy: two telescopes with different
 responses are now in one event list, and no single ARF describes it.
 
+Both merges replace whatever is already at their output path: ``merge_gtis`` and
+``merge_event_files`` each delete their own output before they start. That is what makes the
+step re-runnable over a directory that still holds the previous run's products -- which is
+how you force the join to run again, by removing ``JOIN_DONE_SRC<N>.TXT``. ``ftmerge`` is
+called without CFITSIO's ``!`` clobber prefix and simply refuses to create a file that
+exists (return code 105, ``failed to create new file (already exists?)``); the prefix is not
+used because it adds a character to a path that already has to fit in 128 (see `How long a
+file name may be`_). ``merge_event_files`` refuses outright to merge a file into itself, since it would
+delete that input first. See issue 52 in :ref:`known_issues`.
+
 Solar flare filtering
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -1181,6 +1191,10 @@ for the existence of their output file directly (``barycenter_file``, ``get_goes
 The sentinels record only *that* a step ran, not with which parameters. Re-running an
 observation with different ``flags``, a different ``minimum_class`` or a different region
 size will not invalidate them; the output directory has to be deleted by hand.
+
+Removing a sentinel by hand does make its step run again, and the step must survive finding
+its own outputs already in place. ``join_source_data`` is the one that had to be fixed for
+this (issue 52); the others either write through ``clobber="yes"`` or delete first.
 
 
 What a HEASOFT tool says it produces

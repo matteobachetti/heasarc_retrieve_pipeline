@@ -911,6 +911,9 @@ class StubHeasoft:
 
     The files it leaves behind are not empty: ``heasoft.run`` now checks that each tool
     produced what it said it would, and a real ``ftmerge`` writes a real event file.
+
+    ``ftmerge`` here also refuses an output that is already there, exactly as the real one
+    does. That refusal is what :class:`TestJoiningTwice` is about.
     """
 
     def __init__(self, fail_on=None):
@@ -922,7 +925,15 @@ class StubHeasoft:
         if name == self.fail_on:
             raise RuntimeError(f"{name} failed")
         if name == "ftmerge":
-            with open(kwargs["outfile"].lstrip("!"), "w") as fobj:
+            outfile = kwargs["outfile"]
+            if not outfile.startswith("!") and os.path.exists(outfile):
+                # Verbatim from the 30702012004 run: CFITSIO will not create a file that
+                # is already there, and ftmerge is called without the "!" clobber prefix.
+                raise RuntimeError(
+                    "ftmerge failed with return code 105: failed to create new file "
+                    f"(already exists?): {outfile}"
+                )
+            with open(outfile.lstrip("!"), "w") as fobj:
                 fobj.write("not a real event file, but not an empty one either")
 
     def ftmerge(self, **kwargs):
@@ -1023,6 +1034,118 @@ class TestMergeEventFilesTemporary:
             self.merge(tmp_path, monkeypatch, fail_on="fappend")
 
         assert glob.glob(os.path.join(tmp_path, "*.gti")) == []
+
+
+class TestMergeEventFilesOverwrites:
+    """A merge over an output that is already there.
+
+    ``ftmerge`` is called without CFITSIO's ``!`` clobber prefix -- adding one would also
+    add a character to a path that already has to fit in 128 (see
+    :func:`nu_longest_output_name`) -- so the output is removed first instead, which is
+    what :func:`merge_gtis` right above it has always done with its own.
+    """
+
+    def merge(self, tmp_path, monkeypatch):
+        def stub_merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
+            with open(outfile_gti, "w") as fobj:
+                fobj.write("not a real GTI file, but not an empty one either")
+
+        stub = StubHeasoft()
+        monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
+        monkeypatch.setattr(heasoft, "hsp", stub, raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        outfile = os.path.join(tmp_path, "nu123A_src1.evt")
+        return stub, outfile
+
+    def test_an_output_left_by_an_earlier_run_is_replaced(self, tmp_path, monkeypatch):
+        _stub, outfile = self.merge(tmp_path, monkeypatch)
+        with open(outfile, "w") as fobj:
+            fobj.write("what the previous run left behind")
+
+        nustar.merge_event_files.fn(["a.evt", "b.evt"], outfile)
+
+        with open(outfile) as fobj:
+            assert "previous run" not in fobj.read()
+
+    def test_merging_a_file_into_itself_is_refused(self, tmp_path, monkeypatch):
+        """The deletion would destroy the input before ``ftmerge`` ever saw it."""
+        stub, outfile = self.merge(tmp_path, monkeypatch)
+        open(outfile, "w").close()
+
+        with pytest.raises(ValueError, match="both an input and the output"):
+            nustar.merge_event_files.fn(["a.evt", outfile], outfile)
+
+        assert os.path.exists(outfile)
+        assert stub.calls == []
+
+    def test_the_merge_still_runs_every_tool(self, tmp_path, monkeypatch):
+        """Deleting the output must not turn the merge into a no-op."""
+        stub, outfile = self.merge(tmp_path, monkeypatch)
+        open(outfile, "w").close()
+
+        nustar.merge_event_files.fn(["a.evt", "b.evt"], outfile)
+
+        assert [name for name, _ in stub.calls] == ["ftmerge", "ftsort", "fappend"]
+
+
+class TestJoiningTwice:
+    """The join run a second time over a directory that still holds its own outputs.
+
+    Removing the ``JOIN_DONE_SRC<n>.TXT`` markers to force a rerun left the combined
+    ``nu<OBSID>_src1.evt`` in place -- the per-module files were deleted, that one was not
+    -- and ``ftmerge`` refuses to create a file that exists: return code 105, ``failed to
+    create new file (already exists?)``, and the observation reported as failed. Seen on
+    30702012004.
+
+    ``merge_event_files`` runs for real here, unlike in the diagnostics tests that stub it
+    out; only HEASOFT itself is stubbed, by a :class:`StubHeasoft` that refuses to clobber
+    the way the real ``ftmerge`` does.
+    """
+
+    def join_twice(self, tmp_path, monkeypatch, src_num=1):
+        def stub_merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
+            with open(outfile_gti, "w") as fobj:
+                fobj.write("not a real GTI file, but not an empty one either")
+
+        stub = StubHeasoft()
+        monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
+        monkeypatch.setattr(heasoft, "hsp", stub, raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        pipedir = nu_pipeline_output_path(OBSID, config)
+        os.makedirs(pipedir, exist_ok=True)
+        label = f"_src{src_num}" if src_num > 0 else "_back"
+        for fpm in "AB":
+            open(os.path.join(pipedir, f"nu{OBSID}{fpm}01{label}.evt"), "w").close()
+
+        first = join_source_data.fn(OBSID, [pipedir], config, src_num=src_num)
+
+        outdir = nu_base_output_path(OBSID, config=config)
+        os.unlink(os.path.join(outdir, f"JOIN_DONE_SRC{src_num}.TXT"))
+
+        second = join_source_data.fn(OBSID, [pipedir], config, src_num=src_num)
+        return stub, first, second
+
+    def test_the_rerun_produces_the_combined_file_again(self, tmp_path, monkeypatch):
+        _, first, second = self.join_twice(tmp_path, monkeypatch)
+
+        assert second == first
+        assert os.path.exists(second[0])
+
+    def test_the_rerun_merges_everything_the_first_run_did(self, tmp_path, monkeypatch):
+        """Two modules and then the A+B pair, both times: three merges per run."""
+        stub, _, _ = self.join_twice(tmp_path, monkeypatch)
+
+        assert [name for name, _ in stub.calls].count("ftmerge") == 6
+
+    def test_the_background_rerun_works_the_same_way(self, tmp_path, monkeypatch):
+        """``_back`` has its own marker and its own combined file."""
+        _, first, second = self.join_twice(tmp_path, monkeypatch, src_num=0)
+
+        assert second == first
+        assert os.path.exists(second[0])
 
 
 class TestGoesDownloadPath:

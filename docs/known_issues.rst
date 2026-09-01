@@ -1291,6 +1291,35 @@ heasarc_retrieve_pipeline.report <outdir>`` rebuilds everything from what is on 
 finding the observations by looking rather than from a list of what the run meant to do.
 
 
+52. A forced re-run of the join could not overwrite its own output -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The way to make ``join_source_data`` run again is to delete its ``JOIN_DONE_SRC<N>.TXT``
+markers. Doing that on an observation whose joined files were still on disk failed the whole
+observation::
+
+    RuntimeError: ftmerge failed with return code 105:
+    failed to create new file (already exists?): .../nu30702012004_src1.evt
+    CFITSIO ERROR FILE_NOT_CREATED
+
+``ftmerge`` is called without CFITSIO's ``!`` clobber prefix, so it will not write a file
+that exists. The per-module files ``nu<OBSID>{A,B}_src1.evt`` were deleted by
+``join_source_data`` before each merge and so were fine; the combined ``nu<OBSID>_src1.evt``
+was not, and it is the second merge, so the step got most of the way through before dying.
+Reproduced on 30702012004.
+
+**Fixed** in ``merge_event_files``, not in its caller: it now deletes its own output before
+merging, exactly as ``merge_gtis`` immediately above it has always done with its own. The
+caller's ``os.unlink`` is gone, so the rule lives in one place and holds for any future
+caller. Deleting rather than passing ``!`` + ``outfile`` keeps the path a character shorter,
+which matters against the 128-character limit of issue 39. Merging a file into itself is now
+a ``ValueError`` rather than a silent loss of that input.
+
+Tested by joining the same directory twice with the marker removed in between, running the
+real ``merge_event_files`` against a HEASOFT double whose ``ftmerge`` refuses an existing
+output the way the real one does.
+
+
 Science caveats
 ---------------
 
