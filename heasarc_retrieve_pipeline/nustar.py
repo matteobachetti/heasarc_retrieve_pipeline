@@ -64,6 +64,7 @@ from .utils import (
     record_skipped_input,
     rootname,
     splitext_improved,
+    time_reference,
 )
 
 from . import heasoft
@@ -1248,9 +1249,13 @@ def observation_time_span(obsid, config):
         with fits.open(path) as hdul:
             header = hdul[1].header
             gti = read_gti(hdul)
+            # Read while the file is still open: the reference epoch may live on the
+            # primary header rather than the events extension, and time_reference looks
+            # in both.
+            mjdrefi, mjdreff = time_reference(hdul)
         starts.append(float(header["TSTART"]))
         stops.append(float(header["TSTOP"]))
-        mjdref = header["MJDREFI"] + header["MJDREFF"]
+        mjdref = mjdrefi + mjdreff
         if len(gti):
             starts.append(float(gti[:, 0].min()))
             stops.append(float(gti[:, 1].max()))

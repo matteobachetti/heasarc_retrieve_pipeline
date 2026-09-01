@@ -874,3 +874,307 @@ class TestWhereTheWorkspaceGoes:
 
         with short_workspace(str(outdir), tmpdir=str(chosen)) as workspace:
             assert workspace.data.startswith(str(chosen))
+
+
+class TestTimeReference:
+    """Reading the reference epoch, whichever of the two conventions a file uses."""
+
+    def test_split_keywords(self):
+        header = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852})
+        assert utils.time_reference(header) == (55197.0, 0.00076601852)
+
+    def test_single_keyword(self):
+        mjdrefi, mjdreff = utils.time_reference(fits.Header({"MJDREF": 55197.00076601852}))
+        assert mjdrefi == 55197.0
+        assert mjdreff == pytest.approx(0.00076601852, abs=1e-9)
+
+    def test_the_two_conventions_agree(self):
+        """A file written either way must place the same MJD at the same MET."""
+        split = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852})
+        whole = fits.Header({"MJDREF": 55197.00076601852})
+        assert utils.met_from_mjd(56689.0, split) == pytest.approx(
+            utils.met_from_mjd(56689.0, whole), abs=1e-3
+        )
+
+    def test_integer_day_without_a_fraction(self):
+        assert utils.time_reference(fits.Header({"MJDREFI": 55197})) == (55197.0, 0.0)
+
+    def test_neither_keyword_is_fatal(self):
+        """Defaulting to zero would put every time 55197 days out, silently."""
+        with pytest.raises(ValueError, match="MJDREFI.*MJDREFF.*MJDREF"):
+            utils.time_reference(fits.Header({"TELESCOP": "NuSTAR"}))
+
+    def test_found_on_the_events_extension_of_an_open_file(self):
+        hdul = make_event_file([1.0, 2.0], [[0.0, 3.0]])
+        hdul["EVENTS"].header["MJDREFI"] = 55197
+        hdul["EVENTS"].header["MJDREFF"] = 0.00076601852
+        assert utils.time_reference(hdul) == (55197.0, 0.00076601852)
+
+    def test_found_on_the_primary_when_the_events_extension_has_none(self):
+        hdul = make_event_file([1.0, 2.0], [[0.0, 3.0]])
+        hdul[0].header["MJDREF"] = 49353.000696574074
+        mjdrefi, _ = utils.time_reference(hdul)
+        assert mjdrefi == 49353.0
+
+    def test_the_events_extension_wins(self):
+        hdul = make_event_file([1.0, 2.0], [[0.0, 3.0]])
+        hdul[0].header["MJDREFI"] = 40000
+        hdul["EVENTS"].header["MJDREFI"] = 55197
+        assert utils.time_reference(hdul)[0] == 55197.0
+
+
+class TestTimeSystem:
+    def test_read_and_lowercased(self):
+        assert utils.time_system(fits.Header({"TIMESYS": "TT"})) == "tt"
+
+    def test_defaults_to_tt(self):
+        assert utils.time_system(fits.Header()) == "tt"
+
+    def test_default_can_be_overridden(self):
+        assert utils.time_system(fits.Header(), default="UTC") == "utc"
+
+
+#: NuSTAR's reference epoch, and the time system its files are written in.
+NUSTAR_TIME_HEADER = fits.Header(
+    {"MJDREFI": 55197, "MJDREFF": 0.00076601852, "TIMESYS": "TT"}
+)
+
+
+class TestMetFromMjd:
+    """MJD to mission elapsed time, and back."""
+
+    def test_agrees_with_astropy(self):
+        from astropy.time import Time
+
+        reference = Time(55197 + 0.00076601852, format="mjd", scale="tt")
+        target = Time(56689.0, format="mjd", scale="tt")
+        expected = (target - reference).sec
+        assert utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER) == pytest.approx(
+            expected, abs=1e-3
+        )
+
+    def test_round_trip(self):
+        met = utils.met_from_mjd(56689.25, NUSTAR_TIME_HEADER)
+        assert utils.mjd_from_met(met, NUSTAR_TIME_HEADER) == pytest.approx(
+            56689.25, abs=1e-9
+        )
+
+    def test_the_split_reference_keeps_more_precision(self):
+        """
+        Subtracting the integer day before the fraction is worth about 300 nanoseconds.
+
+        ``MJDREFI + MJDREFF`` as one float64 is only good to about half an ULP at 55197,
+        which is 0.3 microseconds, and that error goes straight into every time the file
+        produces. Subtracting 55197 first leaves a number near 1492 where the fraction
+        still has all its bits.
+        """
+        import math
+        from decimal import Decimal, getcontext
+
+        getcontext().prec = 50
+        mjdrefi, mjdreff = utils.time_reference(NUSTAR_TIME_HEADER)
+
+        split_errors = []
+        collapsed_errors = []
+        ulps = []
+        for mjd in np.linspace(55200.0, 60000.0, 500):
+            exact = (Decimal(float(mjd)) - Decimal(mjdrefi) - Decimal(mjdreff)) * Decimal(
+                86400
+            )
+            split = utils.met_from_mjd(mjd, NUSTAR_TIME_HEADER)
+            split_errors.append(abs(float(Decimal(split) - exact)))
+            collapsed_errors.append(
+                abs(float(Decimal((mjd - (mjdrefi + mjdreff)) * 86400.0) - exact))
+            )
+            ulps.append(math.ulp(split))
+
+        # The split form sits at the float64 floor: never worse than a couple of ULPs of
+        # the answer itself, which no arithmetic could beat.
+        assert all(error <= 2 * ulp for error, ulp in zip(split_errors, ulps))
+
+        # The collapsed form carries the rounding of MJDREFI + MJDREFF as well. That is
+        # a fixed error of order 100 ns which, unlike the one above, does not shrink as
+        # the answer gets smaller -- so near the start of the mission it is thousands of
+        # times the representable precision.
+        assert min(collapsed_errors) > 1e-7
+        assert min(split_errors) < 1e-9
+
+    def test_utc_differs_by_the_leap_seconds_of_the_day(self):
+        """MJD 56689 is in 2014, when TAI - UTC was 35 s, so TT - UTC is 67.184 s."""
+        as_tt = utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER)
+        as_utc = utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER, scale="utc")
+        assert as_utc - as_tt == pytest.approx(67.184, abs=1e-3)
+
+    def test_the_offset_follows_the_leap_second_era(self):
+        """MJD 55198 is in 2010, one leap second earlier: 66.184 s."""
+        as_tt = utils.met_from_mjd(55198.0, NUSTAR_TIME_HEADER)
+        as_utc = utils.met_from_mjd(55198.0, NUSTAR_TIME_HEADER, scale="utc")
+        assert as_utc - as_tt == pytest.approx(66.184, abs=1e-3)
+
+    def test_no_scale_means_no_conversion(self):
+        """The default has to round-trip exactly, which a conversion would spoil."""
+        assert utils.met_from_mjd(
+            56689.0, NUSTAR_TIME_HEADER, scale="tt"
+        ) == utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER)
+
+    def test_mjd_from_met_can_answer_in_utc(self):
+        met = utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER)
+        as_utc = utils.mjd_from_met(met, NUSTAR_TIME_HEADER, scale="utc")
+        assert (56689.0 - as_utc) * 86400.0 == pytest.approx(67.184, abs=1e-3)
+
+
+class TestTimezeroDoesNotMoveTheCut:
+    """
+    A segment boundary must land on the same absolute time whatever ``TIMEZERO`` is.
+
+    NuSTAR has no ``TIMEZERO``, so this would never show up on the data this package was
+    written against; RXTE has one, and some NICER releases carry ``TIMEZERO = -1.0``.
+    """
+
+    @staticmethod
+    def _file(timezero):
+        # The same four absolute times, written on a TIME column shifted by TIMEZERO.
+        absolute = np.array([10.0, 30.0, 60.0, 90.0])
+        hdul = make_event_file(
+            absolute - timezero, [[0.0 - timezero, 100.0 - timezero]], timezero=timezero
+        )
+        hdul["EVENTS"].header["MJDREFI"] = 55197
+        hdul["EVENTS"].header["MJDREFF"] = 0.00076601852
+        return hdul
+
+    def test_read_gti_agrees(self):
+        assert read_gti(self._file(0.0)).tolist() == read_gti(self._file(-1.0)).tolist()
+
+    def test_the_same_events_survive(self):
+        kept = []
+        for timezero in (0.0, -1.0, 7.5):
+            hdul = self._file(timezero)
+            apply_gti(hdul, [[0.0, 50.0]])
+            kept.append(
+                (np.asarray(hdul["EVENTS"].data["TIME"]) + timezero).round(6).tolist()
+            )
+        assert kept[0] == [10.0, 30.0]
+        assert kept[1] == kept[0]
+        assert kept[2] == kept[0]
+
+    def test_met_from_mjd_is_unaffected(self):
+        """The conversion is to the TIME + TIMEZERO scale, so TIMEZERO does not enter."""
+        assert utils.met_from_mjd(56689.0, self._file(0.0)) == utils.met_from_mjd(
+            56689.0, self._file(-1.0)
+        )
+
+
+class TestSegmentBounds:
+    """Cutting a time range into segments."""
+
+    def test_one_split(self):
+        assert utils.segment_bounds(0, 100, [40]).tolist() == [[0.0, 40.0], [40.0, 100.0]]
+
+    def test_no_splits_is_the_whole_range(self):
+        assert utils.segment_bounds(0, 100, []).tolist() == [[0.0, 100.0]]
+
+    def test_splits_are_sorted(self):
+        assert utils.segment_bounds(0, 100, [70, 30]).tolist() == [
+            [0.0, 30.0],
+            [30.0, 70.0],
+            [70.0, 100.0],
+        ]
+
+    def test_a_split_past_the_end_leaves_an_empty_segment(self):
+        """Renumbering would make seg2 mean different things in different runs."""
+        assert utils.segment_bounds(0, 100, [120]).tolist() == [
+            [0.0, 100.0],
+            [100.0, 100.0],
+        ]
+
+    def test_a_split_before_the_start_leaves_an_empty_segment(self):
+        assert utils.segment_bounds(50, 100, [10]).tolist() == [
+            [50.0, 50.0],
+            [50.0, 100.0],
+        ]
+
+    def test_the_count_is_always_one_more_than_the_splits(self):
+        for splits in ([], [10], [10, 20], [10, 20, 30, 40]):
+            assert len(utils.segment_bounds(0, 100, splits)) == len(splits) + 1
+
+    def test_a_backwards_range_is_fatal(self):
+        with pytest.raises(ValueError, match="before tstart"):
+            utils.segment_bounds(100, 0, [50])
+
+    def test_a_split_inside_a_gti_gap_gives_two_usable_segments(self):
+        """Intersecting with a real GTI is what turns bounds into segment GTIs."""
+        gti = [[0.0, 30.0], [70.0, 100.0]]
+        first, second = utils.segment_bounds(0, 100, [50])
+        assert intersect_intervals(gti, [first]).tolist() == [[0.0, 30.0]]
+        assert intersect_intervals(gti, [second]).tolist() == [[70.0, 100.0]]
+
+
+class TestUpdateTimeBounds:
+    """Correcting what a filtered file says about when it was taken."""
+
+    @staticmethod
+    def _file(timezero=0.0):
+        hdul = make_event_file(
+            [10.0, 30.0, 60.0, 90.0], [[0.0, 100.0]], timezero=timezero
+        )
+        for hdu in hdul:
+            hdu.header["MJDREFI"] = 55197
+            hdu.header["MJDREFF"] = 0.00076601852
+            hdu.header["TIMESYS"] = "TT"
+        events = hdul["EVENTS"].header
+        events["TSTART"] = 0.0 - timezero
+        events["TSTOP"] = 100.0 - timezero
+        events["TELAPSE"] = 100.0
+        events["DATE-OBS"] = "2010-01-01T00:00:00.0000"
+        events["DATE-END"] = "2010-01-01T00:01:40.0000"
+        return hdul
+
+    def test_bounds_are_narrowed(self):
+        hdul = self._file()
+        result = utils.update_time_bounds(hdul, [[20.0, 50.0]])
+        assert result["tstart"] == 20.0
+        assert result["tstop"] == 50.0
+        assert hdul["EVENTS"].header["TSTART"] == 20.0
+        assert hdul["EVENTS"].header["TSTOP"] == 50.0
+        assert hdul["EVENTS"].header["TELAPSE"] == 30.0
+
+    def test_written_on_each_hdu_own_time_scale(self):
+        """TSTART is a TIME-column value, so that HDU's TIMEZERO comes back off it."""
+        hdul = self._file(timezero=-1.0)
+        utils.update_time_bounds(hdul, [[20.0, 50.0]])
+        assert hdul["EVENTS"].header["TSTART"] == 21.0
+        assert hdul["EVENTS"].header["TSTOP"] == 51.0
+        assert hdul["EVENTS"].header["TELAPSE"] == 30.0
+
+    def test_dates_are_rewritten_in_the_files_own_timesys(self):
+        hdul = self._file()
+        result = utils.update_time_bounds(hdul, [[20.0, 50.0]])
+        # MJDREF itself is 2010-01-01T00:01:06.184 TT, so MET 20 s is 26.184 s past
+        # the minute, not 20 s past midnight. Hard-coded because getting this wrong is
+        # exactly the mistake the function exists to prevent.
+        assert result["date_obs"] == "2010-01-01T00:01:26.1840"
+        assert hdul["EVENTS"].header["DATE-OBS"] == result["date_obs"]
+        assert hdul["EVENTS"].header["DATE-END"] == result["date_end"]
+
+    def test_missing_keywords_are_not_added(self):
+        hdul = self._file()
+        assert "TSTART" not in hdul[0].header
+        assert "DATE-OBS" not in hdul["GTI"].header
+        utils.update_time_bounds(hdul, [[20.0, 50.0]])
+        assert "TSTART" not in hdul[0].header
+        assert "DATE-OBS" not in hdul["GTI"].header
+
+    def test_an_empty_gti_changes_nothing(self):
+        hdul = self._file()
+        assert utils.update_time_bounds(hdul, np.zeros((0, 2))) == {}
+        assert hdul["EVENTS"].header["TSTART"] == 0.0
+        assert hdul["EVENTS"].header["TSTOP"] == 100.0
+
+    def test_the_dates_agree_with_the_numbers(self):
+        """The civil-time strings and TSTART must name the same instant."""
+        from astropy.time import Time
+
+        hdul = self._file()
+        result = utils.update_time_bounds(hdul, [[20.0, 50.0]])
+        stamp = Time(result["date_obs"], format="isot", scale="tt")
+        assert utils.met_from_mjd(stamp.mjd, hdul) == pytest.approx(20.0, abs=1e-3)

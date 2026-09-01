@@ -22,18 +22,25 @@ __all__ = [
     "check_name_length",
     "get_logger",
     "good_intervals",
+    "gti_extension_index",
     "gti_to_array",
     "intersect_intervals",
     "intervals_above_threshold",
     "intervals_removed",
     "merge_intervals",
     "mask_from_gti",
+    "met_from_mjd",
+    "mjd_from_met",
     "read_gti",
     "read_skipped_inputs",
     "record_skipped_input",
+    "segment_bounds",
     "short_workspace",
     "skipped_inputs_file",
     "splitext_improved",
+    "time_reference",
+    "time_system",
+    "update_time_bounds",
 ]
 
 
@@ -620,6 +627,63 @@ def good_intervals(bad, tstart, tstop):
     return np.array(good, dtype=float).reshape(-1, 2)
 
 
+def segment_bounds(tstart, tstop, split_times):
+    """
+    Split a time range at a list of times, as ``(N + 1, 2)`` bounds.
+
+    The segments come back in time order whatever order the split times were given in,
+    and there are always exactly ``len(split_times) + 1`` of them, so ``seg1``, ``seg2``
+    and so on mean the same thing however the data turn out. A split time outside
+    ``[tstart, tstop]`` is clipped rather than dropped, which leaves a zero-length
+    segment: that is deliberate. Renumbering the others to hide it would make ``seg2``
+    mean a different stretch of the observation depending on data the caller cannot see.
+    The caller skips the empty one and records why.
+
+    Parameters
+    ----------
+    tstart, tstop : float
+        Bounds of the range, in the same units as ``split_times``.
+    split_times : iterable of float
+        Where to cut. May be empty, which gives the whole range as one segment.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(len(split_times) + 1, 2)``.
+
+    Raises
+    ------
+    ValueError
+        If ``tstop`` is before ``tstart``.
+
+    Examples
+    --------
+    >>> segment_bounds(0, 100, [40]).tolist()
+    [[0.0, 40.0], [40.0, 100.0]]
+    >>> segment_bounds(0, 100, []).tolist()
+    [[0.0, 100.0]]
+
+    Out of order is fine:
+
+    >>> segment_bounds(0, 100, [70, 30]).tolist()
+    [[0.0, 30.0], [30.0, 70.0], [70.0, 100.0]]
+
+    A split past the end leaves an empty segment rather than renumbering:
+
+    >>> segment_bounds(0, 100, [120]).tolist()
+    [[0.0, 100.0], [100.0, 100.0]]
+    """
+    tstart = float(tstart)
+    tstop = float(tstop)
+    if tstop < tstart:
+        raise ValueError(f"tstop ({tstop}) is before tstart ({tstart})")
+
+    edges = [tstart]
+    edges += [min(max(float(t), tstart), tstop) for t in sorted(float(t) for t in split_times)]
+    edges += [tstop]
+    return np.array([edges[:-1], edges[1:]], dtype=float).T
+
+
 def gti_to_array(gti):
     """
     Normalise a good time interval list to an ``(N, 2)`` array of floats.
@@ -718,6 +782,269 @@ def intervals_removed(before, after):
     for start, stop in gti_to_array(before):
         removed.extend(good_intervals(after, start, stop).tolist())
     return np.array(removed, dtype=float).reshape(-1, 2)
+
+
+def _time_headers(header_or_hdul):
+    """
+    Headers to look for time keywords in, most authoritative first.
+
+    A ``Header`` is used as it stands. An open file is searched in the order events
+    extension, primary, everything else: NuSTAR repeats the reference epoch in every HDU,
+    but other missions write it only on the events extension, and a few only on the
+    primary.
+    """
+    if hasattr(header_or_hdul, "cards"):
+        return [header_or_hdul]
+
+    hdul = list(header_or_hdul)
+    order = []
+    events_index = _extension_index(hdul, ("EVENTS",), None)
+    if events_index is not None:
+        order.append(events_index)
+    order += [index for index in range(len(hdul)) if index not in order]
+    return [hdul[index].header for index in order]
+
+
+def time_reference(header):
+    """
+    The reference epoch of a FITS time column, as an integer day and a fraction.
+
+    Missions write this epoch two different ways and a given file uses one or the other,
+    never both:
+
+    ``MJDREFI`` and ``MJDREFF``
+        An integer day and a fraction of a day, kept apart so that no precision is lost.
+        NuSTAR, NICER, RXTE and Swift do this. NuSTAR's is
+        ``MJDREFI = 55197``, ``MJDREFF = 7.6601852e-04``.
+
+    ``MJDREF``
+        One floating-point number. XMM, Chandra and older files do this, and the
+        precision below about a microsecond is already gone by the time we see it --
+        nothing here can recover it.
+
+    Either way the answer comes back **split**, because that is what lets
+    :func:`met_from_mjd` subtract the integer day before the fraction and keep the full
+    precision of the difference. A file with ``MJDREFI`` but no ``MJDREFF`` is read as a
+    whole number of days.
+
+    Parameters
+    ----------
+    header : astropy.io.fits.Header or astropy.io.fits.HDUList
+        A header, or an open file to find one in -- see :func:`_time_headers` for the
+        order it looks in.
+
+    Returns
+    -------
+    mjdrefi : float
+        Integer part of the reference MJD.
+    mjdreff : float
+        Fractional part, in ``[0, 1)``.
+
+    Raises
+    ------
+    ValueError
+        If neither form is present. Defaulting to zero here would put every time in the
+        file 55197 days out and nothing downstream would notice, so this is fatal.
+
+    Examples
+    --------
+    >>> from astropy.io import fits
+    >>> split = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852})
+    >>> time_reference(split)
+    (55197.0, 0.00076601852)
+
+    The single-keyword form gives the same answer:
+
+    >>> whole = fits.Header({"MJDREF": 55197.00076601852})
+    >>> mjdrefi, mjdreff = time_reference(whole)
+    >>> mjdrefi
+    55197.0
+    >>> round(mjdreff, 11)
+    0.00076601852
+    """
+    for candidate in _time_headers(header):
+        if "MJDREFI" in candidate:
+            return float(candidate["MJDREFI"]), float(candidate.get("MJDREFF", 0.0))
+        if "MJDREF" in candidate:
+            mjdref = float(candidate["MJDREF"])
+            mjdrefi = float(np.floor(mjdref))
+            return mjdrefi, mjdref - mjdrefi
+    raise ValueError(
+        "No reference epoch in this header: expected MJDREFI (with MJDREFF) or MJDREF"
+    )
+
+
+def time_system(header, default="TT"):
+    """
+    The ``TIMESYS`` of a file, lowercased for :class:`astropy.time.Time`.
+
+    Parameters
+    ----------
+    header : astropy.io.fits.Header or astropy.io.fits.HDUList
+        A header, or an open file to find one in.
+    default : str, optional
+        What to assume when ``TIMESYS`` is absent. ``"TT"`` is right for every mission
+        this package handles.
+
+    Returns
+    -------
+    str
+        ``"tt"``, ``"utc"``, ``"tdb"`` or ``"tai"``.
+
+    Examples
+    --------
+    >>> from astropy.io import fits
+    >>> time_system(fits.Header({"TIMESYS": "TT"}))
+    'tt'
+    >>> time_system(fits.Header())
+    'tt'
+    """
+    for candidate in _time_headers(header):
+        if "TIMESYS" in candidate:
+            return str(candidate["TIMESYS"]).strip().lower()
+    return str(default).strip().lower()
+
+
+def _rescale_mjd(mjd, from_scale, to_scale):
+    """
+    Reinterpret an MJD from one time scale in another, keeping the precision.
+
+    The two scales label the same instant with different numbers, and the difference is
+    small -- 67.184 s between UTC and TT in 2013 -- so it is computed from the two-part
+    ``jd1``/``jd2`` and added to the original number. Going through ``Time.mjd`` instead
+    would round both values to about a microsecond before subtracting them.
+    """
+    if from_scale == to_scale:
+        return float(mjd)
+
+    from astropy.time import Time
+
+    original = Time(float(mjd), format="mjd", scale=from_scale)
+    converted = getattr(original, to_scale)
+    offset = (converted.jd1 - original.jd1) + (converted.jd2 - original.jd2)
+    return float(mjd) + float(offset)
+
+
+def met_from_mjd(mjd, header, scale=None):
+    """
+    Mission elapsed time of a given MJD, on the ``TIME + TIMEZERO`` scale.
+
+    Which scale the answer is on is the thing to be careful about. The FITS convention is
+    that the absolute time of an event is ``MJDREF + (TIMEZERO + TIME) / 86400``, so
+    ``(mjd - MJDREF) * 86400`` is a time on the ``TIME + TIMEZERO`` scale -- exactly the
+    one :func:`read_gti`, :func:`apply_gti` and :func:`mask_from_gti` work on. This
+    function therefore takes no ``TIMEZERO`` term of its own, and its result can be
+    compared with those functions' intervals directly. It may **not** be compared with a
+    raw ``TIME`` column without adding that column's ``TIMEZERO`` first. NuSTAR has no
+    ``TIMEZERO`` at all, so the distinction is invisible there; RXTE does, and some NICER
+    releases carry ``TIMEZERO = -1.0``.
+
+    The integer day is subtracted before the fraction, which keeps the full precision of
+    the difference. Collapsing the reference to a single float first -- ``mjd - (MJDREFI
+    + MJDREFF)`` -- rounds it before anything else happens, and ``55197.000766`` has only
+    so many bits left over: measured across the NuSTAR mission that costs a fixed 140 to
+    200 nanoseconds, which, unlike the rounding of the answer itself, does not shrink as
+    the answer gets smaller. This form stays within a couple of ULPs of exact throughout.
+
+    Parameters
+    ----------
+    mjd : float
+        The date to convert.
+    header : astropy.io.fits.Header or astropy.io.fits.HDUList
+        A header carrying the reference epoch, or an open file to find one in.
+    scale : str, optional
+        The time scale ``mjd`` is expressed in. ``None``, the default, means the file's
+        own ``TIMESYS``, so nothing is converted and the number round-trips through
+        :func:`mjd_from_met` exactly. Pass ``"utc"`` for a date read off something
+        labelled in civil time: NuSTAR's ``TIMESYS`` is ``TT``, and MJD 56689 TT is
+        67.184 s earlier than MJD 56689 UTC, which is enough to put a split in the wrong
+        place.
+
+    Returns
+    -------
+    float
+        Mission elapsed time, in seconds.
+
+    Examples
+    --------
+    >>> from astropy.io import fits
+    >>> header = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852, "TIMESYS": "TT"})
+    >>> round(met_from_mjd(55198.00076601852, header), 6)
+    86400.0
+
+    Reading the same number as UTC moves it by the TT-UTC offset of the day:
+
+    >>> round(met_from_mjd(55198.00076601852, header, scale="utc")
+    ...       - met_from_mjd(55198.00076601852, header), 3)
+    66.184
+    """
+    mjdrefi, mjdreff = time_reference(header)
+    if scale is not None:
+        mjd = _rescale_mjd(mjd, str(scale).strip().lower(), time_system(header))
+    return ((float(mjd) - mjdrefi) - mjdreff) * 86400.0
+
+
+def mjd_from_met(met, header, scale=None):
+    """
+    The MJD of a mission elapsed time, the inverse of :func:`met_from_mjd`.
+
+    ``met`` is taken to be on the ``TIME + TIMEZERO`` scale, as
+    :func:`met_from_mjd` returns and :func:`read_gti` reports.
+
+    Unlike the forward conversion this one has to hand back a single float, so the
+    reference epoch is recombined and the result carries about a microsecond of rounding.
+    That is a property of asking for one number, not of the arithmetic.
+
+    Parameters
+    ----------
+    met : float
+        Mission elapsed time, in seconds.
+    header : astropy.io.fits.Header or astropy.io.fits.HDUList
+        A header carrying the reference epoch, or an open file to find one in.
+    scale : str, optional
+        The time scale to express the answer in. ``None``, the default, means the file's
+        own ``TIMESYS``.
+
+    Returns
+    -------
+    float
+        Modified Julian Date.
+
+    Examples
+    --------
+    >>> from astropy.io import fits
+    >>> header = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852, "TIMESYS": "TT"})
+    >>> round(mjd_from_met(86400.0, header), 8)
+    55198.00076602
+    >>> round(mjd_from_met(met_from_mjd(56689.5, header), header), 8)
+    56689.5
+    """
+    mjdrefi, mjdreff = time_reference(header)
+    mjd = mjdrefi + (mjdreff + float(met) / 86400.0)
+    if scale is not None:
+        mjd = _rescale_mjd(mjd, time_system(header), str(scale).strip().lower())
+    return mjd
+
+
+def gti_extension_index(hdul):
+    """
+    Index of the extension holding the good time intervals.
+
+    Found by ``EXTNAME`` -- ``GTI`` or ``STDGTI``, or anything ending in ``GTI`` --
+    falling back to index 2, which is where an event file keeps it. A GTI *file* written
+    by ``ftmgtime`` has it at index 1, and is found by name.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        Open file.
+
+    Returns
+    -------
+    int
+        Index into ``hdul``.
+    """
+    return _extension_index(hdul, ("GTI", "STDGTI"), 2, suffix="GTI")
 
 
 def read_gti(hdul):
@@ -846,6 +1173,93 @@ def apply_gti(hdul, gti):
         "livetime_before": livetime_before,
         "livetime_after": livetime_before * scale,
     }
+
+
+def update_time_bounds(hdul, gti):
+    """
+    Narrow a file's advertised time span to a new GTI, in every HDU that carries it.
+
+    :func:`apply_gti` corrects what a filtered file says about its *exposure*; this
+    corrects what it says about *when* it was taken. The two are kept apart on purpose:
+    the flare filtering has always left ``TSTART`` and ``TSTOP`` alone, and
+    :func:`~heasarc_retrieve_pipeline.nustar.observation_time_span` compensates by taking
+    the widest of the header bounds and the GTI extent. Cutting an observation in half is
+    different -- a segment whose ``TSTART`` still names the start of the whole observation
+    is wrong in a way that would mislead anything reading it, this package included.
+
+    ``TSTART``, ``TSTOP`` and ``TELAPSE`` are written on each HDU's own ``TIME`` scale,
+    so that HDU's ``TIMEZERO`` is subtracted from the interval bounds -- the events and
+    GTI extensions may legitimately carry different ones. ``DATE-OBS``, ``DATE-END``,
+    ``MJD-BEG``, ``MJD-END`` and ``MJD-OBS`` are written in the file's own ``TIMESYS``,
+    which is what HEASOFT does: verified against ``nuproducts`` output, where
+    ``DATE-OBS`` formatted in TT reproduces the string in the file and formatted in UTC
+    does not.
+
+    Keywords that are not already in an HDU are not added to it.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        Open file. Modified in place.
+    gti : array-like or table
+        The intervals the file now covers, as accepted by :func:`gti_to_array`, on the
+        ``TIME + TIMEZERO`` scale.
+
+    Returns
+    -------
+    dict
+        ``tstart`` and ``tstop`` as written, and ``date_obs``/``date_end`` if they could
+        be formatted. Empty if ``gti`` is empty, in which case nothing is changed.
+    """
+    gti = gti_to_array(gti)
+    if not gti.size:
+        return {}
+
+    tstart = float(gti[:, 0].min())
+    tstop = float(gti[:, 1].max())
+
+    dates = {}
+    try:
+        from astropy.time import Time
+
+        scale = time_system(hdul)
+        mjd_beg = mjd_from_met(tstart, hdul)
+        mjd_end = mjd_from_met(tstop, hdul)
+        formatted = []
+        for mjd in (mjd_beg, mjd_end):
+            stamp = Time(mjd, format="mjd", scale=scale)
+            stamp.precision = 4
+            formatted.append(str(stamp.isot))
+        dates = {
+            "DATE-OBS": formatted[0],
+            "DATE-BEG": formatted[0],
+            "DATE-END": formatted[1],
+            "MJD-BEG": mjd_beg,
+            "MJD-OBS": mjd_beg,
+            "MJD-END": mjd_end,
+        }
+    except (ValueError, ImportError):
+        # An unusual TIMESYS, or no astropy.time. The numeric bounds below are still
+        # right and are what everything in this package reads; the civil-time strings
+        # are a convenience, and a wrong one would be worse than a stale one.
+        dates = {}
+
+    for hdu in hdul:
+        timezero = float(hdu.header.get("TIMEZERO", 0.0))
+        numeric = {
+            "TSTART": tstart - timezero,
+            "TSTOP": tstop - timezero,
+            "TELAPSE": tstop - tstart,
+        }
+        for keyword, value in list(numeric.items()) + list(dates.items()):
+            if keyword in hdu.header:
+                hdu.header[keyword] = value
+
+    result = {"tstart": tstart, "tstop": tstop}
+    if dates:
+        result["date_obs"] = dates["DATE-OBS"]
+        result["date_end"] = dates["DATE-END"]
+    return result
 
 
 def binned_lightcurve(times, gti, dt, min_fraction=0.5):
