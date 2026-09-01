@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 from collections import namedtuple
 
 import numpy as np
@@ -28,7 +29,10 @@ __all__ = [
     "merge_intervals",
     "mask_from_gti",
     "read_gti",
+    "read_skipped_inputs",
+    "record_skipped_input",
     "short_workspace",
+    "skipped_inputs_file",
     "splitext_improved",
 ]
 
@@ -904,3 +908,132 @@ def binned_lightcurve(times, gti, dt, min_fraction=0.5):
         "rate": counts / exposure,
         "rate_err": np.sqrt(counts) / exposure,
     }
+
+
+#: Serialises the read-modify-write of a skip report. Several tasks of one observation can
+#: skip a file at the same time, and each rewrites the whole file, so without this one of
+#: the two records is lost.
+_SKIPPED_LOCK = threading.Lock()
+
+#: First line of a skip report. Written so that the file explains itself when it turns up
+#: in an output directory a year from now.
+_SKIPPED_HEADER = "# Inputs skipped while reducing {obsid}"
+
+
+def skipped_inputs_file(obsid, config):
+    """
+    Path of an observation's report of the inputs its reduction had to skip.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/skipped_inputs.txt``.
+
+    Examples
+    --------
+    >>> skipped_inputs_file("90202038002", {"out_data_path": "out"})
+    'out/90202038002/skipped_inputs.txt'
+    """
+    return os.path.join(config["out_data_path"], obsid, "skipped_inputs.txt")
+
+
+def read_skipped_inputs(obsid, config):
+    """
+    What an observation's reduction skipped, as ``(item, reason)`` pairs.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    list of (str, str)
+        In the order they were recorded. Empty if nothing was skipped, or if the
+        observation has not been reduced.
+    """
+    path = skipped_inputs_file(obsid, config)
+    if not os.path.exists(path):
+        return []
+
+    skipped = []
+    with open(path) as fobj:
+        for line in fobj:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            item, _, reason = line.partition(" ")
+            skipped.append((item, reason.strip()))
+    return skipped
+
+
+def record_skipped_input(obsid, config, item, reason):
+    """
+    Add one skipped input to an observation's report, if it is not already there.
+
+    A mode-06 CHU subset that cannot be reduced is skipped and the observation still
+    counts as reduced -- see :class:`NoSourceInScienceData` for the mode-01 case, which
+    does not. That is only defensible if the skips can be audited afterwards without
+    reading a 40 MB log, which is what this file is for.
+
+    Only the **base name** of the input is recorded, never a full path. Worker processes
+    see the output tree through a ``short_workspace`` symbolic link under ``/tmp`` whose
+    name is different on every run, so an absolute path recorded today means nothing
+    tomorrow.
+
+    The file is read, added to and replaced whole, under a lock and through
+    :func:`os.replace`, so a reader never sees a half-written report and two tasks skipping
+    at the same time cannot lose one of the two records. Recording the same pair twice
+    leaves one line, which makes a resumed run idempotent.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    item : str
+        The input that was skipped. A path is reduced to its base name.
+    reason : str
+        Why, in a few words. Written on the same line, so it must not contain a newline.
+
+    Returns
+    -------
+    list of (str, str)
+        The report as it now stands.
+    """
+    item = os.path.basename(str(item).rstrip("/"))
+    reason = " ".join(str(reason).split())
+
+    path = skipped_inputs_file(obsid, config)
+    directory = os.path.dirname(path) or "."
+
+    with _SKIPPED_LOCK:
+        os.makedirs(directory, exist_ok=True)
+        skipped = read_skipped_inputs(obsid, config)
+        if (item, reason) not in skipped:
+            skipped.append((item, reason))
+
+            lines = [_SKIPPED_HEADER.format(obsid=obsid)]
+            width = max(len(name) for name, _ in skipped)
+            lines += [f"{name:<{width}}  {why}" for name, why in skipped]
+
+            handle, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            try:
+                with os.fdopen(handle, "w") as fobj:
+                    fobj.write("\n".join(lines) + "\n")
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+    return skipped

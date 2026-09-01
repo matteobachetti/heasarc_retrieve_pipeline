@@ -60,6 +60,7 @@ from .utils import (
     mask_from_gti,
     merge_intervals,
     read_gti,
+    record_skipped_input,
     rootname,
     splitext_improved,
 )
@@ -2167,9 +2168,14 @@ def calculate_spectra(
                 max_offset=max_offset,
             )
         if not os.path.exists(this_src) or not os.path.exists(this_bkg):
-            # Determinate: either no source was found or it was too far from the mode-01
-            # position. Rerunning would decide the same, so this is a clean skip.
+            # Determinate: either no source was found, or it was too faint to place a
+            # radius on, or it was too far from the mode-01 position. Rerunning would
+            # decide the same, so this is a clean skip -- recorded so that a run can be
+            # audited without reading a 40 MB log.
             logger.warning(f"No usable extraction region for {infile}, skipping")
+            record_skipped_input(
+                obsid, config, infile, "no usable extraction region could be measured"
+            )
             continue
 
         outfile_gti_temp = os.path.join(filedir, root_name + "_noflares.gti")

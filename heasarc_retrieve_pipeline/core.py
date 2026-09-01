@@ -49,6 +49,7 @@ from .utils import (
     absolute_config,
     check_name_length,
     get_logger,
+    read_skipped_inputs,
     short_workspace,
 )
 
@@ -1422,6 +1423,20 @@ def process_observations(
         logger.info(f"No science data in: {no_science}")
     if failed:
         logger.error(f"{len(failed)} of {len(items)} observations failed: {failed}")
+
+    # An unusable mode-06 CHU subset is skipped and the observation still counts as
+    # reduced. Naming the observations that skipped something is what makes that
+    # auditable without reading the whole log.
+    with_skips = [
+        item["obsid"]
+        for item in items
+        if read_skipped_inputs(item["obsid"], dict(out_data_path=outdir))
+    ]
+    if with_skips:
+        logger.info(
+            f"{len(with_skips)} observation(s) had to skip an input; see "
+            f"skipped_inputs.txt in each of {with_skips}"
+        )
     return failed
 
 
