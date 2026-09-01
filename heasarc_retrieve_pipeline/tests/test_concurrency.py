@@ -26,7 +26,11 @@ from heasarc_retrieve_pipeline.core import (
     observation_work_items,
     prepare_worker,
 )
-from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, read_manifest
+from heasarc_retrieve_pipeline.diagnostics import (
+    diagnostics_path,
+    read_manifest,
+    read_records,
+)
 
 
 def worker_state(roots):
@@ -347,7 +351,6 @@ class TestOneFailureDoesNotStopTheRest:
         )
         return failed, processed
 
-
     def test_every_observation_gets_a_manifest_even_the_failing_one(
         self, tmp_path, monkeypatch
     ):
@@ -379,6 +382,59 @@ class TestOneFailureDoesNotStopTheRest:
 
         assert manifest["url"] == "https://example.invalid/obs0/"
         assert manifest["mission"] == "nustar"
+
+
+    def test_every_observation_is_recorded_as_a_whole(self, tmp_path, monkeypatch):
+        """The outcome of the observation itself, not only of its steps."""
+        self.run(monkeypatch, tmp_path, failing={"obs1"}, no_science={"obs2"})
+
+        outcomes = {}
+        for obsid in "obs0", "obs1", "obs2":
+            (record,) = [
+                r
+                for r in read_records(
+                    diagnostics_path(obsid, dict(out_data_path=str(tmp_path)))
+                )
+                if r["step"] == "observation"
+            ]
+            outcomes[obsid] = record
+
+        assert outcomes["obs0"]["status"] == "done"
+        assert outcomes["obs1"]["status"] == "failed"
+        assert "obs1 is no good" in outcomes["obs1"]["error"]
+        assert outcomes["obs2"]["status"] == "skipped"
+        assert "no science data" in outcomes["obs2"]["reason"]
+
+    def test_every_observation_gets_a_page_including_the_failing_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed observation is exactly the one somebody will want to look at."""
+        pytest.importorskip("plotly")
+        self.run(monkeypatch, tmp_path, failing={"obs1"})
+
+        for obsid in "obs0", "obs1", "obs2":
+            assert os.path.exists(os.path.join(tmp_path, obsid, "diagnostics.html"))
+
+        with open(os.path.join(tmp_path, "obs1", "diagnostics.html")) as fobj:
+            page = fobj.read()
+        assert "obs1 is no good" in page
+        assert "target1" in page
+
+    def test_a_report_that_cannot_be_written_does_not_fail_the_observation(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing plotly, a full disk: a page is worth less than a reduction."""
+        import heasarc_retrieve_pipeline.report as report_module
+
+        def explode(obsid, outdir):
+            raise RuntimeError("no plotly here")
+
+        monkeypatch.setattr(report_module, "write_observation_page", explode)
+
+        failed, processed = self.run(monkeypatch, tmp_path, failing=set())
+
+        assert failed == []
+        assert processed == ["obs0", "obs1", "obs2"]
 
     def test_the_good_ones_all_run(self, tmp_path, monkeypatch):
         _, processed = self.run(monkeypatch, tmp_path, failing={"obs1"})

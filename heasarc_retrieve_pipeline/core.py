@@ -44,7 +44,12 @@ from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
 
-from .diagnostics import catalogue_row, diagnostics_path, write_manifest
+from .diagnostics import (
+    catalogue_row,
+    diagnostics_path,
+    record_step,
+    write_manifest,
+)
 from .utils import (
     NO_SCIENCE_DATA,
     absolute_config,
@@ -1352,15 +1357,61 @@ def download_and_process_observation(
         MISSION_CONFIG[mission]["default_config"],
     )
 
-    recursive_download(url, outdir, test_str=".", test=test)
-    if test:
-        return None
+    # The page is written whatever happens below, which is why it is here and not in
+    # the mission flow: this is the only place that knows both the observation and the
+    # output directory and still runs when the observation raises. A failed observation
+    # is exactly the one somebody will want to look at.
+    #
+    # The record closes before the page is written, so that the page shows how the
+    # observation ended rather than showing it as still running.
+    try:
+        with record_step(diagnostics_path(obsid, config), obsid, "observation") as rec:
+            recursive_download(url, outdir, test_str=".", test=test)
+            if test:
+                rec.skip("a test run: nothing was downloaded and nothing was processed")
+                return None
 
-    # recursive_download is a flow, and a subflow call is synchronous and raises, so the
-    # ordering is already guaranteed by the line above. Prefect 3 has no flow.submit().
-    return MISSION_CONFIG[mission]["obsid_processing"](
-        obsid, config=config, ra=ra, dec=dec, flags=flags
-    )
+            # recursive_download is a flow, and a subflow call is synchronous and raises,
+            # so the ordering is already guaranteed by the line above. Prefect 3 has no
+            # flow.submit().
+            result = MISSION_CONFIG[mission]["obsid_processing"](
+                obsid, config=config, ra=ra, dec=dec, flags=flags
+            )
+            if result == NO_SCIENCE_DATA:
+                # A slew is a real observation with nothing in it for this pipeline.
+                rec.skip("the observation holds no science data")
+            return result
+    finally:
+        write_page(obsid, outdir)
+
+
+def write_page(obsid, outdir):
+    """
+    Write one observation's diagnostics page, or say why it could not be written.
+
+    Imported here rather than at module scope: the report needs plotly, and a pipeline
+    installed without it must still reduce data.
+
+    A reporting failure must never turn a good observation into a failed one, and must
+    never replace the exception an observation raised -- which is what an exception
+    escaping a ``finally`` would do. So everything is caught, and the reduction goes on.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    outdir : str
+        Run output directory.
+    """
+    try:
+        from .report import write_observation_page
+
+        write_observation_page(obsid, outdir)
+    except Exception as error:
+        get_logger().warning(
+            f"Could not write the diagnostics page for {obsid}: "
+            f"{type(error).__name__}: {error}"
+        )
 
 
 @flow(flow_run_name="process_{mission}_observations")
