@@ -181,29 +181,60 @@ def working_directory(path):
     """
     Run a block with the process's working directory somewhere else.
 
-    ``addspec`` has no parameter for where to look for the files its inputs name, so the
-    only way to tell it is to be there. The directory is always put back.
+    The working directory belongs to the whole process, and steering a pipeline step by
+    changing it is exactly what ``test_prefect_wiring`` forbids. This is the one exception,
+    and it is forced by the ``addspec`` bug described in :func:`stage_inputs`: a background
+    spectrum has to be named without a directory, so the only way to say *which* background
+    spectrum is to be standing in its directory.
+
+    :data:`~heasarc_retrieve_pipeline.heasoft.HEASOFT_LOCK` is held throughout, which is
+    what makes it safe: every HEASOFT call in this package goes through that lock, so no
+    other tool can run while the directory is moved. It is re-entrant, so the
+    :func:`~heasarc_retrieve_pipeline.heasoft.run` calls inside the block take it again
+    without deadlocking.
 
     Parameters
     ----------
     path : str
         Directory to change into.
     """
-    previous = os.getcwd()
-    os.chdir(path)
-    try:
-        yield path
-    finally:
-        os.chdir(previous)
+    with heasoft.HEASOFT_LOCK:
+        previous = os.getcwd()
+        os.chdir(path)
+        try:
+            yield path
+        finally:
+            os.chdir(previous)
 
 
 def stage_inputs(spectra, stagedir):
     """
-    Gather the spectra of a merge, and everything they point at, into one directory.
+    Gather the spectra of a merge into one directory, with pointers ``addspec`` can read.
 
-    Each source spectrum is *copied* -- its ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``
-    are rewritten to bare names, and the originals must not be touched. Everything those
-    name is *linked*, because an ``.rmf`` is 68 MB and nothing writes to it.
+    This exists to work around one specific ``addspec`` bug, and the shape of the
+    workaround follows exactly from the shape of the bug. ``addspec`` co-adds the
+    backgrounds by building a ``mathpha`` expression out of the ``BACKFILE`` values and
+    spawning it -- but, unlike the expression it builds for the source spectra, it does
+    **not** quote the operands::
+
+        mathpha "expr='/path/nu..._sr.pha'+'/path/nu..._sr.pha'"          quoted, fine
+        mathpha "expr=(/path/nu..._bk.pha*31.5)+(/path/nu..._bk.pha*31.5)"  not quoted
+
+    ``mathpha`` reads the second as arithmetic, so every ``/`` in the path is a division
+    operator and the run dies on ``fitsio 4.060 error message: could not open the named
+    file``. A ``BACKFILE`` must therefore contain no directory at all, which leaves being
+    in the right directory as the only way to say which file is meant.
+
+    That is the whole of the constraint, so the staging is no wider than it. Measured, not
+    assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and writes its
+    ``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
+    absolute too.
+
+    So each source spectrum is *copied* -- the originals must not be touched -- and in the
+    copy ``BACKFILE`` is reduced to a bare name while ``RESPFILE`` and ``ANCRFILE`` are
+    made absolute, pointing back at the parent's own responses. Only the background
+    spectra are linked into the directory; the 68 MB ``.rmf`` files are never linked or
+    copied at all.
 
     The file names already carry the OBSID, so spectra from different observations cannot
     collide here.
@@ -238,8 +269,14 @@ def stage_inputs(spectra, stagedir):
                     if not value or value.lower() in ("none", "no"):
                         continue
                     referenced = os.path.basename(value)
-                    hdu.header[keyword] = referenced
-                    _link(os.path.join(source, referenced), os.path.join(stagedir, referenced))
+                    original = os.path.join(source, referenced)
+                    if keyword == "BACKFILE":
+                        # Bare, and linked in beside us: mathpha would read a path as
+                        # arithmetic. This is the only keyword that has to be handled.
+                        hdu.header[keyword] = referenced
+                        _link(original, os.path.join(stagedir, referenced))
+                    else:
+                        hdu.header[keyword] = os.path.abspath(original)
 
         staged.append(name)
         logger.debug(f"Staged {name} for merging")
@@ -251,9 +288,8 @@ def _link(source, destination):
     """
     Point ``destination`` at ``source``, quietly doing nothing if it is already there.
 
-    A symbolic link rather than a copy: the responses are the bulk of an observation's
-    products and a merge only reads them. Falls back to copying where linking is not
-    available.
+    A symbolic link rather than a copy: a merge only reads the background spectra. Falls
+    back to copying where linking is not available.
     """
     if os.path.exists(destination) or os.path.islink(destination):
         return

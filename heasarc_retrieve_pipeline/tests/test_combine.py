@@ -153,13 +153,24 @@ class TestStageInputs:
         combine.stage_inputs(original, str(tmp_path / "stage"))
         assert all(os.path.exists(path) for path in original)
 
-    def test_the_pointers_become_bare_names(self, tree, tmp_path):
+    def test_the_background_pointer_becomes_a_bare_name(self, tree, tmp_path):
+        """The whole point of staging. ``addspec`` interpolates ``BACKFILE`` into a
+        ``mathpha`` expression unquoted, so a ``/`` in it is read as division."""
+        stage = str(tmp_path / "stage")
+        staged = combine.stage_inputs(self.spectra(tree), stage)
+        with fits.open(os.path.join(stage, staged[0])) as hdul:
+            assert os.sep not in hdul["SPECTRUM"].header["BACKFILE"]
+
+    def test_the_responses_stay_absolute(self, tree, tmp_path):
+        """Only ``BACKFILE`` has the problem, so only ``BACKFILE`` is narrowed. Verified
+        against HEASOFT: ``addspec`` builds its ``.rsp`` from absolute pointers."""
         stage = str(tmp_path / "stage")
         staged = combine.stage_inputs(self.spectra(tree), stage)
         with fits.open(os.path.join(stage, staged[0])) as hdul:
             header = hdul["SPECTRUM"].header
-            for keyword in ("BACKFILE", "RESPFILE", "ANCRFILE"):
-                assert os.sep not in header[keyword]
+            for keyword in ("RESPFILE", "ANCRFILE"):
+                assert os.path.isabs(header[keyword])
+                assert os.path.exists(header[keyword])
 
     def test_everything_named_is_there_to_be_found(self, tree, tmp_path):
         stage = str(tmp_path / "stage")
@@ -168,6 +179,8 @@ class TestStageInputs:
             with fits.open(os.path.join(stage, name)) as hdul:
                 header = hdul["SPECTRUM"].header
                 for keyword in ("BACKFILE", "RESPFILE", "ANCRFILE"):
+                    # Bare names resolve inside the staging directory, which is where
+                    # addspec runs; absolute ones resolve on their own.
                     assert os.path.exists(os.path.join(stage, header[keyword]))
 
     def test_the_originals_are_untouched(self, tree, tmp_path):
@@ -178,12 +191,19 @@ class TestStageInputs:
         with fits.open(original) as hdul:
             assert hdul["SPECTRUM"].header["RESPFILE"] == before
 
-    def test_the_responses_are_linked_not_copied(self, tree, tmp_path):
-        """An rmf is 68 MB and a merge only reads it."""
+    def test_the_background_is_linked_not_copied(self, tree, tmp_path):
+        """A merge only reads it, and it has to be here under a bare name."""
         stage = str(tmp_path / "stage")
         combine.stage_inputs(self.spectra(tree)[:1], stage)
-        rmf = [n for n in os.listdir(stage) if n.endswith(".rmf")][0]
-        assert os.path.islink(os.path.join(stage, rmf))
+        background = [n for n in os.listdir(stage) if n.endswith("_bk.pha")][0]
+        assert os.path.islink(os.path.join(stage, background))
+
+    def test_the_big_responses_are_never_brought_in(self, tree, tmp_path):
+        """An rmf is 68 MB. Nothing needs it here, so nothing links or copies it."""
+        stage = str(tmp_path / "stage")
+        combine.stage_inputs(self.spectra(tree), stage)
+        brought_in = [n for n in os.listdir(stage) if n.endswith((".rmf", ".arf"))]
+        assert brought_in == []
 
     def test_spectra_from_two_observations_do_not_collide(self, tree, tmp_path):
         both = self.spectra(tree) + [

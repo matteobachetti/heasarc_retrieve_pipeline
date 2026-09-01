@@ -1275,6 +1275,35 @@ class TestLongestOutputName:
 
         assert len(longest) - len(root) == 61
 
+    def other_names_the_split_builds(self, obsid, config):
+        """The long names ``segments.py`` adds on top of a finished reduction.
+
+        The split is post-processing, not part of the reduction, so these are checked
+        separately -- but they are written into the same tree and hit the same limit.
+        """
+        split = split_path(obsid, config)
+        base = nu_base_output_path(obsid, config)
+        products = nu_product_output_path(obsid, config)
+        stem6 = f"nu{obsid}A06_chu123_N"
+        # Ten or more segments would add a character; nobody cuts an observation into
+        # ten pieces, and the margin below is wider than that anyway.
+        tag = "seg1"
+        return [
+            os.path.join(split, f"{stem6}_cl_{tag}.gti"),
+            os.path.join(products, f"{stem6}_grp_{tag}.pha"),
+            os.path.join(products, f"{stem6}_sr_{tag}.pha"),
+            # nuproducts writes a plot whether or not it is wanted, named from stemout
+            os.path.join(products, f"{stem6}_{tag}_ph.gif"),
+            os.path.join(base, f"nu{obsid}_src1_noflares_bary_{tag}.evt"),
+        ]
+
+    def test_the_split_does_not_build_a_longer_name(self):
+        """``nu_longest_output_name`` still bounds the tree once segments are in it."""
+        longest = nu_longest_output_name(OBSID, self.CONFIG)
+
+        for name in self.other_names_the_split_builds(OBSID, self.CONFIG):
+            assert len(name) <= len(longest), f"{name} is longer than {longest}"
+
 
 class TestRecoverSpacecraftScienceWithoutMode06:
     """An observation with no mode-06 data must still finish the step.

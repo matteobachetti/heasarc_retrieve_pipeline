@@ -578,8 +578,8 @@ requirement.
 Conversely, ``pytest`` is listed as a *runtime* dependency and imported (unused) at
 ``core.py:7``.
 
-23. The installed console script points at nothing
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+23. The installed console script points at nothing -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``pyproject.toml`` declares::
 
@@ -590,6 +590,13 @@ Conversely, ``pytest`` is listed as a *runtime* dependency and imported (unused)
 crashes with ``ModuleNotFoundError``. It is a leftover from the OpenAstronomy package
 template; remove it, or replace it with a real command-line entry point -- the package is a
 pipeline and currently has none, so every user has to write Python.
+
+**Fixed.** The template entry is gone, replaced by the three commands the package
+actually has: ``hrp-split-obsid``, ``hrp-merge-obsids`` and ``hrp-report``. Each is the
+``main(argv=None)`` of a module that was already runnable with ``python -m``, so the
+entry points add a name on ``PATH`` and nothing else. Running the reduction itself still
+means writing Python, because it takes a config dictionary rather than a set of flags;
+that is issue 24's business, not this one's.
 
 24. ``read_config`` cannot work
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

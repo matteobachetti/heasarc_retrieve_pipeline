@@ -1004,7 +1004,215 @@ All well inside the 3 arcmin default, and consistent with the roughly 2 arcmin s
 The resulting spectra are one set per CHU combination per module. They are **not** to be
 combined by merging their event files -- the merged event files this pipeline produces are
 timing-only precisely because they mix aspect solutions and exposures. Combine them at the
-spectrum level with ``addascaspec``, or load them as separate datasets and fit them jointly.
+spectrum level -- which is what ``hrp-merge-obsids`` below does -- or load them as separate
+datasets and fit them jointly.
+
+
+Splitting and merging observations
+----------------------------------
+
+Two post-processing tools work on a tree the pipeline has already finished. Neither
+re-runs ``nupipeline`` and neither regenerates responses, which is what makes them take
+seconds rather than the 50 minutes a reduction costs::
+
+    hrp-split-obsid  <out_data_path> <OBSID> <MJD> [<MJD> ...]
+    hrp-merge-obsids <out_data_path> <OBSID> <OBSID> [...] [--name NAME]
+
+The first cuts one observation into time segments -- for a source that changes state
+part-way through. The second co-adds several observations that are each too faint to fit
+on their own.
+
+Time conventions
+~~~~~~~~~~~~~~~~
+
+Turning a user's MJD into the number a FITS file counts in is where a silent error would
+be worst, so it lives in three small functions in ``utils.py`` -- ``time_reference``,
+``met_from_mjd`` and ``mjd_from_met`` -- with their own tests. Four things they have to
+get right:
+
+**Two reference conventions.** A file states its reference epoch one of two ways, never
+both:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Form
+     - Who writes it
+   * - ``MJDREFI`` (integer day) + ``MJDREFF`` (fraction)
+     - NuSTAR, NICER, RXTE, Swift, most modern HEASARC missions
+   * - ``MJDREF`` (a single float)
+     - XMM, Chandra, older files
+
+``time_reference`` accepts either and always returns the split pair; for a single
+``MJDREF`` it returns ``(floor(MJDREF), MJDREF - floor(MJDREF))``. A header with neither
+raises, naming what was looked for, rather than defaulting to zero and producing a time
+55197 days wrong. NuSTAR repeats the keywords in every HDU including the primary while
+other missions put them only in the events extension, so the lookup tries the extension
+it was handed, then the primary, then any HDU that has them.
+
+**Keep the integer and the fraction apart.** ``met_from_mjd`` computes
+
+.. code-block:: python
+
+    ((mjd - mjdrefi) - mjdreff) * 86400.0     # yes
+    (mjd - (mjdrefi + mjdreff)) * 86400.0     # no
+
+The second form collapses the reference into one float before subtracting, and
+``55197.000766...`` in a float64 has about a nanosecond-of-a-day of resolution left over
+after the integer part. Measured over 500 epochs against exact decimal arithmetic, the
+split form stays within 2 units in the last place -- at worst 43 nanoseconds -- while the
+collapsed form has a **floor** of 140 to 200 nanoseconds that does not shrink as the
+answer gets smaller. It makes no difference to a split at MJD 56689 and it costs nothing,
+but this is a package people do timing with. (For a file that carries only a single
+``MJDREF``, the precision is gone before we see it and nothing can recover it.)
+
+**Which scale the answer is on.** The FITS convention is
+``absolute = MJDREF + (TIMEZERO + TIME)/86400``, so ``met_from_mjd`` returns a time on the
+``TIME + TIMEZERO`` scale -- the scale ``read_gti`` and ``apply_gti`` already work on. The
+helpers take no ``TIMEZERO`` term of their own and everything downstream goes through
+those two functions. This is worth stating because it is the trap: NuSTAR has no
+``TIMEZERO`` at all, so the distinction is invisible here, but RXTE does and some NICER
+releases carry ``TIMEZERO = -1.0``. ``TIMEZERO`` is also per-HDU, and the events and GTI
+extensions may legitimately disagree; ``apply_gti`` reads them separately and the split
+code does not undo that.
+
+**TT versus UTC.** NuSTAR's ``TIMESYS`` is ``TT``, so MJD 56689 in this arithmetic means
+MJD 56689 *TT*, which is 67.184 s earlier than MJD 56689 UTC. A split time read off a
+light curve labelled in civil time and fed in naively lands a minute out. The default is
+to read the given MJD in the file's own ``TIMESYS``, since that is what round-trips
+through ``mjd_from_met``; ``--utc`` reads it as UTC and converts. The tool logs the
+resolved MET and the civil date it corresponds to, so a wrong choice is visible before
+anything is written.
+
+Splitting: ``segments.py``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``N`` split times give ``N + 1`` segments, ``seg1`` ... ``seg<N+1>`` in time order. The
+numbering never shifts: a split time outside the observation leaves an *empty* segment
+rather than renumbering the others, because ``seg2`` has to mean the same stretch of the
+observation no matter what else was asked for.
+
+Everything is written into the parent's own tree, with the tag last::
+
+    <OBSID>/products/nu<OBSID>A01_sr_seg1.pha     source spectrum
+    <OBSID>/products/nu<OBSID>A01_bk_seg1.pha     background spectrum
+    <OBSID>/products/nu<OBSID>A01_grp_seg1.pha    grouped, the one you fit
+    <OBSID>/nu<OBSID>A_src1_bary_seg1.evt         event list
+
+Living in the same directory as the parent is not cosmetic. ``RESPFILE``, ``ANCRFILE`` and
+``BACKFILE`` are bare file names that XSPEC resolves relative to the spectrum's own
+directory, so a segment sitting next to its parent points at the parent's 68 MB ``.rmf``
+with no copy, no symbolic link and no path rewriting.
+
+The spectra come from ``nuproducts``, not from editing the parent's ``COUNTS`` column.
+``calculate_spectra`` already passes ``usrgtifile`` on every call -- the flare-free GTI --
+so handing it a *segment's* GTI instead is the whole of the spectral split, and the
+segments are consistent with the unsplit products by construction rather than by this
+module reimplementing the region and grade filters. ``runmkarf=no runmkrmf=no`` skips the
+slow part; ``lcfile``, ``bkglcfile`` and ``imagefile`` are ``NONE``; ``phafile``,
+``bkgphafile`` and ``grpphafile`` are named explicitly, which is where the layout above
+comes from with no renaming pass. ``stemout`` carries the tag too, so that the plot
+``nuproducts`` insists on writing (``plotdevice`` has no "off" setting) cannot land on the
+parent's; it is deleted afterwards, in the spirit of commit 710c1d5.
+
+Each segment's GTI file is a **copy of the parent's** ``<root>_noflares.gti`` with only
+its table rows replaced, by ``intersect_intervals`` of that GTI with the segment bounds.
+Copying rather than building one from scratch keeps ``MJDREFI``, ``TIMESYS``, ``TIMEUNIT``
+and everything else exactly as HEASOFT wrote it. A segment whose intersection is empty is
+skipped and recorded.
+
+Regions are the parent's, looked up next to the event file. If they are missing the file
+is skipped and the reason recorded -- deliberately, rather than re-measuring: a segment
+must use the parent's region or the ARF it is about to reuse is wrong.
+
+Event lists are split in pure astropy, no HEASOFT: ``apply_gti`` already drops the events,
+rewrites the GTI extension and rescales ``ONTIME``/``LIVETIME``/``EXPOSURE``. It does not
+touch ``TSTART``/``TSTOP``/``TELAPSE`` or the ``DATE-*``/``MJD-*`` keywords, which after a
+time cut would be plainly wrong, so ``utils.update_time_bounds`` does that beside it. It
+narrows only keywords that were already there, subtracts each HDU's own ``TIMEZERO``, and
+writes the dates in the file's own ``TIMESYS`` -- for NuSTAR that is TT, so a ``DATE-OBS``
+from this pipeline is a TT date, exactly as HEASOFT's own are.
+
+**The caveat worth stating.** Reusing the parent's ARF for a time segment assumes the
+effective area did not change across the split. The ARF folds in the vignetting for the
+source's off-axis angle and the PSF correction for the extraction radius, both averaged
+over the exposure. Within a single pointing these are effectively constant, so the
+approximation is good -- but it is an approximation, and it would break down where the
+aspect wanders, which is exactly what mode 06 is. If a segment's spectrum ever looks
+suspicious, regenerating its response with ``runmkarf=yes`` is a one-flag change and the
+honest cross-check.
+
+Merging: ``combine.py``
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Output goes to a **new sibling tree**, ``<out_data_path>/<NAME>/`` (default
+``merged_<first>_<last>``). That choice is what gets the merged dataset a report page for
+free: ``observation_directories`` treats any subdirectory with a ``diagnostics/`` in it as
+an observation, so writing records through ``record_step`` there needs no change to
+``report.py`` at all.
+
+Spectra are grouped by focal-plane module -- A with A, B with B -- across all input
+OBSIDs, and go through ``addspec`` with ``qaddrmf=yes`` (exposure-weights the ARFs and
+RMFs into one response) and ``qsubback=yes`` (combines the backgrounds), then ``grppha``
+with the pipeline's usual ``group min 20 & bad 0-34 & bad 1910-4095``.
+
+Only files ending ``_sr.pha`` are inputs. The anchor on the end matters: it is what keeps
+a ``_sr_seg1.pha`` left by ``hrp-split-obsid`` out of a merge, which would otherwise count
+the same photons twice.
+
+By default this includes mode 01 *and* the mode-06 CHU spectra, because ``addspec``
+weights their different responses correctly and the mode-06 exposure is a large part of
+why they are extracted at all. ``--mode01-only`` restricts to normal science.
+
+``addspec`` is run from a **staging directory**, which looks like needless copying and is
+not. It works around one specific ``addspec`` bug. To co-add the backgrounds, ``addspec``
+builds a ``mathpha`` expression out of the ``BACKFILE`` values and spawns it -- but,
+unlike the expression it builds for the source spectra, it does not quote the operands::
+
+    mathpha "expr='/path/nu..._sr.pha'+'/path/nu..._sr.pha'"             quoted, fine
+    mathpha "expr=(/path/nu..._bk.pha*31.5)+(/path/nu..._bk.pha*31.5)"   not quoted
+
+``mathpha`` reads the second as arithmetic, so every ``/`` in the path becomes a division
+operator and the run dies on ``fitsio 4.060 error message: could not open the named
+file``. A ``BACKFILE`` must therefore carry no directory at all, and being in the right
+directory is then the only way to say which file is meant.
+
+The staging is no wider than that constraint, which was established by experiment rather
+than assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and builds its
+``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
+absolute too. So each spectrum is copied -- the originals are never touched -- with
+``BACKFILE`` reduced to a bare name and ``RESPFILE``/``ANCRFILE`` made absolute, and only
+the background spectra are linked in beside it. The 68 MB ``.rmf`` files are neither
+copied nor linked.
+
+Changing the working directory is otherwise forbidden in this package, and
+``test_prefect_wiring`` enforces that by walking the AST for ``os.chdir``. The one
+exception is listed there with this reason. It holds ``HEASOFT_LOCK`` for the duration, so
+no other HEASOFT call in the process can see the directory move, and ``hrp-merge-obsids``
+is post-processing on a finished tree rather than a step inside the reduction flow.
+
+Afterwards the outputs are moved into ``products/`` and the staging directory is removed;
+the list file is kept there as ``<NAME>_<FPM>_inputs.lis``, the record of what was
+co-added.
+
+Event lists are merged by ``merge_event_files``, which already handled arbitrary lists of
+paths -- only its callers were OBSID-scoped -- with ``gti_operation="OR"``. Only the
+**barycentred** files are merged: the days-long gap between two observations shows up as a
+gap in the merged GTI, which is correct and is what any downstream timing code should see,
+but only once the times are on a common inertial clock.
+
+Checked against HEASOFT on two copies of a real reduced observation: for both modules the
+merged ``COUNTS`` array equals the sum of the inputs channel for channel, and ``EXPOSURE``
+equals their sum.
+
+Both tools and the file-name limit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nu_longest_output_name`` still bounds the tree. The longest name either tool builds is
+``<OBSID>/products/nu<OBSID>A06_chu123_N_grp_seg1.pha``, 60 characters after the output
+root, against the reduction's own champion at 61 -- so the 128-character check the flow
+makes before it starts still covers everything written afterwards. ``TestLongestOutputName``
+asserts it, so it stays that way.
 
 
 NICER

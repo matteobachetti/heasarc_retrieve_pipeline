@@ -1097,7 +1097,7 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         print(__doc__.strip().splitlines()[0])
-        print("usage: python -m heasarc_retrieve_pipeline.report <output directory>")
+        print("usage: hrp-report <output directory>")
         return 2
 
     outdir = os.path.abspath(argv[0])

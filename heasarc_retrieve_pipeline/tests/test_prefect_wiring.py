@@ -220,9 +220,17 @@ def chdir_calls(source):
     return callers
 
 
-#: The one place a working directory may be set: a worker process, once, before it runs
-#: anything, into a private directory of its own.
-CHDIR_ALLOWED_IN = {"prepare_worker"}
+#: Where a working directory may be set. ``prepare_worker`` is the ordinary case: a worker
+#: process, once, before it runs anything, into a private directory of its own.
+#:
+#: ``combine.working_directory`` is the exception, and it is forced from outside. ``addspec``
+#: builds the ``mathpha`` expression that co-adds the backgrounds without quoting the
+#: ``BACKFILE`` values, so a path in one is parsed as division and the run dies; a background
+#: spectrum has to be named bare, and the only way to say which one is to be standing in its
+#: directory. It holds ``heasoft.HEASOFT_LOCK`` while the directory is moved, so no other
+#: HEASOFT call in the process can see it, and it is not part of the reduction flow -- it is
+#: a post-processing command that runs on a tree the pipeline has already finished.
+CHDIR_ALLOWED_IN = {"prepare_worker", "working_directory"}
 
 
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)

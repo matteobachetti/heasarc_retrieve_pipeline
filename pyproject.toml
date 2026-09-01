@@ -39,7 +39,9 @@ docs = [
 
 
 [project.scripts]
-astropy_package_template_example = "heasarc_retrieve_pipeline.example_mod:main"
+hrp-split-obsid = "heasarc_retrieve_pipeline.segments:main"
+hrp-merge-obsids = "heasarc_retrieve_pipeline.combine:main"
+hrp-report = "heasarc_retrieve_pipeline.report:main"
 
 
 [project.urls]
