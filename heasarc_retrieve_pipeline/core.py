@@ -37,6 +37,7 @@ from .nustar import (
     process_nustar_obsid,
     DEFAULT_CONFIG as NUSTAR_DEFAULT_CONFIG,
 )
+from . import heasoft
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
 from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 
@@ -1206,10 +1207,9 @@ def prepare_worker(pfiles_root, work_root):
     os.makedirs(pfiles, exist_ok=True)
     os.makedirs(workdir, exist_ok=True)
     if "HEADAS" in os.environ:
-        # First entry is where parameters are written, after the ";" is the read-only
-        # system copy the tools fall back on.
-        system = os.path.join(os.environ["HEADAS"], "syspfiles")
-        os.environ["PFILES"] = f"{pfiles};{system}"
+        # heasoft remembers this value and puts it back if anything changes it; see
+        # heasoft._hold_on_to_private_pfiles for why that turned out to be necessary.
+        heasoft.use_private_pfiles(pfiles)
     os.chdir(workdir)
 
     _WORKER_DIRECTORY = workdir

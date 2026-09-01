@@ -6,6 +6,7 @@ parameter file about one time in ten. See :mod:`heasarc_retrieve_pipeline.heasof
 """
 
 import ast
+import os
 import pathlib
 import threading
 import time
@@ -187,3 +188,92 @@ def test_no_module_calls_a_heasoft_tool_behind_the_lock(path):
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
 def test_only_one_module_imports_heasoftpy(path):
     assert "import heasoftpy" not in path.read_text(), f"{path.name} imports heasoftpy"
+
+
+class TestPrivatePfilesAreHeldOnTo:
+    """PFILES must still be this process's own when a tool actually runs.
+
+    Each worker process gets a private parameter directory precisely so that four of them
+    cannot delete one another's ``<tool>.par``. In the 2026 reprocessing of 56 M82
+    observations that isolation did not hold: 1016 ``fthedit`` calls ran, and a handful
+    failed with the parameter file resolving to the shared ``$HOME/pfiles`` instead --
+    under all four worker PIDs, not one bad process. Seven observations were lost that way.
+
+    heasoftpy reads ``os.environ["PFILES"]`` afresh on every call (``core.find_pfile``), so
+    checking it immediately before the call is enough to undo whatever put the shared
+    directory back, and says so in the log the first time.
+    """
+
+    def worker(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HEADAS", str(tmp_path / "headas"))
+        monkeypatch.setattr(heasoft, "_EXPECTED_PFILES", None)
+        monkeypatch.setattr(heasoft, "_PFILES_REPAIRED", False)
+        return heasoft.use_private_pfiles(str(tmp_path / "mine"))
+
+    def seen_by_the_tool(self, monkeypatch):
+        """Run a tool that records the PFILES in force at the moment it is called."""
+        seen = []
+
+        def tool(*args, **kwargs):
+            seen.append(os.environ.get("PFILES"))
+            return "done"
+
+        monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(ftlist=tool), raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+        return seen
+
+    def test_it_sets_pfiles_to_the_private_directory_first(self, monkeypatch, tmp_path):
+        expected = self.worker(monkeypatch, tmp_path)
+
+        assert os.environ["PFILES"] == expected
+        assert str(tmp_path / "mine") == expected.split(";")[0]
+        assert expected.endswith(os.path.join(str(tmp_path / "headas"), "syspfiles"))
+
+    def test_a_clobbered_pfiles_is_repaired_before_the_tool_runs(self, monkeypatch, tmp_path):
+        expected = self.worker(monkeypatch, tmp_path)
+        seen = self.seen_by_the_tool(monkeypatch)
+        monkeypatch.setenv("PFILES", "/home/someone/pfiles;/opt/heasoft/syspfiles")
+
+        heasoft.run("ftlist", infile="a")
+
+        assert seen == [expected]
+
+    def test_an_intact_pfiles_is_left_alone(self, monkeypatch, tmp_path):
+        expected = self.worker(monkeypatch, tmp_path)
+        seen = self.seen_by_the_tool(monkeypatch)
+
+        heasoft.run("ftlist", infile="a")
+
+        assert seen == [expected]
+
+    def test_nothing_is_touched_when_no_private_directory_was_claimed(self, monkeypatch):
+        """A plain script that never called prepare_worker keeps its own environment."""
+        monkeypatch.setattr(heasoft, "_EXPECTED_PFILES", None)
+        seen = self.seen_by_the_tool(monkeypatch)
+        monkeypatch.setenv("PFILES", "/whatever;/else")
+
+        heasoft.run("ftlist", infile="a")
+
+        assert seen == ["/whatever;/else"]
+
+    def test_run_task_is_guarded_too(self, monkeypatch, tmp_path):
+        """HSPTask reads the parameter file when it is built, so it needs the guard first."""
+        expected = self.worker(monkeypatch, tmp_path)
+        seen = []
+
+        class FakeTask:
+            def __init__(self, name):
+                seen.append(os.environ.get("PFILES"))
+
+            def __call__(self, **params):
+                return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(
+            heasoft, "hsp", SimpleNamespace(HSPTask=FakeTask), raising=False
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+        monkeypatch.setenv("PFILES", "/home/someone/pfiles;/opt/heasoft/syspfiles")
+
+        heasoft.run_task("nupipeline", indir="a")
+
+        assert seen == [expected]
