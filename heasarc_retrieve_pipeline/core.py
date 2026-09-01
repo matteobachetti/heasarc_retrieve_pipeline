@@ -43,7 +43,13 @@ from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
 
-from .utils import absolute_config, check_name_length, get_logger, short_workspace
+from .utils import (
+    NO_SCIENCE_DATA,
+    absolute_config,
+    check_name_length,
+    get_logger,
+    short_workspace,
+)
 
 
 def _download_pysmartdl(url: str, dest: str):
@@ -1323,7 +1329,9 @@ def process_observations(
     Returns
     -------
     list of str
-        The OBSIDs that failed.
+        The OBSIDs that failed. Observations whose processing returned
+        :data:`heasarc_retrieve_pipeline.utils.NO_SCIENCE_DATA` -- NuSTAR slews, for
+        instance -- are counted and logged separately, and are *not* in this list.
     """
     logger = get_run_logger()
     futures = [
@@ -1343,13 +1351,23 @@ def process_observations(
     ]
 
     failed = []
+    no_science = []
     for item, future in zip(items, futures):
         try:
-            future.result()
+            if future.result() == NO_SCIENCE_DATA:
+                no_science.append(item["obsid"])
         except Exception as exc:
             failed.append(item["obsid"])
             logger.error(f"OBSID {item['obsid']} failed: {type(exc).__name__}: {exc}")
 
+    reduced = len(items) - len(failed) - len(no_science)
+    logger.info(
+        f"{reduced} of {len(items)} observations reduced, "
+        f"{len(no_science)} held no science data, {len(failed)} failed"
+    )
+    if no_science:
+        # Not an error: a slew is a real observation with nothing in it for this pipeline.
+        logger.info(f"No science data in: {no_science}")
     if failed:
         logger.error(f"{len(failed)} of {len(items)} observations failed: {failed}")
     return failed

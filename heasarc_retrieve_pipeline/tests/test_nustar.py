@@ -941,3 +941,70 @@ class TestRecoverSpacecraftScienceWithoutMode06:
         _, called = self.run(tmp_path, monkeypatch, modes=("01", "06"))
 
         assert [name for name, _ in called] == ["nusplitsc", "nusplitsc"]
+
+
+class TestObservingModesPresent:
+    """Which observing modes Level 2 produced, and whether any of them is science.
+
+    Measured on the 56 M82 observations reprocessed in 2026: every one of the 32 that
+    reduced successfully produced both mode 01 and mode 06. The four slews produced
+    neither -- 30202022001 had only mode 03, and 30502020001, 30502020003 and 30502022001
+    had only modes 02 and 03.
+    """
+
+    def tree(self, tmp_path, *names):
+        config = dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+        pipedir = nu_pipeline_output_path(OBSID, config)
+        os.makedirs(pipedir, exist_ok=True)
+        for name in names:
+            open(os.path.join(pipedir, name), "w").close()
+        return config
+
+    def test_it_lists_the_modes_it_finds(self, tmp_path):
+        config = self.tree(
+            tmp_path,
+            f"nu{OBSID}A01_cl.evt",
+            f"nu{OBSID}B01_cl.evt",
+            f"nu{OBSID}A06_cl.evt",
+        )
+
+        assert nustar.observing_modes_present(OBSID, config) == ["01", "06"]
+
+    def test_compressed_files_count_too(self, tmp_path):
+        config = self.tree(tmp_path, f"nu{OBSID}A01_cl.evt.gz")
+
+        assert nustar.observing_modes_present(OBSID, config) == ["01"]
+
+    def test_it_ignores_files_of_other_observations(self, tmp_path):
+        config = self.tree(tmp_path, "nu99999999999A01_cl.evt", f"nu{OBSID}A03_cl.evt")
+
+        assert nustar.observing_modes_present(OBSID, config) == ["03"]
+
+    def test_it_ignores_unfiltered_and_uncleaned_files(self, tmp_path):
+        config = self.tree(
+            tmp_path, f"nu{OBSID}A01_uf.evt", f"nu{OBSID}A_fpm.hk", f"nu{OBSID}A06_cl.evt"
+        )
+
+        assert nustar.observing_modes_present(OBSID, config) == ["06"]
+
+    def test_a_slew_has_no_science_data(self, tmp_path):
+        config = self.tree(tmp_path, f"nu{OBSID}A02_cl.evt", f"nu{OBSID}A03_cl.evt")
+
+        assert nustar.observing_modes_present(OBSID, config) == ["02", "03"]
+        assert not nustar.has_science_data(OBSID, config)
+
+    def test_mode_01_alone_is_science(self, tmp_path):
+        config = self.tree(tmp_path, f"nu{OBSID}A01_cl.evt", f"nu{OBSID}A03_cl.evt")
+
+        assert nustar.has_science_data(OBSID, config)
+
+    def test_mode_06_alone_is_science(self, tmp_path):
+        config = self.tree(tmp_path, f"nu{OBSID}A06_cl.evt")
+
+        assert nustar.has_science_data(OBSID, config)
+
+    def test_an_empty_pipeline_directory_is_not_science(self, tmp_path):
+        config = self.tree(tmp_path)
+
+        assert nustar.observing_modes_present(OBSID, config) == []
+        assert not nustar.has_science_data(OBSID, config)

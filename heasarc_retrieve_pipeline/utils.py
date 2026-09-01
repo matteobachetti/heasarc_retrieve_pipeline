@@ -31,6 +31,14 @@ __all__ = [
 ]
 
 
+#: What a mission's per-observation processing returns when the observation holds nothing
+#: it can reduce -- a NuSTAR slew, for instance, which is a real catalogue entry with real
+#: downloaded files and no science-mode data. It is deliberately a returned value and not
+#: an exception: nothing went wrong, so the flow run must not end Failed, and the caller
+#: counts these apart from the observations that genuinely broke.
+NO_SCIENCE_DATA = "NO_SCIENCE_DATA"
+
+
 def get_logger():
     """
     Prefect's run logger inside a flow or task run, a plain one outside.

@@ -45,6 +45,7 @@ from prefect.tasks import task_input_hash
 from .barycenter import barycenter_file
 from .image_utils import filter_sources_in_images
 from .utils import (
+    NO_SCIENCE_DATA,
     absolute_config,
     apply_gti,
     binned_lightcurve,
@@ -312,6 +313,72 @@ def spectral_input_files(obsid, config):
             yield fpm, infile
         for infile in _cl_event_files(splitdir, f"nu{obsid}{fpm}06_chu*_cl.evt*"):
             yield fpm, infile
+
+
+#: Observing modes that carry usable science. 01 is normal science, with the aspect
+#: solution from CHU4 on the optics bench; 06 is "spacecraft science", recorded while CHU4
+#: was blinded and reconstructed from CHU1-3 by :func:`recover_spacecraft_science_data`.
+#: Everything else -- 02, 03, 04, 05 -- is slewing and settling, and holds no data this
+#: pipeline can reduce.
+SCIENCE_MODES = ("01", "06")
+
+#: Matches a cleaned Level-2 event file and picks out its focal-plane module and mode.
+CLEANED_EVENT_RE = re.compile(r"^nu(?P<obsid>\d+)(?P<fpm>[AB])(?P<mode>\d\d)_cl\.evt")
+
+
+def observing_modes_present(obsid, config):
+    """
+    The observing modes Level 2 actually produced cleaned event files for.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    list of str
+        Sorted two-character mode numbers, for example ``["01", "06"]``. Empty if the
+        pipeline directory holds no cleaned event files at all.
+    """
+    pipedir = nu_pipeline_output_path(obsid, config=config)
+    modes = set()
+    for path in glob.glob(os.path.join(pipedir, f"nu{obsid}[AB]*_cl.evt*")):
+        match = CLEANED_EVENT_RE.match(os.path.basename(path))
+        if match is not None and match.group("obsid") == obsid:
+            modes.add(match.group("mode"))
+    return sorted(modes)
+
+
+def has_science_data(obsid, config):
+    """
+    Whether an observation produced anything this pipeline can reduce.
+
+    A NuSTAR observation that is really a slew -- the satellite moving between targets --
+    carries only modes 02 and 03, sometimes 04. It is a real entry in ``numaster`` with a
+    real OBSID and real downloaded files, and nothing in the FITS headers marks it as a
+    slew, so the only way to tell is to look at which modes came out of Level 2.
+
+    ``numaster`` does have an observation-mode column that says ``SLEW``, but it is set for
+    only a handful of the observations that actually are slews. The SOC identifies the rest
+    by their exposure being far shorter than the observation immediately following, which
+    is a judgement, not a flag.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    bool
+        True if mode 01 or mode 06 is present.
+    """
+    return bool(set(observing_modes_present(obsid, config)) & set(SCIENCE_MODES))
 
 
 def mode_01_input_files(obsid, config):
@@ -1866,6 +1933,12 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         Source position in degrees. Overridden as described above.
     flags : dict, optional
         Extra ``nupipeline`` parameters.
+
+    Returns
+    -------
+    str or None
+        :data:`heasarc_retrieve_pipeline.utils.NO_SCIENCE_DATA` if Level 2 produced no
+        science-mode data -- see :func:`has_science_data` -- and ``None`` otherwise.
     """
     # Pinned here, once: every path below hangs off these two entries, and a relative
     # path would mean "wherever this process is standing" at each separate use.
@@ -1883,6 +1956,20 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     # and report success. Calling .result() re-raises, and the flow run ends FAILED.
     pipeline = nu_run_l2_pipeline.submit(obsid, config=config, flags=flags)
     pipeline.result()
+
+    # A slew is indistinguishable from a science observation until Level 2 has run: it has
+    # an OBSID, a numaster row and downloaded files, and only the observing modes that come
+    # out the far end give it away. Stopping here is not a failure, and must not be counted
+    # as one. The data stay on disk -- the slew exposure next to a long observation may yet
+    # be worth joining to it.
+    if not has_science_data(obsid, config):
+        modes = observing_modes_present(obsid, config)
+        logger.warning(
+            f"{obsid} has no science data: Level 2 produced cleaned events for observing "
+            f"mode(s) {', '.join(modes) if modes else 'none at all'}, and none of "
+            f"{', '.join(SCIENCE_MODES)}. This is what a slew looks like. Nothing to reduce."
+        )
+        return NO_SCIENCE_DATA
 
     splitdir = recover_spacecraft_science_data(obsid, config, wait_for=[pipeline])
 

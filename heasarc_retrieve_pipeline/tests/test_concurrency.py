@@ -255,7 +255,7 @@ class TestOneFailureDoesNotStopTheRest:
             for i in range(n)
         ]
 
-    def run(self, monkeypatch, tmp_path, failing):
+    def run(self, monkeypatch, tmp_path, failing, no_science=()):
         """Run the flow with the download and the reduction stubbed out."""
         processed = []
 
@@ -265,6 +265,8 @@ class TestOneFailureDoesNotStopTheRest:
         def stub_processing(obsid, config=None, ra=None, dec=None, flags=None):
             if obsid in failing:
                 raise ValueError(f"{obsid} is no good")
+            if obsid in no_science:
+                return core.NO_SCIENCE_DATA
             processed.append(obsid)
             return obsid
 
@@ -516,3 +518,35 @@ def _no_workspace(tmpdir):
         return short_workspace(outdir, tmpdir=tmpdir, scratch_dir=scratch_dir)
 
     return wrapped
+
+
+class TestObservationsWithNoScienceData:
+    """A slew is not a failure.
+
+    A NuSTAR slew has an OBSID, a numaster row and downloadable files, and nothing in the
+    headers marks it as one -- only the observing modes Level 2 produces give it away. Four
+    of the 56 M82 observations reprocessed in 2026 were slews. Counting them as failures
+    hides the observations that really did break.
+    """
+
+    def run(self, monkeypatch, tmp_path, failing=(), no_science=()):
+        harness = TestOneFailureDoesNotStopTheRest()
+        return harness.run(monkeypatch, tmp_path, set(failing), no_science=set(no_science))
+
+    def test_a_slew_is_not_counted_as_a_failure(self, tmp_path, monkeypatch):
+        failed, _ = self.run(monkeypatch, tmp_path, no_science={"obs1"})
+
+        assert failed == []
+
+    def test_the_others_still_run(self, tmp_path, monkeypatch):
+        _, processed = self.run(monkeypatch, tmp_path, no_science={"obs1"})
+
+        assert sorted(processed) == ["obs0", "obs2"]
+
+    def test_failures_are_still_counted_alongside_slews(self, tmp_path, monkeypatch):
+        failed, processed = self.run(
+            monkeypatch, tmp_path, failing={"obs0"}, no_science={"obs1"}
+        )
+
+        assert failed == ["obs0"]
+        assert processed == ["obs2"]
