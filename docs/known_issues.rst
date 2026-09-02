@@ -1327,7 +1327,8 @@ real ``merge_event_files`` against a HEASOFT double whose ``ftmerge`` refuses an
 output the way the real one does.
 
 
-53. The combined FPMA+FPMB file kept events only one module saw -- FIXED
+
+53.  The combined FPMA+FPMB file kept events only one module saw -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Found while checking a claim that ought to have been harmless: that event files ordinarily
@@ -1421,6 +1422,39 @@ the sum over the disjoint inputs while for an ``AND`` merge across two modules t
 single defensible answer, and writing a right ``ONTIME`` next to a wrong ``LIVETIME`` would
 make the file's live-time *fraction* worse than it is now. Anything needing the exposure of
 a merged file should compute it from the GTI extension.
+
+54.  A rerun blanked the page of the observation it skipped -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reducing an observation a second time took every figure off its page. So did opening the
+page of any observation reduced before the diagnostics existed, which is every tree
+produced up to now.
+
+Two separate causes, with the same symptom.
+
+The first was in the record layer, and the data was never actually lost. ``write()``
+guards the array payload behind ``if self.arrays:``, so a run that measured nothing left
+the previous run's ``.npz`` untouched on disk -- but ``as_dict()`` wrote ``"arrays":
+None`` whenever this run measured nothing, so the record stopped pointing at a file that
+was still sitting right beside it. ``values`` went the same way, overwritten with an empty
+dict. An orphaned payload and a blank record.
+
+The second was in ``separate_sources``, which skips per directory and simply carried on
+to the next one, opening no record at all. That step was therefore missing from the
+timeline as well as from the figures, and it is the one that draws the focal plane.
+
+**Fixed** by making a record inherit what the record it replaces held, unless this run
+measured something newer, and by having a skipped directory write one ``skipped`` record
+per candidate file. ``arrays_from_earlier_run`` marks the inherited case so the page can
+draw the figure and still say the step did not run. The payload is found by looking for
+the file rather than by trusting the old record, which also adopts the ``.npz`` files that
+reruns had already orphaned.
+
+Neither fix helps a tree that was never recorded at all, so
+``heasarc_retrieve_pipeline.recover`` measures those from their own products -- the
+separation from the cleaned event files, the joining and the flare filtering exactly from
+the files they left, and the spectra straight out of the PHAs. It writes nothing into a
+reduction and runs only where a dataset is missing. See :ref:`diagnostics_and_reporting`.
 
 
 Science caveats

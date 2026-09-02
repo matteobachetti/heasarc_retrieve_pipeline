@@ -609,6 +609,42 @@ def separate_sources_in_event_file(
         )
 
 
+def separation_candidates(directory):
+    """
+    The cleaned event files in a directory that the separation would actually work on.
+
+    Both loops in :func:`separate_sources` walk this, so the one that records a skip
+    cannot disagree with the one that does the work about what counts as a candidate.
+    The two rejected kinds are the same ones :func:`separate_sources_in_event_file`
+    turns away: an encrypted file nobody can process, and a name that is not an event
+    file at all.
+
+    Parameters
+    ----------
+    directory : str
+        Directory to scan.
+
+    Returns
+    -------
+    list of str
+        Full paths, sorted, so a run is reproducible.
+
+    Examples
+    --------
+    >>> import os, tempfile
+    >>> d = tempfile.mkdtemp()
+    >>> for name in ("nu90101201002A01_cl.evt", "nu90101201002B01_cl.evt.gpg", "junk.evt"):
+    ...     _ = open(os.path.join(d, name), "w").close()
+    >>> [os.path.basename(f) for f in separation_candidates(d)]
+    ['nu90101201002A01_cl.evt']
+    """
+    return sorted(
+        f
+        for f in glob.glob(os.path.join(directory, "nu*_cl.evt*"))
+        if not f.endswith(".gpg") and valid_re.search(os.path.basename(f))
+    )
+
+
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
@@ -619,7 +655,9 @@ def separate_sources(directories, config, region_size=30, back_region_size=55, o
     Run the image-based source separation over every cleaned event file in some directories.
 
     Writes a ``SEPARATE_DONE.TXT`` sentinel in each directory and skips directories that
-    already have one.
+    already have one. A skipped directory still records one ``skipped`` record per
+    candidate file, so the report can say the step was not run and can still draw it from
+    what the run that did run measured.
 
     Parameters
     ----------
@@ -638,15 +676,26 @@ def separate_sources(directories, config, region_size=30, back_region_size=55, o
         somewhere.
     """
     directory = diagnostics_path(obsid, config) if obsid else None
+    logger = get_logger()
     for d in directories:
         separate_done_file = os.path.join(d, "SEPARATE_DONE.TXT")
         if os.path.exists(separate_done_file):
-            logger = get_logger()
             logger.info(f"Source separation already done in {d}")
+            # Recording the skip is what keeps the focal plane on the page. The record
+            # this opens inherits the payload the run that did the work left beside it,
+            # so the figure survives; skipping the directory in silence, as this used to,
+            # left the step missing from the timeline and its images missing with it.
+            for event_file in separation_candidates(d):
+                with record_step(
+                    directory,
+                    obsid,
+                    "separate_sources",
+                    key=rootname(os.path.basename(event_file)),
+                ) as rec:
+                    rec.skip("SEPARATE_DONE.TXT already exists")
             continue
-        logger = get_logger()
         logger.info(f"Separating sources in {d}")
-        for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
+        for event_file in separation_candidates(d):
             separate_sources_in_event_file(
                 event_file,
                 region_size=region_size,
@@ -838,6 +887,44 @@ def _recover_spacecraft_science_data(obsid, config, rec):
         ),
     )
     return splitdir
+
+
+def join_input_files(obsid, directories, fpm, label):
+    """
+    The files the joining merges for one focal-plane module.
+
+    Both the joining and :mod:`heasarc_retrieve_pipeline.recover` walk this, so a page
+    drawn from a reduction it did not watch shows the same input rows the reduction
+    itself would have recorded.
+
+    Mode-01 and mode-06 cleaned files both count. The *unsplit* mode-06 file does not:
+    ``nusplitsc`` has already replaced it with its CHU-resolved parts, and merging both
+    would count those events twice.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    directories : list of str
+        Directories to collect from -- the ``nupipeline`` output and the ``nusplitsc``
+        sub-observations.
+    fpm : str
+        ``"A"`` or ``"B"``.
+    label : str
+        ``"_src<n>"`` or ``"_back"``.
+
+    Returns
+    -------
+    list of str
+        Full paths, in the order the directories were given.
+    """
+    files = []
+    for d in directories:
+        for path in glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*{label}.evt*")):
+            if f"{fpm}06" in path and "chu" not in path:
+                continue
+            files.append(path)
+    return files
 
 
 def gti_of(path):
@@ -1124,21 +1211,11 @@ def _join_source_data(obsid, directories, config, src_num, label, rec):
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
 
         logger.info(f"Joining source data for fpm {fpm} into {outfile}")
-        files_to_join = []
-        for d in directories:
-            logger.info(f"Adding data from {d}")
-            new_files = glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*{label}.evt*"))
-            to_be_removed = []
-            for nf in new_files:
-                if f"{fpm}01" in nf:
-                    logger.info(f"Copying {nf} to {outdir}")
-                    os.system(f"cp {nf} {outdir}/")
-                elif f"{fpm}06" in nf and "chu" not in nf:
-                    logger.info(f"Discarding {nf}")
-                    to_be_removed.append(nf)
-            for nf in to_be_removed:
-                new_files.remove(nf)
-            files_to_join.extend(new_files)
+        files_to_join = join_input_files(obsid, directories, fpm, label)
+        for nf in files_to_join:
+            if f"{fpm}01" in nf:
+                logger.info(f"Copying {nf} to {outdir}")
+                os.system(f"cp {nf} {outdir}/")
 
         if not files_to_join:
             # ftmgtime handed an empty list exits 0 and writes nothing, and ftsort then
@@ -2243,6 +2320,101 @@ def _get_best_source_regions(obsid, config, rec):
     return mean_ra / count, mean_dec / count, mean_rlimit / count
 
 
+def read_spectrum(pha_file):
+    """
+    The counts spectrum of a PHA file, in energy rather than channel.
+
+    ``nuproducts`` writes the source and background spectra of every extraction as
+    ``<stem>_sr.pha`` and ``<stem>_bk.pha``. Those are the observation's last product and
+    the one a reader most wants to look at, and until now nothing drew them.
+
+    Channels are converted with the same relation the rest of this module uses,
+    ``E [keV] = 0.04 * PI + 1.6``, rather than through the response matrix. That is exact
+    for the channel *centres*, which is what a diagnostic plot needs; it is not a
+    substitute for folding a model through the RMF, and nothing here should be used for
+    fitting.
+
+    Parameters
+    ----------
+    pha_file : str
+        Path of a PHA spectrum.
+
+    Returns
+    -------
+    dict or None
+        ``energy`` (keV), ``rate`` (counts/s/keV) and ``rate_err``, or ``None`` if the
+        file has no counts column this can read.
+
+    Notes
+    -----
+    A PHA may carry ``COUNTS`` or ``RATE``; both are handled, and ``COUNTS`` is divided by
+    the header ``EXPOSURE``. The uncertainty is Poisson on the counts, which is right for
+    an unbinned spectrum and an underestimate for a grouped one -- so the ungrouped
+    ``_sr.pha`` is what the reduction records, not the ``_grp.pha`` it also writes.
+    """
+    from astropy.io import fits
+
+    with fits.open(pha_file) as hdul:
+        data = hdul[1].data
+        header = hdul[1].header
+        columns = {name.upper() for name in data.columns.names}
+        exposure = float(header.get("EXPOSURE") or header.get("ONTIME") or 1.0)
+        if exposure <= 0:
+            exposure = 1.0
+
+        if "COUNTS" in columns:
+            counts = np.asarray(data["COUNTS"], dtype=float)
+        elif "RATE" in columns:
+            counts = np.asarray(data["RATE"], dtype=float) * exposure
+        else:
+            return None
+
+        channel = np.asarray(data["CHANNEL"], dtype=float)
+
+    energy = 0.04 * channel + 1.6
+    # Per keV, so that the shape does not depend on the channel width.
+    width = 0.04
+    return dict(
+        energy=energy,
+        rate=counts / exposure / width,
+        rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
+    )
+
+
+def spectrum_arrays(outdir, stem):
+    """
+    The source and background spectra of one extraction, ready to record.
+
+    Parameters
+    ----------
+    outdir : str
+        The observation's products directory.
+    stem : str
+        ``stemout`` as handed to ``nuproducts``.
+
+    Returns
+    -------
+    dict
+        Empty if neither spectrum is readable -- a missing one is not an error, since
+        ``nuproducts`` is allowed to have failed for a single file.
+    """
+    arrays = {}
+    for which, suffix in (("src", "_sr.pha"), ("bkg", "_bk.pha")):
+        path = os.path.join(outdir, stem + suffix)
+        if not os.path.exists(path):
+            continue
+        try:
+            spectrum = read_spectrum(path)
+        except Exception as error:
+            get_logger().warning(f"Could not read the spectrum {path}: {error}")
+            continue
+        if spectrum is None:
+            continue
+        for key, values in spectrum.items():
+            arrays[f"spec_{stem}_{which}_{key}"] = np.asarray(values, dtype=np.float32)
+    return arrays
+
+
 @task(
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
@@ -2399,6 +2571,9 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
             verbose=True,
         )
         spectra.append(os.path.basename(params["grpphafile"]))
+        # The spectrum itself, so the page can show what came out rather than only its
+        # file name. Recorded here, where the stem is known.
+        rec.array(**spectrum_arrays(outdir, stem))
 
     rec.value(
         inputs=inputs,

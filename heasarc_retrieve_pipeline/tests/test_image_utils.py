@@ -25,6 +25,7 @@ from heasarc_retrieve_pipeline.image_utils import (
     filter_table_outside_regions,
     get_random_fluxes_in_img,
     has_sky_position,
+    measure_sources_in_file,
     valid_table,
 )
 
@@ -295,3 +296,85 @@ class TestTheSeparationRecordsWhatItFound:
         path = event_file(tmp_path / "nu123A01_cl.evt")
 
         assert filter_sources_in_images(path) is True
+
+
+class TestMeasuringWithoutWriting:
+    """
+    The measuring half on its own.
+
+    ``recover`` calls this over event files a finished reduction left behind, so it must
+    produce exactly what the separation produced -- it is the same code -- and it must not
+    touch the directory it is reading.
+    """
+
+    def test_nothing_is_written_beside_the_file(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+        before = sorted(os.listdir(tmp_path))
+
+        measure_sources_in_file(path)
+
+        assert sorted(os.listdir(tmp_path)) == before
+
+    def test_it_finds_the_source(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+
+        found = measure_sources_in_file(path)
+
+        assert len(found["peaks"]) >= 1
+        assert found["peaks"][0][0] == pytest.approx(500, abs=15)
+        assert found["peaks"][0][1] == pytest.approx(500, abs=15)
+
+    def test_the_peaks_are_brightest_first(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+
+        found = measure_sources_in_file(path)
+
+        assert list(found["fluxes"]) == sorted(found["fluxes"], reverse=True)
+
+    def test_it_records_what_the_page_is_drawn_from(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+        directory = str(tmp_path / "diag")
+
+        with record_step(directory, "123", "separate_sources", key="nu123A01_cl") as rec:
+            measure_sources_in_file(path, rec=rec)
+
+        record = read_records(directory)[0]
+        arrays = read_arrays(directory, record)
+        assert record["values"]["n_peaks"] >= 1
+        assert arrays["image"].shape == (99, 99)
+        assert arrays["peaks"].shape[1] == 2
+        assert len(arrays["peak_fluxes"]) == len(arrays["peaks"])
+
+    def test_a_file_with_too_few_events_is_a_recorded_skip(self, tmp_path):
+        path = event_file(tmp_path / "nu123A01_cl.evt", n_source=5, n_background=5)
+        directory = str(tmp_path / "diag")
+
+        with record_step(directory, "123", "separate_sources", key="nu123A01_cl") as rec:
+            found = measure_sources_in_file(path, rec=rec)
+
+        assert found is None
+        record = read_records(directory)[0]
+        assert record["status"] == "skipped"
+        assert "20 events" in record["reason"]
+
+    def test_it_measures_what_the_separation_measured(self, tmp_path):
+        """The two must not drift: one is the other's first half."""
+        path = event_file(tmp_path / "nu123A01_cl.evt")
+        directory = str(tmp_path / "diag")
+
+        np.random.seed(7)
+        with record_step(directory, "123", "separate_sources", key="separated") as rec:
+            filter_sources_in_images(path, rec=rec)
+        np.random.seed(7)
+        with record_step(directory, "123", "separate_sources", key="measured") as rec:
+            measure_sources_in_file(path, rec=rec)
+
+        records = {r["key"]: r for r in read_records(directory)}
+        separated = read_arrays(directory, records["separated"])
+        measured = read_arrays(directory, records["measured"])
+        np.testing.assert_array_equal(separated["image"], measured["image"])
+        np.testing.assert_array_equal(separated["peaks"], measured["peaks"])
+        assert (
+            records["separated"]["values"]["acceptance_threshold"]
+            == records["measured"]["values"]["acceptance_threshold"]
+        )

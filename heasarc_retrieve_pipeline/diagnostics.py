@@ -39,6 +39,23 @@ disk keeps every task's return type exactly as it was.
 lets this module do without the lock that ``record_skipped_input`` needs for its single
 shared file.
 
+The dataset outlives the run
+----------------------------
+
+The arrays are a measurement of the observation, not of the run that happened to take it.
+A step that skips because its output was already on disk measures nothing, and the record
+it writes must therefore *keep* what the run that did the work wrote: the ``.npz`` beside
+it, and the values in it. Otherwise a rerun of a finished observation quietly replaces a
+full record with an empty one, orphans the payload on disk, and takes the figure off the
+page -- which is precisely what it used to do.
+
+So a record inherits. On entry it picks up the values of the record it is about to
+replace, and on every write it keeps pointing at the payload beside it unless this run
+measured a new one. ``arrays_from_earlier_run`` says which of the two happened, so the
+report can draw the figure and still say plainly that the numbers are not from this run.
+Inheritance reads only the file this record already owns, so the one-writer-one-file-name
+invariant above is untouched.
+
 Statuses
 --------
 
@@ -92,7 +109,10 @@ __all__ = [
 ]
 
 #: Bumped when the shape of a record changes in a way a reader has to know about.
-SCHEMA = 1
+#: 2 added ``arrays_from_earlier_run``. Readers use ``.get()``, so schema-1 records
+#: written before that -- a whole reduction's worth, for anyone who has already run this
+#: -- still read back fine.
+SCHEMA = 2
 
 #: The manifest is a record of the observation, not of a step, so
 #: :func:`read_records` leaves it alone.
@@ -237,6 +257,8 @@ class StepRecord:
         self._traceback = None
         self._started = None
         self._monotonic = None
+        self._inherited_values = {}
+        self._earlier = False
 
     @property
     def path(self):
@@ -256,6 +278,17 @@ class StepRecord:
         """Record arrays, for a figure to be drawn from. They go in the ``.npz``."""
         self.arrays.update(arrays)
 
+    def from_earlier_outputs(self):
+        """
+        Mark the arrays as describing work this run did not do.
+
+        A record that inherits its payload is marked by itself. This is for
+        :mod:`heasarc_retrieve_pipeline.recover`, which measures *now* but measures the
+        output of a run that finished some time ago -- so the arrays are fresh and the
+        work behind them is not, and the page has to say the second thing.
+        """
+        self._earlier = True
+
     def skip(self, reason):
         """
         Mark the step as having decided to do nothing, and say why.
@@ -267,6 +300,9 @@ class StepRecord:
 
     def as_dict(self):
         """The record as it will be written."""
+        inherited = self._earlier or (
+            not self.arrays and os.path.exists(self.arrays_path)
+        )
         duration = None
         if self._monotonic is not None:
             duration = round(time.monotonic() - self._monotonic, 3)
@@ -286,8 +322,13 @@ class StepRecord:
                 else datetime.fromtimestamp(self._started, timezone.utc).isoformat()
             ),
             "duration_s": duration,
-            "values": _jsonable(self.values),
-            "arrays": os.path.basename(self.arrays_path) if self.arrays else None,
+            "values": _jsonable({**self._inherited_values, **self.values}),
+            "arrays": (
+                os.path.basename(self.arrays_path)
+                if self.arrays or inherited
+                else None
+            ),
+            "arrays_from_earlier_run": inherited,
         }
 
     def write(self):
@@ -303,10 +344,29 @@ class StepRecord:
             lambda fobj: fobj.write(json.dumps(payload, indent=1).encode("utf-8")),
         )
 
+    def _inherit(self):
+        """
+        Pick up the values of the record this one is about to replace.
+
+        The payload needs no such care: it is picked up in :meth:`as_dict` by looking for
+        the file, which also adopts a ``.npz`` left orphaned by a rerun that ran before
+        any of this was fixed.
+        """
+        try:
+            with open(self.path, "rb") as fobj:
+                previous = json.load(fobj)
+        except (OSError, ValueError):
+            # No earlier run, or one whose record did not survive. Either way there is
+            # nothing to inherit, and refusing to record now would be the worse failure.
+            return
+        if isinstance(previous, dict) and isinstance(previous.get("values"), dict):
+            self._inherited_values = previous["values"]
+
     def __enter__(self):
         self._started = time.time()
         self._monotonic = time.monotonic()
         os.makedirs(self.directory, exist_ok=True)
+        self._inherit()
         self.write()
         return self
 

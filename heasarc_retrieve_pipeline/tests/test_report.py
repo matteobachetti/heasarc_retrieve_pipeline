@@ -153,6 +153,23 @@ def a_flare_filtering(tmp_path, obsid=OBSID, goes=True):
         rec.array(**arrays)
 
 
+def a_spectrum(tmp_path, obsid=OBSID, stems=("nu123A01", "nu123B01")):
+    """A ``calculate_spectra`` record with a source and background spectrum per stem."""
+    # Channel 35 is 3 keV and channel 1935 is 79 keV, via E = 0.04 * PI + 1.6.
+    energy = 0.04 * np.arange(35, 1935, 10.0) + 1.6
+    with record_step(observation(tmp_path, obsid), obsid, "calculate_spectra") as rec:
+        rec.value(spectra=[stem + "_grp.pha" for stem in stems])
+        arrays = {}
+        for stem in stems:
+            arrays[f"spec_{stem}_src_energy"] = energy
+            arrays[f"spec_{stem}_src_rate"] = 10.0 * energy**-1.8
+            arrays[f"spec_{stem}_src_rate_err"] = 0.1 * energy**-1.8
+            arrays[f"spec_{stem}_bkg_energy"] = energy
+            arrays[f"spec_{stem}_bkg_rate"] = np.full_like(energy, 0.02)
+            arrays[f"spec_{stem}_bkg_rate_err"] = np.full_like(energy, 0.002)
+        rec.array(**arrays)
+
+
 def a_full_observation(tmp_path, obsid=OBSID):
     """One observation with a record of every kind, as a finished reduction leaves."""
     a_manifest(tmp_path, obsid)
@@ -162,6 +179,7 @@ def a_full_observation(tmp_path, obsid=OBSID):
     a_region(tmp_path, obsid)
     a_join(tmp_path, obsid)
     a_flare_filtering(tmp_path, obsid)
+    a_spectrum(tmp_path, obsid)
 
 
 class TestTheShapeOfThePage:
@@ -193,13 +211,13 @@ class TestTheShapeOfThePage:
         assert os.path.getsize(path) < 2_000_000
 
     def test_there_is_one_plot_div_per_figure(self, tmp_path):
-        """Timeline, separation, radial profile, joining, flares."""
+        """Timeline, separation, radial profile, joining, flares, spectra."""
         a_full_observation(tmp_path)
 
         path = report.write_observation_page(OBSID, str(tmp_path))
 
         divs = soup(path).find_all("div", class_="plotly-graph-div")
-        assert len(divs) == 5
+        assert len(divs) == 6
 
     def test_the_observation_parameters_are_on_the_page(self, tmp_path):
         a_full_observation(tmp_path)
@@ -370,6 +388,137 @@ class TestWhatTheFiguresContain:
         assert fig.layout.template.layout.plot_bgcolor is None
 
 
+class TestAFigureFromAnEarlierRun:
+    """
+    A rerun that skips every step still draws them, from what the first run measured.
+
+    The timeline goes on saying ``skipped``, because the page must never claim work this
+    run did not do. The provenance is said next to the figure instead.
+    """
+
+    SKIPS = (
+        ("separate_sources", "nu123A01_cl", "SEPARATE_DONE.TXT already exists"),
+        ("join_source_data", "src1", "JOIN_DONE_SRC1.TXT already exists"),
+        ("flare_filtering", "nu_src1", "the flare-filtered file was already there"),
+    )
+
+    def rerun(self, tmp_path):
+        """Reduce once, then run again over a tree where everything is already done."""
+        a_full_observation(tmp_path)
+        for step, key, reason in self.SKIPS:
+            with record_step(observation(tmp_path), OBSID, step, key=key) as rec:
+                rec.skip(reason)
+        return report.write_observation_page(OBSID, str(tmp_path))
+
+    def test_every_figure_is_still_drawn(self, tmp_path):
+        """Six on a fresh reduction, and six after a rerun that did none of it."""
+        path = self.rerun(tmp_path)
+
+        divs = soup(path).find_all("div", class_="plotly-graph-div")
+        assert len(divs) == 6
+
+    def test_the_focal_plane_survives_the_skip(self, tmp_path):
+        """The separation is the one that used to disappear completely."""
+        self.rerun(tmp_path)
+        summary = report.observation_summary(OBSID, str(tmp_path))
+        (record,) = [r for r in summary["records"] if r["step"] == "separate_sources"]
+
+        fig = report.separation_figure(
+            record, read_arrays(observation(tmp_path), record)
+        )
+
+        assert fig is not None
+        assert fig.data[0].z.shape == (99, 99)
+
+    def test_the_page_says_the_numbers_are_not_from_this_run(self, tmp_path):
+        path = self.rerun(tmp_path)
+
+        notes = soup(path).find_all("p", class_="earlier")
+
+        assert len(notes) == len(self.SKIPS)
+        assert "earlier run" in notes[0].get_text()
+
+    def test_the_timeline_still_says_the_step_was_skipped(self, tmp_path):
+        """The page must not claim work that this run did not do."""
+        path = self.rerun(tmp_path)
+        summary = report.observation_summary(OBSID, str(tmp_path))
+
+        assert {r["status"] for r in summary["records"] if r["step"] == "join_source_data"} == {
+            "skipped"
+        }
+        assert "JOIN_DONE_SRC1.TXT already exists" in soup(path).get_text()
+
+    def test_a_reduction_that_ran_carries_no_note(self, tmp_path):
+        a_full_observation(tmp_path)
+
+        path = report.write_observation_page(OBSID, str(tmp_path))
+
+        assert soup(path).find_all("p", class_="earlier") == []
+
+
+class TestTheSpectra:
+    """The observation's last product, and the first version of this page to show it."""
+
+    def records(self, tmp_path, step):
+        directory = observation(tmp_path)
+        (record,) = [r for r in read_records(directory) if r["step"] == step]
+        return record, read_arrays(directory, record)
+
+    def test_a_source_and_a_background_are_drawn_for_each_stem(self, tmp_path):
+        a_spectrum(tmp_path)
+        record, arrays = self.records(tmp_path, "calculate_spectra")
+
+        fig = report.spectrum_figure(record, arrays)
+
+        assert len(fig.data) == 4
+        assert {trace.name for trace in fig.data} == {
+            "nu123A01 source",
+            "nu123A01 background",
+            "nu123B01 source",
+            "nu123B01 background",
+        }
+
+    def test_both_axes_are_logarithmic(self, tmp_path):
+        """Four decades of counts against a factor of twenty-five in energy."""
+        a_spectrum(tmp_path)
+        record, arrays = self.records(tmp_path, "calculate_spectra")
+
+        fig = report.spectrum_figure(record, arrays)
+
+        assert fig.layout.xaxis.type == "log"
+        assert fig.layout.yaxis.type == "log"
+
+    def test_channels_outside_the_nustar_band_are_left_out(self, tmp_path):
+        """A log axis would give the dead channels below 3 keV half of the plot."""
+        directory = observation(tmp_path)
+        energy = np.array([0.5, 1.0, 3.0, 20.0, 79.0, 120.0])
+        with record_step(directory, OBSID, "calculate_spectra") as rec:
+            rec.array(
+                spec_nu123A01_src_energy=energy,
+                spec_nu123A01_src_rate=np.ones_like(energy),
+            )
+        record, arrays = self.records(tmp_path, "calculate_spectra")
+
+        fig = report.spectrum_figure(record, arrays)
+
+        np.testing.assert_allclose(fig.data[0].x, [3.0, 20.0, 79.0])
+
+    def test_an_observation_that_made_no_spectrum_draws_nothing(self, tmp_path):
+        directory = observation(tmp_path)
+        with record_step(directory, OBSID, "calculate_spectra") as rec:
+            rec.skip("PRODUCTS_DONE.TXT already exists")
+        record, arrays = self.records(tmp_path, "calculate_spectra")
+
+        assert report.spectrum_figure(record, arrays) is None
+
+    def test_the_spectra_reach_the_page(self, tmp_path):
+        a_full_observation(tmp_path)
+
+        path = report.write_observation_page(OBSID, str(tmp_path), recover=False)
+
+        assert "Spectra" in soup(path).get_text()
+
+
 class TestPagesThatCouldGoWrong:
     """Every one of these has happened, or will. None of them may raise."""
 
@@ -435,7 +584,7 @@ class TestPagesThatCouldGoWrong:
 
         path = report.write_observation_page(OBSID, str(tmp_path))
 
-        assert len(soup(path).find_all("div", class_="plotly-graph-div")) == 4
+        assert len(soup(path).find_all("div", class_="plotly-graph-div")) == 5
 
     def test_the_page_is_written_whole_or_not_at_all(self, tmp_path):
         """A page half written by a killed process would not open in a browser."""
@@ -482,6 +631,41 @@ class TestJoiningTheOtherTwoRecords:
             "80002092008",
             "90901333002",
         ]
+
+    def test_a_tree_that_recorded_nothing_is_still_found(self, tmp_path):
+        """The tree the recovery exists for has no diagnostics to be found by."""
+        os.makedirs(os.path.join(tmp_path, "90901333002", "event_pipe"))
+
+        assert report.observation_directories(str(tmp_path)) == ["90901333002"]
+
+    def test_a_downloaded_observation_is_found_by_its_auxil(self, tmp_path):
+        """Every mission's archive delivers one, reduced or not."""
+        os.makedirs(os.path.join(tmp_path, "0104010101", "auxil"))
+        os.makedirs(os.path.join(tmp_path, "0104010101", "xti"))
+
+        assert report.observation_directories(str(tmp_path)) == ["0104010101"]
+
+    def test_a_temporary_working_directory_is_not_an_observation(self, tmp_path):
+        """nuproducts leaves these at the run root; they hold no observation."""
+        os.makedirs(os.path.join(tmp_path, "1988_tmp_nuproducts"))
+        os.makedirs(os.path.join(tmp_path, "90901333002", "event_cl"))
+
+        assert report.observation_directories(str(tmp_path)) == ["90901333002"]
+
+    def test_the_entry_point_gives_an_unrecorded_tree_its_page(self, tmp_path):
+        """End to end: the one command a user runs against a reduction from last year."""
+        # The pair the flare filtering leaves, built by the recovery tests' own fixture
+        # so that the two suites cannot disagree about what a reduced tree looks like.
+        from heasarc_retrieve_pipeline.tests.test_recover import flare_pair
+
+        flare_pair(tmp_path, obsid=OBSID)
+        base = os.path.join(str(tmp_path), OBSID)
+
+        assert report.main([str(tmp_path)]) == 0
+
+        page = os.path.join(base, "diagnostics.html")
+        assert os.path.exists(page)
+        assert "Solar-flare filtering" in soup(page).get_text()
 
 
 class TestTheRunIndex:

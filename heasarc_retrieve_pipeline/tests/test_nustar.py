@@ -1696,6 +1696,61 @@ class TestTheSeparationIsToldWhereToRecord:
         assert len(seen) == 1
         assert not os.path.exists(os.path.join(tmp_path, OBSID, "diagnostics"))
 
+    def test_a_directory_already_done_still_records_each_file(self, tmp_path, monkeypatch):
+        """Skipping the whole directory silently took the focal plane off the page."""
+        names = [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
+        self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
+
+        seen = self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
+
+        assert seen == [], "the work itself must still be skipped"
+        records = read_records(
+            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        )
+        assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl", f"nu{OBSID}B01_cl"}
+        assert all(r["status"] == "skipped" for r in records)
+        assert all("SEPARATE_DONE.TXT" in r["reason"] for r in records)
+
+    def test_the_rerun_keeps_what_the_first_run_measured(self, tmp_path, monkeypatch):
+        """The point of recording the skip: the figure is drawn from the first run."""
+        names = [f"nu{OBSID}A01_cl.evt"]
+        self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
+
+        self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
+
+        record = read_records(
+            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        )[0]
+        assert record["status"] == "skipped"
+        assert record["values"]["stubbed"] is True
+
+    def test_a_directory_already_done_still_ignores_an_encrypted_file(
+        self, tmp_path, monkeypatch
+    ):
+        """The skip loop must agree with the working one about what is a candidate."""
+        self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt"], obsid=OBSID)
+
+        self.separated(
+            tmp_path,
+            monkeypatch,
+            [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt.gpg"],
+            obsid=OBSID,
+        )
+
+        records = read_records(
+            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        )
+        assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl"}
+
+    def test_a_directory_already_done_without_an_observation_records_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt"])
+
+        self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt"])
+
+        assert not os.path.exists(os.path.join(tmp_path, OBSID, "diagnostics"))
+
 
 class TestFindingTheSourceRecordsItself:
     """The region step is where an observation most often quietly goes wrong.

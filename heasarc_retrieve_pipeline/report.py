@@ -47,6 +47,24 @@ from .utils import get_logger, read_skipped_inputs
 PLOTLY_BUNDLE = "plotly.min.js"
 """Name of the shared plotly bundle, written once at the output root."""
 
+#: The subdirectories an observation is delivered or reduced with. One of these is
+#: enough to call a directory an observation, which is what lets a tree reduced before
+#: any of the diagnostics existed be found at all -- it has no records to be found by.
+#: ``auxil`` comes down from the archive whatever the mission; the rest are made by the
+#: reduction, and a partly reduced observation may have only one of them. Temporary
+#: working directories such as ``1988_tmp_nuproducts`` have none, which is the point.
+OBSERVATION_SUBDIRECTORIES = (
+    "auxil",
+    "event_cl",
+    "event_pipe",
+    "event_uf",
+    "hk",
+    "products",
+    "split",
+    "xti",
+)
+
+
 STATUS_COLOURS = {
     "done": "#2a9d8f",
     "skipped": "#e9c46a",
@@ -92,6 +110,7 @@ tr + tr td, tr + tr th { border-top: 1px solid #eee; }
 .status { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 0.6rem;
           color: #fff; font-size: 0.8rem; }
 .empty { color: #888; font-style: italic; }
+.earlier { color: #8a6d3b; font-size: 0.85rem; margin: 0.2rem 0 0 0; }
 .error { font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap;
          background: #fdf1ee; border-left: 3px solid #e76f51; padding: 0.5rem 0.8rem; }
 footer { margin-top: 3rem; color: #888; font-size: 0.8rem; }
@@ -359,6 +378,82 @@ def radial_profile_figure(record, arrays):
                       legend=dict(orientation="h", y=1.12, x=0))
     fig.update_yaxes(type="log")
     return _blank(fig)
+
+
+def spectrum_figure(record, arrays):
+    """
+    The source and background spectra of every extraction, on one pair of log axes.
+
+    One trace per extraction and per kind, so an FPMA source spectrum sitting on top of
+    its background is visible as such, and a file whose source is no brighter than its
+    background is visible as that.
+
+    Parameters
+    ----------
+    record : dict
+        A ``calculate_spectra`` record.
+    arrays : dict of numpy.ndarray
+        Its array payload, whose keys are ``spec_<stem>_<src|bkg>_<energy|rate|rate_err>``.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if no spectrum was recorded -- an observation with no usable event file,
+        or one reduced before the spectra were written down.
+
+    Notes
+    -----
+    Counts are placed in energy with ``E = 0.04 * PI + 1.6``, not by folding the response.
+    That is right for a diagnostic and wrong for a fit; see
+    :func:`heasarc_retrieve_pipeline.nustar.read_spectrum`.
+    """
+    go, _ = _plotly()
+
+    if not arrays:
+        return None
+
+    stems = sorted(
+        {
+            key[len("spec_") : -len("_src_energy")]
+            for key in arrays
+            if key.startswith("spec_") and key.endswith("_src_energy")
+        }
+    )
+    if not stems:
+        return None
+
+    fig = go.Figure()
+    for stem in stems:
+        for which, name, dash in (("src", "source", None), ("bkg", "background", "dot")):
+            energy = arrays.get(f"spec_{stem}_{which}_energy")
+            rate = arrays.get(f"spec_{stem}_{which}_rate")
+            if energy is None or rate is None:
+                continue
+            # Below 3 keV and above 79 keV NuSTAR has no effective area, and a log axis
+            # would give the empty channels the whole left half of the plot.
+            inside = (np.asarray(energy) >= 3.0) & (np.asarray(energy) <= 79.0)
+            fig.add_trace(
+                go.Scatter(
+                    x=np.asarray(energy)[inside],
+                    y=np.asarray(rate)[inside],
+                    mode="lines",
+                    name=f"{stem} {name}",
+                    line=dict(width=1, dash=dash),
+                    hovertemplate="%{x:.1f} keV: %{y:.3g}<extra></extra>",
+                )
+            )
+
+    if not fig.data:
+        return None
+
+    fig.update_layout(
+        xaxis_title="energy (keV)",
+        yaxis_title="counts s<sup>-1</sup> keV<sup>-1</sup>",
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
+    fig.update_xaxes(type="log")
+    fig.update_yaxes(type="log")
+    return _blank(fig, height=460)
 
 
 def gti_figure(record, arrays):
@@ -763,6 +858,7 @@ def observation_body(summary, directory):
         ("Extraction regions", "source_region", radial_profile_figure),
         ("Joining", "join_source_data", gti_figure),
         ("Solar-flare filtering", "flare_filtering", flare_figure),
+        ("Spectra", "calculate_spectra", spectrum_figure),
     )
     for heading, step, builder in sections:
         drawn = []
@@ -775,6 +871,15 @@ def observation_body(summary, directory):
         parts.append(f"<h2>{heading}</h2>")
         for record, fig in drawn:
             parts.append(f"<h3>{html.escape(record.get('key') or _label(record))}</h3>")
+            if record.get("arrays_from_earlier_run"):
+                # The step did not run this time, and the timeline says so. Drawing what
+                # an earlier run measured is the useful thing to do -- the numbers still
+                # describe the files on disk -- but the page must not let the figure be
+                # read as this run's work.
+                parts.append(
+                    '<p class="earlier">This run did not run this step. The figure '
+                    "describes the files an earlier run left.</p>"
+                )
             parts.append("$FIGURE")
             figures.append(fig)
 
@@ -1002,7 +1107,7 @@ def write_index(outdir, obsids=None):
     return path
 
 
-def write_observation_page(obsid, outdir):
+def write_observation_page(obsid, outdir, recover=True):
     """
     Write ``<outdir>/<OBSID>/diagnostics.html``.
 
@@ -1015,12 +1120,29 @@ def write_observation_page(obsid, outdir):
         Observation identifier.
     outdir : str
         Run output directory.
+    recover : bool, optional
+        Measure the datasets the observation is missing before drawing, with
+        :func:`heasarc_retrieve_pipeline.recover.recover_observation`. This is what puts
+        a page on an observation reduced before any of it was recorded. It costs a
+        directory scan when nothing is missing, which is the normal case, and it never
+        re-runs any part of the reduction.
 
     Returns
     -------
     str
         The path written.
     """
+    if recover:
+        # Imported here, not at module scope: this is the only part of the report that
+        # needs the mission modules, and ``python -m ...report`` on a finished tree
+        # should not pay for importing them when there is nothing to recover.
+        from . import recover as recover_module
+
+        try:
+            recover_module.recover_observation(obsid, outdir)
+        except Exception as error:  # pragma: no cover - a page must survive its own tools
+            get_logger().warning(f"Could not recover the datasets of {obsid}: {error}")
+
     summary = observation_summary(obsid, outdir)
     directory = diagnostics_path(obsid, dict(out_data_path=outdir))
     body = observation_body(summary, directory)
@@ -1114,8 +1236,17 @@ def observation_directories(outdir):
     """
     Every observation directory under a run root, in order.
 
-    An observation is any subdirectory holding a ``diagnostics`` directory or a
-    ``skipped_inputs.txt``: enough for there to be something to say about it.
+    An observation is any subdirectory holding a ``diagnostics`` directory, a
+    ``skipped_inputs.txt``, one of :data:`OBSERVATION_SUBDIRECTORIES`, or an event file of
+    its own: enough for there to be something to say about it. The last of those catches
+    an observation whose working directories were cleaned away and whose merged event
+    files were kept, which is a normal thing to do to a finished reduction.
+
+    That last one is what makes the recovery reachable. A tree reduced before this package
+    recorded anything has neither of the first two, so looking only for those found
+    nothing at all and the one command a user runs on an old reduction --
+    ``python -m heasarc_retrieve_pipeline.report <outdir>`` -- printed
+    ``0 observation page(s)`` over a directory full of them.
 
     Parameters
     ----------
@@ -1132,8 +1263,14 @@ def observation_directories(outdir):
         path = os.path.join(outdir, name)
         if not os.path.isdir(path):
             continue
-        if os.path.isdir(os.path.join(path, "diagnostics")) or os.path.exists(
-            os.path.join(path, "skipped_inputs.txt")
+        if (
+            os.path.isdir(os.path.join(path, "diagnostics"))
+            or os.path.exists(os.path.join(path, "skipped_inputs.txt"))
+            or any(
+                os.path.isdir(os.path.join(path, sub))
+                for sub in OBSERVATION_SUBDIRECTORIES
+            )
+            or glob.glob(os.path.join(path, "*.evt"))
         ):
             obsids.append(name)
     return obsids

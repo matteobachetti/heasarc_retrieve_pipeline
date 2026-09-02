@@ -1886,13 +1886,89 @@ A record is a JSON file and, when there are arrays, an ``.npz`` sibling::
         rec.skip("fewer than 20 events passed the energy and position filter")
 
 with fields ``obsid``, ``step``, ``key``, ``status``, ``reason``, ``error``,
-``traceback``, ``started``, ``started_iso``, ``duration_s``, ``values`` and ``arrays``.
+``traceback``, ``started``, ``started_iso``, ``duration_s``, ``values``, ``arrays`` and
+``arrays_from_earlier_run``.
 
 There are four statuses. ``running`` is written on entry and replaced on exit, so a run
 killed mid-step still names the step it died in. ``done`` and ``skipped`` -- with a
 human-readable ``reason`` -- are the two ordinary outcomes; ``rec.skip`` does not raise.
 ``failed`` carries the error and its traceback, and the exception is **re-raised**:
 ``process_observations`` still has to count the failure.
+
+The dataset outlives the run
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The arrays are a measurement of the *observation*, not of the run that happened to take
+it. A step that skips because its output was already on disk measures nothing, so the
+record it writes keeps what the run that did the work wrote: the ``.npz`` beside it, and
+the values in it.
+
+This was got wrong at first, in a way worth remembering because the symptom was so much
+larger than the cause. ``write()`` guards the payload behind ``if self.arrays:``, so the
+previous run's ``.npz`` was never deleted -- but ``as_dict()`` wrote ``"arrays": None``
+whenever *this* run measured nothing. The data sat on disk, orphaned, while the record
+stopped pointing at it, and every figure vanished from the page of any observation that
+was reduced twice.
+
+So a record inherits. On entry it picks up the values of the record it is about to
+replace, and on every write it keeps pointing at the payload beside it unless this run
+measured a new one. It finds that payload by looking for the file rather than by trusting
+the old record, which also adopts the ``.npz`` files orphaned by reruns that happened
+before the fix. Inheritance reads only the file the record already owns, so the
+one-writer-one-file-name rule below is untouched.
+
+``arrays_from_earlier_run`` says which of the two happened. Where it is true the page
+draws the figure and says, next to it, that this run did not run the step -- the timeline
+goes on reporting ``skipped``, because a page must never claim work that did not happen.
+
+Source separation needed one more change to fit this. It skips per *directory* and used
+to ``continue`` in silence, opening no record at all, so the step was missing from the
+timeline and every focal-plane image with it. A skipped directory now writes one
+``skipped`` record per candidate file, which is what gives the inheritance something to
+hang the images on.
+
+Recovering an observation nobody recorded
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Inheritance does nothing for a tree reduced before any of this existed, which is every
+tree produced up to now: there are no records to inherit from. Their products are still
+on disk, though, and ``heasarc_retrieve_pipeline.recover`` measures those and writes the
+datasets that were missing. ``write_observation_page`` runs it first, so an old tree gets
+a page without re-running any part of the reduction.
+
+It is gated on absence -- a step that already has a payload is passed over -- so a
+finished observation pays one directory scan and nothing else, and recovery is a one-off:
+what it writes is read like any other dataset afterwards.
+
+Nothing in it calls HEASOFT, writes an event file or touches a product. Where the
+reduction has a function that measures without writing, recovery calls that one rather
+than reimplementing it, which is why ``filter_sources_in_images`` was split into
+``measure_sources_in_image`` and the extraction that follows it, and why the joining's
+input selection became ``join_input_files``. A test pins the equivalence of the first
+pair: same seed, same image, same peaks, same threshold.
+
+Four of the five steps recover:
+
+* the **separation**, by re-measuring the cleaned event files;
+* the **joining**, exactly -- good time intervals are read out of a small extension and
+  nothing is re-derived;
+* the **flare filtering**, exactly -- the filtering writes ``<root>_noflares.evt`` and
+  never touches ``<root>.evt``, so both halves of the comparison survive. The solar
+  X-ray light curve is looked for under both of the names this package has used for it,
+  ``nu<OBSID>_goes.fits`` now and ``<root>_goes.fits`` back when it was fetched once per
+  event file, because the older name is the one an old tree has;
+* the **spectra**, which need no measurement at all: a PHA is already the answer.
+
+The **extraction regions** do not. Their radial profile comes from ``make_image``, which
+writes an image file, and recovery does not write. Little is lost: the radius and position
+survive a rerun already, because ``get_best_source_region`` reads them back off the
+``.reg`` file on its skip path, so what is missing is the profile alone and only for a
+tree reduced before this existed.
+
+What a recovered dataset cannot carry is anything that was only ever a property of a run:
+how long a step took, whether it was retried, the parameters it was called with.
+Extraction radii are the package defaults, recorded as the values used rather than passed
+off as the ones the original run chose.
 
 Why files, and why one file per writer
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1957,7 +2033,13 @@ reason, then a section per step:
 * a **GTI chart** for the join: one row per input file, then the OR-merged row per
   telescope, the AND-merged A+B row, and the flare-filtered row, so it is visible which
   input cost which good time;
-* the **flare panels** described under "Solar flare filtering" above.
+* the **flare panels** described under "Solar flare filtering" above;
+* the **spectra**, source and background for every extraction on one pair of log axes, so
+  a source sitting on top of its background is visible as such. Channels become energies
+  with ``E = 0.04 * PI + 1.6`` rather than by folding the response -- exact for channel
+  centres, which is what a diagnostic needs, and no substitute for a fit. Channels outside
+  3--79 keV are left out, where NuSTAR has no effective area and a log axis would hand
+  them half the plot.
 
 The sky image and the region files are in different frames -- pixels with no WCS on one
 side, ICRS degrees on the other -- and come from different steps, so they are two figures
@@ -1991,7 +2073,8 @@ And everything can be rebuilt from what is on disk::
 
 That needs no list of what the run meant to do -- it finds the observations by looking --
 which is the difference between a crashed run leaving forty unreachable pages and one you
-can browse.
+can browse. It is also how an old tree gets its pages: the recovery layer runs from there
+too, so pointing it at a reduction from last year fills in the datasets and draws them.
 
 Building the pages
 ~~~~~~~~~~~~~~~~~~

@@ -278,9 +278,17 @@ def get_random_fluxes_in_img(table, region_size=30, n_rand=100):
     return fluxes
 
 
-def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec=None):
+def measure_sources_in_image(table, region_size=30, back_region_size=50, rec=None):
     """
-    Split a NuSTAR event file into per-source and background event files.
+    Find the sources in an event table, without writing anything.
+
+    This is the measuring half of :func:`filter_sources_in_images`, and the whole of what
+    the observation's page is drawn from. It is separate because a reduction that has
+    already run leaves its event files on disk but, if it ran before this package recorded
+    anything, no measurement of them --
+    :mod:`heasarc_retrieve_pipeline.recover` calls this to fill that gap in, and calling
+    the same code the reduction called is what stops the page and the reduction from
+    drifting apart.
 
     The steps are:
 
@@ -297,33 +305,26 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
     4. **Threshold.** The median and MAD of 300 random apertures give the acceptance
        threshold ``median + MAD``; see the module docstring for what that does and does not
        mean.
-    5. **Extraction.** Accepted peaks are sorted by aperture counts in decreasing order, so
-       ``_src1`` is always the brightest. Each gets its own event file; the background file
-       holds everything outside ``back_region_size`` of *every* detected peak.
-
-    What was found is recorded through ``rec``, and drawn on the observation's page by
-    :mod:`heasarc_retrieve_pipeline.report`. This used to write three JPEGs next to every
-    event file as well.
 
     Parameters
     ----------
-    eventfile : str
-        Path of a cleaned NuSTAR event file, optionally gzipped.
+    table : :class:`numpy.ndarray`
+        The event table, as read from the first extension of a cleaned event file.
     region_size : float, optional
         Radius of the source extraction circles, in sky pixels (1 pixel = 2.45 arcsec).
     back_region_size : float, optional
         Radius, in sky pixels, of the region excluded around every detected peak when
-        building the background file.
+        building the background file. Recorded here; used by the caller.
     rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
-        Where to write the image, the detected peaks and the acceptance threshold. This
-        function is handed one event file and knows no observation, so the caller opens
-        the record. ``None`` records nothing.
+        Where to write the image, the detected peaks and the acceptance threshold.
+        ``None`` records nothing.
 
     Returns
     -------
-    bool or None
-        ``True`` if files were written, ``None`` if fewer than 20 events passed the energy
-        and position filter.
+    dict or None
+        ``None`` if fewer than 20 events passed the energy and position filter -- the
+        skip is recorded. Otherwise ``events`` (those that passed), ``peaks`` (brightest
+        first, in sky pixels), ``fluxes`` (aperture counts, same order) and ``threshold``.
 
     Notes
     -----
@@ -334,9 +335,6 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
     """
     if rec is None:
         rec = no_record()
-    hdul = fits.open(eventfile)
-
-    table = copy.deepcopy(hdul[1].data)
 
     energy = table["PI"] * 0.04 + 1.6
     good = (energy >= 3.0) & (energy < 79.0) & has_sky_position(table)
@@ -352,9 +350,8 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
     )
 
     if np.count_nonzero(good) < 20:
-        hdul.close()
         rec.skip("fewer than 20 events passed the energy and sky-position filter")
-        return
+        return None
 
     table = table[good]
     xmin = np.min(table["Y"])
@@ -408,14 +405,106 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
     region_fluxes = np.asarray(region_fluxes)
     order = np.argsort(region_fluxes)
     coordinates = coordinates[order[::-1]]
+    region_fluxes = region_fluxes[order[::-1]]
 
-    rec.array(peak_fluxes=np.asarray(region_fluxes[order[::-1]], dtype=float))
+    rec.array(peak_fluxes=np.asarray(region_fluxes, dtype=float))
+
+    return dict(
+        events=table,
+        peaks=coordinates,
+        fluxes=region_fluxes,
+        threshold=median + std,
+    )
+
+
+def measure_sources_in_file(eventfile, region_size=30, back_region_size=50, rec=None):
+    """
+    :func:`measure_sources_in_image`, given a file rather than a table.
+
+    Parameters
+    ----------
+    eventfile : str
+        Path of a cleaned NuSTAR event file, optionally gzipped.
+    region_size, back_region_size : float, optional
+        As :func:`measure_sources_in_image`.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        As :func:`measure_sources_in_image`.
+
+    Returns
+    -------
+    dict or None
+        As :func:`measure_sources_in_image`.
+    """
+    with fits.open(eventfile) as hdul:
+        return measure_sources_in_image(
+            copy.deepcopy(hdul[1].data),
+            region_size=region_size,
+            back_region_size=back_region_size,
+            rec=rec,
+        )
+
+
+def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec=None):
+    """
+    Split a NuSTAR event file into per-source and background event files.
+
+    The field is measured by :func:`measure_sources_in_image` -- energy filter, image,
+    peak detection and acceptance threshold -- and this function does the extraction:
+    accepted peaks are taken in decreasing order of aperture counts, so ``_src1`` is
+    always the brightest, and each gets its own event file. The background file holds
+    everything outside ``back_region_size`` of *every* detected peak.
+
+    What was found is recorded through ``rec``, and drawn on the observation's page by
+    :mod:`heasarc_retrieve_pipeline.report`. This used to write three JPEGs next to every
+    event file as well.
+
+    Parameters
+    ----------
+    eventfile : str
+        Path of a cleaned NuSTAR event file, optionally gzipped.
+    region_size : float, optional
+        Radius of the source extraction circles, in sky pixels (1 pixel = 2.45 arcsec).
+    back_region_size : float, optional
+        Radius, in sky pixels, of the region excluded around every detected peak when
+        building the background file.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where to write the image, the detected peaks and the acceptance threshold. This
+        function is handed one event file and knows no observation, so the caller opens
+        the record. ``None`` records nothing.
+
+    Returns
+    -------
+    bool or None
+        ``True`` if files were written, ``None`` if fewer than 20 events passed the energy
+        and position filter.
+
+    Notes
+    -----
+    See :func:`measure_sources_in_image` for what the threshold does and does not mean.
+    """
+    if rec is None:
+        rec = no_record()
+    hdul = fits.open(eventfile)
+
+    found = measure_sources_in_image(
+        copy.deepcopy(hdul[1].data),
+        region_size=region_size,
+        back_region_size=back_region_size,
+        rec=rec,
+    )
+    if found is None:
+        hdul.close()
+        return
+
+    table = found["events"]
+    coordinates = found["peaks"]
+    threshold = found["threshold"]
 
     accepted = []
     for i, coord in enumerate(coordinates):
         table_filt = filter_table(table, coord, region_size=region_size)
         flux = len(table_filt)
-        if flux < median + std:
+        if flux < threshold:
             continue
         accepted.append(dict(source=i + 1, x=float(coord[1]), y=float(coord[0]), flux=flux))
 
