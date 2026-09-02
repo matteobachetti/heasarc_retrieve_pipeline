@@ -292,7 +292,7 @@ class TestRecoveringTheFlareFiltering:
     def test_the_diagnostic_is_recovered_from_the_pair(self, tmp_path):
         flare_pair(tmp_path)
 
-        recovered = recover.recover_observation(OBSID, str(tmp_path))
+        recovered = recover.recover_flare_filtering(OBSID, str(tmp_path))
 
         assert len(recovered) == 1
         (record,) = [
@@ -366,7 +366,7 @@ class TestRecoveringTheFlareFiltering:
             os.path.join(base, f"nu{OBSID}_src1.evt"), gti=[(0.0, 1000.0)]
         )
 
-        assert recover.recover_observation(OBSID, str(tmp_path)) == []
+        assert recover.recover_flare_filtering(OBSID, str(tmp_path)) == []
 
     def test_a_step_that_already_has_a_dataset_is_left_alone(self, tmp_path):
         flare_pair(tmp_path)
@@ -374,7 +374,7 @@ class TestRecoveringTheFlareFiltering:
         with record_step(directory, OBSID, "flare_filtering", key=f"nu{OBSID}_src1") as rec:
             rec.array(removed=np.array([[1.0, 2.0]]))
 
-        assert recover.recover_observation(OBSID, str(tmp_path)) == []
+        assert recover.recover_flare_filtering(OBSID, str(tmp_path)) == []
 
 
 class TestRecoveringTheSpectra:
@@ -436,3 +436,113 @@ class TestRecoveringTheSpectra:
         arrays = read_arrays(directory, record)
         assert "spec_nu90101201002A01_src_rate" in arrays
         assert "spec_nu90101201002A01_bkg_rate" not in arrays
+
+
+class TestRecoveringTheJoining:
+    """
+    The intervals of every file the joining merged.
+
+    Nothing is re-derived here: good time intervals are read out of a small extension,
+    and the merged files are still named exactly as the joining named them.
+    """
+
+    def a_joined_observation(self, tmp_path, obsid=OBSID, label="_src1"):
+        """A base directory with per-module and combined files, and their inputs."""
+        base = os.path.join(str(tmp_path), obsid)
+        pipedir = os.path.join(base, "event_pipe")
+        os.makedirs(pipedir, exist_ok=True)
+        for fpm in "A", "B":
+            make_event_file_with_gti(
+                os.path.join(pipedir, f"nu{obsid}{fpm}01_cl{label}.evt"),
+                gti=[(0.0, 400.0), (600.0, 1000.0)],
+            )
+            make_event_file_with_gti(
+                os.path.join(base, f"nu{obsid}{fpm}{label}.evt"),
+                gti=[(0.0, 400.0), (600.0, 1000.0)],
+            )
+        combined = os.path.join(base, f"nu{obsid}{label}.evt")
+        make_event_file_with_gti(combined, gti=[(0.0, 400.0), (600.0, 1000.0)])
+        return combined
+
+    def record_of(self, tmp_path, key="src1"):
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        (record,) = [
+            r
+            for r in read_records(directory)
+            if r["step"] == "join_source_data" and r["key"] == key
+        ]
+        return record, read_arrays(directory, record)
+
+    def test_the_joining_is_recovered(self, tmp_path):
+        combined = self.a_joined_observation(tmp_path)
+
+        recovered = recover.recover_joining(OBSID, str(tmp_path))
+
+        assert recovered == [combined]
+        record, _ = self.record_of(tmp_path)
+        assert record["arrays_from_earlier_run"] is True
+
+    def test_every_input_and_both_merges_are_there(self, tmp_path):
+        self.a_joined_observation(tmp_path)
+
+        recover.recover_joining(OBSID, str(tmp_path))
+
+        _, arrays = self.record_of(tmp_path)
+        assert "gti_A_in_0" in arrays
+        assert "gti_B_in_0" in arrays
+        assert "gti_A_out" in arrays
+        assert "gti_B_out" in arrays
+        assert "gti_combined" in arrays
+
+    def test_the_intervals_are_the_ones_on_disk(self, tmp_path):
+        self.a_joined_observation(tmp_path)
+
+        recover.recover_joining(OBSID, str(tmp_path))
+
+        _, arrays = self.record_of(tmp_path)
+        np.testing.assert_allclose(
+            arrays["gti_combined"], [[0.0, 400.0], [600.0, 1000.0]]
+        )
+
+    def test_the_figure_can_be_drawn_from_it(self, tmp_path):
+        self.a_joined_observation(tmp_path)
+
+        recover.recover_joining(OBSID, str(tmp_path))
+
+        record, arrays = self.record_of(tmp_path)
+        assert report.gti_figure(record, arrays) is not None
+
+    def test_the_background_product_is_recovered_too(self, tmp_path):
+        self.a_joined_observation(tmp_path, label="_back")
+
+        recover.recover_joining(OBSID, str(tmp_path))
+
+        record, _ = self.record_of(tmp_path, key="back")
+        assert record["values"]["combined"] == f"nu{OBSID}_back.evt"
+
+    def test_the_unsplit_mode_06_file_is_not_counted_twice(self, tmp_path):
+        """nusplitsc has already replaced it with its CHU-resolved parts."""
+        self.a_joined_observation(tmp_path)
+        splitdir = os.path.join(str(tmp_path), OBSID, "split")
+        os.makedirs(splitdir, exist_ok=True)
+        for name in (f"nu{OBSID}A06_cl_src1.evt", f"nu{OBSID}A06_chu1_cl_src1.evt"):
+            make_event_file_with_gti(os.path.join(splitdir, name), gti=[(0.0, 100.0)])
+
+        recover.recover_joining(OBSID, str(tmp_path))
+
+        record, _ = self.record_of(tmp_path)
+        assert f"nu{OBSID}A06_chu1_cl_src1.evt" in record["values"]["inputs_A"]
+        assert f"nu{OBSID}A06_cl_src1.evt" not in record["values"]["inputs_A"]
+
+    def test_an_observation_that_was_never_joined_recovers_nothing(self, tmp_path):
+        os.makedirs(os.path.join(str(tmp_path), OBSID), exist_ok=True)
+
+        assert recover.recover_joining(OBSID, str(tmp_path)) == []
+
+    def test_a_run_that_recorded_its_joining_is_left_alone(self, tmp_path):
+        self.a_joined_observation(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        with record_step(directory, OBSID, "join_source_data", key="src1") as rec:
+            rec.array(gti_combined=np.array([[1.0, 2.0]]))
+
+        assert recover.recover_joining(OBSID, str(tmp_path)) == []

@@ -51,6 +51,8 @@ from astropy.io import fits
 from .diagnostics import diagnostics_path, read_records, record_step
 from .image_utils import measure_sources_in_file
 from .nustar import (
+    gti_of,
+    join_input_files,
     nu_base_output_path,
     nu_goes_lc_file,
     nu_pipeline_output_path,
@@ -65,6 +67,7 @@ from .utils import apply_gti, get_logger, read_gti, rootname
 __all__ = [
     "measured_steps",
     "recover_flare_filtering",
+    "recover_joining",
     "recover_observation",
     "recover_separations",
     "recover_spectra",
@@ -271,6 +274,75 @@ def recover_spectra(obsid, outdir, measured=None):
     return stems
 
 
+def recover_joining(obsid, outdir, measured=None):
+    """
+    Read back the intervals of every file the joining merged.
+
+    The most exact of these recoveries and the cheapest: good time intervals are read
+    from a small extension, and the merged files are still named exactly as the joining
+    named them. Nothing is re-derived -- the intervals on disk *are* the answer.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    outdir : str
+        The run's output root.
+    measured : set, optional
+        From :func:`measured_steps`. Computed if not given.
+
+    Returns
+    -------
+    list of str
+        The combined files that were read, one per product joined.
+    """
+    config = dict(out_data_path=outdir)
+    directory = diagnostics_path(obsid, config)
+    if measured is None:
+        measured = measured_steps(directory)
+
+    base = nu_base_output_path(obsid, config)
+    sources = [
+        d
+        for d in (nu_pipeline_output_path(obsid, config), split_path(obsid, config))
+        if os.path.isdir(d)
+    ]
+    logger = get_logger()
+
+    recovered = []
+    for label in ("_src1", "_back"):
+        key = label.lstrip("_")
+        if ("join_source_data", key) in measured:
+            continue
+        combined = os.path.join(base, f"nu{obsid}{label}.evt")
+        if not os.path.exists(combined):
+            continue
+
+        logger.info(f"Recovering the joining of {combined}")
+        arrays = {}
+        values = {}
+        modules = []
+        for fpm in "A", "B":
+            per_module = os.path.join(base, f"nu{obsid}{fpm}{label}.evt")
+            if not os.path.exists(per_module):
+                continue
+            inputs = sorted(join_input_files(obsid, sources, fpm, label))
+            for index, path in enumerate(inputs):
+                arrays[f"gti_{fpm}_in_{index}"] = gti_of(path)
+            arrays[f"gti_{fpm}_out"] = gti_of(per_module)
+            values[f"inputs_{fpm}"] = [os.path.basename(path) for path in inputs]
+            modules.append(os.path.basename(per_module))
+
+        arrays["gti_combined"] = gti_of(combined)
+        with record_step(directory, obsid, "join_source_data", key=key) as rec:
+            rec.from_earlier_outputs()
+            rec.skip("measured from the files an earlier run left")
+            rec.value(modules=modules, combined=os.path.basename(combined), **values)
+            rec.array(**arrays)
+        recovered.append(combined)
+    return recovered
+
+
 def recover_observation(obsid, outdir):
     """
     Fill in every dataset an observation is missing.
@@ -302,7 +374,12 @@ def recover_observation(obsid, outdir):
     logger = get_logger()
 
     recovered = []
-    for recovery in (recover_separations, recover_flare_filtering, recover_spectra):
+    for recovery in (
+        recover_separations,
+        recover_joining,
+        recover_flare_filtering,
+        recover_spectra,
+    ):
         try:
             recovered.extend(recovery(obsid, outdir, measured=measured))
         except Exception as error:

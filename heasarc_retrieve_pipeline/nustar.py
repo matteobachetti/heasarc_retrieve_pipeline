@@ -887,6 +887,44 @@ def _recover_spacecraft_science_data(obsid, config, rec):
     return splitdir
 
 
+def join_input_files(obsid, directories, fpm, label):
+    """
+    The files the joining merges for one focal-plane module.
+
+    Both the joining and :mod:`heasarc_retrieve_pipeline.recover` walk this, so a page
+    drawn from a reduction it did not watch shows the same input rows the reduction
+    itself would have recorded.
+
+    Mode-01 and mode-06 cleaned files both count. The *unsplit* mode-06 file does not:
+    ``nusplitsc`` has already replaced it with its CHU-resolved parts, and merging both
+    would count those events twice.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    directories : list of str
+        Directories to collect from -- the ``nupipeline`` output and the ``nusplitsc``
+        sub-observations.
+    fpm : str
+        ``"A"`` or ``"B"``.
+    label : str
+        ``"_src<n>"`` or ``"_back"``.
+
+    Returns
+    -------
+    list of str
+        Full paths, in the order the directories were given.
+    """
+    files = []
+    for d in directories:
+        for path in glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*{label}.evt*")):
+            if f"{fpm}06" in path and "chu" not in path:
+                continue
+            files.append(path)
+    return files
+
+
 def gti_of(path):
     """
     The good time intervals of an event file, as an ``(N, 2)`` array.
@@ -1156,21 +1194,11 @@ def _join_source_data(obsid, directories, config, src_num, label, rec):
         outfile = os.path.join(outdir, f"nu{obsid}{fpm}{label}.evt")
 
         logger.info(f"Joining source data for fpm {fpm} into {outfile}")
-        files_to_join = []
-        for d in directories:
-            logger.info(f"Adding data from {d}")
-            new_files = glob.glob(os.path.join(d, f"nu{obsid}{fpm}0[16]*{label}.evt*"))
-            to_be_removed = []
-            for nf in new_files:
-                if f"{fpm}01" in nf:
-                    logger.info(f"Copying {nf} to {outdir}")
-                    os.system(f"cp {nf} {outdir}/")
-                elif f"{fpm}06" in nf and "chu" not in nf:
-                    logger.info(f"Discarding {nf}")
-                    to_be_removed.append(nf)
-            for nf in to_be_removed:
-                new_files.remove(nf)
-            files_to_join.extend(new_files)
+        files_to_join = join_input_files(obsid, directories, fpm, label)
+        for nf in files_to_join:
+            if f"{fpm}01" in nf:
+                logger.info(f"Copying {nf} to {outdir}")
+                os.system(f"cp {nf} {outdir}/")
 
         if not files_to_join:
             # ftmgtime handed an empty list exits 0 and writes nothing, and ftsort then
