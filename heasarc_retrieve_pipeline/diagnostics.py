@@ -258,6 +258,7 @@ class StepRecord:
         self._started = None
         self._monotonic = None
         self._inherited_values = {}
+        self._earlier = False
 
     @property
     def path(self):
@@ -277,6 +278,17 @@ class StepRecord:
         """Record arrays, for a figure to be drawn from. They go in the ``.npz``."""
         self.arrays.update(arrays)
 
+    def from_earlier_outputs(self):
+        """
+        Mark the arrays as describing work this run did not do.
+
+        A record that inherits its payload is marked by itself. This is for
+        :mod:`heasarc_retrieve_pipeline.recover`, which measures *now* but measures the
+        output of a run that finished some time ago -- so the arrays are fresh and the
+        work behind them is not, and the page has to say the second thing.
+        """
+        self._earlier = True
+
     def skip(self, reason):
         """
         Mark the step as having decided to do nothing, and say why.
@@ -288,7 +300,9 @@ class StepRecord:
 
     def as_dict(self):
         """The record as it will be written."""
-        inherited = not self.arrays and os.path.exists(self.arrays_path)
+        inherited = self._earlier or (
+            not self.arrays and os.path.exists(self.arrays_path)
+        )
         duration = None
         if self._monotonic is not None:
             duration = round(time.monotonic() - self._monotonic, 3)

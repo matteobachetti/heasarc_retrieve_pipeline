@@ -782,8 +782,8 @@ def observation_body(summary, directory):
                 # describe the files on disk -- but the page must not let the figure be
                 # read as this run's work.
                 parts.append(
-                    '<p class="earlier">Measured by an earlier run; this run skipped '
-                    "the step.</p>"
+                    '<p class="earlier">This run did not run this step. The figure '
+                    "describes the files an earlier run left.</p>"
                 )
             parts.append("$FIGURE")
             figures.append(fig)
@@ -1012,7 +1012,7 @@ def write_index(outdir, obsids=None):
     return path
 
 
-def write_observation_page(obsid, outdir):
+def write_observation_page(obsid, outdir, recover=True):
     """
     Write ``<outdir>/<OBSID>/diagnostics.html``.
 
@@ -1025,12 +1025,29 @@ def write_observation_page(obsid, outdir):
         Observation identifier.
     outdir : str
         Run output directory.
+    recover : bool, optional
+        Measure the datasets the observation is missing before drawing, with
+        :func:`heasarc_retrieve_pipeline.recover.recover_observation`. This is what puts
+        a page on an observation reduced before any of it was recorded. It costs a
+        directory scan when nothing is missing, which is the normal case, and it never
+        re-runs any part of the reduction.
 
     Returns
     -------
     str
         The path written.
     """
+    if recover:
+        # Imported here, not at module scope: this is the only part of the report that
+        # needs the mission modules, and ``python -m ...report`` on a finished tree
+        # should not pay for importing them when there is nothing to recover.
+        from . import recover as recover_module
+
+        try:
+            recover_module.recover_observation(obsid, outdir)
+        except Exception as error:  # pragma: no cover - a page must survive its own tools
+            get_logger().warning(f"Could not recover the datasets of {obsid}: {error}")
+
     summary = observation_summary(obsid, outdir)
     directory = diagnostics_path(obsid, dict(out_data_path=outdir))
     body = observation_body(summary, directory)
