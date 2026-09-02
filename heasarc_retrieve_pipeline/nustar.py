@@ -607,6 +607,42 @@ def separate_sources_in_event_file(
         )
 
 
+def separation_candidates(directory):
+    """
+    The cleaned event files in a directory that the separation would actually work on.
+
+    Both loops in :func:`separate_sources` walk this, so the one that records a skip
+    cannot disagree with the one that does the work about what counts as a candidate.
+    The two rejected kinds are the same ones :func:`separate_sources_in_event_file`
+    turns away: an encrypted file nobody can process, and a name that is not an event
+    file at all.
+
+    Parameters
+    ----------
+    directory : str
+        Directory to scan.
+
+    Returns
+    -------
+    list of str
+        Full paths, sorted, so a run is reproducible.
+
+    Examples
+    --------
+    >>> import os, tempfile
+    >>> d = tempfile.mkdtemp()
+    >>> for name in ("nu90101201002A01_cl.evt", "nu90101201002B01_cl.evt.gpg", "junk.evt"):
+    ...     _ = open(os.path.join(d, name), "w").close()
+    >>> [os.path.basename(f) for f in separation_candidates(d)]
+    ['nu90101201002A01_cl.evt']
+    """
+    return sorted(
+        f
+        for f in glob.glob(os.path.join(directory, "nu*_cl.evt*"))
+        if not f.endswith(".gpg") and valid_re.search(os.path.basename(f))
+    )
+
+
 @task(
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(days=1000),
@@ -617,7 +653,9 @@ def separate_sources(directories, config, region_size=30, back_region_size=55, o
     Run the image-based source separation over every cleaned event file in some directories.
 
     Writes a ``SEPARATE_DONE.TXT`` sentinel in each directory and skips directories that
-    already have one.
+    already have one. A skipped directory still records one ``skipped`` record per
+    candidate file, so the report can say the step was not run and can still draw it from
+    what the run that did run measured.
 
     Parameters
     ----------
@@ -636,15 +674,26 @@ def separate_sources(directories, config, region_size=30, back_region_size=55, o
         somewhere.
     """
     directory = diagnostics_path(obsid, config) if obsid else None
+    logger = get_logger()
     for d in directories:
         separate_done_file = os.path.join(d, "SEPARATE_DONE.TXT")
         if os.path.exists(separate_done_file):
-            logger = get_logger()
             logger.info(f"Source separation already done in {d}")
+            # Recording the skip is what keeps the focal plane on the page. The record
+            # this opens inherits the payload the run that did the work left beside it,
+            # so the figure survives; skipping the directory in silence, as this used to,
+            # left the step missing from the timeline and its images missing with it.
+            for event_file in separation_candidates(d):
+                with record_step(
+                    directory,
+                    obsid,
+                    "separate_sources",
+                    key=rootname(os.path.basename(event_file)),
+                ) as rec:
+                    rec.skip("SEPARATE_DONE.TXT already exists")
             continue
-        logger = get_logger()
         logger.info(f"Separating sources in {d}")
-        for event_file in glob.glob(os.path.join(d, "nu*_cl.evt*")):
+        for event_file in separation_candidates(d):
             separate_sources_in_event_file(
                 event_file,
                 region_size=region_size,
