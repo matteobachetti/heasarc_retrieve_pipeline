@@ -1632,7 +1632,10 @@ Four of the five steps recover:
 * the **joining**, exactly -- good time intervals are read out of a small extension and
   nothing is re-derived;
 * the **flare filtering**, exactly -- the filtering writes ``<root>_noflares.evt`` and
-  never touches ``<root>.evt``, so both halves of the comparison survive;
+  never touches ``<root>.evt``, so both halves of the comparison survive. The solar
+  X-ray light curve is looked for under both of the names this package has used for it,
+  ``nu<OBSID>_goes.fits`` now and ``<root>_goes.fits`` back when it was fetched once per
+  event file, because the older name is the one an old tree has;
 * the **spectra**, which need no measurement at all: a PHA is already the answer.
 
 The **extraction regions** do not. Their radial profile comes from ``make_image``, which

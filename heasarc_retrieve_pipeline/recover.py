@@ -65,6 +65,7 @@ from .nustar import (
 from .utils import apply_gti, get_logger, read_gti, rootname
 
 __all__ = [
+    "goes_light_curve_of",
     "measured_steps",
     "recover_flare_filtering",
     "recover_joining",
@@ -101,6 +102,40 @@ def measured_steps(directory):
         for record in read_records(directory)
         if record.get("arrays")
     }
+
+
+def goes_light_curve_of(event_file, obsid, config):
+    """
+    The solar X-ray light curve that goes with an event file, under either name.
+
+    This package now fetches one light curve per observation, because the Sun does not
+    care which module the data came from -- but it used to fetch one per event file, and
+    the trees this module exists to read were made then. Both names are looked for, the
+    current one first.
+
+    Parameters
+    ----------
+    event_file : str
+        The unfiltered event file the diagnostic compares.
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str or None
+        A path that exists, or ``None``. A missing light curve is not an error: a rerun
+        skips the download, and the event light curves are the useful half of the figure.
+    """
+    per_observation = nu_goes_lc_file(obsid, config)
+    if os.path.exists(per_observation):
+        return per_observation
+
+    per_file = event_file.replace(".evt", "_goes.fits")
+    if os.path.exists(per_file):
+        return per_file
+    return None
 
 
 def recover_separations(obsid, outdir, measured=None):
@@ -181,12 +216,6 @@ def recover_flare_filtering(obsid, outdir, measured=None):
         measured = measured_steps(directory)
     logger = get_logger()
 
-    goes_lc_file = nu_goes_lc_file(obsid, config)
-    if not os.path.exists(goes_lc_file):
-        # A rerun skips the download, so an absent light curve is normal. The event
-        # light curves are the useful half of the figure and do not depend on it.
-        goes_lc_file = None
-
     recovered = []
     base = nu_base_output_path(obsid, config)
     for filtered in sorted(glob.glob(os.path.join(base, "*_noflares.evt"))):
@@ -215,7 +244,7 @@ def recover_flare_filtering(obsid, outdir, measured=None):
                 event_file,
                 gti_before,
                 gti_after,
-                goes_lc_file=goes_lc_file,
+                goes_lc_file=goes_light_curve_of(event_file, obsid, config),
                 rec=rec,
             )
         recovered.append(event_file)

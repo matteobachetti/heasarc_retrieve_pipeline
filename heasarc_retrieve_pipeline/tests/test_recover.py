@@ -133,6 +133,21 @@ def a_products_directory(tmp_path, obsid=OBSID, stems=("nu90101201002A01",)):
     return products
 
 
+
+def a_goes_light_curve(path, tstart=0.0, tstop=1000.0, nbins=20):
+    """A solar X-ray light curve in the observation's mission elapsed time."""
+    time = np.linspace(tstart, tstop, nbins)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="TIME", format="D", array=time),
+            fits.Column(name="XRSA", format="D", array=np.full(nbins, 5e-8)),
+            fits.Column(name="XRSB", format="D", array=np.full(nbins, 2e-6)),
+        ],
+        name="GOES",
+    )
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return path
+
 class TestRecoveringTheSeparation:
     """The focal plane of a reduction that finished before anything recorded it."""
 
@@ -375,6 +390,54 @@ class TestRecoveringTheFlareFiltering:
             rec.array(removed=np.array([[1.0, 2.0]]))
 
         assert recover.recover_flare_filtering(OBSID, str(tmp_path)) == []
+
+
+    def test_the_observations_light_curve_is_used(self, tmp_path):
+        flare_pair(tmp_path)
+        base = os.path.join(str(tmp_path), OBSID)
+        a_goes_light_curve(os.path.join(base, f"nu{OBSID}_goes.fits"))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_flare_filtering(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert record["values"]["goes_light_curve"] == f"nu{OBSID}_goes.fits"
+        assert "goes_xrsb" in read_arrays(directory, record)
+
+    def test_the_older_per_file_light_curve_is_found_too(self, tmp_path):
+        """Before it was fetched once per observation it was fetched once per file."""
+        event_file, _ = flare_pair(tmp_path)
+        a_goes_light_curve(event_file.replace(".evt", "_goes.fits"))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_flare_filtering(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert record["values"]["goes_light_curve"] == f"nu{OBSID}_src1_goes.fits"
+        assert "goes_xrsb" in read_arrays(directory, record)
+
+    def test_the_observations_light_curve_wins(self, tmp_path):
+        """Both names can be present; the one this package writes now is the newer."""
+        event_file, _ = flare_pair(tmp_path)
+        base = os.path.join(str(tmp_path), OBSID)
+        a_goes_light_curve(os.path.join(base, f"nu{OBSID}_goes.fits"))
+        a_goes_light_curve(event_file.replace(".evt", "_goes.fits"))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_flare_filtering(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert record["values"]["goes_light_curve"] == f"nu{OBSID}_goes.fits"
+
+    def test_no_light_curve_anywhere_still_recovers_the_rest(self, tmp_path):
+        flare_pair(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_flare_filtering(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert record["values"]["goes_light_curve"] is None
+        assert "lc_3_10_before_rate" in read_arrays(directory, record)
 
 
 class TestRecoveringTheSpectra:
