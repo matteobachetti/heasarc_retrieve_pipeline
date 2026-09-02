@@ -632,6 +632,41 @@ class TestJoiningTheOtherTwoRecords:
             "90901333002",
         ]
 
+    def test_a_tree_that_recorded_nothing_is_still_found(self, tmp_path):
+        """The tree the recovery exists for has no diagnostics to be found by."""
+        os.makedirs(os.path.join(tmp_path, "90901333002", "event_pipe"))
+
+        assert report.observation_directories(str(tmp_path)) == ["90901333002"]
+
+    def test_a_downloaded_observation_is_found_by_its_auxil(self, tmp_path):
+        """Every mission's archive delivers one, reduced or not."""
+        os.makedirs(os.path.join(tmp_path, "0104010101", "auxil"))
+        os.makedirs(os.path.join(tmp_path, "0104010101", "xti"))
+
+        assert report.observation_directories(str(tmp_path)) == ["0104010101"]
+
+    def test_a_temporary_working_directory_is_not_an_observation(self, tmp_path):
+        """nuproducts leaves these at the run root; they hold no observation."""
+        os.makedirs(os.path.join(tmp_path, "1988_tmp_nuproducts"))
+        os.makedirs(os.path.join(tmp_path, "90901333002", "event_cl"))
+
+        assert report.observation_directories(str(tmp_path)) == ["90901333002"]
+
+    def test_the_entry_point_gives_an_unrecorded_tree_its_page(self, tmp_path):
+        """End to end: the one command a user runs against a reduction from last year."""
+        # The pair the flare filtering leaves, built by the recovery tests' own fixture
+        # so that the two suites cannot disagree about what a reduced tree looks like.
+        from heasarc_retrieve_pipeline.tests.test_recover import flare_pair
+
+        flare_pair(tmp_path, obsid=OBSID)
+        base = os.path.join(str(tmp_path), OBSID)
+
+        assert report.main([str(tmp_path)]) == 0
+
+        page = os.path.join(base, "diagnostics.html")
+        assert os.path.exists(page)
+        assert "Solar-flare filtering" in soup(page).get_text()
+
 
 class TestTheRunIndex:
     """One page for the run, one row per observation, every link resolving."""

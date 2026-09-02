@@ -47,6 +47,24 @@ from .utils import get_logger, read_skipped_inputs
 PLOTLY_BUNDLE = "plotly.min.js"
 """Name of the shared plotly bundle, written once at the output root."""
 
+#: The subdirectories an observation is delivered or reduced with. One of these is
+#: enough to call a directory an observation, which is what lets a tree reduced before
+#: any of the diagnostics existed be found at all -- it has no records to be found by.
+#: ``auxil`` comes down from the archive whatever the mission; the rest are made by the
+#: reduction, and a partly reduced observation may have only one of them. Temporary
+#: working directories such as ``1988_tmp_nuproducts`` have none, which is the point.
+OBSERVATION_SUBDIRECTORIES = (
+    "auxil",
+    "event_cl",
+    "event_pipe",
+    "event_uf",
+    "hk",
+    "products",
+    "split",
+    "xti",
+)
+
+
 STATUS_COLOURS = {
     "done": "#2a9d8f",
     "skipped": "#e9c46a",
@@ -1218,8 +1236,17 @@ def observation_directories(outdir):
     """
     Every observation directory under a run root, in order.
 
-    An observation is any subdirectory holding a ``diagnostics`` directory or a
-    ``skipped_inputs.txt``: enough for there to be something to say about it.
+    An observation is any subdirectory holding a ``diagnostics`` directory, a
+    ``skipped_inputs.txt``, one of :data:`OBSERVATION_SUBDIRECTORIES`, or an event file of
+    its own: enough for there to be something to say about it. The last of those catches
+    an observation whose working directories were cleaned away and whose merged event
+    files were kept, which is a normal thing to do to a finished reduction.
+
+    That last one is what makes the recovery reachable. A tree reduced before this package
+    recorded anything has neither of the first two, so looking only for those found
+    nothing at all and the one command a user runs on an old reduction --
+    ``python -m heasarc_retrieve_pipeline.report <outdir>`` -- printed
+    ``0 observation page(s)`` over a directory full of them.
 
     Parameters
     ----------
@@ -1236,8 +1263,14 @@ def observation_directories(outdir):
         path = os.path.join(outdir, name)
         if not os.path.isdir(path):
             continue
-        if os.path.isdir(os.path.join(path, "diagnostics")) or os.path.exists(
-            os.path.join(path, "skipped_inputs.txt")
+        if (
+            os.path.isdir(os.path.join(path, "diagnostics"))
+            or os.path.exists(os.path.join(path, "skipped_inputs.txt"))
+            or any(
+                os.path.isdir(os.path.join(path, sub))
+                for sub in OBSERVATION_SUBDIRECTORIES
+            )
+            or glob.glob(os.path.join(path, "*.evt"))
         ):
             obsids.append(name)
     return obsids
