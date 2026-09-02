@@ -106,6 +106,33 @@ def make_event_file_with_gti(path, gti, tstart=0.0, tstop=1000.0, nevents=800, s
     return str(path)
 
 
+def pha_file(path, exposure=1000.0, counts=None, nchan=100, seed=3):
+    """A PHA spectrum shaped like the one ``nuproducts`` writes."""
+    rng = np.random.default_rng(seed)
+    if counts is None:
+        counts = rng.poisson(50, nchan)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="CHANNEL", format="J", array=np.arange(nchan) + 35),
+            fits.Column(name="COUNTS", format="J", array=np.asarray(counts)),
+        ],
+        name="SPECTRUM",
+    )
+    hdu.header["EXPOSURE"] = exposure
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+def a_products_directory(tmp_path, obsid=OBSID, stems=("nu90101201002A01",)):
+    """A products directory as a finished reduction leaves it, with no records."""
+    products = os.path.join(str(tmp_path), obsid, "products")
+    os.makedirs(products, exist_ok=True)
+    for stem in stems:
+        pha_file(os.path.join(products, stem + "_sr.pha"))
+        pha_file(os.path.join(products, stem + "_bk.pha"), counts=np.full(100, 5))
+    return products
+
+
 class TestRecoveringTheSeparation:
     """The focal plane of a reduction that finished before anything recorded it."""
 
@@ -348,3 +375,64 @@ class TestRecoveringTheFlareFiltering:
             rec.array(removed=np.array([[1.0, 2.0]]))
 
         assert recover.recover_observation(OBSID, str(tmp_path)) == []
+
+
+class TestRecoveringTheSpectra:
+    """The observation's last product, which nothing drew until now."""
+
+    def test_the_spectra_are_read_back(self, tmp_path):
+        a_products_directory(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recovered = recover.recover_spectra(OBSID, str(tmp_path))
+
+        assert recovered == ["nu90101201002A01"]
+        (record,) = [r for r in read_records(directory) if r["step"] == "calculate_spectra"]
+        arrays = read_arrays(directory, record)
+        assert "spec_nu90101201002A01_src_energy" in arrays
+        assert "spec_nu90101201002A01_bkg_rate" in arrays
+
+    def test_the_channels_become_energies_in_the_nustar_band(self, tmp_path):
+        a_products_directory(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_spectra(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "calculate_spectra"]
+        energy = read_arrays(directory, record)["spec_nu90101201002A01_src_energy"]
+        # Channel 35 is 3 keV, via E = 0.04 * PI + 1.6.
+        assert energy[0] == pytest.approx(3.0, abs=0.01)
+
+    def test_the_figure_can_be_drawn_from_it(self, tmp_path):
+        a_products_directory(tmp_path, stems=("nuA01", "nuB01"))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_spectra(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "calculate_spectra"]
+        fig = report.spectrum_figure(record, read_arrays(directory, record))
+        assert fig is not None
+        assert len(fig.data) == 4, "a source and a background for each of two stems"
+
+    def test_an_observation_with_no_products_recovers_nothing(self, tmp_path):
+        assert recover.recover_spectra(OBSID, str(tmp_path)) == []
+
+    def test_a_run_that_recorded_its_spectra_is_left_alone(self, tmp_path):
+        a_products_directory(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        with record_step(directory, OBSID, "calculate_spectra") as rec:
+            rec.array(spec_already_src_energy=np.array([3.0, 4.0]))
+
+        assert recover.recover_spectra(OBSID, str(tmp_path)) == []
+
+    def test_a_background_that_was_never_written_is_not_an_error(self, tmp_path):
+        products = a_products_directory(tmp_path)
+        os.unlink(os.path.join(products, "nu90101201002A01_bk.pha"))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_spectra(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "calculate_spectra"]
+        arrays = read_arrays(directory, record)
+        assert "spec_nu90101201002A01_src_rate" in arrays
+        assert "spec_nu90101201002A01_bkg_rate" not in arrays

@@ -54,9 +54,11 @@ from .nustar import (
     nu_base_output_path,
     nu_goes_lc_file,
     nu_pipeline_output_path,
+    nu_product_output_path,
     record_flare_filtering,
     separation_candidates,
     split_path,
+    spectrum_arrays,
 )
 from .utils import apply_gti, get_logger, read_gti, rootname
 
@@ -65,6 +67,7 @@ __all__ = [
     "recover_flare_filtering",
     "recover_observation",
     "recover_separations",
+    "recover_spectra",
 ]
 
 #: The extraction radii :func:`~heasarc_retrieve_pipeline.nustar.separate_sources` uses
@@ -216,6 +219,58 @@ def recover_flare_filtering(obsid, outdir, measured=None):
     return recovered
 
 
+def recover_spectra(obsid, outdir, measured=None):
+    """
+    Read back the spectra ``nuproducts`` wrote, for a run that did not record them.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    outdir : str
+        The run's output root.
+    measured : set, optional
+        From :func:`measured_steps`. Computed if not given.
+
+    Returns
+    -------
+    list of str
+        The extraction stems that were read.
+    """
+    config = dict(out_data_path=outdir)
+    directory = diagnostics_path(obsid, config)
+    if measured is None:
+        measured = measured_steps(directory)
+    if ("calculate_spectra", "") in measured:
+        return []
+
+    products = nu_product_output_path(obsid, config)
+    if not os.path.isdir(products):
+        return []
+
+    logger = get_logger()
+    stems = sorted(
+        os.path.basename(path)[: -len("_sr.pha")]
+        for path in glob.glob(os.path.join(products, "*_sr.pha"))
+    )
+    if not stems:
+        return []
+
+    arrays = {}
+    for stem in stems:
+        logger.info(f"Recovering the spectrum of {stem}")
+        arrays.update(spectrum_arrays(products, stem))
+    if not arrays:
+        return []
+
+    with record_step(directory, obsid, "calculate_spectra") as rec:
+        rec.from_earlier_outputs()
+        rec.skip("measured from the files an earlier run left")
+        rec.value(spectra=[stem + "_sr.pha" for stem in stems])
+        rec.array(**arrays)
+    return stems
+
+
 def recover_observation(obsid, outdir):
     """
     Fill in every dataset an observation is missing.
@@ -247,7 +302,7 @@ def recover_observation(obsid, outdir):
     logger = get_logger()
 
     recovered = []
-    for recovery in (recover_separations, recover_flare_filtering):
+    for recovery in (recover_separations, recover_flare_filtering, recover_spectra):
         try:
             recovered.extend(recovery(obsid, outdir, measured=measured))
         except Exception as error:

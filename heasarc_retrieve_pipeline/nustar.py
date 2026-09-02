@@ -2271,6 +2271,101 @@ def _get_best_source_regions(obsid, config, rec):
     return mean_ra / count, mean_dec / count, mean_rlimit / count
 
 
+def read_spectrum(pha_file):
+    """
+    The counts spectrum of a PHA file, in energy rather than channel.
+
+    ``nuproducts`` writes the source and background spectra of every extraction as
+    ``<stem>_sr.pha`` and ``<stem>_bk.pha``. Those are the observation's last product and
+    the one a reader most wants to look at, and until now nothing drew them.
+
+    Channels are converted with the same relation the rest of this module uses,
+    ``E [keV] = 0.04 * PI + 1.6``, rather than through the response matrix. That is exact
+    for the channel *centres*, which is what a diagnostic plot needs; it is not a
+    substitute for folding a model through the RMF, and nothing here should be used for
+    fitting.
+
+    Parameters
+    ----------
+    pha_file : str
+        Path of a PHA spectrum.
+
+    Returns
+    -------
+    dict or None
+        ``energy`` (keV), ``rate`` (counts/s/keV) and ``rate_err``, or ``None`` if the
+        file has no counts column this can read.
+
+    Notes
+    -----
+    A PHA may carry ``COUNTS`` or ``RATE``; both are handled, and ``COUNTS`` is divided by
+    the header ``EXPOSURE``. The uncertainty is Poisson on the counts, which is right for
+    an unbinned spectrum and an underestimate for a grouped one -- so the ungrouped
+    ``_sr.pha`` is what the reduction records, not the ``_grp.pha`` it also writes.
+    """
+    from astropy.io import fits
+
+    with fits.open(pha_file) as hdul:
+        data = hdul[1].data
+        header = hdul[1].header
+        columns = {name.upper() for name in data.columns.names}
+        exposure = float(header.get("EXPOSURE") or header.get("ONTIME") or 1.0)
+        if exposure <= 0:
+            exposure = 1.0
+
+        if "COUNTS" in columns:
+            counts = np.asarray(data["COUNTS"], dtype=float)
+        elif "RATE" in columns:
+            counts = np.asarray(data["RATE"], dtype=float) * exposure
+        else:
+            return None
+
+        channel = np.asarray(data["CHANNEL"], dtype=float)
+
+    energy = 0.04 * channel + 1.6
+    # Per keV, so that the shape does not depend on the channel width.
+    width = 0.04
+    return dict(
+        energy=energy,
+        rate=counts / exposure / width,
+        rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
+    )
+
+
+def spectrum_arrays(outdir, stem):
+    """
+    The source and background spectra of one extraction, ready to record.
+
+    Parameters
+    ----------
+    outdir : str
+        The observation's products directory.
+    stem : str
+        ``stemout`` as handed to ``nuproducts``.
+
+    Returns
+    -------
+    dict
+        Empty if neither spectrum is readable -- a missing one is not an error, since
+        ``nuproducts`` is allowed to have failed for a single file.
+    """
+    arrays = {}
+    for which, suffix in (("src", "_sr.pha"), ("bkg", "_bk.pha")):
+        path = os.path.join(outdir, stem + suffix)
+        if not os.path.exists(path):
+            continue
+        try:
+            spectrum = read_spectrum(path)
+        except Exception as error:
+            get_logger().warning(f"Could not read the spectrum {path}: {error}")
+            continue
+        if spectrum is None:
+            continue
+        for key, values in spectrum.items():
+            arrays[f"spec_{stem}_{which}_{key}"] = np.asarray(values, dtype=np.float32)
+    return arrays
+
+
 @task(
     task_run_name="nu_calc_spec_{obsid}_src-reg_{src_reg}_back-reg_{bkg_reg}",
 )
@@ -2427,6 +2522,9 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
             verbose=True,
         )
         spectra.append(os.path.basename(params["grpphafile"]))
+        # The spectrum itself, so the page can show what came out rather than only its
+        # file name. Recorded here, where the stem is known.
+        rec.array(**spectrum_arrays(outdir, stem))
 
     rec.value(
         inputs=inputs,
