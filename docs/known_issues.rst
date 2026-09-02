@@ -1329,7 +1329,7 @@ output the way the real one does.
 
 
 53.  The combined FPMA+FPMB file kept events only one module saw -- FIXED
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Found while checking a claim that ought to have been harmless: that event files ordinarily
 contain a few events outside their good time intervals, because an event is recorded
