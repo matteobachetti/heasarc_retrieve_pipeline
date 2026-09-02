@@ -43,6 +43,12 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     position_is_consistent,
     spectral_input_files,
 )
+from heasarc_retrieve_pipeline.utils import (  # noqa: E402
+    intersect_intervals,
+    mask_from_gti,
+    merge_intervals,
+    read_gti,
+)
 
 
 OBSID = "80002092008"
@@ -914,6 +920,12 @@ class StubHeasoft:
 
     ``ftmerge`` here also refuses an output that is already there, exactly as the real one
     does. That refusal is what :class:`TestJoiningTwice` is about.
+
+    What it writes is a real, empty FITS event file rather than a line of prose, because
+    ``merge_event_files`` reopens the output of an ``AND`` merge to drop the events outside
+    its GTI. Empty on purpose: these tests are about which tools ran and in what order, and
+    an all-header FITS file is still plain text, so the "is the earlier run's output gone?"
+    assertion below can go on reading it as one.
     """
 
     def __init__(self, fail_on=None):
@@ -933,8 +945,24 @@ class StubHeasoft:
                     "ftmerge failed with return code 105: failed to create new file "
                     f"(already exists?): {outfile}"
                 )
-            with open(outfile.lstrip("!"), "w") as fobj:
-                fobj.write("not a real event file, but not an empty one either")
+            from astropy.io import fits
+
+            fits.HDUList(
+                [
+                    fits.PrimaryHDU(),
+                    fits.BinTableHDU.from_columns(
+                        [fits.Column(name="TIME", format="D", array=np.zeros(0))],
+                        name="EVENTS",
+                    ),
+                    fits.BinTableHDU.from_columns(
+                        [
+                            fits.Column(name="START", format="D", array=np.zeros(0)),
+                            fits.Column(name="STOP", format="D", array=np.zeros(0)),
+                        ],
+                        name="GTI",
+                    ),
+                ]
+            ).writeto(outfile.lstrip("!"), overwrite=True)
 
     def ftmerge(self, **kwargs):
         self._record("ftmerge", **kwargs)
@@ -2017,3 +2045,163 @@ class TestTheStepsRecordThemselves:
         record = self.only(tmp_path, "join_source_data")
         assert record["duration_s"] >= 0.0
         assert record["obsid"] == OBSID
+
+
+class RealFileHeasoft:
+    """A HEASOFT stub that writes real FITS, so the astropy step after it has something.
+
+    ``StubHeasoft`` above writes a line of text where an event file should be, which is
+    enough for the tests that only count tool calls. The GTI filtering at the end of
+    :func:`~heasarc_retrieve_pipeline.nustar.merge_event_files` opens its output, so these
+    tests need ``ftmerge`` to concatenate real event tables and ``fappend`` to attach a
+    real GTI extension -- including ``ftmerge``'s habit of ignoring the GTI entirely, which
+    is the whole point of what is being tested.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, name, **kwargs):
+        self.calls.append((name, kwargs))
+
+    def ftmerge(self, **kwargs):
+        self._record("ftmerge", **kwargs)
+        from astropy.io import fits
+
+        tables = [
+            fits.open(name)["EVENTS"].data for name in kwargs["infile"].split(",")
+        ]
+        times = np.concatenate([np.asarray(t["TIME"], dtype=float) for t in tables])
+        merged = fits.BinTableHDU.from_columns(
+            [fits.Column(name="TIME", format="D", array=times)], name="EVENTS"
+        )
+        # Verbatim ftmerge behaviour: the exposure keywords come from the first input.
+        first = fits.open(kwargs["infile"].split(",")[0])["EVENTS"].header
+        for keyword in ("ONTIME", "LIVETIME", "EXPOSURE", "TIMEZERO"):
+            if keyword in first:
+                merged.header[keyword] = first[keyword]
+        fits.HDUList([fits.PrimaryHDU(), merged]).writeto(
+            kwargs["outfile"].lstrip("!"), overwrite=True
+        )
+
+    def ftsort(self, **kwargs):
+        self._record("ftsort", **kwargs)
+        from astropy.io import fits
+
+        path = kwargs["outfile"].lstrip("!")
+        with fits.open(path, mode="update") as hdul:
+            hdul[1].data = hdul[1].data[np.argsort(hdul[1].data[kwargs["columns"]])]
+
+    def fappend(self, **kwargs):
+        self._record("fappend", **kwargs)
+        from astropy.io import fits
+
+        source = fits.open(kwargs["infile"].split("[")[0])[1]
+        with fits.open(kwargs["outfile"], mode="update") as hdul:
+            hdul.append(fits.BinTableHDU(data=source.data, name="GTI"))
+
+
+def write_event_file(path, times, gti, **kwargs):
+    """A real one-extension-each event file at ``path``, for the merge tests."""
+    from heasarc_retrieve_pipeline.tests.test_utils import make_event_file
+
+    make_event_file(times=times, gti=np.asarray(gti, dtype=float), **kwargs).writeto(
+        path, overwrite=True
+    )
+    return str(path)
+
+
+class TestTheCombinedFileHoldsOnlyItsOwnGoodTime:
+    """The FPMA+FPMB merge, and the events that used to survive outside its GTI.
+
+    ``ftmgtime merge=AND`` gets the intersection right; ``ftmerge`` then concatenates both
+    event tables and knows nothing about it. On observation 90901333002 that left two
+    events out of 62705 in the combined file sitting 0.66 s and 0.77 s past the end of a
+    GTI -- FPMB events recorded in the fraction of a second after FPMA's good time ended.
+    A combined file is meant to have a constant effective area, so those have to go.
+    """
+
+    def merge(self, tmp_path, monkeypatch, gti_operation="AND"):
+        from astropy.io import fits
+
+        stub = RealFileHeasoft()
+
+        def stub_merge_gtis(files_to_join, outfile_gti, gti_operation="OR"):
+            gtis = [read_gti(fits.open(name)) for name in files_to_join]
+            combined = (
+                intersect_intervals(*gtis)
+                if gti_operation == "AND"
+                else merge_intervals(np.concatenate(gtis))
+            )
+            fits.HDUList(
+                [
+                    fits.PrimaryHDU(),
+                    fits.BinTableHDU.from_columns(
+                        [
+                            fits.Column(name="START", format="D", array=combined[:, 0]),
+                            fits.Column(name="STOP", format="D", array=combined[:, 1]),
+                        ],
+                        name="GTI",
+                    ),
+                ]
+            ).writeto(outfile_gti, overwrite=True)
+
+        monkeypatch.setattr(nustar, "merge_gtis", stub_merge_gtis)
+        monkeypatch.setattr(heasoft, "hsp", stub, raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        # FPMB's good time runs one second longer, as it does in the real observation, and
+        # it has an event in that second.
+        fpma = write_event_file(
+            os.path.join(tmp_path, "nu123A_src1.evt"), [5.0, 15.0], [[0, 20]]
+        )
+        fpmb = write_event_file(
+            os.path.join(tmp_path, "nu123B_src1.evt"), [6.0, 16.0, 20.5], [[0, 21]]
+        )
+        outfile = os.path.join(tmp_path, "nu123_src1.evt")
+
+        nustar.merge_event_files.fn([fpma, fpmb], outfile, gti_operation=gti_operation)
+        return stub, outfile
+
+    def test_an_event_outside_the_intersection_is_dropped(self, tmp_path, monkeypatch):
+        from astropy.io import fits
+
+        _stub, outfile = self.merge(tmp_path, monkeypatch)
+
+        with fits.open(outfile) as hdul:
+            assert np.allclose(hdul["EVENTS"].data["TIME"], [5.0, 6.0, 15.0, 16.0])
+
+    def test_no_event_is_left_outside_the_combined_gti(self, tmp_path, monkeypatch):
+        from astropy.io import fits
+
+        _stub, outfile = self.merge(tmp_path, monkeypatch)
+
+        with fits.open(outfile) as hdul:
+            times = np.asarray(hdul["EVENTS"].data["TIME"], dtype=float)
+            assert mask_from_gti(times, read_gti(hdul)).all()
+
+    def test_the_intersection_itself_is_left_as_heasoft_wrote_it(
+        self, tmp_path, monkeypatch
+    ):
+        from astropy.io import fits
+
+        _stub, outfile = self.merge(tmp_path, monkeypatch)
+
+        with fits.open(outfile) as hdul:
+            assert np.allclose(read_gti(hdul), [[0, 20]])
+
+    def test_an_or_merge_is_not_filtered(self, tmp_path, monkeypatch):
+        """The union covers every input's good time, so there is nothing to drop.
+
+        Left out rather than made a no-op: the OR merge is also the one that runs on files
+        HEASOFT has only half-written in the other tests here, and it has never needed to
+        be reopened.
+        """
+        stub, _outfile = self.merge(tmp_path, monkeypatch, gti_operation="OR")
+
+        assert [name for name, _ in stub.calls] == ["ftmerge", "ftsort", "fappend"]
+
+    def test_the_merge_still_runs_every_heasoft_tool(self, tmp_path, monkeypatch):
+        stub, _outfile = self.merge(tmp_path, monkeypatch)
+
+        assert [name for name, _ in stub.calls] == ["ftmerge", "ftsort", "fappend"]

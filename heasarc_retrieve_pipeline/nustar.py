@@ -52,6 +52,7 @@ from .utils import (
     absolute_config,
     apply_gti,
     binned_lightcurve,
+    drop_events_outside_gti,
     get_logger,
     good_intervals,
     gti_to_array,
@@ -1004,6 +1005,21 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
             infile=f"{outfile_gti}[1]",
             outfile=outfile,
         )
+
+        if gti_operation == "AND":
+            # ftmerge concatenated the event tables of both modules under the intersection
+            # ftmgtime just wrote, and knows nothing about it. An event one module recorded
+            # a fraction of a second after the other's good time ended is still in there.
+            # See utils.drop_events_outside_gti for the measurement and the rationale.
+            from astropy.io import fits
+
+            with fits.open(outfile, mode="update") as hdul:
+                stats = drop_events_outside_gti(hdul)
+            dropped = stats["nevents_before"] - stats["nevents_after"]
+            logger.info(
+                f"Dropped {dropped} of {stats['nevents_before']} events from {outfile}, "
+                "recorded while only one module was observing"
+            )
     finally:
         if os.path.exists(outfile_gti):
             logger.info(f"Removing {outfile_gti}")

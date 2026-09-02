@@ -532,6 +532,18 @@ The combined A+B file roughly doubles the counting statistics, which is exactly 
 timing analysis wants. It is again unusable for spectroscopy: two telescopes with different
 responses are now in one event list, and no single ARF describes it.
 
+The intersection has to be applied to the *events* as well as to the GTI extension, and
+that is a separate step. ``ftmgtime`` computes the intersection correctly, but the
+``ftmerge`` on the line after it concatenates both event tables and knows nothing about it,
+so a module whose good time ran a fraction of a second longer than the other's contributes
+its events from that fraction of a second. Two such events out of 62 705 on observation
+90901333002. ``merge_event_files`` therefore reopens the output of an ``AND`` merge and
+drops the events its own GTI excludes, through ``utils.drop_events_outside_gti``. Without
+that the constant effective area the intersection exists to guarantee does not actually
+hold. The ``OR`` merge needs no such step: the union covers every input event already. See
+issue 53 in :ref:`known_issues`, which also records why the exposure keywords of a merged
+file are *not* corrected here and should not be trusted.
+
 Both merges replace whatever is already at their output path: ``merge_gtis`` and
 ``merge_event_files`` each delete their own output before they start. That is what makes the
 step re-runnable over a directory that still holds the previous run's products -- which is

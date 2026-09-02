@@ -18,6 +18,7 @@ __all__ = [
     "NoSourceInScienceData",
     "absolute_config",
     "apply_gti",
+    "drop_events_outside_gti",
     "binned_lightcurve",
     "check_name_length",
     "get_logger",
@@ -1180,6 +1181,55 @@ def apply_gti(hdul, gti):
         "livetime_before": livetime_before,
         "livetime_after": livetime_before * scale,
     }
+
+
+def drop_events_outside_gti(hdul):
+    """
+    Drop the events an open event file's *own* GTI excludes, leaving the header alone.
+
+    :func:`apply_gti` narrows a file to a *new* GTI and corrects the exposure keywords to
+    match. This is the smaller job: the GTI extension is already the one the file should
+    have, and only the event table disagrees with it.
+
+    That happens when HEASOFT builds a merged file in two steps. ``ftmgtime`` combines the
+    intervals -- with ``merge=AND`` when the inputs are the two NuSTAR focal-plane modules
+    observing at once, so that the result covers only the time both were live -- and then
+    ``ftmerge`` concatenates the event tables and knows nothing about that intersection.
+    An event recorded in FPMB's good time a fraction of a second after FPMA's stopped
+    survives into the combined file, outside the combined file's own GTI. Two such events
+    out of 62705 in observation 90901333002, 0.66 s and 0.77 s past the end of an interval.
+    Small, but a combined file is meant to have a constant effective area, and an event
+    from one module in a stretch the other did not see breaks exactly that.
+
+    The exposure keywords are deliberately *not* touched here, unlike in
+    :func:`apply_gti`. They are already wrong before this function is reached -- ``ftmerge``
+    copies ``ONTIME`` and ``LIVETIME`` from its first input rather than recomputing them,
+    so a merged file can claim an ``ONTIME`` of 56126 s over a GTI totalling 73655 s.
+    Rewriting one of the two keywords here and not the other would leave a file whose
+    live-time *fraction* is more wrong than it was before. See issue 53 in
+    ``docs/known_issues.rst``.
+
+    Parameters
+    ----------
+    hdul : astropy.io.fits.HDUList
+        Open event file. The event table is modified in place.
+
+    Returns
+    -------
+    dict
+        ``nevents_before`` and ``nevents_after``.
+    """
+    events_index = _extension_index(hdul, ("EVENTS",), 1)
+    events = hdul[events_index]
+
+    timezero = float(events.header.get("TIMEZERO", 0.0))
+    times = np.asarray(events.data["TIME"], dtype=float) + timezero
+    mask = mask_from_gti(times, read_gti(hdul))
+
+    nevents_before = times.size
+    events.data = events.data[mask]
+
+    return {"nevents_before": int(nevents_before), "nevents_after": int(mask.sum())}
 
 
 def update_time_bounds(hdul, gti):

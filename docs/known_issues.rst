@@ -1327,6 +1327,80 @@ real ``merge_event_files`` against a HEASOFT double whose ``ftmerge`` refuses an
 output the way the real one does.
 
 
+53. The combined FPMA+FPMB file kept events only one module saw -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Found while checking a claim that ought to have been harmless: that event files ordinarily
+contain a few events outside their good time intervals, because an event is recorded
+whether or not the interval it lands in was later declared good. That is true of some
+missions. It is not true of the NuSTAR files this pipeline is given. Counting events not
+covered by any interval of a file's own ``GTI`` extension, in the archive-delivered
+``event_cl`` products:
+
+============================  =========  ======  ========
+file                          events     GTIs    outside
+============================  =========  ======  ========
+``nu90901333002A01_cl.evt``      76 640    1212         0
+``nu90901333002A06_cl.evt``      24 233    1227         0
+``nu90901333002B01_cl.evt``      72 867    1212         0
+``nu30702012004A01_cl.evt``     168 814    1456         0
+``nu30702012004A06_cl.evt``     105 461    1458         0
+``nu80002092003A06_cl.evt``         691       1         0
+============================  =========  ======  ========
+
+Zero, in both science modes, across three observations. So a stray event in one of this
+pipeline's own products is this pipeline's doing. Walking the chain on 90901333002 shows
+exactly where they appear:
+
+==================================  =========  ======  ========
+stage                               events     GTIs    outside
+==================================  =========  ======  ========
+``nu...A01_cl_src1.evt``               24 446    1212  0
+``nu...A_src1.evt``   (FPMA merge)     32 269    1999  0
+``nu...A_src1_bary.evt``               32 269    1999  0
+``nu..._src1.evt``   (FPMA+FPMB)       62 705    1999  **2**
+``nu..._src1_bary.evt``                62 705    1999  **2**
+==================================  =========  ======  ========
+
+Not barycentring -- the count is unchanged across ``barycorr`` -- and not the GTI
+arithmetic either. ``ftmgtime merge=AND`` writes the correct intersection: FPMB's intervals
+contain FPMA's here (three of the 1999 stop up to 3 s later, 6 s more good time out of
+73 655 s), so the intersection is FPMA's GTI, which is exactly what the combined file
+carries. The defect is one step further on. ``merge_event_files`` then runs::
+
+    ftmerge infile=<FPMA file>,<FPMB file> outfile=<combined file> copyall=NO
+
+which concatenates both event tables and knows nothing about the intersection, and
+``fappend`` attaches the intersection afterwards. Both stray events are genuine FPMB
+events, inside FPMB's GTI and outside FPMA's, recorded 0.66 s and 0.77 s after an FPMA
+interval ended.
+
+Two events in 62 705 is not a large error, but the reason the A+B merge intersects rather
+than unions is that the combined file is meant to have a **constant effective area** -- see
+:ref:`technical_details`. An event from one module in a stretch of time the other did not
+see is precisely what that intersection exists to exclude, so keeping it defeats the
+purpose of the step.
+
+**Fixed** in ``merge_event_files``: after ``fappend``, an ``AND`` merge reopens its output
+and drops the events its own GTI excludes, through ``utils.drop_events_outside_gti``.
+Verified on the real 90901333002 product -- 62 705 events in, 62 703 out, GTI untouched,
+event table still sorted. The ``OR`` merge is deliberately left alone: it takes the union
+of its inputs' intervals, which covers every input event by construction, so there is
+nothing there to drop.
+
+**Not fixed, and worth knowing:** the exposure keywords of every merged file are wrong,
+before and after this change. ``ftmerge`` copies ``ONTIME``, ``LIVETIME`` and ``EXPOSURE``
+from its *first* input rather than recomputing them, so ``nu90901333002A_src1.evt`` claims
+``ONTIME = 56 126 s`` over a GTI totalling 73 655 s -- the mode-01 value, with the mode-06
+CHU subsets missing from it. ``drop_events_outside_gti`` deliberately leaves the header
+alone rather than correcting one keyword and not the others: ``ONTIME`` is by definition
+the GTI total and could be set here, but the correct ``LIVETIME`` for an ``OR`` merge is
+the sum over the disjoint inputs while for an ``AND`` merge across two modules there is no
+single defensible answer, and writing a right ``ONTIME`` next to a wrong ``LIVETIME`` would
+make the file's live-time *fraction* worse than it is now. Anything needing the exposure of
+a merged file should compute it from the GTI extension.
+
+
 Science caveats
 ---------------
 

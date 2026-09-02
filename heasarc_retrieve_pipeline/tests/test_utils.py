@@ -18,6 +18,7 @@ from heasarc_retrieve_pipeline import utils
 from heasarc_retrieve_pipeline.utils import (
     absolute_config,
     apply_gti,
+    drop_events_outside_gti,
     check_name_length,
     binned_lightcurve,
     good_intervals,
@@ -1178,3 +1179,71 @@ class TestUpdateTimeBounds:
         result = utils.update_time_bounds(hdul, [[20.0, 50.0]])
         stamp = Time(result["date_obs"], format="isot", scale="tt")
         assert utils.met_from_mjd(stamp.mjd, hdul) == pytest.approx(20.0, abs=1e-3)
+
+
+class TestDropEventsOutsideGti:
+    """Enforcing the invariant that a file's events lie inside its own GTI.
+
+    The case this comes from is the FPMA+FPMB merge. ``ftmgtime merge=AND`` writes the
+    correct intersection, but ``ftmerge`` concatenates both event tables underneath it, so
+    events recorded in the good time of one module and not the other survived. Two of them
+    on 90901333002, 0.66 s and 0.77 s past the end of an interval.
+    """
+
+    def test_events_outside_the_files_own_gti_are_dropped(self):
+        hdul = make_event_file(times=[5.0, 15.0, 25.0, 35.0], gti=[[10, 30]])
+        drop_events_outside_gti(hdul)
+
+        assert np.allclose(hdul["EVENTS"].data["TIME"], [15.0, 25.0])
+
+    def test_events_on_the_boundary_are_kept(self):
+        hdul = make_event_file(times=[10.0, 30.0], gti=[[10, 30]])
+        drop_events_outside_gti(hdul)
+
+        assert len(hdul["EVENTS"].data) == 2
+
+    def test_a_file_that_already_agrees_with_its_gti_is_left_alone(self):
+        hdul = make_event_file(times=[15.0, 25.0], gti=[[10, 30]])
+        stats = drop_events_outside_gti(hdul)
+
+        assert np.allclose(hdul["EVENTS"].data["TIME"], [15.0, 25.0])
+        assert stats["nevents_before"] == stats["nevents_after"] == 2
+
+    def test_the_gti_extension_is_not_touched(self):
+        hdul = make_event_file(times=[5.0, 15.0], gti=[[10, 20], [30, 40]])
+        drop_events_outside_gti(hdul)
+
+        assert np.allclose(hdul["GTI"].data["START"], [10, 30])
+        assert np.allclose(hdul["GTI"].data["STOP"], [20, 40])
+
+    def test_the_exposure_keywords_are_not_touched(self):
+        """Deliberate, and the reason is in the function's own documentation."""
+        hdul = make_event_file(
+            times=[5.0, 15.0], gti=[[10, 30]], ontime=999.0, livetime=888.0, exposure=777.0
+        )
+        drop_events_outside_gti(hdul)
+
+        assert hdul["EVENTS"].header["ONTIME"] == 999.0
+        assert hdul["EVENTS"].header["LIVETIME"] == 888.0
+        assert hdul["EVENTS"].header["EXPOSURE"] == 777.0
+
+    def test_times_are_compared_on_the_timezero_scale(self):
+        hdul = make_event_file(
+            times=[5.0, 15.0, 25.0, 35.0], gti=[[10, 30]], timezero=1000.0
+        )
+        drop_events_outside_gti(hdul)
+
+        assert np.allclose(hdul["EVENTS"].data["TIME"], [15.0, 25.0])
+
+    def test_it_reports_what_it_dropped(self):
+        hdul = make_event_file(times=[5.0, 15.0, 25.0, 35.0], gti=[[10, 30]])
+        stats = drop_events_outside_gti(hdul)
+
+        assert stats == {"nevents_before": 4, "nevents_after": 2}
+
+    def test_an_empty_gti_drops_everything(self):
+        hdul = make_event_file(times=[5.0, 15.0], gti=[[10, 30]])
+        hdul["GTI"].data = hdul["GTI"].data[:0]
+        drop_events_outside_gti(hdul)
+
+        assert len(hdul["EVENTS"].data) == 0
