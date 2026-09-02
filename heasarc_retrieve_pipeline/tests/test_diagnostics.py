@@ -361,3 +361,111 @@ class TestCanonicalMetadata:
             "cycle": 5,
             "prnb": 12,
         }
+
+
+class TestARerunKeepsWhatTheLastRunMeasured:
+    """
+    The dataset a figure is drawn from belongs to the observation, not to one run.
+
+    A step that skips because its output was already on disk did not measure anything.
+    It must not erase the measurement made by the run that produced that output --
+    which is what a rerun used to do, leaving the ``.npz`` orphaned on disk and the
+    figure missing from the page.
+    """
+
+    def measure(self, tmp_path, **arrays):
+        """A run that does the work."""
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.value(inputs=4)
+            rec.array(**(arrays or {"gti": np.array([[0.0, 10.0]])}))
+
+    def test_a_skipped_rerun_still_points_at_the_payload(self, tmp_path):
+        self.measure(tmp_path)
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        record = read_records(str(tmp_path))[0]
+        assert record["status"] == "skipped"
+        assert record["arrays"] == "join.npz"
+        np.testing.assert_array_equal(
+            read_arrays(str(tmp_path), record)["gti"], [[0.0, 10.0]]
+        )
+
+    def test_the_figure_can_tell_it_was_not_measured_now(self, tmp_path):
+        self.measure(tmp_path)
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        assert read_records(str(tmp_path))[0]["arrays_from_earlier_run"] is True
+
+    def test_a_run_that_measured_is_not_marked_as_earlier(self, tmp_path):
+        self.measure(tmp_path)
+
+        assert read_records(str(tmp_path))[0]["arrays_from_earlier_run"] is False
+
+    def test_a_rerun_that_measures_again_replaces_the_payload(self, tmp_path):
+        self.measure(tmp_path)
+
+        self.measure(tmp_path, gti=np.array([[5.0, 20.0]]))
+
+        record = read_records(str(tmp_path))[0]
+        assert record["arrays_from_earlier_run"] is False
+        np.testing.assert_array_equal(
+            read_arrays(str(tmp_path), record)["gti"], [[5.0, 20.0]]
+        )
+
+    def test_values_from_the_earlier_run_are_kept(self, tmp_path):
+        self.measure(tmp_path)
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        assert read_records(str(tmp_path))[0]["values"]["inputs"] == 4
+
+    def test_this_run_wins_where_both_recorded_the_same_value(self, tmp_path):
+        self.measure(tmp_path)
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.value(inputs=9)
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        assert read_records(str(tmp_path))[0]["values"]["inputs"] == 9
+
+    def test_a_payload_that_is_gone_is_not_promised(self, tmp_path):
+        self.measure(tmp_path)
+        os.unlink(tmp_path / "join.npz")
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        record = read_records(str(tmp_path))[0]
+        assert record["arrays"] is None
+        assert record["arrays_from_earlier_run"] is False
+
+    def test_a_rerun_killed_mid_step_does_not_lose_the_payload(self, tmp_path):
+        """The record written on entry is the one an interrupted run leaves behind."""
+        self.measure(tmp_path)
+
+        record_step(str(tmp_path), OBSID, "join").__enter__()
+
+        record = read_records(str(tmp_path))[0]
+        assert record["status"] == "running"
+        assert record["arrays"] == "join.npz"
+
+    def test_an_unreadable_earlier_record_does_not_stop_the_new_one(self, tmp_path):
+        (tmp_path / "join.json").write_text("{ this is not json")
+
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.value(inputs=1)
+
+        assert read_records(str(tmp_path))[0]["values"]["inputs"] == 1
+
+    def test_a_first_run_that_measures_nothing_has_no_payload(self, tmp_path):
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.skip("JOIN_DONE_SRC1.TXT already exists")
+
+        record = read_records(str(tmp_path))[0]
+        assert record["arrays"] is None
+        assert record["arrays_from_earlier_run"] is False
