@@ -42,6 +42,7 @@ docs = [
 hrp-split-obsid = "heasarc_retrieve_pipeline.segments:main"
 hrp-merge-obsids = "heasarc_retrieve_pipeline.combine:main"
 hrp-report = "heasarc_retrieve_pipeline.report:main"
+hrp-check-roundtrip = "heasarc_retrieve_pipeline.roundtrip:main"
 
 
 [project.urls]

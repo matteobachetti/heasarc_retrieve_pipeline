@@ -302,22 +302,31 @@ def _link(source, destination):
         shutil.copy(source, destination)
 
 
-def merge_spectra(obsids, config, name, mode01_only=False, rec=None):
+def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=None):
     """
     Co-add the observations' spectra with ``addspec``, one output per module.
 
     Parameters
     ----------
     obsids : list of str
-        Observations to merge.
+        Observations to merge. Used to find the inputs, unless ``spectra`` names them,
+        and to report how many observations a lone spectrum was found across.
     config : dict
         Must contain ``out_data_path``.
     name : str
         Name of the merged dataset.
     mode01_only : bool, optional
-        Leave the mode-06 CHU spectra out.
+        Leave the mode-06 CHU spectra out. Ignored when ``spectra`` is given.
     rec : StepRecord, optional
         Diagnostics record to write into.
+    spectra : list of tuple, optional
+        ``(fpm, path)`` pairs to co-add, in place of everything :func:`source_spectra`
+        would find in ``obsids``. The caller then owns the choice entirely, which is the
+        point: :data:`SPECTRUM_RE` refuses a ``_seg<N>`` spectrum on purpose, so that
+        merging observations cannot double-count one that was previously split, and that
+        guard has to stay. Naming the files instead is how the segment round trip -- split
+        an observation, co-add the pieces, compare with the parent -- is reached without
+        weakening it. See :mod:`heasarc_retrieve_pipeline.roundtrip`.
 
     Returns
     -------
@@ -329,9 +338,14 @@ def merge_spectra(obsids, config, name, mode01_only=False, rec=None):
     os.makedirs(outdir, exist_ok=True)
 
     by_module = {}
-    for obsid in obsids:
-        for fpm, path in source_spectra(obsid, config, mode01_only=mode01_only):
-            by_module.setdefault(fpm, []).append(path)
+    if spectra is None:
+        spectra = [
+            pair
+            for obsid in obsids
+            for pair in source_spectra(obsid, config, mode01_only=mode01_only)
+        ]
+    for fpm, path in spectra:
+        by_module.setdefault(fpm, []).append(path)
 
     written = {}
     inputs = {}

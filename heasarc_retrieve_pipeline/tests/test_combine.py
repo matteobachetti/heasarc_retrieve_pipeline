@@ -368,3 +368,74 @@ class TestCommandLine:
         status = combine.main([tree["out_data_path"]] + OBSIDS + ["--name", "vela"])
         assert status == 0
         assert "vela" in capsys.readouterr().out
+
+
+class TestMergingAnExplicitListOfSpectra:
+    """Co-adding files named by the caller rather than found by globbing.
+
+    ``source_spectra`` deliberately refuses anything with a ``_seg<N>`` tag, so that a merge
+    of observations cannot double-count one that was previously split -- see
+    :class:`TestSourceSpectra` above. That guard is what makes the segment round trip
+    unreachable through the ordinary entry point, and it is not going anywhere. This is the
+    way in for a caller that has worked out for itself which files belong together, and
+    ``roundtrip.py`` is the one that has.
+    """
+
+    def spectra_of(self, tree, obsid, fpm="A"):
+        products = os.path.join(tree["out_data_path"], obsid, "products")
+        return [(fpm, os.path.join(products, f"nu{obsid}{fpm}01_sr.pha"))]
+
+    def test_the_named_spectra_are_the_ones_co_added(self, tree, stub):
+        spectra = self.spectra_of(tree, OBSIDS[0]) + self.spectra_of(tree, OBSIDS[1])
+        combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
+
+        products = os.path.join(tree["out_data_path"], "explicit", "products")
+        lines = [
+            line.strip()
+            for line in open(os.path.join(products, "explicit_A_inputs.lis"))
+            if line.strip()
+        ]
+        assert lines == [os.path.basename(path) for _, path in spectra]
+
+    def test_the_glob_is_not_consulted_at_all(self, tree, stub, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise AssertionError("source_spectra must not be called")
+
+        monkeypatch.setattr(combine, "source_spectra", refuse)
+        spectra = self.spectra_of(tree, OBSIDS[0]) + self.spectra_of(tree, OBSIDS[1])
+        combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
+
+        assert [name for name, _ in stub.calls if name == "addspec"] == ["addspec"]
+
+    def test_a_segment_spectrum_can_be_named_even_though_it_is_never_found(
+        self, tree, stub
+    ):
+        """The round trip in one test: the two halves of a split, co-added by name."""
+        products = os.path.join(tree["out_data_path"], OBSIDS[0], "products")
+        stem = f"nu{OBSIDS[0]}A01"
+        segments = []
+        for number in (1, 2):
+            path = os.path.join(products, f"{stem}_sr_seg{number}.pha")
+            make_spectrum(path, stem)
+            segments.append(("A", path))
+
+        found = [os.path.basename(path) for _, path in combine.source_spectra(OBSIDS[0], tree)]
+        assert not [name for name in found if "_seg" in name]
+
+        combine.merge_spectra([OBSIDS[0]], tree, "trip", spectra=segments)
+
+        merged = os.path.join(tree["out_data_path"], "trip", "products")
+        lines = [
+            line.strip()
+            for line in open(os.path.join(merged, "trip_A_inputs.lis"))
+            if line.strip()
+        ]
+        assert lines == [f"{stem}_sr_seg1.pha", f"{stem}_sr_seg2.pha"]
+
+    def test_the_modules_are_still_kept_apart(self, tree, stub):
+        spectra = self.spectra_of(tree, OBSIDS[0], "A") + self.spectra_of(
+            tree, OBSIDS[1], "A"
+        ) + self.spectra_of(tree, OBSIDS[0], "B") + self.spectra_of(tree, OBSIDS[1], "B")
+        written = combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
+
+        assert sorted(written) == ["A", "B"]

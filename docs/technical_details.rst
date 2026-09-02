@@ -1023,16 +1023,18 @@ datasets and fit them jointly.
 Splitting and merging observations
 ----------------------------------
 
-Two post-processing tools work on a tree the pipeline has already finished. Neither
-re-runs ``nupipeline`` and neither regenerates the 68 MB responses, so neither costs
-anything like the 50 minutes a reduction does::
+Three post-processing tools work on a tree the pipeline has already finished. None of them
+re-runs ``nupipeline`` and none regenerates the 68 MB responses, so none costs anything
+like the 50 minutes a reduction does::
 
-    hrp-split-obsid  <out_data_path> <OBSID> <MJD> [<MJD> ...]
-    hrp-merge-obsids <out_data_path> <OBSID> <OBSID> [...] [--name NAME]
+    hrp-split-obsid     <out_data_path> <OBSID> <MJD> [<MJD> ...]
+    hrp-merge-obsids    <out_data_path> <OBSID> <OBSID> [...] [--name NAME]
+    hrp-check-roundtrip <out_data_path> <OBSID> <MJD> [<MJD> ...]
 
 The first cuts one observation into time segments -- for a source that changes state
 part-way through. The second co-adds several observations that are each too faint to fit
-on their own.
+on their own. The third checks the first two against each other, on a copy, and is
+described under `Checking the round trip: roundtrip.py`_.
 
 They are not equally quick, and it is worth knowing which is which before you start one.
 The merge is seconds: ``addspec`` and ``grppha`` do arithmetic on files that already
@@ -1247,6 +1249,59 @@ but only once the times are on a common inertial clock.
 Checked against HEASOFT on two copies of a real reduced observation: for both modules the
 merged ``COUNTS`` array equals the sum of the inputs channel for channel, and ``EXPOSURE``
 equals their sum.
+
+Checking the round trip: ``roundtrip.py``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The two tools above are supposed to undo each other. ``hrp-check-roundtrip`` asks whether
+they do, on a copy, without re-running a reduction::
+
+    hrp-check-roundtrip <out_data_path> <OBSID> <MJD> [<MJD> ...]
+
+It stages a copy of one observation's directory into a scratch tree, splits *that*, and
+compares the pieces with the parent they came from. Working on a copy is the point: a check
+that failed half way through would otherwise leave segment products scattered through a
+real reduction, and the whole appeal of the round trip is being able to run it repeatedly
+while changing the split.
+
+Three things keep it cheap enough to run repeatedly.
+
+**Mode 01 only, by default.** ``spectral_input_files`` takes normal science from
+``event_pipe/`` and the CHU-resolved spacecraft-science subsets from ``split/``. Leaving
+``split/`` out of the copy therefore cuts the work from eight ``nuproducts`` calls per
+segment to two -- and it does so without a flag or a branch anywhere in ``segments.py``,
+because there is simply nothing in ``split/`` to find. A mode-06 observation takes about
+16 minutes per cut and a mode-01-only copy of it about four. ``--with-mode06`` copies the
+directory when the CHU subsets are what is being checked.
+
+**The strong check needs no HEASOFT.** ``nuproducts`` extracted each segment over
+``intersect_intervals(parent GTI, segment bounds)``, so the segments partition the parent's
+good time -- every event in exactly one of them, nothing counted twice, nothing left over.
+``compare_spectra`` therefore asserts that the segment spectra sum to the parent's
+**channel for channel**, all 4096 of them, and that their exposures sum to the parent's.
+That is a stronger statement than "the totals agree": counts moved from one channel to
+another leave the total alone and are caught here. ``compare_events`` does the same for the
+event lists, where the split is pure astropy and the comparison can be exact -- the
+segments' event times, concatenated and sorted, must *be* the parent's.
+
+**The addspec half is the weaker check, and the one a user would reach for.**
+``addspec_roundtrip`` co-adds each family's segments back with the same ``addspec`` call
+``hrp-merge-obsids`` uses, and compares the result with the parent. One merge per family --
+per module, per mode -- rather than one for the whole observation: mode 01 and a mode-06 CHU
+subset of the same module are different pointings with different responses, and co-adding
+them would be answering a different question. ``--no-addspec`` leaves a check that is pure
+astropy and runs in seconds.
+
+The round trip deliberately does **not** go through ``hrp-merge-obsids``. ``SPECTRUM_RE``
+anchors on ``_sr.pha`` so that a ``_seg<N>`` spectrum is never swept into a merge of
+observations, and that guard is what stops a merge double-counting an observation that was
+previously split. Rather than weaken it, ``merge_spectra`` takes an optional ``spectra=``
+argument -- an explicit list of ``(fpm, path)`` pairs -- and the round trip names the
+segment files itself. The caller then owns the choice entirely, which is the right place
+for it: nothing can reach those files by accident.
+
+The exit status is 0 when every comparison held and 1 when any did not, so the check can be
+run from a script.
 
 Both tools and the file-name limit
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
