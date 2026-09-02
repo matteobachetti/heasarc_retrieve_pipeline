@@ -113,12 +113,14 @@ def encrypted_obsid_url(obsid: str):
     >>> encrypted_obsid_url("31101028002")
     'https://heasarc.gsfc.nasa.gov/FTP/nustar/data/encrypted/11/3/31101028002/'
     """
-    return f"https://heasarc.gsfc.nasa.gov/FTP/nustar/data/encrypted/{obsid[1:3]}/{obsid[0]}/{obsid}/"
+    return (
+        f"https://heasarc.gsfc.nasa.gov/FTP/nustar/data/encrypted/{obsid[1:3]}/{obsid[0]}/{obsid}/"
+    )
 
 
 def decrypt_obsid_directory(obsid_dir: str, passphrase: str):
     """
-    Decrypt all .gz files in an observation directory.
+    Decrypt all .gpg files in an observation directory.
 
     Uses gpg in batch mode with the given passphrase. Encrypted files are
     deleted after decryption.
@@ -138,17 +140,25 @@ def decrypt_obsid_directory(obsid_dir: str, passphrase: str):
     import subprocess
 
     logger = get_logger()
-    encrypted_files = glob.glob(os.path.join(obsid_dir, "**", "*.gz"), recursive=True)
+    encrypted_files = glob.glob(os.path.join(obsid_dir, "**", "*.gpg"), recursive=True)
 
     if not encrypted_files:
         raise RuntimeError(f"No encrypted files found in {obsid_dir}")
 
     for encrypted_file in encrypted_files:
-        decrypted_file = encrypted_file[:-3]  # Remove .gz extension
+        decrypted_file = encrypted_file[:-4]  # Remove .gpg extension
         logger.info(f"Decrypting {encrypted_file}")
         try:
             subprocess.run(
-                ["gpg", "--batch", "--passphrase", passphrase, "--output", decrypted_file, encrypted_file],
+                [
+                    "gpg",
+                    "--batch",
+                    "--passphrase",
+                    passphrase,
+                    "--output",
+                    decrypted_file,
+                    encrypted_file,
+                ],
                 check=True,
                 capture_output=True,
             )
@@ -835,7 +845,6 @@ def recursive_download(
     re_exclude: str = "",
     verify: bool = True,
 ):
-
     """
     Fetch an observation directory, choosing the transport from the URL scheme.
 
@@ -1141,7 +1150,6 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
 
 @task
 def get_source_position(source: str):
-
     """
     Resolve a source name to coordinates through SIMBAD/NED.
 
@@ -1247,8 +1255,7 @@ def locate_data(result_table, catalog_name):
     ]
     dl_result.add_column(newcol, name="sciserver", index=2)
     newcol = [
-        f"s3://{Heasarc.S3_BUCKET}/{row[5:]}" if row != "" else ""
-        for row in dl_result["sciserver"]
+        f"s3://{Heasarc.S3_BUCKET}/{row[5:]}" if row != "" else "" for row in dl_result["sciserver"]
     ]
     dl_result.add_column(newcol, name="aws", index=3)
 
@@ -1352,7 +1359,9 @@ def download_link_column(force_heasarc=False, force_s3=False, environ=None):
     return "aws"
 
 
-def observation_work_items(result_table, links, link_col_name, source_position=None, mission="nustar", pgp_keys_file=None):
+def observation_work_items(
+    result_table, links, link_col_name, source_position=None, mission="nustar", pgp_keys_file=None
+):
     """
     One unit of work per observation that actually has data to download.
 
@@ -1433,7 +1442,17 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
 
 @task(task_run_name="observation_{obsid}")
 def download_and_process_observation(
-    obsid, url, ra, dec, outdir, mission, pfiles_root, work_root, flags=None, test=False, pgp_passphrase=None
+    obsid,
+    url,
+    ra,
+    dec,
+    outdir,
+    mission,
+    pfiles_root,
+    work_root,
+    flags=None,
+    test=False,
+    pgp_passphrase=None,
 ):
     """
     Download one observation and reduce it, in this process alone.
@@ -1530,15 +1549,12 @@ def write_page(obsid, outdir):
         write_observation_page(obsid, outdir)
     except Exception as error:
         get_logger().warning(
-            f"Could not write the diagnostics page for {obsid}: "
-            f"{type(error).__name__}: {error}"
+            f"Could not write the diagnostics page for {obsid}: " f"{type(error).__name__}: {error}"
         )
 
 
 @flow(flow_run_name="process_{mission}_observations")
-def process_observations(
-    items, outdir, mission, pfiles_root, work_root, flags=None, test=False
-):
+def process_observations(items, outdir, mission, pfiles_root, work_root, flags=None, test=False):
     """
     Reduce every observation, one process each.
 
@@ -1693,8 +1709,7 @@ def write_shared_report_files(outdir, obsids=None):
         return write_index(outdir, obsids)
     except Exception as error:
         get_logger().warning(
-            f"Could not write the run report in {outdir}: "
-            f"{type(error).__name__}: {error}"
+            f"Could not write the run report in {outdir}: " f"{type(error).__name__}: {error}"
         )
         return None
 
@@ -1713,7 +1728,6 @@ def retrieve_and_process_data(
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
 ):
-
     """
     Download and reduce every observation in a catalogue table.
 
@@ -1801,7 +1815,14 @@ def retrieve_and_process_data(
             "The S3 mirror (the default, force_s3=True) serves parallel readers better."
         )
 
-    items = observation_work_items(result_table, links, link_col_name, source_position, mission=mission, pgp_keys_file=pgp_keys_file)
+    items = observation_work_items(
+        result_table,
+        links,
+        link_col_name,
+        source_position,
+        mission=mission,
+        pgp_keys_file=pgp_keys_file,
+    )
     if test:
         items = items[:1]
 
@@ -1816,9 +1837,7 @@ def retrieve_and_process_data(
         longest_name = MISSION_CONFIG[mission].get("longest_output_name")
         if longest_name is not None:
             for item in items:
-                check_name_length(
-                    longest_name(item["obsid"], dict(out_data_path=workspace.data))
-                )
+                check_name_length(longest_name(item["obsid"], dict(out_data_path=workspace.data)))
 
         runner = ProcessPoolTaskRunner(max_workers=n_workers)
         logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
@@ -1848,7 +1867,6 @@ def retrieve_heasarc_data_by_source_name(
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
 ):
-
     """
     Download and reduce every observation of a named source.
 
@@ -1925,7 +1943,6 @@ def retrieve_heasarc_data_by_obsid(
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
 ):
-
     """
     Download and reduce observations, by OBSID.
 
