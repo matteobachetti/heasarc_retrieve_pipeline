@@ -1388,11 +1388,33 @@ event table still sorted. The ``OR`` merge is deliberately left alone: it takes 
 of its inputs' intervals, which covers every input event by construction, so there is
 nothing there to drop.
 
+Confirmed independently on the M82 pair 30202022002 and 30202022004, reduced from the
+archive with the fix in place. Every combined file loses the handful of events only one
+module saw:
+
+====================================  ========  ========  ========  ==========  =======
+combined file                         FPMA      FPMB      A + B     combined    dropped
+====================================  ========  ========  ========  ==========  =======
+``nu30202022002_src1.evt``              26 567    25 763    52 330      52 327         3
+``nu30202022002_back.evt``              31 040    29 386    60 426      60 419         7
+``nu30202022004_src1.evt``              47 311    45 479    92 790      92 767        23
+``nu30202022004_back.evt``              34 563    31 837    66 400      66 364        36
+====================================  ========  ========  ========  ==========  =======
+
+Each of them then holds zero events outside its own GTI, and that GTI is bit-for-bit the
+intersection of the two modules' -- 1256 intervals totalling 58 185.749 s for 30202022002,
+669 totalling 59 483.949 s for 30202022004. As on 90901333002, FPMA's intervals lie inside
+FPMB's in both observations, so the intersection coincides with FPMA's GTI; the point of
+the table is that the *events* no longer do.
+
 **Not fixed, and worth knowing:** the exposure keywords of every merged file are wrong,
 before and after this change. ``ftmerge`` copies ``ONTIME``, ``LIVETIME`` and ``EXPOSURE``
 from its *first* input rather than recomputing them, so ``nu90901333002A_src1.evt`` claims
 ``ONTIME = 56 126 s`` over a GTI totalling 73 655 s -- the mode-01 value, with the mode-06
-CHU subsets missing from it. ``drop_events_outside_gti`` deliberately leaves the header
+CHU subsets missing from it. The M82 pair shows the same thing at 15% and 28%:
+``nu30202022004A_src1.evt`` claims 50 418.3 s over a 59 483.9 s GTI, and
+``nu30202022002A_src1.evt`` claims 41 633.8 s over a 58 185.7 s one, each the good time of
+the mode-01 ``_cl`` file it was built from. The A+B merge then inherits it. ``drop_events_outside_gti`` deliberately leaves the header
 alone rather than correcting one keyword and not the others: ``ONTIME`` is by definition
 the GTI total and could be set here, but the correct ``LIVETIME`` for an ``OR`` merge is
 the sum over the disjoint inputs while for an ``AND`` merge across two modules there is no

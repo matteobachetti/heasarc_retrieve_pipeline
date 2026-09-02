@@ -1248,7 +1248,13 @@ but only once the times are on a common inertial clock.
 
 Checked against HEASOFT on two copies of a real reduced observation: for both modules the
 merged ``COUNTS`` array equals the sum of the inputs channel for channel, and ``EXPOSURE``
-equals their sum.
+equals their sum. Repeated on two genuinely different observations of M82, 30202022002 and
+30202022004, whose spectra were co-added from nine input files per module -- mode 01 plus
+the CHU subsets of both: FPMA 80 541 counts over 109 964.700 s against 80 541 and
+109 964.684 s summed over the inputs, FPMB 78 006 over 109 735.200 s against 78 006 and
+109 735.159 s, with no channel disagreeing in either. The twelve merged event lists hold
+every input event -- 145 094 source and 126 783 background across both observations -- over
+a GTI equal to the union of the inputs', 117 666.074 s, with no event outside it.
 
 Checking the round trip: ``roundtrip.py``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1302,6 +1308,15 @@ for it: nothing can reach those files by accident.
 
 The exit status is 0 when every comparison held and 1 when any did not, so the check can be
 run from a script.
+
+Run on the M82 pair, cutting each observation once at the midpoint of its own span, every
+comparison held: for 30202022002 the two segments give back 21 657 and 20 625 counts for
+FPMA and FPMB with no channel wrong and exposures of 39 021.288 s and 38 918.412 s, and for
+30202022004 43 737 and 42 280 counts over 47 035.047 s and 46 963.388 s. The ``addspec``
+half returns the same counts and lands within 2 ms of the parent exposure -- ``addspec``
+sums the ``EXPOSURE`` keywords as written, and each has already been rounded into its own
+header. All 24 event lists per observation, ``_cl`` and joined and barycentred and
+flare-filtered alike, partition exactly.
 
 Both tools and the file-name limit
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
