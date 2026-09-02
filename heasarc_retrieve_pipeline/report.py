@@ -92,6 +92,7 @@ tr + tr td, tr + tr th { border-top: 1px solid #eee; }
 .status { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 0.6rem;
           color: #fff; font-size: 0.8rem; }
 .empty { color: #888; font-style: italic; }
+.earlier { color: #8a6d3b; font-size: 0.85rem; margin: 0.2rem 0 0 0; }
 .error { font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap;
          background: #fdf1ee; border-left: 3px solid #e76f51; padding: 0.5rem 0.8rem; }
 footer { margin-top: 3rem; color: #888; font-size: 0.8rem; }
@@ -775,6 +776,15 @@ def observation_body(summary, directory):
         parts.append(f"<h2>{heading}</h2>")
         for record, fig in drawn:
             parts.append(f"<h3>{html.escape(record.get('key') or _label(record))}</h3>")
+            if record.get("arrays_from_earlier_run"):
+                # The step did not run this time, and the timeline says so. Drawing what
+                # an earlier run measured is the useful thing to do -- the numbers still
+                # describe the files on disk -- but the page must not let the figure be
+                # read as this run's work.
+                parts.append(
+                    '<p class="earlier">Measured by an earlier run; this run skipped '
+                    "the step.</p>"
+                )
             parts.append("$FIGURE")
             figures.append(fig)
 

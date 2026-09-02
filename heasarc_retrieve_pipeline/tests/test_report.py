@@ -370,6 +370,74 @@ class TestWhatTheFiguresContain:
         assert fig.layout.template.layout.plot_bgcolor is None
 
 
+class TestAFigureFromAnEarlierRun:
+    """
+    A rerun that skips every step still draws them, from what the first run measured.
+
+    The timeline goes on saying ``skipped``, because the page must never claim work this
+    run did not do. The provenance is said next to the figure instead.
+    """
+
+    SKIPS = (
+        ("separate_sources", "nu123A01_cl", "SEPARATE_DONE.TXT already exists"),
+        ("join_source_data", "src1", "JOIN_DONE_SRC1.TXT already exists"),
+        ("flare_filtering", "nu_src1", "the flare-filtered file was already there"),
+    )
+
+    def rerun(self, tmp_path):
+        """Reduce once, then run again over a tree where everything is already done."""
+        a_full_observation(tmp_path)
+        for step, key, reason in self.SKIPS:
+            with record_step(observation(tmp_path), OBSID, step, key=key) as rec:
+                rec.skip(reason)
+        return report.write_observation_page(OBSID, str(tmp_path))
+
+    def test_every_figure_is_still_drawn(self, tmp_path):
+        """Five on a fresh reduction, and five after a rerun that did none of it."""
+        path = self.rerun(tmp_path)
+
+        divs = soup(path).find_all("div", class_="plotly-graph-div")
+        assert len(divs) == 5
+
+    def test_the_focal_plane_survives_the_skip(self, tmp_path):
+        """The separation is the one that used to disappear completely."""
+        self.rerun(tmp_path)
+        summary = report.observation_summary(OBSID, str(tmp_path))
+        (record,) = [r for r in summary["records"] if r["step"] == "separate_sources"]
+
+        fig = report.separation_figure(
+            record, read_arrays(observation(tmp_path), record)
+        )
+
+        assert fig is not None
+        assert fig.data[0].z.shape == (99, 99)
+
+    def test_the_page_says_the_numbers_are_not_from_this_run(self, tmp_path):
+        path = self.rerun(tmp_path)
+
+        notes = soup(path).find_all("p", class_="earlier")
+
+        assert len(notes) == len(self.SKIPS)
+        assert "earlier run" in notes[0].get_text()
+
+    def test_the_timeline_still_says_the_step_was_skipped(self, tmp_path):
+        """The page must not claim work that this run did not do."""
+        path = self.rerun(tmp_path)
+        summary = report.observation_summary(OBSID, str(tmp_path))
+
+        assert {r["status"] for r in summary["records"] if r["step"] == "join_source_data"} == {
+            "skipped"
+        }
+        assert "JOIN_DONE_SRC1.TXT already exists" in soup(path).get_text()
+
+    def test_a_reduction_that_ran_carries_no_note(self, tmp_path):
+        a_full_observation(tmp_path)
+
+        path = report.write_observation_page(OBSID, str(tmp_path))
+
+        assert soup(path).find_all("p", class_="earlier") == []
+
+
 class TestPagesThatCouldGoWrong:
     """Every one of these has happened, or will. None of them may raise."""
 
