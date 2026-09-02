@@ -56,6 +56,56 @@ def a_reduction_nobody_recorded(tmp_path, obsid=OBSID, modules=("A", "B")):
     return pipedir
 
 
+def flare_pair(tmp_path, obsid=OBSID, root="_src1", removed=(400.0, 600.0)):
+    """The two files the flare filtering leaves: the input, and its filtered copy.
+
+    The filtered one is the input with an interval cut out of its GTI, which is what
+    ``apply_gti`` produces and what recovery has to read back.
+    """
+    base = os.path.join(str(tmp_path), obsid)
+    os.makedirs(base, exist_ok=True)
+    event_file = os.path.join(base, f"nu{obsid}{root}.evt")
+    make_event_file_with_gti(event_file, gti=[(0.0, 1000.0)])
+    filtered = event_file.replace(".evt", "_noflares.evt")
+    make_event_file_with_gti(
+        filtered, gti=[(0.0, removed[0]), (removed[1], 1000.0)]
+    )
+    return event_file, filtered
+
+
+def make_event_file_with_gti(path, gti, tstart=0.0, tstop=1000.0, nevents=800, seed=42):
+    """A NuSTAR-shaped event file with the given good time intervals."""
+    rng = np.random.default_rng(seed)
+    times = np.sort(rng.uniform(tstart, tstop, nevents))
+    events = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="TIME", format="D", array=times),
+            # PI 35 is 3 keV and PI 1935 is 79 keV, via E = 0.04 * PI + 1.6, so this
+            # spans both of the bands the diagnostic compares.
+            fits.Column(name="PI", format="J", array=rng.integers(35, 1935, nevents)),
+        ],
+        name="EVENTS",
+    )
+    events.header["TIMEZERO"] = 0.0
+    events.header["TSTART"] = tstart
+    events.header["TSTOP"] = tstop
+    events.header["MJDREFI"] = 55197
+    events.header["MJDREFF"] = 0.00076601852
+    events.header["ONTIME"] = sum(stop - start for start, stop in gti)
+    events.header["LIVETIME"] = 0.9 * events.header["ONTIME"]
+    events.header["EXPOSURE"] = events.header["LIVETIME"]
+
+    gti_hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="START", format="D", array=np.array([g[0] for g in gti])),
+            fits.Column(name="STOP", format="D", array=np.array([g[1] for g in gti])),
+        ],
+        name="GTI",
+    )
+    fits.HDUList([fits.PrimaryHDU(), events, gti_hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
 class TestRecoveringTheSeparation:
     """The focal plane of a reduction that finished before anything recorded it."""
 
@@ -202,3 +252,99 @@ class TestThePageOfAnUnrecordedReduction:
         report.write_observation_page(OBSID, str(tmp_path), recover=False)
 
         assert read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))) == []
+
+
+class TestRecoveringTheFlareFiltering:
+    """
+    The light curve of the solar-flare cut, from a reduction that recorded nothing.
+
+    Both halves of the comparison are on disk -- the filtering writes a copy and never
+    touches its input -- so this one is exact rather than approximate.
+    """
+
+    def test_the_diagnostic_is_recovered_from_the_pair(self, tmp_path):
+        flare_pair(tmp_path)
+
+        recovered = recover.recover_observation(OBSID, str(tmp_path))
+
+        assert len(recovered) == 1
+        (record,) = [
+            r
+            for r in read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))))
+            if r["step"] == "flare_filtering"
+        ]
+        assert record["arrays"]
+        assert record["arrays_from_earlier_run"] is True
+
+    def test_both_bands_are_there_before_and_after(self, tmp_path):
+        flare_pair(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_observation(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        arrays = read_arrays(directory, record)
+        for band in ("3_10", "10_79"):
+            for when in ("before", "after"):
+                assert f"lc_{band}_{when}_time" in arrays
+                assert f"lc_{band}_{when}_rate" in arrays
+
+    def test_the_removed_interval_is_the_one_the_cut_took_out(self, tmp_path):
+        flare_pair(tmp_path, removed=(400.0, 600.0))
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_observation(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        removed = read_arrays(directory, record)["removed"]
+        np.testing.assert_allclose(removed, [[400.0, 600.0]])
+
+    def test_the_figure_can_be_drawn_from_it(self, tmp_path):
+        flare_pair(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_observation(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert report.flare_figure(record, read_arrays(directory, record)) is not None
+
+    def test_the_live_time_lost_is_recorded(self, tmp_path):
+        flare_pair(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+
+        recover.recover_observation(OBSID, str(tmp_path))
+
+        (record,) = [r for r in read_records(directory) if r["step"] == "flare_filtering"]
+        assert record["values"]["nevents_after"] < record["values"]["nevents_before"]
+
+    def test_nothing_is_written_next_to_the_products(self, tmp_path):
+        flare_pair(tmp_path)
+        base = os.path.join(str(tmp_path), OBSID)
+        before = sorted(os.listdir(base))
+
+        recover.recover_observation(OBSID, str(tmp_path))
+
+        assert sorted(os.listdir(base)) == sorted(before + ["diagnostics"])
+
+    def test_a_filtered_file_whose_input_is_gone_is_passed_over(self, tmp_path):
+        event_file, _ = flare_pair(tmp_path)
+        os.unlink(event_file)
+
+        assert recover.recover_observation(OBSID, str(tmp_path)) == []
+
+    def test_an_observation_that_was_never_filtered_recovers_nothing(self, tmp_path):
+        base = os.path.join(str(tmp_path), OBSID)
+        os.makedirs(base, exist_ok=True)
+        make_event_file_with_gti(
+            os.path.join(base, f"nu{OBSID}_src1.evt"), gti=[(0.0, 1000.0)]
+        )
+
+        assert recover.recover_observation(OBSID, str(tmp_path)) == []
+
+    def test_a_step_that_already_has_a_dataset_is_left_alone(self, tmp_path):
+        flare_pair(tmp_path)
+        directory = diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
+        with record_step(directory, OBSID, "flare_filtering", key=f"nu{OBSID}_src1") as rec:
+            rec.array(removed=np.array([[1.0, 2.0]]))
+
+        assert recover.recover_observation(OBSID, str(tmp_path)) == []

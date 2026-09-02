@@ -43,14 +43,29 @@ Examples
 []
 """
 
+import glob
 import os
+
+from astropy.io import fits
 
 from .diagnostics import diagnostics_path, read_records, record_step
 from .image_utils import measure_sources_in_file
-from .nustar import nu_pipeline_output_path, separation_candidates, split_path
-from .utils import get_logger, rootname
+from .nustar import (
+    nu_base_output_path,
+    nu_goes_lc_file,
+    nu_pipeline_output_path,
+    record_flare_filtering,
+    separation_candidates,
+    split_path,
+)
+from .utils import apply_gti, get_logger, read_gti, rootname
 
-__all__ = ["measured_steps", "recover_observation", "recover_separations"]
+__all__ = [
+    "measured_steps",
+    "recover_flare_filtering",
+    "recover_observation",
+    "recover_separations",
+]
 
 #: The extraction radii :func:`~heasarc_retrieve_pipeline.nustar.separate_sources` uses
 #: unless a caller says otherwise. A recovered measurement has no way of knowing what the
@@ -130,6 +145,77 @@ def recover_separations(obsid, outdir, measured=None):
     return recovered
 
 
+def recover_flare_filtering(obsid, outdir, measured=None):
+    """
+    Measure what the solar-flare cut removed, from the pair of files it left.
+
+    The filtering writes ``<root>_noflares.evt`` and never touches ``<root>.evt``, so
+    both halves of the comparison survive: the intervals before the cut are the
+    unfiltered file's, the intervals after are the filtered file's, and the light curves
+    are binned from the unfiltered events. That is the whole of what the diagnostic
+    needs, which is why this one recovers exactly rather than approximately.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    outdir : str
+        The run's output root.
+    measured : set, optional
+        From :func:`measured_steps`. Computed if not given.
+
+    Returns
+    -------
+    list of str
+        The unfiltered event files that were measured.
+    """
+    config = dict(out_data_path=outdir)
+    directory = diagnostics_path(obsid, config)
+    if measured is None:
+        measured = measured_steps(directory)
+    logger = get_logger()
+
+    goes_lc_file = nu_goes_lc_file(obsid, config)
+    if not os.path.exists(goes_lc_file):
+        # A rerun skips the download, so an absent light curve is normal. The event
+        # light curves are the useful half of the figure and do not depend on it.
+        goes_lc_file = None
+
+    recovered = []
+    base = nu_base_output_path(obsid, config)
+    for filtered in sorted(glob.glob(os.path.join(base, "*_noflares.evt"))):
+        # Found by looking for the output rather than by guessing which files were
+        # filtered: the reduction filters whatever the joining returned, and that
+        # decision is not recoverable from the directory.
+        event_file = filtered.replace("_noflares.evt", ".evt")
+        if not os.path.exists(event_file):
+            logger.info(f"{filtered} has no unfiltered counterpart; nothing to compare")
+            continue
+        key = rootname(os.path.basename(event_file))
+        if ("flare_filtering", key) in measured:
+            continue
+
+        logger.info(f"Recovering the solar-flare filtering of {event_file}")
+        with record_step(directory, obsid, "flare_filtering", key=key) as rec:
+            rec.from_earlier_outputs()
+            rec.skip("measured from the files an earlier run left")
+            with fits.open(event_file) as hdul, fits.open(filtered) as filtered_hdul:
+                gti_before = read_gti(hdul)
+                gti_after = read_gti(filtered_hdul)
+                # apply_gti works on the open file in memory and is never written back,
+                # so this is the filtering's own arithmetic without the filtering.
+                rec.value(**apply_gti(hdul, gti_after))
+            record_flare_filtering.fn(
+                event_file,
+                gti_before,
+                gti_after,
+                goes_lc_file=goes_lc_file,
+                rec=rec,
+            )
+        recovered.append(event_file)
+    return recovered
+
+
 def recover_observation(obsid, outdir):
     """
     Fill in every dataset an observation is missing.
@@ -161,7 +247,7 @@ def recover_observation(obsid, outdir):
     logger = get_logger()
 
     recovered = []
-    for recovery in (recover_separations,):
+    for recovery in (recover_separations, recover_flare_filtering):
         try:
             recovered.extend(recovery(obsid, outdir, measured=measured))
         except Exception as error:
