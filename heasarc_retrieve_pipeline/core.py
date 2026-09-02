@@ -60,6 +60,105 @@ from .utils import (
 )
 
 
+def read_pgp_keys_file(pgp_keys_file):
+    """
+    Read PGP keys file mapping mission/obsid to passphrases.
+
+    Parameters
+    ----------
+    pgp_keys_file : str or None
+        Path to keys file, or None to use ~/.heasarc_retrieve_pgp_keys.
+
+    Returns
+    -------
+    dict
+        Mapping (mission, obsid) -> passphrase, or empty dict if file not found.
+    """
+    if pgp_keys_file is None:
+        pgp_keys_file = os.path.expanduser("~/.heasarc_retrieve_pgp_keys")
+
+    keys = {}
+    if not os.path.exists(pgp_keys_file):
+        return keys
+
+    with open(pgp_keys_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                mission, obsid, passphrase = parts[0], parts[1], parts[2]
+                keys[(mission, obsid)] = passphrase
+
+    return keys
+
+
+def encrypted_obsid_url(obsid: str):
+    """
+    Build the encrypted data URL for an OBSID.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    str
+        HTTPS URL to the encrypted data directory.
+
+    Examples
+    --------
+    >>> encrypted_obsid_url("31101028002")
+    'https://heasarc.gsfc.nasa.gov/FTP/nustar/data/encrypted/11/3/31101028002/'
+    """
+    return f"https://heasarc.gsfc.nasa.gov/FTP/nustar/data/encrypted/{obsid[1:3]}/{obsid[0]}/{obsid}/"
+
+
+def decrypt_obsid_directory(obsid_dir: str, passphrase: str):
+    """
+    Decrypt all .gz files in an observation directory.
+
+    Uses gpg in batch mode with the given passphrase. Encrypted files are
+    deleted after decryption.
+
+    Parameters
+    ----------
+    obsid_dir : str
+        Path to the observation directory.
+    passphrase : str
+        PGP passphrase for decryption.
+
+    Raises
+    ------
+    RuntimeError
+        If decryption fails or no encrypted files are found.
+    """
+    import subprocess
+
+    logger = get_logger()
+    encrypted_files = glob.glob(os.path.join(obsid_dir, "**", "*.gz"), recursive=True)
+
+    if not encrypted_files:
+        raise RuntimeError(f"No encrypted files found in {obsid_dir}")
+
+    for encrypted_file in encrypted_files:
+        decrypted_file = encrypted_file[:-3]  # Remove .gz extension
+        logger.info(f"Decrypting {encrypted_file}")
+        try:
+            subprocess.run(
+                ["gpg", "--batch", "--passphrase", passphrase, "--output", decrypted_file, encrypted_file],
+                check=True,
+                capture_output=True,
+            )
+            os.remove(encrypted_file)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Failed to decrypt {encrypted_file}: {e.stderr.decode() if e.stderr else str(e)}"
+            )
+
+
 def _download_pysmartdl(url: str, dest: str):
     """
     Download a single URL with pySmartDL.
@@ -1253,7 +1352,7 @@ def download_link_column(force_heasarc=False, force_s3=False, environ=None):
     return "aws"
 
 
-def observation_work_items(result_table, links, link_col_name, source_position=None):
+def observation_work_items(result_table, links, link_col_name, source_position=None, mission="nustar", pgp_keys_file=None):
     """
     One unit of work per observation that actually has data to download.
 
@@ -1267,28 +1366,45 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
         Which mirror column to take the URL from.
     source_position : astropy.coordinates.SkyCoord or None, optional
         Position to barycentre at. ``None`` means each observation's own pointing.
+    mission : str, optional
+        Mission name for encrypted data lookup.
+    pgp_keys_file : str or None, optional
+        Path to PGP keys file, or None to use ~/.heasarc_retrieve_pgp_keys.
 
     Returns
     -------
     list of dict
         ``obsid``, ``url``, ``ra``, ``dec`` and ``catalogue`` for each observation with
         public products. ``catalogue`` is every column the query returned, kept for the
-        report; nothing in the reduction reads it.
+        report; nothing in the reduction reads it. If encrypted, ``pgp_passphrase`` is
+        included.
 
     Notes
     -----
     Links are matched to catalogue rows through the datalink ``ID``, not by position: the
     service does not return one usable row per input row. Observations with no public data
-    products -- typically ones still in their proprietary period -- are logged and skipped.
+    products are checked against the PGP keys file. If found, the encrypted URL is used.
+    If not found, the observation is logged and skipped.
     """
     logger = get_logger()
     link_by_row = {str(i).split("?")[-1]: row for i, row in zip(links["ID"], links)}
+    pgp_keys = read_pgp_keys_file(pgp_keys_file)
 
     items = []
     for row in result_table:
         obsid = row["obsid"]
         link = link_by_row.get(row["__row"])
-        if link is None or not link[link_col_name]:
+
+        url = None
+        pgp_passphrase = None
+
+        if link is not None and link[link_col_name]:
+            url = link[link_col_name]
+        elif (mission, obsid) in pgp_keys:
+            url = encrypted_obsid_url(obsid)
+            pgp_passphrase = pgp_keys[(mission, obsid)]
+            logger.info(f"Using encrypted URL for OBSID {obsid}")
+        else:
             logger.info(
                 f"No public data products for OBSID {obsid} "
                 "(still in its proprietary period?), skipping"
@@ -1300,25 +1416,24 @@ def observation_work_items(result_table, links, link_col_name, source_position=N
         else:
             ra, dec = row["ra"], row["dec"]
 
-        # The reduction needs only the position, but the report needs the target's
-        # name, its exposure and when it was taken -- all of which the query already
-        # fetched and this function used to throw away.
-        items.append(
-            dict(
-                obsid=obsid,
-                url=link[link_col_name],
-                ra=ra,
-                dec=dec,
-                catalogue=catalogue_row(row),
-            )
+        item = dict(
+            obsid=obsid,
+            url=url,
+            ra=ra,
+            dec=dec,
+            catalogue=catalogue_row(row),
         )
+        if pgp_passphrase is not None:
+            item["pgp_passphrase"] = pgp_passphrase
+
+        items.append(item)
 
     return items
 
 
 @task(task_run_name="observation_{obsid}")
 def download_and_process_observation(
-    obsid, url, ra, dec, outdir, mission, pfiles_root, work_root, flags=None, test=False
+    obsid, url, ra, dec, outdir, mission, pfiles_root, work_root, flags=None, test=False, pgp_passphrase=None
 ):
     """
     Download one observation and reduce it, in this process alone.
@@ -1349,6 +1464,8 @@ def download_and_process_observation(
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
         If True, fake the download and do not process.
+    pgp_passphrase : str, optional
+        PGP passphrase for decryption, if this is encrypted data.
     """
     prepare_worker(pfiles_root, work_root)
 
@@ -1370,6 +1487,10 @@ def download_and_process_observation(
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None
+
+            if pgp_passphrase is not None:
+                obsid_dir = os.path.join(outdir, obsid)
+                decrypt_obsid_directory(obsid_dir, pgp_passphrase)
 
             # recursive_download is a flow, and a subflow call is synchronous and raises,
             # so the ordering is already guaranteed by the line above. Prefect 3 has no
@@ -1473,12 +1594,9 @@ def process_observations(
         except OSError as error:
             logger.warning(f"Could not record the manifest for {item['obsid']}: {error}")
 
-    futures = [
-        download_and_process_observation.submit(
-            item["obsid"],
-            item["url"],
-            item["ra"],
-            item["dec"],
+    futures = []
+    for item in items:
+        kwargs = dict(
             outdir=outdir,
             mission=mission,
             pfiles_root=pfiles_root,
@@ -1486,8 +1604,18 @@ def process_observations(
             flags=flags,
             test=test,
         )
-        for item in items
-    ]
+        if "pgp_passphrase" in item:
+            kwargs["pgp_passphrase"] = item["pgp_passphrase"]
+
+        futures.append(
+            download_and_process_observation.submit(
+                item["obsid"],
+                item["url"],
+                item["ra"],
+                item["dec"],
+                **kwargs,
+            )
+        )
 
     failed = []
     no_science = []
@@ -1583,6 +1711,7 @@ def retrieve_and_process_data(
     force_s3: bool = False,
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
+    pgp_keys_file: typing.Union[str, None] = None,
 ):
 
     """
@@ -1633,6 +1762,9 @@ def retrieve_and_process_data(
         observation, about 90% of its raw data size, so ``n_workers`` of them want
         gigabytes and a small shared ``/tmp`` is the wrong place for that. Point this at a
         local disk with room and the reduction gets faster.
+    pgp_keys_file : str or None, optional
+        Path to PGP keys file for encrypted data. If ``None``, defaults to
+        ``~/.heasarc_retrieve_pgp_keys``. File format: ``mission obsid passphrase``.
 
     Returns
     -------
@@ -1669,7 +1801,7 @@ def retrieve_and_process_data(
             "The S3 mirror (the default, force_s3=True) serves parallel readers better."
         )
 
-    items = observation_work_items(result_table, links, link_col_name, source_position)
+    items = observation_work_items(result_table, links, link_col_name, source_position, mission=mission, pgp_keys_file=pgp_keys_file)
     if test:
         items = items[:1]
 
@@ -1714,6 +1846,7 @@ def retrieve_heasarc_data_by_source_name(
     force_s3: bool = False,
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
+    pgp_keys_file: typing.Union[str, None] = None,
 ):
 
     """
@@ -1744,6 +1877,8 @@ def retrieve_heasarc_data_by_source_name(
     scratch_dir : str, optional
         Where the workers' working directories go; see
         :func:`retrieve_and_process_data`.
+    pgp_keys_file : str or None, optional
+        Path to PGP keys file for encrypted data; see :func:`retrieve_and_process_data`.
 
     Returns
     -------
@@ -1771,6 +1906,7 @@ def retrieve_heasarc_data_by_source_name(
         force_s3=force_s3,
         n_workers=n_workers,
         scratch_dir=scratch_dir,
+        pgp_keys_file=pgp_keys_file,
     )
 
     return results
@@ -1787,6 +1923,7 @@ def retrieve_heasarc_data_by_obsid(
     force_s3: bool = False,
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
+    pgp_keys_file: typing.Union[str, None] = None,
 ):
 
     """
@@ -1819,6 +1956,8 @@ def retrieve_heasarc_data_by_obsid(
     scratch_dir : str, optional
         Where the workers' working directories go; see
         :func:`retrieve_and_process_data`.
+    pgp_keys_file : str or None, optional
+        Path to PGP keys file for encrypted data; see :func:`retrieve_and_process_data`.
 
     Returns
     -------
@@ -1849,5 +1988,6 @@ def retrieve_heasarc_data_by_obsid(
         force_s3=force_s3,
         n_workers=n_workers,
         scratch_dir=scratch_dir,
+        pgp_keys_file=pgp_keys_file,
     )
     return results
