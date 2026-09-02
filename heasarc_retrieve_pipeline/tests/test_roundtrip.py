@@ -412,14 +412,16 @@ class TestPairingSegmentEventFilesWithTheirParents:
 
         assert result["events"] == {}
 
-    def test_segments_of_segments_are_not_invented(self, tmp_path, monkeypatch):
-        """A rerun's ``_seg1_seg1`` would otherwise be paired with ``_seg1``."""
+    def test_both_segments_land_under_the_one_parent(self, tmp_path, monkeypatch):
+        """Not one family per segment: the comparison is of the whole set against one file."""
         config = self.tree(tmp_path, monkeypatch, f"nu{OBSID}A_src1_bary")
         result = roundtrip.check_roundtrip(
             OBSID, config, [56000.0], str(tmp_path / "work"), addspec=False
         )
+        comparison = result["events"][f"nu{OBSID}A_src1_bary.evt"]
 
-        assert list(result["events"]) == [f"nu{OBSID}A_src1_bary.evt"]
+        assert len(result["events"]) == 1
+        assert comparison["segment_events"] == comparison["parent_events"] == 3
 
 
 class TestASpectrumGivenAsARate:
