@@ -104,10 +104,10 @@ class TestOneToolAtATime:
 
 
 class TestFailuresAreNoticed:
-    """``heasoftpy`` defaults to ``allow_failure=True``: a tool that exits non-zero comes
-    back as an ordinary result, and the caller carries on with a file that was never
-    written. Measured on a real run: ``fappend`` returned quietly, and the merged event
-    file went downstream with no GTI extension until something much later tripped over it.
+    """``heasoft`` pins ``allow_failure=True``: a tool that exits non-zero comes back as
+    an ordinary result, and the caller carries on with a file that was never written.
+    Measured on a real run: ``fappend`` returned quietly, and the merged event file went
+    downstream with no GTI extension until something much later tripped over it.
     """
 
     def result(self, returncode, stdout="", stderr=""):
@@ -157,6 +157,83 @@ class TestFailuresAreNoticed:
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         assert heasoft.run("ftlist", produces=[], infile="a") is None
+
+
+class TestAHeasoftpyThatRaisesInstead:
+    """The other half of ``allow_failure``, and the reason it is pinned.
+
+    ``heasoftpy`` 1.5 warns that the default is becoming ``False``; on the HEASARC conda
+    channel it already has, and there a failed tool raises ``HSPTaskException`` -- which is
+    an ``Exception``, not a ``RuntimeError``, and never names the tool. That broke a CI job
+    on the very case these tests exist for. Pinning fixes it, but the pin is somebody
+    else's implementation detail, so the translation below is what actually holds the
+    contract.
+    """
+
+    class FakeHSPTaskException(Exception):
+        """Stands in for ``heasoftpy.HSPTaskException``, which has no HEASOFT to need."""
+
+    def raising(self, message):
+        def tool(**kwargs):
+            raise self.FakeHSPTaskException(message)
+
+        return tool
+
+    def test_run_reports_it_as_a_runtime_error_naming_the_tool(self, monkeypatch):
+        monkeypatch.setattr(heasoft, "HSP_FAILURE", self.FakeHSPTaskException)
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(ftmerge=self.raising("Return Code: 105\nalready exists")),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            heasoft.run("ftmerge", produces=[], infile="a,b", outfile="m")
+
+        assert "ftmerge" in str(excinfo.value)
+        assert "105" in str(excinfo.value)
+        assert "already exists" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, self.FakeHSPTaskException)
+
+    def test_the_task_interface_is_translated_too(self, monkeypatch):
+        monkeypatch.setattr(heasoft, "HSP_FAILURE", self.FakeHSPTaskException)
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(HSPTask=lambda name: self.raising("boom")),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        with pytest.raises(RuntimeError, match="nupipeline"):
+            heasoft.run_task("nupipeline", produces=[], indir="x")
+
+    def test_an_unrelated_exception_is_not_dressed_up_as_a_tool_failure(self, monkeypatch):
+        """Only ``heasoftpy``'s own failure gets translated; a bug stays a bug."""
+        monkeypatch.setattr(heasoft, "HSP_FAILURE", self.FakeHSPTaskException)
+
+        def broken(**kwargs):
+            raise KeyError("PFILES")
+
+        monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(ftlist=broken), raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        with pytest.raises(KeyError):
+            heasoft.run("ftlist", produces=[], infile="a")
+
+    def test_pinning_is_skipped_when_heasoftpy_has_no_Config(self, monkeypatch):
+        """An older ``heasoftpy`` without ``Config`` is not a reason to fail to import."""
+        monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(), raising=False)
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        assert heasoft._pin_allow_failure() is False
+
+    def test_pinning_does_nothing_without_heasoftpy(self, monkeypatch):
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", False)
+
+        assert heasoft._pin_allow_failure() is False
 
 
 class TestAToolMustProduceWhatItPromised:

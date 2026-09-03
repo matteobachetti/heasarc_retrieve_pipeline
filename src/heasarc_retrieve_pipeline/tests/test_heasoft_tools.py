@@ -177,6 +177,30 @@ class TestFtmerge:
         assert "105" in str(excinfo.value)
         assert "already exists" in str(excinfo.value)
 
+    def test_it_still_refuses_when_heasoftpy_raises_instead_of_returning(
+        self, tmp_path, two_event_files, monkeypatch
+    ):
+        """The same refusal, with ``heasoftpy`` configured the way CI has it.
+
+        ``allow_failure`` decides whether a non-zero exit is returned or raised, and the
+        two ``heasoftpy`` builds in use disagree about the default. This sets it the way
+        the HEASARC conda channel's build does -- which is what made the test above fail
+        there -- and asks for the same ``RuntimeError`` anyway.
+        """
+        monkeypatch.setattr(heasoft.hsp.Config, "allow_failure", False)
+
+        first, second = two_event_files
+        out = str(tmp_path / "m.evt")
+        heasoft.run("ftmerge", produces=out, infile=f"{first},{second}", outfile=out, copyall="NO")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            heasoft.run(
+                "ftmerge", produces=out, infile=f"{first},{second}", outfile=out, copyall="NO"
+            )
+
+        assert "ftmerge" in str(excinfo.value)
+        assert "105" in str(excinfo.value)
+
     def test_a_leading_bang_overwrites(self, tmp_path, two_event_files):
         first, second = two_event_files
         out = str(tmp_path / "m.evt")

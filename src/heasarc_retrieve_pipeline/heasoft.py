@@ -33,6 +33,44 @@ except ImportError:
     hsp = None
     HAS_HEASOFT = False
 
+
+#: What ``heasoftpy`` raises when a tool exits non-zero and it has been told not to
+#: tolerate that. An empty tuple when ``heasoftpy`` is absent, which an ``except`` clause
+#: accepts and never matches.
+HSP_FAILURE = getattr(hsp, "HSPTaskException", ()) if HAS_HEASOFT else ()
+
+
+def _pin_allow_failure():
+    """
+    Make ``heasoftpy`` hand back failures instead of raising, on every version.
+
+    ``allow_failure`` decides what a non-zero exit does: ``True`` returns an ordinary
+    result object carrying the return code, ``False`` raises ``HSPTaskException``. In
+    ``heasoftpy`` 1.5 the unset default is ``True``, with a deprecation warning on *every
+    call* saying it will become ``False``; in the build on the HEASARC conda channel it
+    already has. The two are not interchangeable here: with ``False``, :func:`_checked`
+    never runs, and the error that reaches the pipeline no longer names the tool that
+    produced it -- which is the entire reason :func:`_checked` exists.
+
+    So pin it rather than inherit it. The result is one behaviour to reason about, and no
+    deprecation warning per call.
+
+    Returns
+    -------
+    bool
+        True if the setting was applied.
+    """
+    if not HAS_HEASOFT:
+        return False
+    try:
+        hsp.Config.allow_failure = True
+    except AttributeError:  # pragma: no cover - a heasoftpy predating Config
+        return False
+    return True
+
+
+_pin_allow_failure()
+
 #: Held while any HEASOFT tool runs in this process. Re-entrant, so a tool that is invoked
 #: from inside another lock-holding call cannot deadlock.
 HEASOFT_LOCK = threading.RLock()
@@ -126,9 +164,9 @@ def _checked(name, result):
     """
     Return ``result``, or raise if the tool reported failure.
 
-    ``heasoftpy`` defaults to ``allow_failure=True``: a tool that exits non-zero comes back
-    as an ordinary result object with a non-zero ``returncode``, and a caller that does not
-    look carries on with a file that was never written. That is not hypothetical -- a real
+    :func:`_pin_allow_failure` makes ``heasoftpy`` return rather than raise: a tool that
+    exits non-zero comes back as an ordinary result object with a non-zero ``returncode``,
+    and a caller that does not look carries on with a file that was never written. That is not hypothetical -- a real
     run had ``fappend`` fail quietly, and the merged event file travelled several steps
     downstream before anything noticed it had no GTI extension.
 
@@ -145,6 +183,28 @@ def _checked(name, result):
             f"{name} failed with return code {returncode}:\n{output}\n{stderr}".strip()
         )
     return result
+
+
+def _calling(name, task, *args, **kwargs):
+    """
+    Call one ``heasoftpy`` task, reporting a failed tool the way this module promises.
+
+    :func:`_pin_allow_failure` normally means a failed tool comes back as a result and
+    :func:`_checked` turns it into the ``RuntimeError`` every caller here expects. But the
+    pin is a ``heasoftpy`` implementation detail, and a version that drops or renames it
+    would silently go back to raising ``HSPTaskException`` -- an exception that is not a
+    ``RuntimeError`` and does not say which tool it came from. Translating it here means
+    the promise in :func:`run` holds whatever ``heasoftpy`` decides to do next.
+
+    Raises
+    ------
+    RuntimeError
+        If ``heasoftpy`` raised for a tool that exited non-zero.
+    """
+    try:
+        return task(*args, **kwargs)
+    except HSP_FAILURE as error:
+        raise RuntimeError(f"{name} failed:\n{error}".strip()) from error
 
 
 class IN_PLACE:
@@ -263,7 +323,7 @@ def run(name, *args, produces, **kwargs):
         raise ImportError("heasoftpy not installed")
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
-        result = _checked(name, getattr(hsp, name)(*args, **kwargs))
+        result = _checked(name, _calling(name, getattr(hsp, name), *args, **kwargs))
         _check_outputs(name, produces)
         return result
 
@@ -301,6 +361,6 @@ def run_task(name, *, produces, **params):
         raise ImportError("heasoftpy not installed")
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
-        result = _checked(name, hsp.HSPTask(name)(**params))
+        result = _checked(name, _calling(name, hsp.HSPTask(name), **params))
         _check_outputs(name, produces)
         return result
