@@ -536,7 +536,7 @@ class TestTheFlowUsesAShortWorkspace:
         monkeypatch.setattr(
             core,
             "observation_work_items",
-            lambda table, links, column, position: [
+            lambda table, links, column, position, mission=None, pgp_keys_file=None: [
                 dict(obsid="obs0", url="https://example.invalid/", ra=1.0, dec=2.0)
             ],
         )
@@ -637,7 +637,7 @@ class TestTheFlowRefusesNamesHeasoftCannotHandle:
         monkeypatch.setattr(
             core,
             "observation_work_items",
-            lambda table, links, column, position: [
+            lambda table, links, column, position, mission=None, pgp_keys_file=None: [
                 dict(obsid="80002092008", url="https://example.invalid/", ra=1.0, dec=2.0)
             ],
         )
