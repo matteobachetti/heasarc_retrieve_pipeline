@@ -1342,10 +1342,27 @@ free: ``observation_directories`` treats any subdirectory with a ``diagnostics/`
 an observation, so writing records through ``record_step`` there needs no change to
 ``report.py`` at all.
 
-Spectra are grouped by focal-plane module -- A with A, B with B -- across all input
-OBSIDs, and go through ``addspec`` with ``qaddrmf=yes`` (exposure-weights the ARFs and
-RMFs into one response) and ``qsubback=yes`` (combines the backgrounds), then ``grppha``
-with the pipeline's usual ``group min 20 & bad 0-34 & bad 1910-4095``.
+Spectra are grouped by focal-plane module **and observing mode** -- ``A01`` with ``A01``,
+``B06`` with ``B06`` -- across all input OBSIDs, and go through ``addspec`` with
+``qaddrmf=yes`` (exposure-weights the ARFs and RMFs into one response) and ``qsubback=yes``
+(combines the backgrounds), then ``grppha`` with the pipeline's usual
+``group min 20 & bad 0-34 & bad 1910-4095``.
+
+The mode was not part of the grouping until this feature, and it should have been:
+``<NAME>_A`` was silently whichever mixture of mode 01 and mode 06 the observations
+happened to contain, with no way to fit either on its own or to tell from the file which it
+was. The merged products are named ``<NAME>_A01``, ``<NAME>_B01``, ``<NAME>_A06`` and
+``<NAME>_B06`` as a result; see ``known_issues.rst`` for what that breaks.
+
+``combine_merged_modules`` then co-adds FPMA with FPMB across those, giving
+``<NAME>_comb01``, ``<NAME>_comb06`` and ``<NAME>_comb0106`` -- the same three flavours,
+built the same way and corrected the same way, as ``combine_module_spectra`` gives a single
+observation. Its inputs are the *merged* per-module spectra rather than the observations'
+own, which changes none of the arithmetic: mode 01 and mode 06 are disjoint in time and
+their exposures add, while FPMA and FPMB are simultaneous and theirs do not, so the case-B
+divisor is two here exactly as it is everywhere else. A mode present for only one module is
+left out of the combination entirely, which is what keeps that divisor a number this code
+knows.
 
 Only files ending ``_sr.pha`` are inputs. The anchor on the end matters: it is what keeps
 a ``_sr_seg1.pha`` left by ``hrp-split-obsid`` out of a merge, which would otherwise count
@@ -1383,7 +1400,7 @@ no other HEASOFT call in the process can see the directory move, and ``hrp-merge
 is post-processing on a finished tree rather than a step inside the reduction flow.
 
 Afterwards the outputs are moved into ``products/`` and the staging directory is removed;
-the list file is kept there as ``<NAME>_<FPM>_inputs.lis``, the record of what was
+the list file is kept there as ``<NAME>_<FPM><MODE>_inputs.lis``, the record of what was
 co-added.
 
 Event lists are merged by ``merge_event_files``, which already handled arbitrary lists of

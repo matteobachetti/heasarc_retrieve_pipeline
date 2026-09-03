@@ -364,13 +364,16 @@ def addspec_roundtrip(obsid, config, families, name=None):
             merged_name,
             spectra=[(fpm, path) for path in segments],
         )
-        if fpm not in written:
+        if not written:
             logger.warning(f"{stem} produced no co-added spectrum")
             results[stem] = None
             continue
 
+        # Every segment here is one stem, so one module and one mode: merge_spectra groups
+        # by exactly that and leaves a single entry, whatever the key is called.
+        key = min(written)
         merged = os.path.join(
-            nu_product_output_path(merged_name, config=config), f"{merged_name}_{fpm}.pha"
+            nu_product_output_path(merged_name, config=config), f"{merged_name}_{key}.pha"
         )
         comparison = compare_spectra(parent, [merged])
         comparison["merged"] = merged

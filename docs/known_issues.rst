@@ -1457,6 +1457,38 @@ the files they left, and the spectra straight out of the PHAs. It writes nothing
 reduction and runs only where a dataset is missing. See :ref:`diagnostics_and_reporting`.
 
 
+55.  A merged spectrum mixed the two observing modes, and is now named differently
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``merge_spectra`` grouped its inputs by focal-plane module alone, so ``<NAME>_A.pha`` was
+whichever mixture of mode 01 and mode 06 the merged observations happened to hold. Nothing
+in the file said which, the two could not be fitted separately afterwards, and adding one
+more observation with a different mode-06 content changed what the product *was* without
+changing its name. ``--mode01-only`` was the only control, and it is all or nothing.
+
+**Fixed** by grouping on module *and* mode. That is a change to the output names, and the
+only one in this package that breaks an existing product::
+
+    <NAME>_A.pha      ->   <NAME>_A01.pha  and  <NAME>_B06.pha  and so on
+    <NAME>_A.rsp           <NAME>_A01.rsp
+    <NAME>_A_grp.pha       <NAME>_A01_grp.pha
+    <NAME>_A_inputs.lis    <NAME>_A01_inputs.lis
+
+A script naming ``<NAME>_A_grp.pha`` will no longer find it, and a merged dataset produced
+before this change keeps its old names beside the new ones if it is merged again -- the
+old files are not deleted, because nothing here deletes a product it did not write. Delete
+them by hand, or merge into a fresh name.
+
+``merge_spectra`` also now co-adds FPMA with FPMB across the merged products, giving
+``<NAME>_comb01``, ``<NAME>_comb06`` and ``<NAME>_comb0106``. Those are additions rather
+than changes: the per-module spectra are still written and are still the right thing to fit
+jointly with a cross-normalisation constant between the modules.
+
+The return value of ``merge_spectra`` is keyed by the new group names, which
+``roundtrip.py`` had to be told about -- it takes whatever single key comes back, since a
+round trip co-adds the segments of one stem and therefore of one module and one mode.
+
+
 Science caveats
 ---------------
 

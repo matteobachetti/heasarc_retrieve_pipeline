@@ -5,11 +5,12 @@ Two short observations taken days apart, each too faint to fit on its own. This 
 combines what the pipeline produced for each of them into one dataset, in a new
 observation-shaped directory beside them::
 
-    <out_data_path>/<NAME>/products/<NAME>_A.pha    co-added source spectrum, FPMA
-    <out_data_path>/<NAME>/products/<NAME>_A.bak    co-added background
-    <out_data_path>/<NAME>/products/<NAME>_A.rsp    combined response
-    <out_data_path>/<NAME>/products/<NAME>_A_grp.pha   grouped, the one you fit
-    <out_data_path>/<NAME>/products/<NAME>_A_inputs.lis  what went into it
+    <out_data_path>/<NAME>/products/<NAME>_A01.pha   co-added source spectrum, FPMA
+    <out_data_path>/<NAME>/products/<NAME>_A01.bak   co-added background
+    <out_data_path>/<NAME>/products/<NAME>_A01.rsp   combined response
+    <out_data_path>/<NAME>/products/<NAME>_A01_grp.pha   grouped, the one you fit
+    <out_data_path>/<NAME>/products/<NAME>_A01_inputs.lis  what went into it
+    <out_data_path>/<NAME>/products/<NAME>_comb01.pha    both modules co-added
     <out_data_path>/<NAME>/<NAME>A_src1_bary.evt    merged event list
     <out_data_path>/<NAME>/diagnostics/             what this run did
 
@@ -18,10 +19,21 @@ A directory of its own is what gets the merged dataset a page in the report for 
 holding a ``diagnostics`` as an observation.
 
 Spectra
-    HEASOFT ``addspec``, per focal-plane module, through
+    HEASOFT ``addspec``, per focal-plane module **and per observing mode**, through
     :func:`~heasarc_retrieve_pipeline.coadd.run_addspec`. It does the exposure weighting,
     the background rescaling and the response combination itself. The ARF is folded into
     the output ``.rsp``, so the merged spectrum has no separate ``ANCRFILE``.
+
+    The mode is part of the grouping because mode 01 and mode 06 are not the same
+    measurement: mode 06 has a reconstructed aspect solution, and its spectra are worth
+    being able to fit -- or to leave out -- on their own. Until this was so, ``<NAME>_A``
+    was silently whichever mixture of the two the observations happened to contain. See
+    ``docs/known_issues.rst``: the merged products are named differently as a result.
+
+    :func:`combine_merged_modules` then co-adds FPMA with FPMB across the merged products,
+    giving ``<NAME>_comb01``, ``<NAME>_comb06`` and ``<NAME>_comb0106`` exactly as
+    :func:`~heasarc_retrieve_pipeline.nustar.combine_module_spectra` does for a single
+    observation, with the same case-B correction.
 
     Merging observations is **case A** of the two ``addspec`` says it may be used for:
     "adding data from the same detector at different times". Its convention of adding the
@@ -65,12 +77,14 @@ import sys
 
 from .coadd import (
     GROUPING_COMMAND,
+    apply_case_b_scaling,
     run_addspec,
     stage_inputs,
     working_directory,
 )
 from .diagnostics import diagnostics_path, record_step, write_manifest
 from .nustar import (
+    COMBINED_PRODUCTS,
     merge_event_files,
     nu_base_output_path,
     nu_product_output_path,
@@ -80,13 +94,16 @@ from .utils import get_logger
 __all__ = [
     "GROUPING_COMMAND",
     "MERGE_NAME_RE",
+    "SPECTRUM_MODE_RE",
     "SPECTRUM_RE",
+    "combine_merged_modules",
     "main",
     "merge_event_lists",
     "merge_name",
     "merge_obsids",
     "merge_spectra",
     "source_spectra",
+    "spectrum_mode",
     "stage_inputs",
     "working_directory",
 ]
@@ -97,6 +114,12 @@ __all__ = [
 #: co-adding a segment with the whole observation it came from would count its events
 #: twice.
 SPECTRUM_RE = re.compile(r"^nu(?P<obsid>\d+)(?P<fpm>[AB])(?P<mode>\d\d)(?P<rest>.*)_sr\.pha$")
+
+#: The observing mode a spectrum's file name declares: the two digits after the module
+#: letter. Deliberately looser than :data:`SPECTRUM_RE` -- it matches a segment spectrum
+#: too, because the round trip co-adds segments and they have to be grouped by mode just
+#: the same.
+SPECTRUM_MODE_RE = re.compile(r"^nu\d+[AB](?P<mode>\d\d)")
 
 #: What a merged dataset may be called. ``mathpha``, which ``addspec`` spawns, parses its
 #: input as an arithmetical expression, so a name carrying ``+``, ``-``, ``*`` or brackets
@@ -180,6 +203,101 @@ def source_spectra(obsid, config, mode01_only=False):
     return found
 
 
+def spectrum_mode(path):
+    """
+    Which observing mode a spectrum came from.
+
+    Parameters
+    ----------
+    path : str
+        Path or base name of a spectrum.
+
+    Returns
+    -------
+    str or None
+        ``"01"``, ``"06"``, or ``None`` for a name that does not carry a mode at all.
+
+    Examples
+    --------
+    >>> spectrum_mode("nu80002092006A01_sr.pha")
+    '01'
+    >>> spectrum_mode("x/nu80002092006B06_chu12_N_sr_seg2.pha")
+    '06'
+    >>> spectrum_mode("something_else.pha") is None
+    True
+    """
+    match = SPECTRUM_MODE_RE.match(os.path.basename(path))
+    return match.group("mode") if match else None
+
+
+def combine_merged_modules(name, config, roots, rec=None):
+    """
+    Co-add FPMA with FPMB across a merged dataset's per-module spectra.
+
+    The merge-level counterpart of
+    :func:`~heasarc_retrieve_pipeline.nustar.combine_module_spectra`, and it works the same
+    way: one product per flavour of :data:`~heasarc_retrieve_pipeline.nustar.COMBINED_PRODUCTS`,
+    built only from modes where both modules are there, with
+    :func:`~heasarc_retrieve_pipeline.coadd.apply_case_b_scaling` putting the exposure right
+    afterwards. The inputs are the merged per-module spectra rather than one observation's,
+    which changes nothing about the arithmetic: mode 01 and mode 06 are disjoint in time and
+    add, while FPMA and FPMB are simultaneous and do not.
+
+    Parameters
+    ----------
+    name : str
+        Name of the merged dataset.
+    config : dict
+        Must contain ``out_data_path``.
+    roots : dict
+        Group key -- module letter followed by mode, as :func:`merge_spectra` builds it --
+        to the base name of the merged spectrum written for it.
+    rec : StepRecord, optional
+        Diagnostics record to write into.
+
+    Returns
+    -------
+    dict
+        Flavour to the base name of the grouped spectrum written for it.
+    """
+    logger = get_logger()
+    outdir = nu_product_output_path(name, config=config)
+
+    by_mode = {}
+    for key, root in roots.items():
+        fpm, mode = key[0], key[1:]
+        if mode not in ("01", "06"):
+            # A group that carried no mode at all, so there is no telling what it is.
+            continue
+        by_mode.setdefault(mode, {})[fpm] = os.path.join(outdir, root + ".pha")
+    paired = {
+        mode: [modules["A"], modules["B"]]
+        for mode, modules in by_mode.items()
+        if len(modules) == 2
+    }
+
+    written = {}
+    inputs = {}
+    for suffix, modes in COMBINED_PRODUCTS.items():
+        if not all(mode in paired for mode in modes):
+            continue
+        spectra = [path for mode in modes for path in paired[mode]]
+        root = f"{name}_{suffix}"
+        inputs[suffix] = [os.path.basename(path) for path in spectra]
+        logger.info(f"Co-adding the modules of {name} into {root}.pha")
+        run_addspec(spectra, outdir, root, f"_inputs_{suffix}")
+        # addspec added the two modules' exposures as though they had observed one after
+        # the other. They did not. See coadd.apply_case_b_scaling.
+        apply_case_b_scaling(
+            [os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2
+        )
+        written[suffix] = root + "_grp.pha"
+
+    if rec is not None:
+        rec.value(combined=written, combined_inputs=inputs)
+    return written
+
+
 def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=None):
     """
     Co-add the observations' spectra with ``addspec``, one output per module.
@@ -209,13 +327,15 @@ def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=Non
     Returns
     -------
     dict
-        Module to the base name of the grouped spectrum written for it.
+        Group key -- the module letter followed by the observing mode, ``"A01"`` -- to the
+        base name of the grouped spectrum written for it, and one entry per flavour
+        :func:`combine_merged_modules` went on to build.
     """
     logger = get_logger()
     outdir = nu_product_output_path(name, config=config)
     os.makedirs(outdir, exist_ok=True)
 
-    by_module = {}
+    by_group = {}
     if spectra is None:
         spectra = [
             pair
@@ -223,24 +343,32 @@ def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=Non
             for pair in source_spectra(obsid, config, mode01_only=mode01_only)
         ]
     for fpm, path in spectra:
-        by_module.setdefault(fpm, []).append(path)
+        # Module and mode together. Mode 01 and mode 06 are different measurements of the
+        # same source -- the second has a reconstructed aspect solution -- so a merged
+        # product that mixed them could be neither fitted nor unpicked afterwards.
+        by_group.setdefault(f"{fpm}{spectrum_mode(path) or ''}", []).append(path)
 
+    roots = {}
     written = {}
     inputs = {}
-    for fpm, spectra in sorted(by_module.items()):
-        inputs[fpm] = [os.path.basename(path) for path in spectra]
-        if len(spectra) < 2:
+    for key, group in sorted(by_group.items()):
+        inputs[key] = [os.path.basename(path) for path in group]
+        if len(group) < 2:
             logger.warning(
-                f"FPM{fpm} has only {len(spectra)} spectrum across {len(obsids)} "
+                f"{key} has only {len(group)} spectrum across {len(obsids)} "
                 "observation(s); nothing to co-add"
             )
             continue
 
-        root = f"{name}_{fpm}"
+        root = f"{name}_{key}"
         # Case A -- the same detector at different times -- so addspec's own convention of
         # adding the exposures is the right one and nothing is rescaled afterwards.
-        run_addspec(spectra, outdir, root, f"_inputs_FPM{fpm}")
-        written[fpm] = root + "_grp.pha"
+        run_addspec(group, outdir, root, f"_inputs_{key}")
+        roots[key] = root
+        written[key] = root + "_grp.pha"
+
+    # Case B, on top of case A: the same two modules, now merged, still observed at once.
+    written.update(combine_merged_modules(name, config, roots, rec=rec))
 
     if rec is not None:
         rec.value(spectra=written, inputs=inputs)

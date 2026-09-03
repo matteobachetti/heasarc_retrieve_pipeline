@@ -17,7 +17,7 @@ from heasarc_retrieve_pipeline import coadd, combine
 OBSIDS = ["80002092002", "80002092004"]
 
 
-def make_spectrum(path, stem, exposure=1000.0):
+def make_spectrum(path, stem, exposure=1000.0, backfile=None, respfile=None, ancrfile=None):
     """A source spectrum shaped like one nuproducts wrote, pointing at its neighbours."""
     spectrum = fits.BinTableHDU.from_columns(
         [
@@ -27,9 +27,9 @@ def make_spectrum(path, stem, exposure=1000.0):
         name="SPECTRUM",
     )
     spectrum.header["EXPOSURE"] = exposure
-    spectrum.header["BACKFILE"] = stem + "_bk.pha"
-    spectrum.header["RESPFILE"] = stem + "_sr.rmf"
-    spectrum.header["ANCRFILE"] = stem + "_sr.arf"
+    spectrum.header["BACKFILE"] = stem + "_bk.pha" if backfile is None else backfile
+    spectrum.header["RESPFILE"] = stem + "_sr.rmf" if respfile is None else respfile
+    spectrum.header["ANCRFILE"] = stem + "_sr.arf" if ancrfile is None else ancrfile
     spectrum.header["DETCHANS"] = 16
     fits.HDUList([fits.PrimaryHDU(), spectrum]).writeto(path, overwrite=True)
 
@@ -76,12 +76,21 @@ class StubAddspec:
         self.cwds.append(os.getcwd())
         if name == "addspec":
             root = kwargs["outfil"]
-            for suffix in (".pha", ".bak", ".rsp"):
+            # Real FITS, because a merged per-module spectrum is itself an input to the
+            # co-addition of the two modules, and that one stages and rescales it.
+            make_spectrum(
+                root + ".pha",
+                root,
+                exposure=2000.0,
+                backfile=root + ".bak",
+                respfile=root + ".rsp",
+                ancrfile="none",
+            )
+            for suffix in (".bak", ".rsp"):
                 with open(root + suffix, "w") as fobj:
                     fobj.write(root + suffix)
         elif name == "grppha":
-            with open(kwargs["outfile"].lstrip("!"), "w") as fobj:
-                fobj.write("grouped")
+            make_spectrum(kwargs["outfile"].lstrip("!"), "grouped", exposure=2000.0)
 
 
 @pytest.fixture
@@ -235,25 +244,37 @@ class TestWorkingDirectory:
 
 
 class TestMergeSpectra:
-    def test_one_addspec_per_module(self, tree, stub):
+    def test_one_addspec_per_module_and_mode(self, tree, stub):
         combine.merge_spectra(OBSIDS, tree, "vela")
-        assert [name for name, _ in stub.calls if name == "addspec"] == [
-            "addspec",
-            "addspec",
+        roots = [
+            params["outfil"] for name, params in stub.calls if name == "addspec"
+        ]
+        assert roots == [
+            "vela_A01",
+            "vela_A06",
+            "vela_B01",
+            "vela_B06",
+            "vela_comb01",
+            "vela_comb06",
+            "vela_comb0106",
         ]
 
     def test_addspec_runs_in_the_staging_directory(self, tree, stub):
         """It resolves BACKFILE against the working directory, so this is load-bearing."""
         combine.merge_spectra(OBSIDS, tree, "vela")
         for cwd in stub.cwds:
-            assert os.path.basename(cwd).startswith("_inputs_FPM")
+            assert os.path.basename(cwd).startswith("_inputs_")
 
     def test_the_list_file_holds_bare_names(self, tree, stub):
         combine.merge_spectra(OBSIDS, tree, "vela")
         products = os.path.join(tree["out_data_path"], "vela", "products")
-        listfile = os.path.join(products, "vela_A_inputs.lis")
+        listfile = os.path.join(products, "vela_A01_inputs.lis")
         lines = [line.strip() for line in open(listfile) if line.strip()]
-        assert len(lines) == 4
+        # One mode-01 spectrum from each of the two observations, and nothing of mode 06.
+        assert lines == [
+            f"nu{OBSIDS[0]}A01_sr.pha",
+            f"nu{OBSIDS[1]}A01_sr.pha",
+        ]
         assert all(os.sep not in line for line in lines)
 
     def test_the_staging_directory_is_cleaned_up(self, tree, stub):
@@ -272,7 +293,7 @@ class TestMergeSpectra:
         combine.merge_spectra(OBSIDS, tree, "vela")
         products = os.path.join(tree["out_data_path"], "vela", "products")
         for suffix in (".pha", ".bak", ".rsp", "_grp.pha"):
-            assert os.path.exists(os.path.join(products, "vela_A" + suffix))
+            assert os.path.exists(os.path.join(products, "vela_A01" + suffix))
 
     def test_the_grouping_matches_the_pipeline(self, tree, stub):
         combine.merge_spectra(OBSIDS, tree, "vela")
@@ -284,9 +305,10 @@ class TestMergeSpectra:
     def test_mode01_only_narrows_the_inputs(self, tree, stub):
         combine.merge_spectra(OBSIDS, tree, "vela", mode01_only=True)
         products = os.path.join(tree["out_data_path"], "vela", "products")
-        listfile = os.path.join(products, "vela_A_inputs.lis")
+        listfile = os.path.join(products, "vela_A01_inputs.lis")
         lines = [line.strip() for line in open(listfile) if line.strip()]
         assert len(lines) == 2
+        assert not os.path.exists(os.path.join(products, "vela_A06_inputs.lis"))
 
     def test_a_module_with_one_spectrum_is_not_co_added(self, tmp_path, stub):
         """addspec on a single file would be a slow, lossy copy."""
@@ -325,6 +347,90 @@ class TestMergeObsids:
         result = combine.merge_obsids(OBSIDS, tree, name="vela_2013")
         assert result["name"] == "vela_2013"
         assert os.path.isdir(os.path.join(tree["out_data_path"], "vela_2013"))
+
+
+class TestCombiningMergedModules:
+    """FPMA and FPMB co-added across a merged dataset, one product per observing mode."""
+
+    def products(self, tree):
+        return os.path.join(tree["out_data_path"], "vela", "products")
+
+    def test_the_modes_are_kept_apart_before_they_are_combined(self, tree, stub):
+        """<NAME>_A used to be whichever mixture of 01 and 06 the observations held."""
+        combine.merge_spectra(OBSIDS, tree, "vela")
+
+        listfile = os.path.join(self.products(tree), "vela_A06_inputs.lis")
+        lines = [line.strip() for line in open(listfile) if line.strip()]
+        assert lines == [
+            f"nu{OBSIDS[0]}A06_chu12_N_sr.pha",
+            f"nu{OBSIDS[1]}A06_chu12_N_sr.pha",
+        ]
+
+    def test_one_product_per_flavour_is_written(self, tree, stub):
+        written = combine.merge_spectra(OBSIDS, tree, "vela")
+
+        assert {"comb01", "comb06", "comb0106"} <= set(written)
+        for suffix in ("comb01", "comb06", "comb0106"):
+            for end in (".pha", "_grp.pha", "_inputs.lis"):
+                assert os.path.exists(os.path.join(self.products(tree), f"vela_{suffix}{end}"))
+
+    def test_the_merged_modules_are_what_goes_in(self, tree, stub):
+        """Not the observations' own spectra: those are already inside the merged ones."""
+        combine.merge_spectra(OBSIDS, tree, "vela")
+
+        listfile = os.path.join(self.products(tree), "vela_comb0106_inputs.lis")
+        lines = [line.strip() for line in open(listfile) if line.strip()]
+        assert lines == ["vela_A01.pha", "vela_B01.pha", "vela_A06.pha", "vela_B06.pha"]
+
+    def test_the_exposure_is_corrected_for_two_modules(self, tree, stub):
+        """addspec handed back 2000 s for two modules that observed at the same time."""
+        combine.merge_spectra(OBSIDS, tree, "vela")
+
+        header = fits.getheader(os.path.join(self.products(tree), "vela_comb01.pha"), 1)
+        assert header["EXPOSURE"] == 1000.0
+        assert header["AREASCAL"] == 2
+
+    def test_a_dataset_with_one_module_is_not_combined(self, tree, stub):
+        spectra = [
+            ("A", os.path.join(tree["out_data_path"], obsid, "products", f"nu{obsid}A01_sr.pha"))
+            for obsid in OBSIDS
+        ]
+
+        written = combine.merge_spectra(OBSIDS, tree, "vela", spectra=spectra)
+
+        assert sorted(written) == ["A01"]
+
+    def test_a_mode_present_for_one_module_only_is_left_out(self, tree, stub):
+        """The case-B correction is a factor of two, so both modules or neither."""
+        spectra = [
+            (fpm, path)
+            for obsid in OBSIDS
+            for fpm, path in combine.source_spectra(obsid, tree)
+            if not (fpm == "B" and "06" in os.path.basename(path))
+        ]
+
+        written = combine.merge_spectra(OBSIDS, tree, "vela", spectra=spectra)
+
+        assert sorted(written) == ["A01", "A06", "B01", "comb01"]
+
+    def test_it_records_what_it_combined(self, tree, stub):
+        from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, record_step
+
+        with record_step(diagnostics_path("vela", tree), "vela", "merge_obsids") as rec:
+            combine.merge_spectra(OBSIDS, tree, "vela", rec=rec)
+
+        from heasarc_retrieve_pipeline.diagnostics import read_records
+
+        record = next(
+            r
+            for r in read_records(diagnostics_path("vela", tree))
+            if r["step"] == "merge_obsids"
+        )
+        assert record["values"]["combined"]["comb01"] == "vela_comb01_grp.pha"
+        assert record["values"]["combined_inputs"]["comb01"] == [
+            "vela_A01.pha",
+            "vela_B01.pha",
+        ]
 
 
 class TestMergeEventLists:
@@ -393,7 +499,7 @@ class TestMergingAnExplicitListOfSpectra:
         products = os.path.join(tree["out_data_path"], "explicit", "products")
         lines = [
             line.strip()
-            for line in open(os.path.join(products, "explicit_A_inputs.lis"))
+            for line in open(os.path.join(products, "explicit_A01_inputs.lis"))
             if line.strip()
         ]
         assert lines == [os.path.basename(path) for _, path in spectra]
@@ -428,7 +534,7 @@ class TestMergingAnExplicitListOfSpectra:
         merged = os.path.join(tree["out_data_path"], "trip", "products")
         lines = [
             line.strip()
-            for line in open(os.path.join(merged, "trip_A_inputs.lis"))
+            for line in open(os.path.join(merged, "trip_A01_inputs.lis"))
             if line.strip()
         ]
         assert lines == [f"{stem}_sr_seg1.pha", f"{stem}_sr_seg2.pha"]
@@ -439,7 +545,7 @@ class TestMergingAnExplicitListOfSpectra:
         ) + self.spectra_of(tree, OBSIDS[0], "B") + self.spectra_of(tree, OBSIDS[1], "B")
         written = combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
 
-        assert sorted(written) == ["A", "B"]
+        assert sorted(written) == ["A01", "B01", "comb01"]
 
 
 class TestCaseBScaling:
