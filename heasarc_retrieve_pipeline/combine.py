@@ -18,11 +18,22 @@ A directory of its own is what gets the merged dataset a page in the report for 
 holding a ``diagnostics`` as an observation.
 
 Spectra
-    HEASOFT ``addspec``, per focal-plane module. Its own help calls this the case it is
-    for -- "adding data from the same detector at different times" -- and it does the
-    exposure weighting, the background rescaling and the response combination itself. The
-    ARF is folded into the output ``.rsp``, so the merged spectrum has no separate
-    ``ANCRFILE``.
+    HEASOFT ``addspec``, per focal-plane module, through
+    :func:`~heasarc_retrieve_pipeline.coadd.run_addspec`. It does the exposure weighting,
+    the background rescaling and the response combination itself. The ARF is folded into
+    the output ``.rsp``, so the merged spectrum has no separate ``ANCRFILE``.
+
+    Merging observations is **case A** of the two ``addspec`` says it may be used for:
+    "adding data from the same detector at different times". Its convention of adding the
+    inputs' exposure times is therefore the right one here, and nothing is rescaled
+    afterwards. That is not true of the other use this package makes of the same tool --
+    co-adding FPMA with FPMB, which is case B, different detectors at the *same* time, and
+    needs the exposure and effective area put right afterwards. The distinction, and the
+    measurement behind it, are in :mod:`heasarc_retrieve_pipeline.coadd`.
+
+    ``addspec`` also warns that adding PHA datasets at all is a dangerous exercise. For
+    case A the danger is a source that varies, or a detector whose response changed between
+    the epochs: a merged spectrum is a time average, and nothing in the file says so.
 
 Event lists
     :func:`~heasarc_retrieve_pipeline.nustar.merge_event_files`, unchanged. It has always
@@ -31,14 +42,12 @@ Event lists
     is what any downstream timing has to see.
 
 Why the inputs are staged
-    ``addspec`` reads each spectrum's ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, and
-    resolves them **relative to the current working directory** -- not, as XSPEC does,
-    relative to the spectrum's own directory. Measured: with the spectra listed by
-    absolute path and the process anywhere else, its ``SUSBAK`` stage dies with "could not
-    open the named file" on a background file that is plainly there. Since the inputs live
-    in one directory per OBSID, there is no single directory to run from, so
-    :func:`stage_inputs` builds one: the spectra copied in with their pointers rewritten
-    to bare names, the responses and backgrounds symbolically linked beside them.
+    ``addspec`` resolves the files a spectrum names **relative to the current working
+    directory**, so the inputs have to be gathered into one directory and run from there.
+    Since the spectra of a merge live one directory per OBSID, there is no such directory
+    until :func:`~heasarc_retrieve_pipeline.coadd.stage_inputs` builds it. The bug that
+    forces this, and the measurement of exactly how far the workaround has to go, are
+    documented there.
 
 Command line::
 

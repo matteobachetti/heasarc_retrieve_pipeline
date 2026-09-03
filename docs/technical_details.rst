@@ -1016,8 +1016,117 @@ All well inside the 3 arcmin default, and consistent with the roughly 2 arcmin s
 The resulting spectra are one set per CHU combination per module. They are **not** to be
 combined by merging their event files -- the merged event files this pipeline produces are
 timing-only precisely because they mix aspect solutions and exposures. Combine them at the
-spectrum level -- which is what ``hrp-merge-obsids`` below does -- or load them as separate
-datasets and fit them jointly.
+spectrum level -- which is what ``combine_module_spectra`` and ``hrp-merge-obsids`` below
+do -- or load them as separate datasets and fit them jointly.
+
+
+Combining the two focal-plane modules
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a faint source, one spectrum per module is the wrong unit to fit: the counts are split
+across two detectors for no reason other than that NuSTAR has two of them.
+``combine_module_spectra`` co-adds them, into three products named for what went into
+each::
+
+    products/nu<OBSID>_comb01.pha    .bak  .rsp  _grp.pha   normal science only
+    products/nu<OBSID>_comb06.pha    .bak  .rsp  _grp.pha   spacecraft science only
+    products/nu<OBSID>_comb0106.pha  .bak  .rsp  _grp.pha   both, for maximum exposure
+
+``comb01`` is the conservative one: mode 01 has the aspect solution from CHU4 and is the
+best understood. ``comb0106`` buys exposure at the price of homogeneity, and is written
+only when there is mode-06 data to add -- otherwise it would be a second copy of
+``comb01``. Since ``addspec`` weights purely by exposure and has no notion of one input
+being less trusted than another, the mode-06 share of the exposure is recorded in the
+diagnostics, so a reader of the report can see what they would be fitting.
+
+These are **not** a replacement for the per-module spectra, which are untouched. Fitting
+FPMA and FPMB simultaneously with a cross-normalisation constant between them is the more
+correct thing to do whenever the source is bright enough to allow it; co-adding throws that
+constant away for good. These products are for when it is not.
+
+The file names do not end in ``_sr.pha``, and that is deliberate. ``_sr.pha``/``_bk.pha``
+is how ``nuproducts`` names an extraction; ``addspec`` writes a different family of files,
+``.pha``/``.bak``/``.rsp``. Keeping them apart means the combined products are invisible to
+``combine.SPECTRUM_RE``, to ``roundtrip.SEGMENT_SPECTRUM_RE`` and to the ``*_sr.pha`` glob
+in ``recover.py``, so no combined product can ever be swept into another co-addition and
+counted twice. No regular expression had to be weakened to make room for them.
+
+One good time interval for both modules
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Co-adding two spectra that cover different stretches of time is only honest if the source
+is steady, so the good time interval is now worked out per **pair** of modules:
+``calculate_spectra`` intersects FPMA's cleaned event file, FPMB's counterpart and the
+flare-free GTI, and hands the result to both extractions. This is the same intersection
+``join_source_data`` has always applied to the combined event list.
+
+It costs essentially nothing. Measured on 90901333002:
+
+===============  ==================  ==================  ==================  ===========
+File             FPMA                FPMB                AND                 Worst loss
+===============  ==================  ==================  ==================  ===========
+``01``           56125.9 s, 1212 iv  56126.9 s, 1212 iv  56125.9 s, 1212 iv  1.0 s
+``06_chu12_N``   2934.7 s, 282 iv    2937.7 s, 282 iv    2934.7 s, 282 iv    3.0 s
+``06_chu23_N``   12697.8 s, 981 iv   12697.8 s, 981 iv   12697.8 s, 981 iv   0.0 s
+``06_chu2_N``    1896.3 s, 54 iv     1898.3 s, 54 iv     1896.3 s, 54 iv     2.0 s
+===============  ==================  ==================  ==================  ===========
+
+The interval counts are identical in every case: FPMA's good time is essentially a subset
+of FPMB's, differing by a second or three at the edges.
+
+A file whose counterpart is missing -- a CHU combination ``nusplitsc`` produced for one
+module only, or a pair one of whose extractions failed -- keeps its own good time, is still
+extracted, and is recorded as ``unpaired``. It is barred from the combined products, which
+is what keeps the correction below a factor the code knows.
+
+Observations reduced before this existed keep a good time per module, and
+``PRODUCTS_DONE.TXT`` stops them being redone, so an archive will hold both conventions.
+Which one produced a given observation is recorded as ``gti_convention``.
+
+Why the exposure has to be corrected afterwards
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``addspec`` warns that adding PHA datasets is a dangerous exercise and names the only two
+cases where it may be valid: (A) the same detector at different times, and (B) different
+but *identical* detectors at the same time. Merging observations is case A. Combining FPMA
+with FPMB is case B, and the tool "implicitly assumes case A) in that it adds together the
+exposure times of the PHA files instead of the effective areas". Its own help says that for
+case B "the count rate will be incorrect and the exposure time and effective areas should
+be adjusted after running the task".
+
+What it writes, measured on 90901333002, is ``EXPOSURE`` = 103961.4 s, the sum of FPMA's
+52206.0 and FPMB's 51755.4, with the response as their exposure-weighted *mean*. What XSPEC
+folds is the product of the two::
+
+    EXPOSURE * RSP = (T_A + T_B) * (A_A*T_A + A_B*T_B)/(T_A + T_B) = A_A*T_A + A_B*T_B
+
+which is the true expected number of counts. **Fitted fluxes are therefore already
+correct.** What is wrong is that the file claims an exposure that is not a real elapsed
+time, and so reports half the count rate the two detectors actually collected -- which
+would have shown up in the report as a combined spectrum plotting at half the flux of the
+FPMA and FPMB spectra beside it, looking exactly like a bug.
+
+``coadd.apply_case_b_scaling`` puts it right with two header keywords::
+
+    EXPOSURE -> EXPOSURE / 2        a real livetime
+    AREASCAL -> 2                   effective area summed, not averaged
+
+``EXPOSURE * AREASCAL`` is unchanged, so no fit moves by a digit; the file now says what it
+means. It is a header edit, and the 68 MB response is never rewritten.
+
+The divisor is the number of **modules**, never the number of files. ``comb0106`` has many
+more inputs than modules, and the mode-01 and mode-06 pieces are disjoint in time: their
+exposures genuinely do add, and only the FPMA/FPMB axis is the simultaneous one. Requiring
+both modules to be present is what keeps that divisor equal to two.
+
+Two more things the same measurement settled. ``ONTIME``, ``LIVETIME``, ``TELAPSE`` and
+``DEADC`` are absent from an ``addspec`` output altogether, so there is nothing else to put
+right. And ``BACKSCAL`` comes out as 1.0 on both the spectrum and its background --
+``addspec`` folds the two modules' differing background areas into the scaling of the
+background itself, through the ``mathpha`` expression that builds it. That background's own
+``EXPOSURE`` is deliberately inflated by a factor of a thousand ("exposure time increased
+to avoid rounding errors") and is left alone: the correction cancels out of the background
+term, so touching it would gain nothing and only obscure ``addspec``'s bookkeeping.
 
 
 Splitting and merging observations
