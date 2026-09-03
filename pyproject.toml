@@ -31,8 +31,12 @@ regions = ["regions"]
 s3 = ["boto3"]
 # The HTML observation pages written by hrp-report
 report = ["plotly"]
-# Solar flare filtering and SNR-optimised extraction regions
-solar = ["sunpy", "nustar_gen"]
+# Solar flare filtering (nustar.filter_solar_flares)
+solar = ["sunpy"]
+# SNR-optimised extraction regions and radial profiles. nustar_gen is not on PyPI, so a
+# direct reference is the only way to declare it, and that is also why it is left out of
+# `all`: cloning a repository in every CI run buys nothing, since no test imports it.
+snr = ["nustar_gen @ git+https://github.com/NuSTAR/nustar-gen-utils"]
 all = [
     "scikit-image",
     "scipy",
@@ -41,7 +45,6 @@ all = [
     "boto3",
     "plotly",
     "sunpy",
-    "nustar_gen",
 ]
 test = [
     "pytest",
