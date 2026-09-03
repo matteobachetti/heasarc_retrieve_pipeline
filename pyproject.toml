@@ -3,33 +3,49 @@ name = "heasarc_retrieve_pipeline"
 description = "Pipeline to automatically retrieve data from HEASARC"
 readme = "README.rst"
 requires-python = ">=3.10"
-license = { file = "licenses/LICENSE.rst", content-type = "text/plain" }
+license = "BSD-3-Clause"
+license-files = ["licenses/LICENSE.rst"]
 authors = [
   { name = "Matteo Bachetti", email = "matteo@matteobachetti.it" },
 ]
+# Everything needed to import the package, query HEASARC, download an observation and
+# run a reduction. Anything imported inside a function belongs in an extra below.
 dependencies = [
   "astropy",
   "numpy",
   "astroquery",
-  "regions",
   "pyvo",
-  "pytest",
   "prefect",
   "pysmartdl",
-  "scikit-image",
-  "scipy",
-  "statsmodels",
   "beautifulsoup4",
-  "boto3",
-  "plotly",
+  "pyyaml",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
+# Source/background splitting from sky images (heasarc_retrieve_pipeline.image_utils)
+imaging = ["scikit-image", "scipy", "statsmodels"]
+# ds9 region files for the nuproducts spectral path
+regions = ["regions"]
+# Anonymous S3 transport, used by recursive_download when the archive offers it
+s3 = ["boto3"]
+# The HTML observation pages written by hrp-report
+report = ["plotly"]
+# Solar flare filtering and SNR-optimised extraction regions
+solar = ["sunpy", "nustar_gen"]
+all = [
+    "scikit-image",
+    "scipy",
+    "statsmodels",
+    "regions",
+    "boto3",
+    "plotly",
+    "sunpy",
+    "nustar_gen",
+]
 test = [
     "pytest",
     "pytest-astropy",
-    "tox",
 ]
 docs = [
     "sphinx",
@@ -50,8 +66,9 @@ repository = "http://github.com/matteobachetti/heasarc_retrieve_pipeline"
 
 [build-system]
 requires = [
-  "setuptools>=61.2",
-  "setuptools_scm[toml]>=3.4",
+  # 77 is where PEP 639 `license`/`license-files` became available
+  "setuptools>=77",
+  "setuptools_scm[toml]>=8",
 ]
 build-backend = "setuptools.build_meta"
 
