@@ -33,8 +33,6 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.doctest",
     "sphinx.ext.mathjax",
-    "sphinx_automodapi.automodapi",
-    "sphinx_automodapi.smart_resolver",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -43,7 +41,9 @@ extensions = [
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# completion_model_plan.md is a planning document, not user documentation: it is in no
+# toctree, and a -W build treats that as an error.
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "completion_model_plan.md"]
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
@@ -55,7 +55,11 @@ master_doc = "index"
 # -- Options for intersphinx extension ---------------------------------------
 
 # Example configuration for intersphinx: refer to the Python standard library.
-intersphinx_mapping = {"python": ("https://docs.python.org/3", None)}
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "astropy": ("https://docs.astropy.org/en/stable/", None),
+}
 
 # -- Options for HTML output -------------------------------------------------
 

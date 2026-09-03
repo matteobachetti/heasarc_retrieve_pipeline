@@ -2309,23 +2309,53 @@ Relevant environment:
 ``CALDB``
     Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``.
 
-Runtime dependencies beyond the standard scientific stack: ``prefect``, ``astroquery``,
-``boto3``, ``pySmartDL``, ``beautifulsoup4``, ``scikit-image``, ``statsmodels``, and -- for
-the NuSTAR spectral path -- ``sunpy``, ``nustar_gen`` and ``regions``.
+Required at runtime, beyond the standard scientific stack: ``prefect``, ``astroquery``,
+``pyvo``, ``pySmartDL``, ``beautifulsoup4`` and ``pyyaml``. Everything else is an extra,
+imported inside the function that needs it and declared in ``[project.optional-dependencies]``
+in ``pyproject.toml``: ``scikit-image``/``scipy``/``statsmodels`` (``imaging``),
+``regions``, ``boto3`` (``s3``), ``plotly`` (``report``), ``sunpy`` (``solar``) and
+``nustar_gen`` (``snr``). The package imports, queries and downloads with none of them
+installed, which is what the ``py310-test`` job in CI checks.
 
 
 Testing
 -------
 
-The test suite is :mod:`heasarc_retrieve_pipeline.tests.test_pipeline`: four test
-functions, all marked ``@pytest.mark.remote_data``, all parametrised over the ``heasarc``
-and ``aws`` hosts.
+The suite lives in ``heasarc_retrieve_pipeline/tests`` and is run with::
 
-Three of them call the top-level flows with ``test=True``, so they exercise the catalogue
-query, the datalink lookup and the download dispatch, but fake the actual transfer and
-never reach the processing code. The fourth, ``test_recursive_download``, does a real
-download of two NuSTAR event files and checks the include/exclude filtering.
+    pytest --pyargs heasarc_retrieve_pipeline
 
-Nothing runs without network access, and nothing exercises the mission processing modules,
-the image analysis or the RXTE screening. See :ref:`known_issues` for a proposed offline
-test suite.
+Almost all of it is offline and needs no HEASOFT: about 900 tests and 47 module doctests,
+in under a minute. Four markers divide up what is not:
+
+``remote_data``
+    The four functions in ``tests/test_pipeline.py`` that talk to HEASARC and to AWS.
+    Skipped unless ``--remote-data`` is given, and run weekly rather than on every push,
+    so that an archive outage does not turn a pull request red.
+
+``slow``
+    ``tests/test_concurrency.py``: 57 tests that fork a real process pool and start a
+    temporary Prefect server to prove that each worker gets its own ``PFILES``. About
+    half the runtime of the whole suite, so they are deselected unless ``--run-slow`` is
+    given, and CI runs them in a job of their own.
+
+``heasoft``
+    ``tests/test_heasoft_tools.py``: the tests that call a real ftool instead of a
+    recorded double. Skipped unless ``heasoftpy`` imports and ``HEADAS`` is set. They
+    cover the CALDB-free tools the pipeline drives -- ``ftmerge``, ``ftsort``,
+    ``ftmgtime``, ``fthedit``, ``fappend``, ``grppha``, ``addspec`` -- and exist to check
+    the beliefs the doubles elsewhere encode: that ``ftmerge`` concatenates without
+    sorting, takes its exposure keywords from the *first* input, and refuses an existing
+    output with return code 105; that ``ftmgtime`` writes an extension called ``STDGTI``.
+    ``nupipeline``, ``nuproducts``, ``nusplitsc``, ``nicerl2`` and ``barycorr`` need
+    calibration files and minutes of CPU, and stay stubbed.
+
+(no marker)
+    Everything else: the path builders, the GTI arithmetic, the image analysis, the RXTE
+    screening, the report writer, the split/merge round trip, and a set of tests that
+    walk the package source and assert structural properties of it -- that only one
+    module imports ``heasoftpy``, that every HEASOFT call declares what it produces, that
+    no ``wait_for`` gets a bare function.
+
+Continuous integration runs all of this through ``tox``; see ``tox.ini`` and
+``.github/workflows/ci_tests.yml``. Every environment CI uses can be run locally by name.

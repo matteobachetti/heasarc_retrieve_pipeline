@@ -9,6 +9,7 @@ This is the documentation for heasarc_retrieve_pipeline.
 
    technical_details
    known_issues
+   api
 
 
 Indices and tables

@@ -52,8 +52,6 @@ test = [
 ]
 docs = [
     "sphinx",
-    "sphinx-automodapi",
-    "tomli; python_version <\"3.11\"",
 ]
 
 

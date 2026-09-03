@@ -1535,82 +1535,39 @@ reading the outputs, and they are described in more detail in :ref:`technical_de
   position. NuSTAR's field of view is 12x12 arcmin, so serendipitous coverage of a target
   by an observation pointed elsewhere in the field will be missed at the default radius.
 
-
 Testing and infrastructure
 --------------------------
 
-Current state
-~~~~~~~~~~~~~
+*Resolved.* This section used to describe a suite of four network tests, and a proposal
+for an offline one. Both the suite and the continuous integration around it now exist;
+what follows is what was done, kept because it says where to look.
 
-Four test functions, all ``@pytest.mark.remote_data``. Three fake the download
-(``test=True``) and never reach any processing code; one downloads two real files. So:
+**A and B. Synthetic fixtures and offline unit tests.** Done. ``tests/test_utils.py``
+carries the fixture builders (``make_event_file`` and its neighbours), and the suite is
+about 900 offline tests plus 47 module doctests, running in under a minute with neither
+HEASOFT nor a network. Everything the proposal listed has tests: the image pipeline, the
+GTI arithmetic, the RXTE screening, ``splitext_improved``'s doctests, ``MISSION_CONFIG``
+consistency, ``recursive_download``'s local branch, and the include/exclude filtering.
 
-* with no network, the suite collects **zero** runnable tests;
-* the ``remote_data`` marker only skips anything if ``pytest-remotedata`` (part of
-  ``pytest-astropy``) is installed. Without it the marker is inert and a plain
-  ``pytest`` run hits the network regardless, while emitting an unknown-marker warning;
-* the CI workflow always passes ``--remote-data``, so a HEASARC or AWS outage turns the
-  build red for reasons unrelated to the code;
-* ``heasoftpy`` is never installed in CI, so no processing code is executed anywhere, ever;
-* ``image_utils``, ``rxte``, ``barycenter``, ``utils``, the path builders and the
-  include/exclude filtering have no tests at all.
+**C. CI.** Done, in ``.github/workflows/``:
 
-Proposal
-~~~~~~~~
+* ``ci_tests.yml`` runs on every push and pull request, through ``tox``. It has a code
+  style job (``ruff check`` and ``ruff format --check``), a job with **no** optional
+  dependencies installed -- which is what catches an optional import creeping back to
+  module scope -- coverage on Python 3.12, a Python 3.14 job, macOS, a job for the slow
+  tests alone, a documentation build with warnings as errors, and a source-distribution
+  check. ``--remote-data`` is passed nowhere in it.
+* A ``heasoft`` job in the same workflow installs HEASOFT from the HEASARC conda channel
+  and runs the suite with the ``heasoft``-marked tests enabled, so real ftools are
+  exercised on every push. That environment gets no CALDB, which is why only the
+  CALDB-free tools have real tests -- see the ``heasoft`` marker in
+  ``docs/technical_details.rst``.
+* ``ci_cron_weekly.yml`` runs on Mondays: the ``remote_data`` tests, the documentation
+  link check, and the suite against development astropy and astroquery. An archive outage
+  is therefore noticed without turning somebody's pull request red.
+* ``actions/checkout@v4`` with ``fetch-depth: 0`` -- ``setuptools_scm`` cannot compute a
+  version from a shallow checkout -- and a ``concurrency`` block that cancels superseded
+  runs.
 
-The goal is a suite that runs offline, in seconds, without HEASOFT. Deliberately modest:
-one fixture module and roughly a dozen tests, targeting the code that is pure computation
-and therefore both the easiest to test and the most likely to be silently wrong.
-
-**A. Synthetic fixtures** (``tests/conftest.py``, about 40 lines of astropy):
-
-* ``nustar_event_file`` -- a FITS event file with two Gaussian blobs at known ``X``/``Y``
-  with known and different total counts, a ``PI`` column spanning the 3-79 keV band, a
-  ``GTI`` extension and the header keywords the code reads. This one fixture unlocks most
-  of the image tests.
-* ``rxte_filter_file`` -- a ``*.xfl``-like table with a hand-made ``ELV``/``OFFSET``/
-  ``NUM_PCU_ON``/``Time`` pattern whose correct GTIs can be written down by hand.
-* ``fake_archive_dir`` -- a directory tree mimicking an OBSID, for the local-copy download
-  path.
-
-**B. Offline unit tests**, in rough order of value:
-
-1. ``filter_sources_in_images`` end-to-end on ``nustar_event_file``: both blobs are found,
-   at the right coordinates, ``_src1`` is the brighter one, and ``_back.evt`` excludes
-   both. This single test covers the whole image pipeline and would have caught the
-   X/Y-axis conventions.
-2. ``mask_around_region`` -- including the integer-overflow case its own comment warns
-   about (coordinates far enough apart that ``int16`` squaring would wrap).
-3. ``filter_table`` and ``filter_table_outside_regions`` -- counts in and out of known
-   circles, and the scalar-vs-list ``region_size`` branch.
-4. ``image_from_table`` -- assert the axis order explicitly, since the function histograms
-   ``(Y, X)`` and returns the transpose.
-5. ``create_gti_with_astropy`` on ``rxte_filter_file`` -- exact GTI boundaries, including
-   the ``+TIMEDEL`` edge convention and the empty-GTI branch.
-6. ``apply_gti_with_astropy`` -- the right events survive, including the ``TIMEZERO``
-   offset and the "no events left" branch.
-7. ``splitext_improved`` -- already has doctests; just make sure they actually run
-   (``--doctest-modules`` or the existing ``doctest_plus``).
-8. ``MISSION_CONFIG`` consistency -- every mission has all six keys, and each ``path_func``
-   produces the documented archive layout for a known OBSID.
-9. ``recursive_download`` against ``fake_archive_dir`` -- the local branch is already
-   implemented and completely untested.
-10. ``re_include``/``re_exclude`` filtering against a canned listing (a list of paths, no
-    network), asserting the same two-file result the current remote test checks.
-
-**C. CI**. Split ``.github/workflows/python-package.yml`` into:
-
-* a fast job on every push: install the package, run ``pytest`` **without**
-  ``--remote-data``, upload coverage. This is the job that must stay green;
-* the existing micromamba job, with ``--remote-data``, allowed to fail or scheduled nightly
-  rather than gating every commit;
-* optionally, install ``heasoftpy`` from the HEASARC conda channel in one job so that the
-  mission modules are at least imported and their ``HAS_HEASOFT`` guards exercised.
-
-Also: bump ``actions/checkout`` from v3, and add a ``concurrency`` block so superseded runs
-are cancelled.
-
-**D. Not proposed.** Deliberately out of scope, because the cost outweighs the benefit at
-this size: mocking HEASOFT tasks, a fake HEASARC/S3 server, property-based testing, a
-coverage gate, or a typing pass. The synthetic-fixture tests above give most of the
-protection for a fraction of the effort.
+**D. Not proposed**, and still not: a fake HEASARC/S3 server, property-based testing, a
+coverage gate, or a typing pass.
