@@ -83,6 +83,7 @@ STEP_TITLES = {
     "join_source_data": "Source join",
     "flare_filtering": "Solar-flare filtering",
     "calculate_spectra": "Spectral extraction",
+    "combine_modules": "Module combination",
 }
 """Readable names for the steps, for the timeline and the section headings."""
 
@@ -859,6 +860,10 @@ def observation_body(summary, directory):
         ("Joining", "join_source_data", gti_figure),
         ("Solar-flare filtering", "flare_filtering", flare_figure),
         ("Spectra", "calculate_spectra", spectrum_figure),
+        # The same figure: a combined product is a spectrum like any other, and drawing it
+        # on its own axes is what lets a reader see it sitting at the sum of the two
+        # modules' rates rather than at their average. See coadd.apply_case_b_scaling.
+        ("Combined spectra", "combine_modules", spectrum_figure),
     )
     for heading, step, builder in sections:
         drawn = []

@@ -170,6 +170,22 @@ def a_spectrum(tmp_path, obsid=OBSID, stems=("nu123A01", "nu123B01")):
         rec.array(**arrays)
 
 
+def a_combination(tmp_path, obsid=OBSID, stems=("nu123_comb01", "nu123_comb0106")):
+    """A ``combine_modules`` record, as the co-added products leave behind."""
+    energy = 0.04 * np.arange(35, 1935, 10.0) + 1.6
+    with record_step(observation(tmp_path, obsid), obsid, "combine_modules") as rec:
+        rec.value(
+            spectra=[stem + "_grp.pha" for stem in stems],
+            mode06_exposure_fraction={"nu123_comb01": 0.0, "nu123_comb0106": 0.4},
+        )
+        arrays = {}
+        for stem in stems:
+            arrays[f"spec_{stem}_src_energy"] = energy
+            arrays[f"spec_{stem}_src_rate"] = 20.0 * energy**-1.8
+            arrays[f"spec_{stem}_src_rate_err"] = 0.2 * energy**-1.8
+        rec.array(**arrays)
+
+
 def a_full_observation(tmp_path, obsid=OBSID):
     """One observation with a record of every kind, as a finished reduction leaves."""
     a_manifest(tmp_path, obsid)
@@ -517,6 +533,27 @@ class TestTheSpectra:
         path = report.write_observation_page(OBSID, str(tmp_path), recover=False)
 
         assert "Spectra" in soup(path).get_text()
+
+    def test_the_combined_spectra_get_a_section_of_their_own(self, tmp_path):
+        """A co-added product is drawn like any other spectrum, on its own axes."""
+        a_manifest(tmp_path)
+        a_combination(tmp_path)
+
+        path = report.write_observation_page(OBSID, str(tmp_path), recover=False)
+
+        assert "Combined spectra" in soup(path).get_text()
+
+    def test_the_combination_step_has_a_readable_name(self):
+        """Without this it shows up in the timeline as the bare function name."""
+        assert report.STEP_TITLES["combine_modules"] == "Module combination"
+
+    def test_a_combination_that_found_no_pair_draws_nothing(self, tmp_path):
+        directory = observation(tmp_path)
+        with record_step(directory, OBSID, "combine_modules") as rec:
+            rec.skip("no pair of module spectra to combine")
+        record, arrays = self.records(tmp_path, "combine_modules")
+
+        assert report.spectrum_figure(record, arrays) is None
 
 
 class TestPagesThatCouldGoWrong:
