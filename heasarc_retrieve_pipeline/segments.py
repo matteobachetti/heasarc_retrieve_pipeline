@@ -605,7 +605,7 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
 
 def main(argv=None):
     """
-    ``hrp-split-obsid <out_data_path> <OBSID> <MJD> [<MJD> ...]``.
+    ``hrp-split-obsid <data_dir> <OBSID> <MJD> [<MJD> ...]``.
 
     Parameters
     ----------
@@ -621,7 +621,7 @@ def main(argv=None):
         prog="hrp-split-obsid",
         description=__doc__.strip().splitlines()[0],
     )
-    parser.add_argument("out_data_path", help="the pipeline's output directory")
+    parser.add_argument("data_dir", help="parent directory containing {OBSID}/event_pipe subdirectories")
     parser.add_argument("obsid", help="observation to split; must already be reduced")
     parser.add_argument(
         "mjd", nargs="+", type=float, help="where to cut; N of them give N + 1 segments"
@@ -647,7 +647,7 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    config = {"out_data_path": os.path.abspath(args.out_data_path)}
+    config = {"out_data_path": os.path.abspath(args.data_dir)}
     result = split_obsid(
         args.obsid,
         config,
