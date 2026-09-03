@@ -29,7 +29,12 @@ Everything is written into the parent observation's own tree with a ``_seg<N>`` 
     <OBSID>/products/nu<OBSID>A01_sr_seg1.pha     source spectrum
     <OBSID>/products/nu<OBSID>A01_bk_seg1.pha     background spectrum
     <OBSID>/products/nu<OBSID>A01_grp_seg1.pha    grouped, the one you fit
+    <OBSID>/products/nu<OBSID>_comb01_seg1.pha    both modules co-added
     <OBSID>/nu<OBSID>A_src1_bary_seg1.evt         event list
+
+The co-added spectra are :func:`combine_segment_spectra`, the segment counterpart of
+:func:`~heasarc_retrieve_pipeline.nustar.combine_module_spectra`. They reuse the parent's
+combined response too, so a segment costs no response at all.
 
 That is not tidiness, it is what makes the responses free: ``RESPFILE``, ``ANCRFILE`` and
 ``BACKFILE`` are bare file names resolved relative to the spectrum's own directory, so a
@@ -59,8 +64,11 @@ import numpy as np
 from astropy.io import fits
 
 from . import heasoft
+from .coadd import apply_case_b_scaling, run_addspec
 from .diagnostics import diagnostics_path, record_step
 from .nustar import (
+    combined_spectrum_inputs,
+    module_exposure_ratio,
     nu_base_output_path,
     nu_pipeline_output_path,
     nu_product_output_path,
@@ -84,6 +92,7 @@ from .utils import (
 )
 
 __all__ = [
+    "combine_segment_spectra",
     "event_files_to_split",
     "insert_tag",
     "main",
@@ -425,7 +434,11 @@ def point_at_parent_response(phafiles, rmf, arf):
         Spectra to edit, in place. Missing files are ignored -- ``grppha`` may not have
         produced one.
     rmf, arf : str
-        Base names of the parent's redistribution matrix and ancillary response.
+        Base names of the parent's redistribution matrix and ancillary response. A response
+        that already has the effective area folded into it -- the ``.rsp`` ``addspec``
+        writes, which is what :func:`combine_segment_spectra` points its products at -- is
+        named as ``rmf`` with ``arf`` given as ``"none"``, so that XSPEC does not apply the
+        area twice.
     """
     for path in phafiles:
         if not os.path.exists(path):
@@ -436,6 +449,115 @@ def point_at_parent_response(phafiles, rmf, arf):
                     hdu.header["RESPFILE"] = rmf
                 if "ANCRFILE" in hdu.header:
                     hdu.header["ANCRFILE"] = arf
+
+
+#: How far a segment's FPMA:FPMB exposure ratio may drift from the whole observation's
+#: before :func:`combine_segment_spectra` says so. Once the modules share a good time
+#: interval the ratio is pure deadtime, and on ``90901333002`` it moved only between 1.0084
+#: and 1.0105 across four independent time selections. One per cent is therefore not noise:
+#: it means the source got bright enough to change the deadtime within the segment, which is
+#: the one case where reusing the parent's blended response starts to cost something.
+MODULE_RATIO_TOLERANCE = 0.01
+
+
+def _module_ratio_drift(spectra, parent, obsid):
+    """
+    How far a segment's FPMA:FPMB exposure ratio has moved from the parent's, as a fraction.
+
+    ``None`` when there is nothing to compare against -- no parent product, or an exposure
+    that could not be read. Absence of evidence, so the caller says nothing rather than
+    warning.
+    """
+    if not parent:
+        return None
+    reference = module_exposure_ratio(parent, obsid)
+    ratio = module_exposure_ratio(spectra, obsid)
+    if not np.isfinite(reference) or not np.isfinite(ratio) or reference == 0:
+        return None
+    return ratio / reference - 1.0
+
+
+def combine_segment_spectra(obsid, config, tags, rec=None):
+    """
+    Co-add FPMA and FPMB within each segment, on the parent's combined response.
+
+    The segment counterpart of
+    :func:`~heasarc_retrieve_pipeline.nustar.combine_module_spectra`, and it takes the same
+    shortcut the rest of this module takes with responses: ``addspec`` is run with
+    ``qaddrmf=no`` and the result is pointed at the ``nu<OBSID>_comb*.rsp`` the parent
+    observation already has::
+
+        products/nu<OBSID>_comb01_seg1.pha     .bak  _grp.pha  _inputs.lis
+
+    That reuse is a measurement, not an assumption. A combined response is the two modules'
+    blended by exposure, so reusing it is only wrong to the extent that the segment's
+    FPMA:FPMB weight differs from the whole observation's -- 0.2 per cent on
+    ``90901333002``, applied to two responses that are themselves a few per cent apart, so
+    an effective-area error of order 1e-4. The alternative is a fresh 68 MB response for
+    every segment of every observation. :data:`MODULE_RATIO_TOLERANCE` is the guard against
+    the case where that reasoning stops holding.
+
+    A flavour whose parent response is missing is skipped: the products of this module are
+    bare file names resolved next to themselves, so a spectrum naming a response that is not
+    there would be worse than no spectrum at all. That is what happens on a tree reduced
+    before the modules were ever combined.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    tags : list of str
+        Segment suffixes, as :func:`segment_tag` builds them.
+    rec : StepRecord, optional
+        Diagnostics record to write the results and any warnings into.
+
+    Returns
+    -------
+    list of str
+        Base names of the files written.
+    """
+    logger = get_logger()
+    outdir = nu_product_output_path(obsid, config=config)
+    parents = combined_spectrum_inputs(obsid, config)
+
+    written = []
+    drifted = []
+    for tag in tags:
+        for suffix, spectra in combined_spectrum_inputs(obsid, config, tag=tag).items():
+            response = f"nu{obsid}_{suffix}.rsp"
+            if not os.path.exists(os.path.join(outdir, response)):
+                logger.warning(
+                    f"No {response} for {tag} to point at, so its modules are not combined"
+                )
+                continue
+
+            drift = _module_ratio_drift(spectra, parents.get(suffix), obsid)
+            if drift is not None and abs(drift) > MODULE_RATIO_TOLERANCE:
+                logger.warning(
+                    f"{tag} of {obsid} has an FPMA:FPMB exposure ratio {drift:+.1%} from "
+                    f"the whole observation's, so {response} is the wrong blend for it"
+                )
+                drifted.append({"segment": tag, "product": suffix, "drift": float(drift)})
+
+            root = f"nu{obsid}_{suffix}_{tag}"
+            logger.info(f"Combining {len(spectra)} spectra into {root}.pha")
+            written.extend(
+                run_addspec(spectra, outdir, root, f"_inputs_{suffix}_{tag}", qaddrmf=False)
+            )
+
+            edited = [os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")]
+            # addspec added the two modules' exposures as though they had observed one
+            # after the other. They did not. See coadd.apply_case_b_scaling.
+            apply_case_b_scaling(edited, 2)
+            # The ancillary response is already folded into the .rsp, so there is no
+            # separate .arf to name.
+            point_at_parent_response(edited, response, "none")
+
+    if rec is not None:
+        rec.value(combined=written, module_ratio_drift=drifted)
+    return written
 
 
 def _remove_plot(outdir, stem):
@@ -554,7 +676,7 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
     Returns
     -------
     dict
-        ``bounds``, ``split_mets``, ``spectra`` and ``event_files``.
+        ``bounds``, ``split_mets``, ``spectra``, ``combined`` and ``event_files``.
     """
     from .nustar import observation_time_span
 
@@ -592,6 +714,16 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
             ],
         )
         written_spectra = split_spectra(obsid, config, bounds) if spectra else []
+        written_combined = (
+            combine_segment_spectra(
+                obsid,
+                config,
+                [segment_tag(number) for number in range(1, len(bounds) + 1)],
+                rec=rec,
+            )
+            if spectra
+            else []
+        )
         written_events = split_event_files(obsid, config, bounds) if events else []
         rec.value(spectra=written_spectra, event_files=written_events)
 
@@ -599,6 +731,7 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
         "bounds": bounds,
         "split_mets": mets,
         "spectra": written_spectra,
+        "combined": written_combined,
         "event_files": written_events,
     }
 

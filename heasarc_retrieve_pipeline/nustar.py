@@ -2765,7 +2765,7 @@ def _mode_of(key):
     return "01" if key.startswith("01") else "06"
 
 
-def combined_spectrum_inputs(obsid, config):
+def combined_spectrum_inputs(obsid, config, tag=None):
     """
     The source spectra each combined product is to be built from.
 
@@ -2780,19 +2780,26 @@ def combined_spectrum_inputs(obsid, config):
         Observation identifier.
     config : dict
         Must contain ``out_data_path``.
+    tag : str, optional
+        Segment suffix, as :func:`~heasarc_retrieve_pipeline.segments.segment_tag` builds
+        it. ``None``, the default, means the whole observation. With a tag the same pairing
+        is applied to the segment spectra ``hrp-split-obsid`` wrote, whose names carry the
+        tag last.
 
     Returns
     -------
     dict
-        Key of :data:`COMBINED_PRODUCTS` to the list of spectra to co-add. A product with
-        nothing to add, or one of whose modes produced nothing, is left out.
+        Key of :data:`COMBINED_PRODUCTS` to the list of spectra to co-add, FPMA before FPMB
+        within each pair. A product with nothing to add, or one of whose modes produced
+        nothing, is left out.
     """
     products = nu_product_output_path(obsid, config=config)
     pairs, _ = paired_spectral_inputs(obsid, config)
+    ending = "_sr.pha" if tag is None else f"_sr_{tag}.pha"
 
     by_mode = {}
     for key in pairs:
-        paths = [os.path.join(products, f"nu{obsid}{fpm}{key}_sr.pha") for fpm in ("A", "B")]
+        paths = [os.path.join(products, f"nu{obsid}{fpm}{key}{ending}") for fpm in ("A", "B")]
         if not all(os.path.exists(path) for path in paths):
             # The pair was extractable but one of the two extractions did not produce a
             # spectrum. Half a pair is no pair.
@@ -2843,6 +2850,44 @@ def mode_06_exposure_fraction(spectra, obsid):
         if _mode_of(key) == "06":
             from_mode_06 += exposure
     return from_mode_06 / total if total else 0.0
+
+
+def module_exposure_ratio(spectra, obsid):
+    """
+    How much longer FPMA was live than FPMB, over a combined product's inputs.
+
+    Once the two modules share a good time interval this is pure deadtime, and deadtime
+    tracks the count rate. So the ratio is a cheap witness that a time selection is not
+    doing something odd: measured on ``90901333002`` it sat between 1.0084 and 1.0105
+    across four independent selections, and
+    :func:`~heasarc_retrieve_pipeline.segments.combine_segment_spectra` compares each
+    segment's against the parent's for exactly that reason.
+
+    Parameters
+    ----------
+    spectra : list of str
+        Paths of the spectra that go into one combined product.
+    obsid : str
+        Observation identifier, needed to find the module letter in each file name.
+
+    Returns
+    -------
+    float
+        FPMA exposure over FPMB exposure, or ``nan`` if FPMB contributed nothing readable.
+    """
+    from astropy.io import fits
+
+    totals = {"A": 0.0, "B": 0.0}
+    for path in spectra:
+        # nu<OBSID><FPM>..., so the module letter is the one after the identifier.
+        fpm = os.path.basename(path)[len("nu") + len(obsid)]
+        if fpm not in totals:
+            continue
+        try:
+            totals[fpm] += float(fits.getheader(path, 1).get("EXPOSURE", 0.0) or 0.0)
+        except Exception as error:  # pragma: no cover - unreadable input
+            get_logger().warning(f"Could not read the exposure of {path}: {error}")
+    return totals["A"] / totals["B"] if totals["B"] else float("nan")
 
 
 @task(task_run_name="nu_combine_modules_{obsid}")

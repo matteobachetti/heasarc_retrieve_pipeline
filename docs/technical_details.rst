@@ -1296,6 +1296,43 @@ aspect wanders, which is exactly what mode 06 is. If a segment's spectrum ever l
 suspicious, regenerating its response with ``runmkarf=yes`` is a one-flag change and the
 honest cross-check.
 
+Combining the modules within a segment
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Once the per-module segment spectra exist, ``combine_segment_spectra`` co-adds FPMA and
+FPMB inside each segment, exactly as ``combine_module_spectra`` does for the whole
+observation and with the same case-B correction::
+
+    <OBSID>/products/nu<OBSID>_comb01_seg1.pha    .bak  _grp.pha  _inputs.lis
+
+There is one difference, and it is the same shortcut the rest of the split takes with
+responses: ``addspec`` is run with ``qaddrmf=no``, and the result is pointed at the
+``nu<OBSID>_comb01.rsp`` the parent observation already has. A segment therefore costs no
+response at all -- neither a ``nuproducts`` response nor an ``addspec`` one.
+
+That reuse is a measurement rather than an assumption. A combined ``.rsp`` is the two
+modules' responses blended by exposure, so reusing the parent's is wrong only to the extent
+that the segment's FPMA:FPMB weight differs from the whole observation's. On 90901333002,
+with the good time interval already shared between the modules, that weight is pure
+deadtime and moved only from 1.0084 to 1.0105 across four independent time selections --
+0.2 per cent, applied to two responses that are themselves a few per cent apart, so an
+effective-area error of order 1e-4. The alternative is a fresh 68 MB response per segment
+per flavour.
+
+``MODULE_RATIO_TOLERANCE`` is the guard against the case where that reasoning stops
+holding. Deadtime tracks the count rate, and a source bright enough to change it within one
+segment is exactly what a split is often for, so each segment's FPMA:FPMB exposure ratio is
+compared with the parent's and anything past one per cent is logged and recorded in the
+diagnostics as ``module_ratio_drift``. It is a warning, not a refusal: the product is still
+written, and the reader is told the blend it was folded with is not quite its own.
+
+Because the ancillary response is already folded into a ``.rsp``, the segment products name
+it as ``RESPFILE`` with ``ANCRFILE`` set to ``none`` -- naming both would apply the
+effective area twice. A flavour whose parent ``.rsp`` is not there is skipped rather than
+written: these products resolve their pointers next to themselves, so a spectrum naming a
+response that does not exist would be worse than no spectrum. That is what an observation
+reduced before the modules were ever combined looks like.
+
 Merging: ``combine.py``
 ~~~~~~~~~~~~~~~~~~~~~~~
 

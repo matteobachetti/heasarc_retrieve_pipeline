@@ -15,6 +15,11 @@ import pytest
 from astropy.io import fits
 
 from heasarc_retrieve_pipeline import segments
+from heasarc_retrieve_pipeline.nustar import (
+    nu_pipeline_output_path,
+    nu_product_output_path,
+    split_path,
+)
 from heasarc_retrieve_pipeline.utils import read_gti
 
 from .test_nustar import make_synthetic_event_file
@@ -66,12 +71,41 @@ def make_reduced_tree(base, tstart=0.0, tstop=1000.0, nevents=500, with_regions=
     return {"out_data_path": str(base)}
 
 
+def write_spectrum(path, exposure=500.0, backfile=None, respfile="none"):
+    """
+    A spectrum with the keywords this module reads and rewrites, and nothing else.
+
+    ``EXPOSURE`` is there because the module compares the two focal-plane modules' exposures
+    with each other, and ``BACKFILE`` because a co-addition has to find the background.
+    """
+    spectrum = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="CHANNEL", format="J", array=np.arange(10)),
+            fits.Column(name="COUNTS", format="J", array=np.arange(10)),
+        ],
+        name="SPECTRUM",
+    )
+    spectrum.header["EXPOSURE"] = exposure
+    spectrum.header["DETCHANS"] = 10
+    if backfile is not None:
+        spectrum.header["BACKFILE"] = backfile
+    # What nuproducts writes when it was told not to make a response.
+    spectrum.header["RESPFILE"] = respfile
+    spectrum.header["ANCRFILE"] = "none"
+    fits.HDUList([fits.PrimaryHDU(), spectrum]).writeto(path, overwrite=True)
+
+
 class StubNuproducts:
     """
-    ``nuproducts``, recorded rather than run.
+    The HEASOFT tools this module runs, recorded rather than run.
 
-    The files it claims to produce are written, because ``heasoft.run`` checks that a tool
-    produced what it said it would, and because the code then edits the spectra's headers.
+    ``nuproducts`` is what the spectral split *is*: HEASOFT does the extraction, so all
+    that is left to test is which parameters it was called with. ``addspec`` and ``grppha``
+    are here because the module edits their output afterwards, so the files they claim to
+    write have to exist and to carry an exposure.
+
+    The files each tool claims to produce are written, because ``heasoft.run`` checks that
+    a tool produced what it said it would.
     """
 
     def __init__(self):
@@ -80,24 +114,31 @@ class StubNuproducts:
     def __call__(self, name, *args, **kwargs):
         params = args[0] if args else kwargs
         self.calls.append((name, dict(params)))
+        getattr(self, "_" + name)(params)
+
+    def _nuproducts(self, params):
         for key in ("phafile", "bkgphafile", "grpphafile"):
             path = params.get(key)
             if path in (None, "NONE"):
                 continue
-            spectrum = fits.BinTableHDU.from_columns(
-                [
-                    fits.Column(name="CHANNEL", format="J", array=np.arange(10)),
-                    fits.Column(name="COUNTS", format="J", array=np.arange(10)),
-                ],
-                name="SPECTRUM",
+            backfile = params.get("bkgphafile")
+            write_spectrum(
+                path,
+                backfile=None if key == "bkgphafile" else os.path.basename(backfile),
             )
-            # What nuproducts writes when it was told not to make a response.
-            spectrum.header["RESPFILE"] = "none"
-            spectrum.header["ANCRFILE"] = "none"
-            fits.HDUList([fits.PrimaryHDU(), spectrum]).writeto(path, overwrite=True)
         # The plot it writes whether or not it was asked to.
         with open(os.path.join(params["outdir"], params["stemout"] + "_ph.gif"), "w") as f:
             f.write("gif")
+
+    def _addspec(self, params):
+        root = params["outfil"]
+        # Twice the exposure of one module, which is addspec's case-A convention and what
+        # apply_case_b_scaling is there to undo.
+        write_spectrum(root + ".pha", exposure=1000.0, backfile=root + ".bak")
+        write_spectrum(root + ".bak", exposure=1000.0)
+
+    def _grppha(self, params):
+        write_spectrum(params["outfile"].lstrip("!"), exposure=1000.0)
 
 
 @pytest.fixture
@@ -279,6 +320,174 @@ class TestSplitSpectra:
         assert "region" in open(report).read()
 
 
+class Recorder:
+    """A stand-in for a diagnostics record, keeping what it was told."""
+
+    def __init__(self):
+        self.values = {}
+
+    def value(self, **kwargs):
+        self.values.update(kwargs)
+
+
+#: A little more live time on FPMA than on FPMB, as the deadtime always gives.
+MODULE_EXPOSURES = {"A": 520.0, "B": 515.0}
+
+
+class TestCombiningSegmentModules:
+    """FPMA and FPMB co-added within each segment, on the parent's combined response."""
+
+    def tree(
+        self,
+        tmp_path,
+        keys=("01", "06_chu12_N"),
+        tags=("seg1",),
+        exposures=None,
+        responses=("comb01", "comb06", "comb0106"),
+    ):
+        """
+        A tree in the state the split leaves: parent spectra, segment spectra, responses.
+
+        Only the files this step reads, and nothing of what made them: what is under test
+        is which spectra are co-added and what the result then says about itself.
+        """
+        config = {"out_data_path": str(tmp_path)}
+        exposures = exposures or {}
+        pipedir = nu_pipeline_output_path(OBSID, config=config)
+        splitdir = split_path(OBSID, config=config)
+        products = nu_product_output_path(OBSID, config=config)
+        for directory in (pipedir, splitdir, products):
+            os.makedirs(directory, exist_ok=True)
+
+        for key in keys:
+            for fpm in "AB":
+                stem = f"nu{OBSID}{fpm}{key}"
+                directory = pipedir if key == "01" else splitdir
+                open(os.path.join(directory, stem + "_cl.evt"), "w").close()
+                for end in ["_sr.pha"] + [f"_sr_{tag}.pha" for tag in tags]:
+                    name = stem + end
+                    background = stem + end.replace("_sr", "_bk")
+                    write_spectrum(
+                        os.path.join(products, name),
+                        exposure=exposures.get(name, MODULE_EXPOSURES[fpm]),
+                        backfile=background,
+                    )
+                    write_spectrum(os.path.join(products, background))
+
+        for suffix in responses:
+            open(os.path.join(products, f"nu{OBSID}_{suffix}.rsp"), "w").close()
+        return config, products
+
+    def test_each_segment_gets_one_product_per_mode(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        for suffix in ("comb01", "comb06", "comb0106"):
+            for end in (".pha", ".bak", "_grp.pha", "_inputs.lis"):
+                assert os.path.exists(
+                    os.path.join(products, f"nu{OBSID}_{suffix}_seg1{end}")
+                )
+
+    def test_no_response_is_made_for_a_segment(self, tmp_path, stub):
+        """The whole point: a fresh 68 MB response per segment is what this avoids."""
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        assert [name for name, _ in stub.calls if name == "addspec"]
+        assert all(
+            params["qaddrmf"] == "no" for name, params in stub.calls if name == "addspec"
+        )
+        assert sorted(n for n in os.listdir(products) if n.endswith(".rsp")) == [
+            f"nu{OBSID}_comb01.rsp",
+            f"nu{OBSID}_comb0106.rsp",
+            f"nu{OBSID}_comb06.rsp",
+        ]
+
+    def test_the_segments_point_at_the_parents_combined_response(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        for end in (".pha", "_grp.pha"):
+            header = fits.getheader(
+                os.path.join(products, f"nu{OBSID}_comb06_seg1{end}"), 1
+            )
+            assert header["RESPFILE"] == f"nu{OBSID}_comb06.rsp"
+            # The effective area is folded into that .rsp already.
+            assert header["ANCRFILE"] == "none"
+
+    def test_the_exposure_is_corrected_for_two_modules(self, tmp_path, stub):
+        """addspec handed back 1000 s for two modules that observed at the same time."""
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        header = fits.getheader(os.path.join(products, f"nu{OBSID}_comb01_seg1.pha"), 1)
+        assert header["EXPOSURE"] == 500.0
+        assert header["AREASCAL"] == 2
+
+    def test_a_flavour_without_a_parent_response_is_skipped(self, tmp_path, stub):
+        """A tree reduced before the modules were ever combined has nothing to point at."""
+        config, _ = self.tree(tmp_path, responses=("comb01",))
+
+        written = segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        assert [n for n in written if n.endswith("_seg1.pha")] == [
+            f"nu{OBSID}_comb01_seg1.pha"
+        ]
+
+    def test_a_segment_whose_extraction_failed_is_left_out(self, tmp_path, stub):
+        """Half a pair is no pair, here as everywhere else."""
+        config, products = self.tree(tmp_path)
+        os.unlink(os.path.join(products, f"nu{OBSID}B01_sr_seg1.pha"))
+
+        written = segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        assert {name.split("_")[1] for name in written} == {"comb06"}
+
+    def test_only_the_segments_own_spectra_go_in(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        with open(os.path.join(products, f"nu{OBSID}_comb01_seg1_inputs.lis")) as fobj:
+            assert fobj.read().split() == [
+                f"nu{OBSID}A01_sr_seg1.pha",
+                f"nu{OBSID}B01_sr_seg1.pha",
+            ]
+
+    def test_a_drifting_deadtime_ratio_is_recorded(self, tmp_path, stub):
+        """A source bright enough to move the deadtime is what a split is often for."""
+        config, _ = self.tree(
+            tmp_path, exposures={f"nu{OBSID}B01_sr_seg1.pha": 300.0}
+        )
+        rec = Recorder()
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"], rec=rec)
+
+        drifted = [d for d in rec.values["module_ratio_drift"] if d["product"] == "comb01"]
+        assert len(drifted) == 1
+        assert drifted[0]["segment"] == "seg1"
+        assert drifted[0]["drift"] == pytest.approx(515 / 300 - 1)
+
+    def test_a_steady_deadtime_ratio_says_nothing(self, tmp_path, stub):
+        config, _ = self.tree(tmp_path)
+        rec = Recorder()
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"], rec=rec)
+
+        assert rec.values["module_ratio_drift"] == []
+
+    def test_the_staging_directories_are_cleaned_up(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        segments.combine_segment_spectra(OBSID, config, ["seg1"])
+
+        assert [n for n in os.listdir(products) if n.startswith("_inputs")] == []
+
+
 class TestSplitEventFiles:
     """The events have to be partitioned, not sampled."""
 
@@ -398,6 +607,34 @@ class TestSplitObsid:
         assert record["status"] == "done"
         assert record["values"]["split_mets"][0] == pytest.approx(500.0, abs=1e-3)
         assert record["values"]["timesys"] == "tt"
+
+    def test_the_modules_are_combined_within_each_segment(self, tree, stub):
+        from heasarc_retrieve_pipeline.utils import mjd_from_met
+
+        products = os.path.join(tree["out_data_path"], OBSID, "products")
+        # What nustar.combine_module_spectra leaves behind for the segments to reuse.
+        open(os.path.join(products, f"nu{OBSID}_comb01.rsp"), "w").close()
+        path = os.path.join(tree["out_data_path"], OBSID, "event_pipe", f"nu{OBSID}A01_cl.evt")
+        with fits.open(path) as hdul:
+            mjd = mjd_from_met(500.0, hdul)
+
+        result = segments.split_obsid(OBSID, tree, [mjd], events=False)
+
+        assert f"nu{OBSID}_comb01_seg1.pha" in result["combined"]
+        assert f"nu{OBSID}_comb01_seg2.pha" in result["combined"]
+
+    def test_a_tree_with_nothing_to_point_at_still_splits(self, tree, stub):
+        """No parent .rsp, so no combined segment -- and no failure either."""
+        from heasarc_retrieve_pipeline.utils import mjd_from_met
+
+        path = os.path.join(tree["out_data_path"], OBSID, "event_pipe", f"nu{OBSID}A01_cl.evt")
+        with fits.open(path) as hdul:
+            mjd = mjd_from_met(500.0, hdul)
+
+        result = segments.split_obsid(OBSID, tree, [mjd], events=False)
+
+        assert result["combined"] == []
+        assert len(result["spectra"]) == 4
 
     def test_the_pieces_can_be_asked_for_separately(self, tree, stub):
         from heasarc_retrieve_pipeline.utils import mjd_from_met
