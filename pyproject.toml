@@ -52,23 +52,27 @@ repository = "http://github.com/matteobachetti/heasarc_retrieve_pipeline"
 requires = [
   "setuptools>=61.2",
   "setuptools_scm[toml]>=3.4",
-  "wheel",
-
 ]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 zip-safe = false
 include-package-data = true
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
+where = ["src"]
+include = ["heasarc_retrieve_pipeline*"]
+
+[tool.setuptools.package-data]
+"heasarc_retrieve_pipeline" = ["data/*"]
 
 [tool.setuptools_scm]
-write_to = "heasarc_retrieve_pipeline/_version.py"
+version_file = "src/heasarc_retrieve_pipeline/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = [
-  "heasarc_retrieve_pipeline",
+  "src/heasarc_retrieve_pipeline",
   "docs",
 ]
 doctest_plus = "enabled"
@@ -77,13 +81,13 @@ addopts = "--doctest-rst"
 
 [tool.coverage.run]
 omit = [
- "heasarc_retrieve_pipeline/__init*",
- "heasarc_retrieve_pipeline/conftest.py",
- "heasarc_retrieve_pipeline/*setup_package*",
- "heasarc_retrieve_pipeline/tests/*",
- "heasarc_retrieve_pipeline/*/tests/*",
- "heasarc_retrieve_pipeline/extern/*",
- "heasarc_retrieve_pipeline/version*",
+ "src/heasarc_retrieve_pipeline/__init*",
+ "src/heasarc_retrieve_pipeline/conftest.py",
+ "src/heasarc_retrieve_pipeline/*setup_package*",
+ "src/heasarc_retrieve_pipeline/tests/*",
+ "src/heasarc_retrieve_pipeline/*/tests/*",
+ "src/heasarc_retrieve_pipeline/extern/*",
+ "src/heasarc_retrieve_pipeline/version*",
  "*/heasarc_retrieve_pipeline/__init*",
  "*/heasarc_retrieve_pipeline/conftest.py",
  "*/heasarc_retrieve_pipeline/*setup_package*",
