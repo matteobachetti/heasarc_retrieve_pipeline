@@ -115,8 +115,13 @@ testpaths = [
   "docs",
 ]
 doctest_plus = "enabled"
-text_file_format = "rst"
-addopts = "--doctest-rst"
+# --doctest-rst is deprecated; this is what it expands to. Spelling it out also means a
+# bare `pytest` still starts when pytest-doctestplus is not installed.
+addopts = "--doctest-glob=*.rst"
+markers = [
+  "slow: expensive test, deselected unless --run-slow is given",
+  "heasoft: needs a real HEASOFT installation, not a recorded double",
+]
 
 [tool.coverage.run]
 omit = [

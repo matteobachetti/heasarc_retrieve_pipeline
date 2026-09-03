@@ -5,26 +5,21 @@ file-selection helpers that decide which event files the pipeline works on.
 """
 
 import os
+import glob
+import numpy as np
+from astropy.io import fits
+import pytest
 
-# These tests call Prefect tasks through ``.fn``, outside any flow run. Prefect's API log
-# handler warns about that on every call; it has nothing to report to.
-os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
-import glob  # noqa: E402
-import numpy as np  # noqa: E402
-from astropy.io import fits  # noqa: E402
-import pytest  # noqa: E402
-
-from astropy.coordinates import SkyCoord  # noqa: E402
-import astropy.units as u  # noqa: E402
-
-from heasarc_retrieve_pipeline import coadd, heasoft, nustar  # noqa: E402
-from heasarc_retrieve_pipeline.diagnostics import (  # noqa: E402
+from heasarc_retrieve_pipeline import coadd, heasoft, nustar
+from heasarc_retrieve_pipeline.diagnostics import (
     diagnostics_path,
     read_arrays,
     read_records,
 )
-from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
+from heasarc_retrieve_pipeline.nustar import (
     chi2_dof_against_a_constant,
     flare_filtered_event_file_name,
     nu_base_output_path,
@@ -49,7 +44,7 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     spectral_input_files,
     spectral_input_key,
 )
-from heasarc_retrieve_pipeline.utils import (  # noqa: E402
+from heasarc_retrieve_pipeline.utils import (
     intersect_intervals,
     mask_from_gti,
     merge_intervals,

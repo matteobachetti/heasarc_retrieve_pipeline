@@ -7,14 +7,12 @@ recorded double the merge tests use.
 
 import os
 
-os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
+import numpy as np
+import pytest
+from astropy.io import fits
 
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
-from astropy.io import fits  # noqa: E402
-
-from heasarc_retrieve_pipeline import roundtrip  # noqa: E402
-from heasarc_retrieve_pipeline.roundtrip import (  # noqa: E402
+from heasarc_retrieve_pipeline import roundtrip
+from heasarc_retrieve_pipeline.roundtrip import (
     compare_events,
     compare_spectra,
     segment_families,

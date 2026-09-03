@@ -32,6 +32,11 @@ from heasarc_retrieve_pipeline.diagnostics import (
     read_records,
 )
 
+# About half the runtime of the whole offline suite lives in this file: it forks a real
+# process pool and starts a temporary Prefect server. Run it with ``--run-slow``, or in
+# the continuous-integration job that exists for it.
+pytestmark = pytest.mark.slow
+
 
 def worker_state(roots):
     """What a worker process looks like once :func:`prepare_worker` has run.
