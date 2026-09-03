@@ -1534,14 +1534,16 @@ def get_goes_gtis(obsid, config, minimum_class="C5.0", flux_class="C5.0"):
         which catalogued flares are excluded is a reasonable thing to want, and it must
         not silently destroy the observation.
 
-    The GOES X-ray light curve is also written to :func:`nu_goes_lc_file`, on the
-    observation's own time scale, so that :func:`record_flare_filtering` can show what the
-    Sun was doing without downloading anything a second time.
-
     Returns
     -------
     str
         Path of the GTI file, :func:`nu_goes_gti_file`.
+
+    Notes
+    -----
+    The GOES X-ray light curve is also written to :func:`nu_goes_lc_file`, on the
+    observation's own time scale, so that :func:`record_flare_filtering` can show what the
+    Sun was doing without downloading anything a second time.
 
     Raises
     ------
@@ -1893,14 +1895,16 @@ def filter_from_solar_flares(
         The flux cut that was applied, likewise only recorded. See :func:`get_goes_gtis`
         for why this is separate from ``minimum_class``.
 
-    What the cut removed is measured by :func:`record_flare_filtering` and drawn on the
-    observation's page. Failing to record it is logged, not raised: the science product is
-    already on disk by then.
-
     Returns
     -------
     str
         Path of the filtered file.
+
+    Notes
+    -----
+    What the cut removed is measured by :func:`record_flare_filtering` and drawn on the
+    observation's page. Failing to record it is logged, not raised: the science product is
+    already on disk by then.
     """
     with record_step(
         diagnostics_dir, obsid, "flare_filtering", key=rootname(os.path.basename(event_file))

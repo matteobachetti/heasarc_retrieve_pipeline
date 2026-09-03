@@ -1108,7 +1108,7 @@ def apply_gti(hdul, gti):
     proportional scaling used here -- 0.096%, the same order. Scaling is therefore good
     enough, and it keeps this function independent of any mission's housekeeping file.
     Note the sign: dead time is worse during a flare, so removing flare intervals and
-    scaling proportionally very slightly *under*estimates the surviving live time.
+    scaling proportionally very slightly *underestimates* the surviving live time.
 
     Parameters
     ----------
