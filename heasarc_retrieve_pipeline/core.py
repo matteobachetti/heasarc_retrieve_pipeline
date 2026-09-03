@@ -1319,7 +1319,8 @@ def prepare_worker(pfiles_root, work_root):
     pfiles = os.path.join(pfiles_root, name, "pfiles")
     os.makedirs(pfiles, exist_ok=True)
     os.makedirs(workdir, exist_ok=True)
-    if "HEADAS" in os.environ:
+    headas = os.environ.get("HEADAS")
+    if headas and os.path.isdir(headas):
         # heasoft remembers this value and puts it back if anything changes it; see
         # heasoft._hold_on_to_private_pfiles for why that turned out to be necessary.
         heasoft.use_private_pfiles(pfiles)
