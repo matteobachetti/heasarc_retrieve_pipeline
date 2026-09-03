@@ -284,9 +284,7 @@ class TestReadingBack:
 
 class TestTheManifest:
     def test_it_round_trips(self, tmp_path):
-        write_manifest(
-            str(tmp_path), OBSID, {"name": "M82", "exposure": 1000.0}, url="https://x/y"
-        )
+        write_manifest(str(tmp_path), OBSID, {"name": "M82", "exposure": 1000.0}, url="https://x/y")
 
         manifest = read_manifest(str(tmp_path))
         assert manifest["obsid"] == OBSID
@@ -326,9 +324,7 @@ class TestCatalogueRow:
 class TestCanonicalMetadata:
     """Three missions and two query paths name the same quantity three ways."""
 
-    @pytest.mark.parametrize(
-        "column", ["source_name", "name", "target_name"]
-    )
+    @pytest.mark.parametrize("column", ["source_name", "name", "target_name"])
     def test_whichever_column_carries_the_target(self, column):
         assert canonical_metadata({column: "M82"})["source_name"] == "M82"
 
@@ -388,9 +384,7 @@ class TestARerunKeepsWhatTheLastRunMeasured:
         record = read_records(str(tmp_path))[0]
         assert record["status"] == "skipped"
         assert record["arrays"] == "join.npz"
-        np.testing.assert_array_equal(
-            read_arrays(str(tmp_path), record)["gti"], [[0.0, 10.0]]
-        )
+        np.testing.assert_array_equal(read_arrays(str(tmp_path), record)["gti"], [[0.0, 10.0]])
 
     def test_the_figure_can_tell_it_was_not_measured_now(self, tmp_path):
         self.measure(tmp_path)
@@ -412,9 +406,7 @@ class TestARerunKeepsWhatTheLastRunMeasured:
 
         record = read_records(str(tmp_path))[0]
         assert record["arrays_from_earlier_run"] is False
-        np.testing.assert_array_equal(
-            read_arrays(str(tmp_path), record)["gti"], [[5.0, 20.0]]
-        )
+        np.testing.assert_array_equal(read_arrays(str(tmp_path), record)["gti"], [[5.0, 20.0]])
 
     def test_values_from_the_earlier_run_are_kept(self, tmp_path):
         self.measure(tmp_path)

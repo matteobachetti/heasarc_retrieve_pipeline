@@ -311,7 +311,9 @@ class TestS3KeyDestination:
 
     def test_a_key_not_matching_re_include_is_dropped(self, tmp_path):
         dest = s3_key_destination(
-            PREFIX + "auxil/nu1_att.fits.gz", PREFIX, str(tmp_path),
+            PREFIX + "auxil/nu1_att.fits.gz",
+            PREFIX,
+            str(tmp_path),
             re_include=re.compile(r"evt"),
         )
 
@@ -319,7 +321,9 @@ class TestS3KeyDestination:
 
     def test_a_key_matching_re_exclude_is_dropped(self, tmp_path):
         dest = s3_key_destination(
-            PREFIX + "event_cl/nu1A02_cl.evt.gz", PREFIX, str(tmp_path),
+            PREFIX + "event_cl/nu1A02_cl.evt.gz",
+            PREFIX,
+            str(tmp_path),
             re_exclude=re.compile(r"[AB]0[2-5]"),
         )
 
@@ -327,8 +331,11 @@ class TestS3KeyDestination:
 
     def test_exclude_beats_include(self, tmp_path):
         dest = s3_key_destination(
-            PREFIX + "event_cl/nu1A02_cl.evt.gz", PREFIX, str(tmp_path),
-            re_include=re.compile(r"evt"), re_exclude=re.compile(r"[AB]0[2-5]"),
+            PREFIX + "event_cl/nu1A02_cl.evt.gz",
+            PREFIX,
+            str(tmp_path),
+            re_include=re.compile(r"evt"),
+            re_exclude=re.compile(r"[AB]0[2-5]"),
         )
 
         assert dest is None
@@ -387,10 +394,12 @@ def page(*entries):
 class TestRecursiveDownloadS3:
     def test_keys_beyond_the_first_page_are_downloaded(self, tmp_path, monkeypatch):
         """list_objects_v2 returns at most 1000 keys; the rest are on later pages."""
-        client = StubS3Client([
-            page((PREFIX + "auxil/first.fits.gz", 10)),
-            page((PREFIX + "hk/second.hk.gz", 20)),
-        ])
+        client = StubS3Client(
+            [
+                page((PREFIX + "auxil/first.fits.gz", 10)),
+                page((PREFIX + "hk/second.hk.gz", 20)),
+            ]
+        )
         monkeypatch.setattr(core, "_s3_client", lambda: client)
 
         results = recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path))
@@ -445,9 +454,7 @@ class TestRecursiveDownloadS3:
         client = StubS3Client([page((PREFIX + "auxil/x.fits.gz", 10))])
         monkeypatch.setattr(core, "_s3_client", lambda: client)
 
-        results = recursive_download_s3.fn(
-            f"s3://nasa-heasarc/{PREFIX}", str(tmp_path), test=True
-        )
+        results = recursive_download_s3.fn(f"s3://nasa-heasarc/{PREFIX}", str(tmp_path), test=True)
 
         assert client.downloaded == []
         assert len(results) == 1

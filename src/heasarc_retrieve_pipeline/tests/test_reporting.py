@@ -35,9 +35,7 @@ class TestOneSkip:
 
         record_skipped_input(OBSID, config, FILE, REASON)
 
-        assert skipped_inputs_file(OBSID, config) == str(
-            tmp_path / OBSID / "skipped_inputs.txt"
-        )
+        assert skipped_inputs_file(OBSID, config) == str(tmp_path / OBSID / "skipped_inputs.txt")
         assert os.path.exists(skipped_inputs_file(OBSID, config))
 
     def test_the_file_says_what_it_is(self, tmp_path):

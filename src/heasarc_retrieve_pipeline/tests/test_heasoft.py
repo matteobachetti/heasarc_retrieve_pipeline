@@ -91,9 +91,7 @@ class TestOneToolAtATime:
         assert tool.most_at_once == 1
 
     def test_the_result_comes_back(self, monkeypatch):
-        monkeypatch.setattr(
-            heasoft, "hsp", SimpleNamespace(ftlist=lambda **kw: kw), raising=False
-        )
+        monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(ftlist=lambda **kw: kw), raising=False)
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
         assert heasoft.run("ftlist", produces=[], infile="x") == {"infile": "x"}
@@ -224,9 +222,7 @@ class TestAToolMustProduceWhatItPromised:
 
         heasoft._check_outputs("ftsort", "!" + str(tmp_path / "sorted.evt"))
 
-    def test_a_tool_that_returns_zero_and_writes_nothing_still_raises(
-        self, monkeypatch, tmp_path
-    ):
+    def test_a_tool_that_returns_zero_and_writes_nothing_still_raises(self, monkeypatch, tmp_path):
         """The whole point: the check runs after the return code has already said fine."""
         monkeypatch.setattr(
             heasoft,
@@ -243,9 +239,7 @@ class TestAToolMustProduceWhatItPromised:
         monkeypatch.setattr(
             heasoft,
             "hsp",
-            SimpleNamespace(
-                HSPTask=lambda name: lambda **kw: SimpleNamespace(returncode=0)
-            ),
+            SimpleNamespace(HSPTask=lambda name: lambda **kw: SimpleNamespace(returncode=0)),
             raising=False,
         )
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
@@ -376,9 +370,7 @@ class TestPrivatePfilesAreHeldOnTo:
             def __call__(self, **params):
                 return SimpleNamespace(returncode=0)
 
-        monkeypatch.setattr(
-            heasoft, "hsp", SimpleNamespace(HSPTask=FakeTask), raising=False
-        )
+        monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(HSPTask=FakeTask), raising=False)
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
         monkeypatch.setenv("PFILES", "/home/someone/pfiles;/opt/heasoft/syspfiles")
 

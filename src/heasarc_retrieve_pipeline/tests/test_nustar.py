@@ -96,8 +96,9 @@ def full_observation(tmp_path):
 
 
 def test_mode_01_files_are_found_for_both_modules(full_observation):
-    found = [(fpm, f) for fpm, f in spectral_input_files(OBSID, full_observation)
-             if "01_cl.evt" in f]
+    found = [
+        (fpm, f) for fpm, f in spectral_input_files(OBSID, full_observation) if "01_cl.evt" in f
+    ]
     assert len(found) == 2
     assert {fpm for fpm, _ in found} == {"A", "B"}
     for fpm, f in found:
@@ -213,9 +214,7 @@ def test_existing_regions_are_read_back_on_a_rerun(tmp_path):
     would barycentre the data to RA=0, Dec=0.
     """
     pytest.importorskip("regions")
-    config = make_obsid_tree(
-        tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
-    )
+    config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"])
     pipedir = os.path.join(tmp_path, OBSID, "event_pipe")
     write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
     write_region_files(pipedir, f"nu{OBSID}B01_cl", 149.10, 69.70, 40.0)
@@ -516,9 +515,7 @@ class TestJoiningNothing:
         config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
         return pipedir, config, merged
 
-    def test_a_module_with_mode_01_data_and_nothing_to_join_fails(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_module_with_mode_01_data_and_nothing_to_join_fails(self, tmp_path, monkeypatch):
         """30202022007: FPMA's mode-01 file got no region, so nothing was extracted."""
         pipedir, config, _ = self.observation(
             tmp_path,
@@ -580,9 +577,7 @@ class TestModeOneWithoutASourceIsFatal:
     with the observation or the reduction, and half an observation delivered quietly is
     worse than a failure that says why."""
 
-    def test_a_mode_01_file_with_no_region_fails_the_observation(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_mode_01_file_with_no_region_fails_the_observation(self, tmp_path, monkeypatch):
         config = make_obsid_tree(
             tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]
         )
@@ -814,9 +809,7 @@ class TestRecordFlareFiltering:
     def test_it_works_when_no_light_curve_was_named_at_all(self, tmp_path):
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_src1.evt")
 
-        assert "goes_time" not in record_flare_filtering.fn(
-            event_file, [[0, 1000]], [[0, 1000]]
-        )
+        assert "goes_time" not in record_flare_filtering.fn(event_file, [[0, 1000]], [[0, 1000]])
 
     def test_nothing_removed_is_still_recorded(self, tmp_path):
         event_file = make_synthetic_event_file(tmp_path / f"nu{OBSID}_back.evt")
@@ -917,9 +910,7 @@ class TestNustarPaths:
         )
 
     def test_the_spectral_products_go_in_products(self):
-        assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join(
-            "out", OBSID, "products"
-        )
+        assert nu_product_output_path(OBSID, self.CONFIG) == os.path.join("out", OBSID, "products")
 
     def test_no_directory_ends_in_a_slash(self):
         """Measured in a nuproducts log: given ``.../event_pipe/`` as ``indir``, the tool
@@ -1678,9 +1669,7 @@ class TestTheFlareFilteringRecordsItself:
         assert record["status"] == "skipped"
         assert "already there" in record["reason"]
 
-    def test_a_diagnostic_that_fails_does_not_lose_the_filtering(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_diagnostic_that_fails_does_not_lose_the_filtering(self, tmp_path, monkeypatch):
         """The science product is written by then, and so are the numbers that matter."""
 
         def explode(*args, **kwargs):
@@ -1729,18 +1718,14 @@ class TestTheSeparationIsToldWhereToRecord:
             obsid=OBSID,
         )
 
-        records = read_records(
-            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
-        )
+        records = read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))))
         assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl", f"nu{OBSID}B01_cl"}
         assert all(r["step"] == "separate_sources" for r in records)
         assert all(r["values"]["stubbed"] for r in records)
 
     def test_an_encrypted_file_leaves_no_record(self, tmp_path, monkeypatch):
         """It was never processed, so it is not a separation that went wrong."""
-        seen = self.separated(
-            tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt.gpg"], obsid=OBSID
-        )
+        seen = self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt.gpg"], obsid=OBSID)
 
         assert seen == []
         assert read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))) == []
@@ -1760,9 +1745,7 @@ class TestTheSeparationIsToldWhereToRecord:
         seen = self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
 
         assert seen == [], "the work itself must still be skipped"
-        records = read_records(
-            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
-        )
+        records = read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))))
         assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl", f"nu{OBSID}B01_cl"}
         assert all(r["status"] == "skipped" for r in records)
         assert all("SEPARATE_DONE.TXT" in r["reason"] for r in records)
@@ -1774,15 +1757,11 @@ class TestTheSeparationIsToldWhereToRecord:
 
         self.separated(tmp_path, monkeypatch, names, obsid=OBSID)
 
-        record = read_records(
-            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
-        )[0]
+        record = read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))))[0]
         assert record["status"] == "skipped"
         assert record["values"]["stubbed"] is True
 
-    def test_a_directory_already_done_still_ignores_an_encrypted_file(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_directory_already_done_still_ignores_an_encrypted_file(self, tmp_path, monkeypatch):
         """The skip loop must agree with the working one about what is a candidate."""
         self.separated(tmp_path, monkeypatch, [f"nu{OBSID}A01_cl.evt"], obsid=OBSID)
 
@@ -1793,9 +1772,7 @@ class TestTheSeparationIsToldWhereToRecord:
             obsid=OBSID,
         )
 
-        records = read_records(
-            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path)))
-        )
+        records = read_records(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))))
         assert {r["key"] for r in records} == {f"nu{OBSID}A01_cl"}
 
     def test_a_directory_already_done_without_an_observation_records_nothing(
@@ -1872,9 +1849,7 @@ class TestFindingTheSourceRecordsItself:
         assert record["status"] == "skipped"
         assert record["values"]["read_back"] is True
 
-    def test_a_mode_01_file_with_no_source_is_recorded_as_a_failure(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_mode_01_file_with_no_source_is_recorded_as_a_failure(self, tmp_path, monkeypatch):
         """The exception is recorded and re-raised: the run still has to count it."""
         config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt"])
         monkeypatch.setattr(nustar, "get_best_source_region", lambda *a, **k: None)
@@ -1903,9 +1878,7 @@ class TestFindingTheSourceRecordsItself:
         os.makedirs(pipedir)
         write_region_files(pipedir, f"nu{OBSID}A01_cl", 148.90, 69.66, 30.0)
 
-        result = nustar.get_best_source_region(
-            os.path.join(pipedir, f"nu{OBSID}A01_cl.evt")
-        )
+        result = nustar.get_best_source_region(os.path.join(pipedir, f"nu{OBSID}A01_cl.evt"))
 
         assert result[2] == pytest.approx(30.0)
 
@@ -2027,9 +2000,7 @@ class TestTheStepsRecordThemselves:
         ]
         assert record["values"]["combined"] == f"nu{OBSID}_src1.evt"
 
-    def test_the_source_and_the_background_do_not_overwrite_each_other(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_source_and_the_background_do_not_overwrite_each_other(self, tmp_path, monkeypatch):
         """Both run at once in the flow, so they must not share a file name."""
         names = [f"nu{OBSID}A01{label}.evt" for label in ("_src1", "_back")]
         pipedir, config = self.joinable(tmp_path, monkeypatch, names)
@@ -2040,9 +2011,7 @@ class TestTheStepsRecordThemselves:
         keys = {record["key"] for record in self.records(tmp_path, step="join_source_data")}
         assert keys == {"src1", "back"}
 
-    def test_the_join_records_the_good_time_intervals_it_merged(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_join_records_the_good_time_intervals_it_merged(self, tmp_path, monkeypatch):
         """The Gantt chart of the joining is drawn from these."""
         pipedir, config = self.joinable(tmp_path, monkeypatch, [f"nu{OBSID}A01_src1.evt"])
         monkeypatch.setattr(nustar, "gti_of", lambda path: np.array([[0.0, 10.0]]))
@@ -2050,15 +2019,11 @@ class TestTheStepsRecordThemselves:
         join_source_data.fn(OBSID, [pipedir], config)
 
         record = self.only(tmp_path, "join_source_data")
-        arrays = read_arrays(
-            diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))), record
-        )
+        arrays = read_arrays(diagnostics_path(OBSID, dict(out_data_path=str(tmp_path))), record)
         assert set(arrays) == {"gti_A_in_0", "gti_A_out", "gti_combined"}
         assert np.allclose(arrays["gti_combined"], [[0.0, 10.0]])
 
-    def test_a_module_with_nothing_to_join_is_recorded_as_a_failure(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_module_with_nothing_to_join_is_recorded_as_a_failure(self, tmp_path, monkeypatch):
         """``NoSourceInScienceData`` is recorded and then re-raised, not swallowed."""
         pipedir, config = self.joinable(
             tmp_path,
@@ -2120,9 +2085,7 @@ class TestTheStepsRecordThemselves:
         ]
         assert record["values"]["without_region"] == []
 
-    def test_a_file_with_no_extraction_region_is_named_in_the_record(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_file_with_no_extraction_region_is_named_in_the_record(self, tmp_path, monkeypatch):
         config = self.spectral_tree(tmp_path, monkeypatch, with_regions=False)
 
         nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
@@ -2167,9 +2130,7 @@ class TestTheStepsRecordThemselves:
         monkeypatch.setattr(nustar.heasoft, "run", stub_run)
         return config, merges, products
 
-    def test_both_modules_are_extracted_over_one_shared_good_time(
-        self, tmp_path, monkeypatch
-    ):
+    def test_both_modules_are_extracted_over_one_shared_good_time(self, tmp_path, monkeypatch):
         """The whole point: co-adding A and B is only honest if they cover the same time."""
         config, merges, products = self.gti_watching_tree(tmp_path, monkeypatch)
 
@@ -2216,9 +2177,7 @@ class TestTheStepsRecordThemselves:
         assert record["values"]["unpaired"] == [f"nu{OBSID}A06_chu1_N_cl.evt"]
         assert len(products) == 3
 
-    def test_the_record_says_which_good_time_convention_was_used(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_record_says_which_good_time_convention_was_used(self, tmp_path, monkeypatch):
         """An archive holds observations reduced both ways, so this has to be visible."""
         config, _, _ = self.gti_watching_tree(tmp_path, monkeypatch)
 
@@ -2227,9 +2186,7 @@ class TestTheStepsRecordThemselves:
         record = self.only(tmp_path, "calculate_spectra")
         assert record["values"]["gti_convention"] == "shared_between_modules"
 
-    def test_a_module_without_a_region_leaves_the_other_unpaired(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_module_without_a_region_leaves_the_other_unpaired(self, tmp_path, monkeypatch):
         """Pairing is over what survives the region check, not over what is on disk."""
         config, merges, _ = self.gti_watching_tree(tmp_path, monkeypatch)
         for kind in ("src", "bkg"):
@@ -2293,9 +2250,7 @@ class RealFileHeasoft:
         self._record("ftmerge", **kwargs)
         from astropy.io import fits
 
-        tables = [
-            fits.open(name)["EVENTS"].data for name in kwargs["infile"].split(",")
-        ]
+        tables = [fits.open(name)["EVENTS"].data for name in kwargs["infile"].split(",")]
         times = np.concatenate([np.asarray(t["TIME"], dtype=float) for t in tables])
         merged = fits.BinTableHDU.from_columns(
             [fits.Column(name="TIME", format="D", array=times)], name="EVENTS"
@@ -2377,9 +2332,7 @@ class TestTheCombinedFileHoldsOnlyItsOwnGoodTime:
 
         # FPMB's good time runs one second longer, as it does in the real observation, and
         # it has an event in that second.
-        fpma = write_event_file(
-            os.path.join(tmp_path, "nu123A_src1.evt"), [5.0, 15.0], [[0, 20]]
-        )
+        fpma = write_event_file(os.path.join(tmp_path, "nu123A_src1.evt"), [5.0, 15.0], [[0, 20]])
         fpmb = write_event_file(
             os.path.join(tmp_path, "nu123B_src1.evt"), [6.0, 16.0, 20.5], [[0, 21]]
         )
@@ -2405,9 +2358,7 @@ class TestTheCombinedFileHoldsOnlyItsOwnGoodTime:
             times = np.asarray(hdul["EVENTS"].data["TIME"], dtype=float)
             assert mask_from_gti(times, read_gti(hdul)).all()
 
-    def test_the_intersection_itself_is_left_as_heasoft_wrote_it(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_intersection_itself_is_left_as_heasoft_wrote_it(self, tmp_path, monkeypatch):
         from astropy.io import fits
 
         _stub, outfile = self.merge(tmp_path, monkeypatch)
@@ -2480,9 +2431,7 @@ class TestCombiningTheModules:
                 for suffix in (".bak", ".rsp"):
                     open(root + suffix, "w").close()
             elif name == "grppha":
-                self.write_spectrum(
-                    kwargs["outfile"].lstrip("!"), "grouped", exposure=2000.0
-                )
+                self.write_spectrum(kwargs["outfile"].lstrip("!"), "grouped", exposure=2000.0)
 
         monkeypatch.setattr(coadd.heasoft, "run", run)
         return calls

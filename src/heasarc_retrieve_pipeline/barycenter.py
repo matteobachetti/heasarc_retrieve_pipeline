@@ -43,6 +43,7 @@ def barycentered_file_name(infile):
     root, ext = splitext_improved(infile)
     return root + "_bary" + ext
 
+
 @task(
     task_run_name="barycenter_{infile}_ra{ra}_dec{dec}_to_{outfile}_overwrite_{overwrite}",
 )

@@ -137,9 +137,7 @@ class TestSourceSpectra:
     def test_a_segment_spectrum_is_not_an_input(self, tree):
         """Co-adding a segment with the observation it came from double-counts it."""
         products = os.path.join(tree["out_data_path"], OBSIDS[0], "products")
-        make_spectrum(
-            os.path.join(products, "nu80002092002A01_sr_seg1.pha"), "nu80002092002A01"
-        )
+        make_spectrum(os.path.join(products, "nu80002092002A01_sr_seg1.pha"), "nu80002092002A01")
         found = combine.source_spectra(OBSIDS[0], tree)
         # The base name, not the path: pytest's temporary directory is named after the
         # test, so "seg" appears in the path of every file here.
@@ -216,9 +214,7 @@ class TestStageInputs:
         assert brought_in == []
 
     def test_spectra_from_two_observations_do_not_collide(self, tree, tmp_path):
-        both = self.spectra(tree) + [
-            path for _, path in combine.source_spectra(OBSIDS[1], tree)
-        ]
+        both = self.spectra(tree) + [path for _, path in combine.source_spectra(OBSIDS[1], tree)]
         staged = combine.stage_inputs(both, str(tmp_path / "stage"))
         assert len(set(staged)) == len(both)
 
@@ -246,9 +242,7 @@ class TestWorkingDirectory:
 class TestMergeSpectra:
     def test_one_addspec_per_module_and_mode(self, tree, stub):
         combine.merge_spectra(OBSIDS, tree, "vela")
-        roots = [
-            params["outfil"] for name, params in stub.calls if name == "addspec"
-        ]
+        roots = [params["outfil"] for name, params in stub.calls if name == "addspec"]
         assert roots == [
             "vela_A01",
             "vela_A06",
@@ -332,9 +326,7 @@ class TestMergeObsids:
         assert record["status"] == "done"
         assert record["values"]["obsids"] == OBSIDS
 
-    def test_the_merged_tree_looks_like_an_observation_to_the_report(
-        self, tree, stub, monkeypatch
-    ):
+    def test_the_merged_tree_looks_like_an_observation_to_the_report(self, tree, stub, monkeypatch):
         """report.observation_directories counts anything with a diagnostics directory."""
         monkeypatch.setattr(combine, "merge_event_lists", lambda *a, **k: [])
         from heasarc_retrieve_pipeline.report import observation_directories
@@ -441,9 +433,7 @@ class TestCombiningMergedModules:
         from heasarc_retrieve_pipeline.diagnostics import read_records
 
         record = next(
-            r
-            for r in read_records(diagnostics_path("vela", tree))
-            if r["step"] == "merge_obsids"
+            r for r in read_records(diagnostics_path("vela", tree)) if r["step"] == "merge_obsids"
         )
         assert record["values"]["combined"]["comb01"] == "vela_comb01_grp.pha"
         assert record["values"]["combined_inputs"]["comb01"] == [
@@ -474,9 +464,7 @@ class TestMergeEventLists:
         assert all(len(paths) == 2 for paths, _, _ in merged)
 
     def test_a_product_only_one_observation_has_is_skipped(self, tree, monkeypatch):
-        monkeypatch.setattr(
-            combine.merge_event_files, "fn", lambda *a, **k: None, raising=False
-        )
+        monkeypatch.setattr(combine.merge_event_files, "fn", lambda *a, **k: None, raising=False)
         basedir = os.path.join(tree["out_data_path"], OBSIDS[0])
         open(os.path.join(basedir, f"nu{OBSIDS[0]}A_src2_bary.evt"), "w").close()
 
@@ -533,9 +521,7 @@ class TestMergingAnExplicitListOfSpectra:
 
         assert [name for name, _ in stub.calls if name == "addspec"] == ["addspec"]
 
-    def test_a_segment_spectrum_can_be_named_even_though_it_is_never_found(
-        self, tree, stub
-    ):
+    def test_a_segment_spectrum_can_be_named_even_though_it_is_never_found(self, tree, stub):
         """The round trip in one test: the two halves of a split, co-added by name."""
         products = os.path.join(tree["out_data_path"], OBSIDS[0], "products")
         stem = f"nu{OBSIDS[0]}A01"
@@ -559,9 +545,12 @@ class TestMergingAnExplicitListOfSpectra:
         assert lines == [f"{stem}_sr_seg1.pha", f"{stem}_sr_seg2.pha"]
 
     def test_the_modules_are_still_kept_apart(self, tree, stub):
-        spectra = self.spectra_of(tree, OBSIDS[0], "A") + self.spectra_of(
-            tree, OBSIDS[1], "A"
-        ) + self.spectra_of(tree, OBSIDS[0], "B") + self.spectra_of(tree, OBSIDS[1], "B")
+        spectra = (
+            self.spectra_of(tree, OBSIDS[0], "A")
+            + self.spectra_of(tree, OBSIDS[1], "A")
+            + self.spectra_of(tree, OBSIDS[0], "B")
+            + self.spectra_of(tree, OBSIDS[1], "B")
+        )
         written = combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
 
         assert sorted(written) == ["A01", "B01", "comb01"]

@@ -1546,7 +1546,7 @@ def write_page(obsid, outdir):
         write_observation_page(obsid, outdir)
     except Exception as error:
         get_logger().warning(
-            f"Could not write the diagnostics page for {obsid}: " f"{type(error).__name__}: {error}"
+            f"Could not write the diagnostics page for {obsid}: {type(error).__name__}: {error}"
         )
 
 
@@ -1706,7 +1706,7 @@ def write_shared_report_files(outdir, obsids=None):
         return write_index(outdir, obsids)
     except Exception as error:
         get_logger().warning(
-            f"Could not write the run report in {outdir}: " f"{type(error).__name__}: {error}"
+            f"Could not write the run report in {outdir}: {type(error).__name__}: {error}"
         )
         return None
 

@@ -111,7 +111,6 @@ def ni_pipeline_done_file(obsid, config):
     task_run_name="nicerl2_{obsid}",
 )
 def ni_run_l2_pipeline(obsid, config, flags=None):
-
     """
     Run the ``nicerl2`` Level-2 pipeline on one observation.
 

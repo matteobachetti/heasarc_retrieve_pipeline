@@ -159,14 +159,10 @@ class TestSegmentNaming:
         assert segments.segment_tag(12) == "seg12"
 
     def test_the_tag_goes_before_the_extension(self):
-        assert (
-            segments.insert_tag("nu1A01_sr.pha", "seg1") == "nu1A01_sr_seg1.pha"
-        )
+        assert segments.insert_tag("nu1A01_sr.pha", "seg1") == "nu1A01_sr_seg1.pha"
 
     def test_a_compression_suffix_is_kept(self):
-        assert (
-            segments.insert_tag("nu1A_src1.evt.gz", "seg2") == "nu1A_src1_seg2.evt.gz"
-        )
+        assert segments.insert_tag("nu1A_src1.evt.gz", "seg2") == "nu1A_src1_seg2.evt.gz"
 
     @pytest.mark.parametrize(
         "name, tagged",
@@ -185,9 +181,7 @@ class TestWriteGtiFile:
     """A segment GTI file has to look exactly like the one it came from."""
 
     def test_only_the_rows_change(self, tree, tmp_path):
-        template = os.path.join(
-            tmp_path, OBSID, "event_pipe", f"nu{OBSID}A01_cl_noflares.gti"
-        )
+        template = os.path.join(tmp_path, OBSID, "event_pipe", f"nu{OBSID}A01_cl_noflares.gti")
         out = str(tmp_path / "segment.gti")
         segments.write_gti_file(template, out, [[0.0, 200.0]])
 
@@ -385,9 +379,7 @@ class TestCombiningSegmentModules:
 
         for suffix in ("comb01", "comb06", "comb0106"):
             for end in (".pha", ".bak", "_grp.pha", "_inputs.lis"):
-                assert os.path.exists(
-                    os.path.join(products, f"nu{OBSID}_{suffix}_seg1{end}")
-                )
+                assert os.path.exists(os.path.join(products, f"nu{OBSID}_{suffix}_seg1{end}"))
 
     def test_no_response_is_made_for_a_segment(self, tmp_path, stub):
         """The whole point: a fresh 68 MB response per segment is what this avoids."""
@@ -396,9 +388,7 @@ class TestCombiningSegmentModules:
         segments.combine_segment_spectra(OBSID, config, ["seg1"])
 
         assert [name for name, _ in stub.calls if name == "addspec"]
-        assert all(
-            params["qaddrmf"] == "no" for name, params in stub.calls if name == "addspec"
-        )
+        assert all(params["qaddrmf"] == "no" for name, params in stub.calls if name == "addspec")
         assert sorted(n for n in os.listdir(products) if n.endswith(".rsp")) == [
             f"nu{OBSID}_comb01.rsp",
             f"nu{OBSID}_comb0106.rsp",
@@ -411,9 +401,7 @@ class TestCombiningSegmentModules:
         segments.combine_segment_spectra(OBSID, config, ["seg1"])
 
         for end in (".pha", "_grp.pha"):
-            header = fits.getheader(
-                os.path.join(products, f"nu{OBSID}_comb06_seg1{end}"), 1
-            )
+            header = fits.getheader(os.path.join(products, f"nu{OBSID}_comb06_seg1{end}"), 1)
             assert header["RESPFILE"] == f"nu{OBSID}_comb06.rsp"
             # The effective area is folded into that .rsp already.
             assert header["ANCRFILE"] == "none"
@@ -434,9 +422,7 @@ class TestCombiningSegmentModules:
 
         written = segments.combine_segment_spectra(OBSID, config, ["seg1"])
 
-        assert [n for n in written if n.endswith("_seg1.pha")] == [
-            f"nu{OBSID}_comb01_seg1.pha"
-        ]
+        assert [n for n in written if n.endswith("_seg1.pha")] == [f"nu{OBSID}_comb01_seg1.pha"]
 
     def test_a_segment_whose_extraction_failed_is_left_out(self, tmp_path, stub):
         """Half a pair is no pair, here as everywhere else."""
@@ -460,9 +446,7 @@ class TestCombiningSegmentModules:
 
     def test_a_drifting_deadtime_ratio_is_recorded(self, tmp_path, stub):
         """A source bright enough to move the deadtime is what a split is often for."""
-        config, _ = self.tree(
-            tmp_path, exposures={f"nu{OBSID}B01_sr_seg1.pha": 300.0}
-        )
+        config, _ = self.tree(tmp_path, exposures={f"nu{OBSID}B01_sr_seg1.pha": 300.0})
         rec = Recorder()
 
         segments.combine_segment_spectra(OBSID, config, ["seg1"], rec=rec)
@@ -543,15 +527,11 @@ class TestSplitEventFiles:
 
     def test_a_rerun_does_not_split_its_own_output(self, tree):
         obsdir, first = self.parent_and_segments(tree)
-        second = segments.split_event_files(
-            OBSID, tree, np.array([[0.0, 500.0], [500.0, 1000.0]])
-        )
+        second = segments.split_event_files(OBSID, tree, np.array([[0.0, 500.0], [500.0, 1000.0]]))
         assert sorted(second) == sorted(first)
 
     def test_an_empty_segment_writes_nothing(self, tree):
-        _, written = self.parent_and_segments(
-            tree, bounds=((0.0, 0.0), (0.0, 1000.0))
-        )
+        _, written = self.parent_and_segments(tree, bounds=((0.0, 0.0), (0.0, 1000.0)))
         assert all("seg1" not in name for name in written)
 
 
@@ -749,4 +729,7 @@ class TestSegmentsSpanEachFile:
             for record in payload if isinstance(payload, list) else [payload]:
                 if record.get("step") == "split_obsid":
                     bounds = record["values"]["bounds"]
-        assert bounds == [[None, pytest.approx(500.0, abs=1e-3)], [pytest.approx(500.0, abs=1e-3), None]]
+        assert bounds == [
+            [None, pytest.approx(500.0, abs=1e-3)],
+            [pytest.approx(500.0, abs=1e-3), None],
+        ]

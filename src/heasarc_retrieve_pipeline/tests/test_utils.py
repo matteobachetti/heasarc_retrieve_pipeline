@@ -53,9 +53,7 @@ class TestGoodIntervals:
         assert np.allclose(good_intervals([(80, 130)], 0, 100), [[0, 80]])
 
     def test_bad_intervals_entirely_outside_are_ignored(self):
-        assert np.allclose(
-            good_intervals([(-50, -10), (200, 300)], 0, 100), [[0, 100]]
-        )
+        assert np.allclose(good_intervals([(-50, -10), (200, 300)], 0, 100), [[0, 100]])
 
     def test_bad_interval_covering_everything_leaves_nothing(self):
         assert len(good_intervals([(-10, 200)], 0, 100)) == 0
@@ -64,14 +62,10 @@ class TestGoodIntervals:
         assert len(good_intervals([(0, 100)], 0, 100)) == 0
 
     def test_overlapping_bad_intervals_are_merged(self):
-        assert np.allclose(
-            good_intervals([(20, 50), (40, 70)], 0, 100), [[0, 20], [70, 100]]
-        )
+        assert np.allclose(good_intervals([(20, 50), (40, 70)], 0, 100), [[0, 20], [70, 100]])
 
     def test_touching_bad_intervals_are_merged(self):
-        assert np.allclose(
-            good_intervals([(20, 50), (50, 70)], 0, 100), [[0, 20], [70, 100]]
-        )
+        assert np.allclose(good_intervals([(20, 50), (50, 70)], 0, 100), [[0, 20], [70, 100]])
 
     def test_bad_intervals_out_of_order_are_sorted_first(self):
         assert np.allclose(
@@ -80,9 +74,7 @@ class TestGoodIntervals:
         )
 
     def test_bad_interval_nested_in_another(self):
-        assert np.allclose(
-            good_intervals([(20, 80), (30, 40)], 0, 100), [[0, 20], [80, 100]]
-        )
+        assert np.allclose(good_intervals([(20, 80), (30, 40)], 0, 100), [[0, 20], [80, 100]])
 
     def test_zero_length_bad_interval_changes_nothing(self):
         assert np.allclose(good_intervals([(50, 50)], 0, 100), [[0, 100]])
@@ -140,9 +132,11 @@ def make_event_file(
 
     hdus = [fits.PrimaryHDU(), events]
     if extra_extension_first:
-        hdus.append(fits.BinTableHDU.from_columns(
-            [fits.Column(name="X", format="D", array=np.zeros(3))], name="SOMETHING"
-        ))
+        hdus.append(
+            fits.BinTableHDU.from_columns(
+                [fits.Column(name="X", format="D", array=np.zeros(3))], name="SOMETHING"
+            )
+        )
     hdus.append(gti_hdu)
     return fits.HDUList(hdus)
 
@@ -195,9 +189,7 @@ class TestApplyGti:
         assert hdul["EVENTS"].header["EXPOSURE"] == pytest.approx(20.0)
 
     def test_the_gti_extension_is_found_by_name_not_by_index(self):
-        hdul = make_event_file(
-            times=[5.0, 15.0], gti=[[0, 50]], extra_extension_first=True
-        )
+        hdul = make_event_file(times=[5.0, 15.0], gti=[[0, 50]], extra_extension_first=True)
         assert hdul.index_of("GTI") == 3
 
         apply_gti(hdul, [[10, 30]])
@@ -213,9 +205,7 @@ class TestApplyGti:
 
     def test_timezero_is_honoured(self):
         """Event times are ``TIME + TIMEZERO``; the GTI is on that same scale."""
-        hdul = make_event_file(
-            times=[5.0, 15.0, 25.0], gti=[[0, 50]], timezero=1000.0
-        )
+        hdul = make_event_file(times=[5.0, 15.0, 25.0], gti=[[0, 50]], timezero=1000.0)
         apply_gti(hdul, [[1010, 1030]])
 
         assert np.allclose(hdul["EVENTS"].data["TIME"], [15.0, 25.0])
@@ -229,9 +219,7 @@ class TestApplyGti:
         assert hdul["EVENTS"].header["EXPOSURE"] == pytest.approx(0.0)
 
     def test_it_reports_what_it_removed(self):
-        hdul = make_event_file(
-            times=[5.0, 15.0, 25.0, 45.0], gti=[[0, 50]], livetime=40.0
-        )
+        hdul = make_event_file(times=[5.0, 15.0, 25.0, 45.0], gti=[[0, 50]], livetime=40.0)
         stats = apply_gti(hdul, [[10, 30]])
 
         assert stats["nevents_before"] == 4
@@ -323,9 +311,7 @@ class TestMaskFromGti:
 
 class TestIntervalsRemoved:
     def test_a_hole_punched_in_the_middle(self):
-        assert np.allclose(
-            intervals_removed([[0, 100]], [[0, 40], [60, 100]]), [[40, 60]]
-        )
+        assert np.allclose(intervals_removed([[0, 100]], [[0, 40], [60, 100]]), [[40, 60]])
 
     def test_a_whole_interval_dropped(self):
         assert np.allclose(intervals_removed([[0, 10], [20, 30]], [[0, 10]]), [[20, 30]])
@@ -367,9 +353,7 @@ class TestApplyGtiWithAStaleHeader:
 
     def test_the_ratio_comes_from_the_gti_not_from_ontime(self):
         # As on the real nu80002092008_src1.evt: ONTIME says 36058 s over a 58889 s GTI.
-        hdul = make_event_file(
-            times=[15.0], gti=[[0, 58889]], ontime=36058.0, livetime=33646.0
-        )
+        hdul = make_event_file(times=[15.0], gti=[[0, 58889]], ontime=36058.0, livetime=33646.0)
         apply_gti(hdul, [[0, 56851]])
 
         expected = 33646.0 * 56851 / 58889
@@ -410,9 +394,7 @@ class TestMergeIntervals:
         assert np.allclose(merge_intervals([[0, 10], [10.5, 20]], tolerance=1.0), [[0, 20]])
 
     def test_the_tolerance_does_not_bridge_a_real_gap(self):
-        assert np.allclose(
-            merge_intervals([[0, 10], [11, 20]], tolerance=0.5), [[0, 10], [11, 20]]
-        )
+        assert np.allclose(merge_intervals([[0, 10], [11, 20]], tolerance=0.5), [[0, 10], [11, 20]])
 
     def test_without_a_tolerance_the_smallest_gap_still_separates(self):
         merged = merge_intervals([[0, 10], [10 + 1e-9, 20]])
@@ -430,9 +412,7 @@ class TestIntervalsAboveThreshold:
         times = np.array([0.0, 60.0, 120.0])
         values = np.array([1e-7, 1e-5, 1e-7])
 
-        assert np.allclose(
-            intervals_above_threshold(times, values, 5e-6), [[30.0, 90.0]]
-        )
+        assert np.allclose(intervals_above_threshold(times, values, 5e-6), [[30.0, 90.0]])
 
     def test_jittery_sample_times_do_not_split_one_bright_stretch(self):
         """Real GOES timestamps are not exactly one cadence apart.
@@ -462,18 +442,14 @@ class TestIntervalsAboveThreshold:
         times = np.array([0.0, 60.0, 120.0, 180.0])
         values = np.array([1e-7, 1e-5, 1e-5, 1e-7])
 
-        assert np.allclose(
-            intervals_above_threshold(times, values, 5e-6), [[30.0, 150.0]]
-        )
+        assert np.allclose(intervals_above_threshold(times, values, 5e-6), [[30.0, 150.0]])
 
     def test_separate_flares_stay_separate(self):
         times = np.arange(0.0, 600.0, 60.0)
         values = np.full(times.size, 1e-7)
         values[[1, 7]] = 1e-5
 
-        assert np.allclose(
-            intervals_above_threshold(times, values, 5e-6), [[30, 90], [390, 450]]
-        )
+        assert np.allclose(intervals_above_threshold(times, values, 5e-6), [[30, 90], [390, 450]])
 
     def test_a_sample_exactly_at_the_threshold_counts(self):
         times = np.array([0.0, 60.0])
@@ -636,9 +612,7 @@ class TestShortWorkspace:
 
         with short_workspace(str(outdir)) as workspace:
             assert os.path.isdir(workspace.pfiles)
-            assert not os.path.realpath(workspace.pfiles).startswith(
-                os.path.realpath(str(outdir))
-            )
+            assert not os.path.realpath(workspace.pfiles).startswith(os.path.realpath(str(outdir)))
 
     def test_the_working_directories_go_under_the_output_by_default(self, tmp_path):
         """Measured at 182.5 MB for one observation, so they go where there is room.
@@ -651,9 +625,7 @@ class TestShortWorkspace:
 
         with short_workspace(str(outdir)) as workspace:
             assert os.path.isdir(workspace.work)
-            assert os.path.realpath(workspace.work).startswith(
-                os.path.realpath(str(outdir))
-            )
+            assert os.path.realpath(workspace.work).startswith(os.path.realpath(str(outdir)))
 
     def test_an_explicit_scratch_dir_moves_the_working_directories(self, tmp_path):
         outdir = tmp_path / "out"
@@ -662,22 +634,16 @@ class TestShortWorkspace:
         fast.mkdir()
 
         with short_workspace(str(outdir), scratch_dir=str(fast)) as workspace:
-            assert os.path.realpath(workspace.work).startswith(
-                os.path.realpath(str(fast))
-            )
+            assert os.path.realpath(workspace.work).startswith(os.path.realpath(str(fast)))
             assert os.path.isdir(workspace.work)
 
-    def test_the_parameter_files_and_the_working_directories_are_kept_apart(
-        self, tmp_path
-    ):
+    def test_the_parameter_files_and_the_working_directories_are_kept_apart(self, tmp_path):
         """The whole point of the split: one is tiny and hot, the other is bulky."""
         outdir = tmp_path / "out"
         outdir.mkdir()
 
         with short_workspace(str(outdir)) as workspace:
-            assert os.path.realpath(workspace.pfiles) != os.path.realpath(
-                workspace.work
-            )
+            assert os.path.realpath(workspace.pfiles) != os.path.realpath(workspace.work)
 
     def test_a_scratch_dir_someone_else_supplied_is_not_removed(self, tmp_path):
         """We delete only the run directory we made, never the directory we were given."""
@@ -845,9 +811,7 @@ class TestWhereTheWorkspaceGoes:
         long_one.mkdir()
         short_one.mkdir()
         monkeypatch.setattr(tempfile, "gettempdir", lambda: str(long_one))
-        monkeypatch.setattr(
-            utils, "_TEMPORARY_DIRECTORY_CANDIDATES", (str(short_one),)
-        )
+        monkeypatch.setattr(utils, "_TEMPORARY_DIRECTORY_CANDIDATES", (str(short_one),))
 
         outdir = tmp_path / ("a" * 120)
         outdir.mkdir()
@@ -936,9 +900,7 @@ class TestTimeSystem:
 
 
 #: NuSTAR's reference epoch, and the time system its files are written in.
-NUSTAR_TIME_HEADER = fits.Header(
-    {"MJDREFI": 55197, "MJDREFF": 0.00076601852, "TIMESYS": "TT"}
-)
+NUSTAR_TIME_HEADER = fits.Header({"MJDREFI": 55197, "MJDREFF": 0.00076601852, "TIMESYS": "TT"})
 
 
 class TestMetFromMjd:
@@ -950,15 +912,11 @@ class TestMetFromMjd:
         reference = Time(55197 + 0.00076601852, format="mjd", scale="tt")
         target = Time(56689.0, format="mjd", scale="tt")
         expected = (target - reference).sec
-        assert utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER) == pytest.approx(
-            expected, abs=1e-3
-        )
+        assert utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER) == pytest.approx(expected, abs=1e-3)
 
     def test_round_trip(self):
         met = utils.met_from_mjd(56689.25, NUSTAR_TIME_HEADER)
-        assert utils.mjd_from_met(met, NUSTAR_TIME_HEADER) == pytest.approx(
-            56689.25, abs=1e-9
-        )
+        assert utils.mjd_from_met(met, NUSTAR_TIME_HEADER) == pytest.approx(56689.25, abs=1e-9)
 
     def test_the_split_reference_keeps_more_precision(self):
         """
@@ -979,9 +937,7 @@ class TestMetFromMjd:
         collapsed_errors = []
         ulps = []
         for mjd in np.linspace(55200.0, 60000.0, 500):
-            exact = (Decimal(float(mjd)) - Decimal(mjdrefi) - Decimal(mjdreff)) * Decimal(
-                86400
-            )
+            exact = (Decimal(float(mjd)) - Decimal(mjdrefi) - Decimal(mjdreff)) * Decimal(86400)
             split = utils.met_from_mjd(mjd, NUSTAR_TIME_HEADER)
             split_errors.append(abs(float(Decimal(split) - exact)))
             collapsed_errors.append(
@@ -1014,9 +970,9 @@ class TestMetFromMjd:
 
     def test_no_scale_means_no_conversion(self):
         """The default has to round-trip exactly, which a conversion would spoil."""
-        assert utils.met_from_mjd(
-            56689.0, NUSTAR_TIME_HEADER, scale="tt"
-        ) == utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER)
+        assert utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER, scale="tt") == utils.met_from_mjd(
+            56689.0, NUSTAR_TIME_HEADER
+        )
 
     def test_mjd_from_met_can_answer_in_utc(self):
         met = utils.met_from_mjd(56689.0, NUSTAR_TIME_HEADER)
@@ -1051,9 +1007,7 @@ class TestTimezeroDoesNotMoveTheCut:
         for timezero in (0.0, -1.0, 7.5):
             hdul = self._file(timezero)
             apply_gti(hdul, [[0.0, 50.0]])
-            kept.append(
-                (np.asarray(hdul["EVENTS"].data["TIME"]) + timezero).round(6).tolist()
-            )
+            kept.append((np.asarray(hdul["EVENTS"].data["TIME"]) + timezero).round(6).tolist())
         assert kept[0] == [10.0, 30.0]
         assert kept[1] == kept[0]
         assert kept[2] == kept[0]
@@ -1115,9 +1069,7 @@ class TestUpdateTimeBounds:
 
     @staticmethod
     def _file(timezero=0.0):
-        hdul = make_event_file(
-            [10.0, 30.0, 60.0, 90.0], [[0.0, 100.0]], timezero=timezero
-        )
+        hdul = make_event_file([10.0, 30.0, 60.0, 90.0], [[0.0, 100.0]], timezero=timezero)
         for hdu in hdul:
             hdu.header["MJDREFI"] = 55197
             hdu.header["MJDREFF"] = 0.00076601852
@@ -1228,9 +1180,7 @@ class TestDropEventsOutsideGti:
         assert hdul["EVENTS"].header["EXPOSURE"] == 777.0
 
     def test_times_are_compared_on_the_timezero_scale(self):
-        hdul = make_event_file(
-            times=[5.0, 15.0, 25.0, 35.0], gti=[[10, 30]], timezero=1000.0
-        )
+        hdul = make_event_file(times=[5.0, 15.0, 25.0, 35.0], gti=[[10, 30]], timezero=1000.0)
         drop_events_outside_gti(hdul)
 
         assert np.allclose(hdul["EVENTS"].data["TIME"], [15.0, 25.0])

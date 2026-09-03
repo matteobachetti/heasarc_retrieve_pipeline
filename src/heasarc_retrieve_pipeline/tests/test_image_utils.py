@@ -128,6 +128,7 @@ class TestFilterSourcesInImages:
         assert filter_sources_in_images(path) is None
         assert glob.glob(str(tmp_path / "*_src*.evt")) == []
 
+
 class TestHasSkyPosition:
     """One predicate, because ``image_utils`` used to hold three that disagreed."""
 

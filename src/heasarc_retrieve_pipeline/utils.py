@@ -174,9 +174,7 @@ _TEMPORARY_DIRECTORY_CANDIDATES = ("/tmp",)
 def _shortest_temporary_directory():
     """The shortest directory this process can write a workspace into."""
     candidates = [tempfile.gettempdir(), *_TEMPORARY_DIRECTORY_CANDIDATES]
-    writable = [
-        c for c in candidates if os.path.isdir(c) and os.access(c, os.W_OK | os.X_OK)
-    ]
+    writable = [c for c in candidates if os.path.isdir(c) and os.access(c, os.W_OK | os.X_OK)]
     return min(writable, key=len) if writable else tempfile.gettempdir()
 
 
@@ -415,6 +413,7 @@ def splitext_improved(path):
         ext += gz_ext
     return os.path.join(dir, froot), ext
 
+
 def rootname(infile):
     """
     A path with its extension removed, compression suffix and all.
@@ -437,8 +436,6 @@ def rootname(infile):
     'nu123A01_cl'
     """
     return splitext_improved(infile)[0]
-
-
 
 
 def merge_intervals(intervals, tolerance=0.0):
@@ -877,9 +874,7 @@ def time_reference(header):
             mjdref = float(candidate["MJDREF"])
             mjdrefi = float(np.floor(mjdref))
             return mjdrefi, mjdref - mjdrefi
-    raise ValueError(
-        "No reference epoch in this header: expected MJDREFI (with MJDREFF) or MJDREF"
-    )
+    raise ValueError("No reference epoch in this header: expected MJDREFI (with MJDREFF) or MJDREF")
 
 
 def time_system(header, default="TT"):
@@ -1351,9 +1346,7 @@ def binned_lightcurve(times, gti, dt, min_fraction=0.5):
     gti = gti_to_array(gti)
     times = np.asarray(times, dtype=float)
 
-    empty = {
-        key: np.array([]) for key in ("time", "counts", "exposure", "rate", "rate_err")
-    }
+    empty = {key: np.array([]) for key in ("time", "counts", "exposure", "rate", "rate_err")}
     if gti.size == 0:
         return empty
 

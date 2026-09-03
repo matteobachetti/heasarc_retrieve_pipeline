@@ -67,9 +67,7 @@ def flare_pair(tmp_path, obsid=OBSID, root="_src1", removed=(400.0, 600.0)):
     event_file = os.path.join(base, f"nu{obsid}{root}.evt")
     make_event_file_with_gti(event_file, gti=[(0.0, 1000.0)])
     filtered = event_file.replace(".evt", "_noflares.evt")
-    make_event_file_with_gti(
-        filtered, gti=[(0.0, removed[0]), (removed[1], 1000.0)]
-    )
+    make_event_file_with_gti(filtered, gti=[(0.0, removed[0]), (removed[1], 1000.0)])
     return event_file, filtered
 
 
@@ -133,7 +131,6 @@ def a_products_directory(tmp_path, obsid=OBSID, stems=("nu90101201002A01",)):
     return products
 
 
-
 def a_goes_light_curve(path, tstart=0.0, tstop=1000.0, nbins=20):
     """A solar X-ray light curve in the observation's mission elapsed time."""
     time = np.linspace(tstart, tstop, nbins)
@@ -147,6 +144,7 @@ def a_goes_light_curve(path, tstart=0.0, tstop=1000.0, nbins=20):
     )
     fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
     return path
+
 
 class TestRecoveringTheSeparation:
     """The focal plane of a reduction that finished before anything recorded it."""
@@ -377,9 +375,7 @@ class TestRecoveringTheFlareFiltering:
     def test_an_observation_that_was_never_filtered_recovers_nothing(self, tmp_path):
         base = os.path.join(str(tmp_path), OBSID)
         os.makedirs(base, exist_ok=True)
-        make_event_file_with_gti(
-            os.path.join(base, f"nu{OBSID}_src1.evt"), gti=[(0.0, 1000.0)]
-        )
+        make_event_file_with_gti(os.path.join(base, f"nu{OBSID}_src1.evt"), gti=[(0.0, 1000.0)])
 
         assert recover.recover_flare_filtering(OBSID, str(tmp_path)) == []
 
@@ -390,7 +386,6 @@ class TestRecoveringTheFlareFiltering:
             rec.array(removed=np.array([[1.0, 2.0]]))
 
         assert recover.recover_flare_filtering(OBSID, str(tmp_path)) == []
-
 
     def test_the_observations_light_curve_is_used(self, tmp_path):
         flare_pair(tmp_path)
@@ -563,9 +558,7 @@ class TestRecoveringTheJoining:
         recover.recover_joining(OBSID, str(tmp_path))
 
         _, arrays = self.record_of(tmp_path)
-        np.testing.assert_allclose(
-            arrays["gti_combined"], [[0.0, 400.0], [600.0, 1000.0]]
-        )
+        np.testing.assert_allclose(arrays["gti_combined"], [[0.0, 400.0], [600.0, 1000.0]])
 
     def test_the_figure_can_be_drawn_from_it(self, tmp_path):
         self.a_joined_observation(tmp_path)

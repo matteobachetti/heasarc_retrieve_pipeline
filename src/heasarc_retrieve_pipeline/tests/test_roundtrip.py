@@ -226,8 +226,7 @@ class TestSegmentFamilies:
         """seg10 sorts before seg2 as a string, and that is the wrong order."""
         config = self.products(
             tmp_path,
-            [f"nu{OBSID}A01_sr.pha"]
-            + [f"nu{OBSID}A01_sr_seg{n}.pha" for n in (1, 2, 10)],
+            [f"nu{OBSID}A01_sr.pha"] + [f"nu{OBSID}A01_sr_seg{n}.pha" for n in (1, 2, 10)],
         )
         _parent, segments = segment_families(OBSID, config)[f"nu{OBSID}A01"]
 
@@ -267,9 +266,7 @@ class TestStageObservation:
     def test_the_original_is_not_touched_when_the_copy_is_written_to(self, tmp_path):
         config = self.tree(tmp_path)
         staged = stage_observation(OBSID, config, str(tmp_path / "work"))
-        with open(
-            os.path.join(staged["out_data_path"], OBSID, "products", "a_file"), "w"
-        ) as fobj:
+        with open(os.path.join(staged["out_data_path"], OBSID, "products", "a_file"), "w") as fobj:
             fobj.write("written by the check")
 
         with open(tmp_path / "out" / OBSID / "products" / "a_file") as fobj:
@@ -349,6 +346,7 @@ class TestTheCommandLine:
         bad = write_spectrum(tmp_path / "s2.pha", [2], 100.0, [[0, 100]])
 
         for segment, expected in ((good, 0), (bad, 1)):
+
             def fake_check(obsid, config, mjds, workdir, _segment=segment, **kwargs):
                 return {
                     "config": config,
@@ -380,7 +378,9 @@ class TestPairingSegmentEventFilesWithTheirParents:
         write_events(base / (parent_name + "_seg2" + suffix), [5.0, 9.0], [[4, 10]])
 
         monkeypatch.setattr(
-            roundtrip, "stage_observation", lambda *a, **k: {"out_data_path": str(tmp_path / "work")}
+            roundtrip,
+            "stage_observation",
+            lambda *a, **k: {"out_data_path": str(tmp_path / "work")},
         )
         monkeypatch.setattr(roundtrip, "split_obsid", lambda *a, **k: {"bounds": []})
         return {"out_data_path": str(tmp_path / "out")}
@@ -490,9 +490,7 @@ class TestASplitThatLeavesOnePiece:
             raise AssertionError("addspec must not be reached with one input")
 
         monkeypatch.setattr(roundtrip, "merge_spectra", refuse)
-        merged = roundtrip.addspec_roundtrip(
-            OBSID, config, {stem: (parent, [segment])}
-        )
+        merged = roundtrip.addspec_roundtrip(OBSID, config, {stem: (parent, [segment])})
 
         assert merged == {stem: "single segment"}
 

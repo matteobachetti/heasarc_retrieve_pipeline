@@ -223,18 +223,12 @@ def _check_outputs(name, produces):
     """
     for path in _outputs_to_check(produces):
         if not os.path.exists(path):
-            raise RuntimeError(
-                f"{name} returned success but did not create {path}"
-            )
+            raise RuntimeError(f"{name} returned success but did not create {path}")
         if os.path.isdir(path):
             if not os.listdir(path):
-                raise RuntimeError(
-                    f"{name} returned success but left {path} empty"
-                )
+                raise RuntimeError(f"{name} returned success but left {path} empty")
         elif os.path.getsize(path) == 0:
-            raise RuntimeError(
-                f"{name} returned success but {path} is empty"
-            )
+            raise RuntimeError(f"{name} returned success but {path} is empty")
 
 
 def run(name, *args, produces, **kwargs):

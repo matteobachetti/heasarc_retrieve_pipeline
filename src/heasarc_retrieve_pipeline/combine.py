@@ -272,9 +272,7 @@ def combine_merged_modules(name, config, roots, rec=None):
             continue
         by_mode.setdefault(mode, {})[fpm] = os.path.join(outdir, root + ".pha")
     paired = {
-        mode: [modules["A"], modules["B"]]
-        for mode, modules in by_mode.items()
-        if len(modules) == 2
+        mode: [modules["A"], modules["B"]] for mode, modules in by_mode.items() if len(modules) == 2
     }
 
     written = {}
@@ -290,9 +288,7 @@ def combine_merged_modules(name, config, roots, rec=None):
         repair_addspec_background(os.path.join(outdir, root + ".bak"), spectra)
         # addspec added the two modules' exposures as though they had observed one after
         # the other. They did not. See coadd.apply_case_b_scaling.
-        apply_case_b_scaling(
-            [os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2
-        )
+        apply_case_b_scaling([os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2)
         written[suffix] = root + "_grp.pha"
 
     if rec is not None:
@@ -413,7 +409,7 @@ def merge_event_lists(obsids, config, name, rec=None):
         for path in sorted(glob.glob(os.path.join(basedir, prefix + "*_bary.evt*"))):
             # What the file is, with the observation it came from taken off the front:
             # "A_src1_bary.evt". That is the key two observations have in common.
-            key = os.path.basename(path)[len(prefix):]
+            key = os.path.basename(path)[len(prefix) :]
             groups.setdefault(key, []).append(path)
 
     written = []
@@ -502,12 +498,8 @@ def main(argv=None):
         action="store_true",
         help="co-add only the normal-science spectra, leaving the mode-06 subsets out",
     )
-    parser.add_argument(
-        "--no-spectra", action="store_true", help="do not co-add the spectra"
-    )
-    parser.add_argument(
-        "--no-events", action="store_true", help="do not merge the event lists"
-    )
+    parser.add_argument("--no-spectra", action="store_true", help="do not co-add the spectra")
+    parser.add_argument("--no-events", action="store_true", help="do not merge the event lists")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     if len(args.obsid) < 2:

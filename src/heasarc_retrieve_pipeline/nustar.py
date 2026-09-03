@@ -307,9 +307,7 @@ def nu_longest_output_name(obsid, config):
     True
     """
     band = f"{IMAGE_ELOW}to{IMAGE_EHIGH}keV"
-    return os.path.join(
-        split_path(obsid, config), f"nu{obsid}A06_chu123_N_cl_{band}.fits"
-    )
+    return os.path.join(split_path(obsid, config), f"nu{obsid}A06_chu123_N_cl_{band}.fits")
 
 
 def _cl_event_files(directory, pattern):
@@ -905,9 +903,7 @@ def recover_spacecraft_science_data(obsid, config):
     str
         The ``split`` directory.
     """
-    with record_step(
-        diagnostics_path(obsid, config), obsid, "recover_spacecraft_science"
-    ) as rec:
+    with record_step(diagnostics_path(obsid, config), obsid, "recover_spacecraft_science") as rec:
         return _recover_spacecraft_science_data(obsid, config, rec)
 
 
@@ -1159,9 +1155,7 @@ def merge_event_files(files_to_join, outfile, gti_operation="OR"):
             columns="TIME",
         )
 
-        logger.info(
-            f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}"
-        )
+        logger.info(f"Adding GTIs from {outfile_gti}'s first extension to event file {outfile}")
 
         heasoft.run(
             "fappend",
@@ -1616,7 +1610,7 @@ def get_goes_gtis(obsid, config, minimum_class="C5.0", flux_class="C5.0"):
                 np.ma.asarray(goes_table[channel], dtype=float), np.nan
             )
     logger.info(
-        f"Writing the GOES X-ray light curve ({len(lightcurve['TIME'])} points) " f"to {outfile_lc}"
+        f"Writing the GOES X-ray light curve ({len(lightcurve['TIME'])} points) to {outfile_lc}"
     )
     Table(lightcurve).write(outfile_lc, overwrite=True)
 
@@ -1847,9 +1841,7 @@ def record_flare_filtering(
         )
         for when, curve in (("before", before), ("after", after)):
             for column in ("time", "rate", "rate_err"):
-                arrays[f"lc_{band}_{when}_{column}"] = np.asarray(
-                    curve[column], dtype=float
-                )
+                arrays[f"lc_{band}_{when}_{column}"] = np.asarray(curve[column], dtype=float)
 
     rec.array(**arrays)
     logger.info(
@@ -2261,9 +2253,7 @@ def get_best_source_region(
     )
     rec.value(band_kev=[pair[0], pair[1]], image_band_kev=[elow, ehigh])
 
-    rlimit = snr_optimised_radius(
-        optimize_radius_snr, rind, rad_profile, radial_err, psf_profile
-    )
+    rlimit = snr_optimised_radius(optimize_radius_snr, rind, rad_profile, radial_err, psf_profile)
     if rlimit is None:
         logger.warning(
             f"No radius maximises the signal-to-noise in {infile}: the source is too "
@@ -2273,9 +2263,7 @@ def get_best_source_region(
         return None
 
     max_radius = config.get("max_radius", 80)
-    logger.info(
-        f"Radius of peak SNR for {pair[0]} to {pair[1]} keV in {fname}: {rlimit} arcsec"
-    )
+    logger.info(f"Radius of peak SNR for {pair[0]} to {pair[1]} keV in {fname}: {rlimit} arcsec")
     rec.value(
         rlimit_snr=float(rlimit),
         max_radius=max_radius,
@@ -2564,9 +2552,7 @@ def calculate_spectra(
     time and is recorded as ``unpaired``; it cannot become part of a combined product.
     """
     with record_step(diagnostics_path(obsid, config), obsid, "calculate_spectra") as rec:
-        return _calculate_spectra(
-            obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, rec
-        )
+        return _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, rec)
 
 
 def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, rec):
@@ -2740,9 +2726,7 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
         )
         # Not a failure -- the spectra that could be made were made -- but not a clean
         # finish either, and the report has to be able to tell the two apart.
-        rec.skip(
-            f"{problems} file(s) had no flare-free GTI; not marking the observation as done"
-        )
+        rec.skip(f"{problems} file(s) had no flare-free GTI; not marking the observation as done")
         return
 
     open(product_done_file, "w").close()
@@ -2961,9 +2945,7 @@ def _combine_module_spectra(obsid, config, rec):
 
         # addspec added the two modules' exposures as though they had observed one after the
         # other. They did not. See coadd.apply_case_b_scaling.
-        apply_case_b_scaling(
-            [os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2
-        )
+        apply_case_b_scaling([os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2)
         rec.array(**spectrum_arrays(outdir, root, suffixes=ADDSPEC_SPECTRA))
 
     rec.value(spectra=written, inputs=inputs, mode06_exposure_fraction=fractions)

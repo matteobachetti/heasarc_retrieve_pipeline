@@ -68,14 +68,10 @@ class TestPrepareWorker:
         (headas / "syspfiles").mkdir(parents=True)
         monkeypatch.setenv("HEADAS", str(headas))
 
-        states = self.run_in_workers(
-            tmp_path / "roomy", n_workers=1, pfiles_root=tmp_path / "fast"
-        )
+        states = self.run_in_workers(tmp_path / "roomy", n_workers=1, pfiles_root=tmp_path / "fast")
 
         pid, pfiles, cwd, _ = states[0]
-        assert pfiles.split(";")[0] == os.path.join(
-            tmp_path, "fast", f"worker_{pid}", "pfiles"
-        )
+        assert pfiles.split(";")[0] == os.path.join(tmp_path, "fast", f"worker_{pid}", "pfiles")
         assert cwd == os.path.realpath(os.path.join(tmp_path, "roomy", f"worker_{pid}"))
 
     def test_no_two_workers_share_a_directory(self, tmp_path):
@@ -335,12 +331,8 @@ class TestOneFailureDoesNotStopTheRest:
             return obsid
 
         monkeypatch.setattr(core, "recursive_download", stub_download)
-        monkeypatch.setattr(
-            core, "prepare_worker", lambda pfiles_root, work_root: str(tmp_path)
-        )
-        monkeypatch.setitem(
-            core.MISSION_CONFIG["nustar"], "obsid_processing", stub_processing
-        )
+        monkeypatch.setattr(core, "prepare_worker", lambda pfiles_root, work_root: str(tmp_path))
+        monkeypatch.setitem(core.MISSION_CONFIG["nustar"], "obsid_processing", stub_processing)
 
         failed = core.process_observations(
             self.items(),
@@ -351,24 +343,18 @@ class TestOneFailureDoesNotStopTheRest:
         )
         return failed, processed
 
-    def test_every_observation_gets_a_manifest_even_the_failing_one(
-        self, tmp_path, monkeypatch
-    ):
+    def test_every_observation_gets_a_manifest_even_the_failing_one(self, tmp_path, monkeypatch):
         self.run(monkeypatch, tmp_path, failing={"obs1"})
 
         for obsid in "obs0", "obs1", "obs2":
-            manifest = read_manifest(
-                diagnostics_path(obsid, dict(out_data_path=str(tmp_path)))
-            )
+            manifest = read_manifest(diagnostics_path(obsid, dict(out_data_path=str(tmp_path))))
             assert manifest is not None, obsid
             assert manifest["obsid"] == obsid
 
     def test_the_manifest_names_the_target_and_the_exposure(self, tmp_path, monkeypatch):
         self.run(monkeypatch, tmp_path, failing=set())
 
-        manifest = read_manifest(
-            diagnostics_path("obs1", dict(out_data_path=str(tmp_path)))
-        )
+        manifest = read_manifest(diagnostics_path("obs1", dict(out_data_path=str(tmp_path))))
 
         assert manifest["metadata"]["source_name"] == "target1"
         assert manifest["metadata"]["exposure"] == 1000.0
@@ -376,13 +362,10 @@ class TestOneFailureDoesNotStopTheRest:
     def test_the_manifest_records_where_the_data_came_from(self, tmp_path, monkeypatch):
         self.run(monkeypatch, tmp_path, failing=set())
 
-        manifest = read_manifest(
-            diagnostics_path("obs0", dict(out_data_path=str(tmp_path)))
-        )
+        manifest = read_manifest(diagnostics_path("obs0", dict(out_data_path=str(tmp_path))))
 
         assert manifest["url"] == "https://example.invalid/obs0/"
         assert manifest["mission"] == "nustar"
-
 
     def test_every_observation_is_recorded_as_a_whole(self, tmp_path, monkeypatch):
         """The outcome of the observation itself, not only of its steps."""
@@ -392,9 +375,7 @@ class TestOneFailureDoesNotStopTheRest:
         for obsid in "obs0", "obs1", "obs2":
             (record,) = [
                 r
-                for r in read_records(
-                    diagnostics_path(obsid, dict(out_data_path=str(tmp_path)))
-                )
+                for r in read_records(diagnostics_path(obsid, dict(out_data_path=str(tmp_path))))
                 if r["step"] == "observation"
             ]
             outcomes[obsid] = record
@@ -405,9 +386,7 @@ class TestOneFailureDoesNotStopTheRest:
         assert outcomes["obs2"]["status"] == "skipped"
         assert "no science data" in outcomes["obs2"]["reason"]
 
-    def test_every_observation_gets_a_page_including_the_failing_one(
-        self, tmp_path, monkeypatch
-    ):
+    def test_every_observation_gets_a_page_including_the_failing_one(self, tmp_path, monkeypatch):
         """A failed observation is exactly the one somebody will want to look at."""
         pytest.importorskip("plotly")
         self.run(monkeypatch, tmp_path, failing={"obs1"})
@@ -435,7 +414,6 @@ class TestOneFailureDoesNotStopTheRest:
 
         assert failed == []
         assert sorted(processed) == ["obs0", "obs1", "obs2"]
-
 
     def test_the_run_leaves_an_index_of_every_observation(self, tmp_path, monkeypatch):
         pytest.importorskip("plotly")
@@ -542,9 +520,7 @@ class TestTheFlowUsesAShortWorkspace:
         )
         monkeypatch.setattr(core, "process_observations", Recorder())
 
-        core.retrieve_and_process_data(
-            Table({"__row": [0]}), outdir=str(outdir), **kwargs
-        )
+        core.retrieve_and_process_data(Table({"__row": [0]}), outdir=str(outdir), **kwargs)
         return seen
 
     def long_outdir(self, tmp_path):
@@ -552,9 +528,7 @@ class TestTheFlowUsesAShortWorkspace:
         outdir.mkdir()
         return outdir
 
-    def test_the_workers_get_a_shorter_name_than_the_real_directory(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_workers_get_a_shorter_name_than_the_real_directory(self, tmp_path, monkeypatch):
         outdir = self.long_outdir(tmp_path)
 
         seen = self.run(monkeypatch, outdir)
@@ -568,17 +542,13 @@ class TestTheFlowUsesAShortWorkspace:
 
         assert (outdir / "a_result.txt").is_file()
 
-    def test_the_parameter_files_are_not_inside_the_output_directory(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_parameter_files_are_not_inside_the_output_directory(self, tmp_path, monkeypatch):
         """They used to be ``<outdir>/.workers/*/pfiles``, on the shared filesystem."""
         outdir = self.long_outdir(tmp_path)
 
         seen = self.run(monkeypatch, outdir)
 
-        assert not os.path.realpath(seen["pfiles_root"]).startswith(
-            os.path.realpath(str(outdir))
-        )
+        assert not os.path.realpath(seen["pfiles_root"]).startswith(os.path.realpath(str(outdir)))
 
     def test_the_working_directories_stay_where_there_is_room(self, tmp_path, monkeypatch):
         """182.5 MB per worker will not fit on a shared /tmp with 7.9 GB free."""
@@ -586,9 +556,7 @@ class TestTheFlowUsesAShortWorkspace:
 
         seen = self.run(monkeypatch, outdir)
 
-        assert os.path.realpath(seen["work_root"]).startswith(
-            os.path.realpath(str(outdir))
-        )
+        assert os.path.realpath(seen["work_root"]).startswith(os.path.realpath(str(outdir)))
 
     def test_scratch_dir_moves_the_working_directories(self, tmp_path, monkeypatch):
         outdir = self.long_outdir(tmp_path)
@@ -597,9 +565,7 @@ class TestTheFlowUsesAShortWorkspace:
 
         seen = self.run(monkeypatch, outdir, scratch_dir=str(fast))
 
-        assert os.path.realpath(seen["work_root"]).startswith(
-            os.path.realpath(str(fast))
-        )
+        assert os.path.realpath(seen["work_root"]).startswith(os.path.realpath(str(fast)))
 
     def test_the_workspace_is_cleaned_up_but_the_output_is_not(self, tmp_path, monkeypatch):
         outdir = self.long_outdir(tmp_path)
@@ -675,9 +641,7 @@ class TestTheFlowRefusesNamesHeasoftCannotHandle:
         with pytest.raises(ValueError, match="A06_chu123_N_cl_"):
             self.run(monkeypatch, outdir, tmpdir=str(no_shorter))
 
-    def test_the_short_name_is_what_saves_a_long_output_directory(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_short_name_is_what_saves_a_long_output_directory(self, tmp_path, monkeypatch):
         """The same 120-character root is fine once the workspace has renamed it."""
         outdir = tmp_path / ("d" * 120)
         outdir.mkdir()
@@ -719,9 +683,7 @@ class TestObservationsWithNoScienceData:
         assert sorted(processed) == ["obs0", "obs2"]
 
     def test_failures_are_still_counted_alongside_slews(self, tmp_path, monkeypatch):
-        failed, processed = self.run(
-            monkeypatch, tmp_path, failing={"obs0"}, no_science={"obs1"}
-        )
+        failed, processed = self.run(monkeypatch, tmp_path, failing={"obs0"}, no_science={"obs1"})
 
         assert failed == ["obs0"]
         assert processed == ["obs2"]

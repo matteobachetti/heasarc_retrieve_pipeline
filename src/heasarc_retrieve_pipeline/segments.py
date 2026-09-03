@@ -605,8 +605,7 @@ def event_files_to_split(obsid, config):
     return sorted(
         path
         for path in found
-        if not path.endswith(".gpg")
-        and SEGMENT_RE.search(rootname(os.path.basename(path))) is None
+        if not path.endswith(".gpg") and SEGMENT_RE.search(rootname(os.path.basename(path))) is None
     )
 
 
@@ -697,9 +696,7 @@ def split_obsid(obsid, config, split_mjds, scale=None, spectra=True, events=True
         )
     logger.info(f"{obsid} runs {tstart:.3f} to {tstop:.3f}: {len(bounds)} segment(s)")
 
-    with record_step(
-        diagnostics_path(obsid, config), obsid, "split_obsid"
-    ) as rec:
+    with record_step(diagnostics_path(obsid, config), obsid, "split_obsid") as rec:
         rec.value(
             split_mjds=[float(m) for m in split_mjds],
             split_mets=mets,
@@ -754,7 +751,9 @@ def main(argv=None):
         prog="hrp-split-obsid",
         description=__doc__.strip().splitlines()[0],
     )
-    parser.add_argument("data_dir", help="parent directory containing {OBSID}/event_pipe subdirectories")
+    parser.add_argument(
+        "data_dir", help="parent directory containing {OBSID}/event_pipe subdirectories"
+    )
     parser.add_argument("obsid", help="observation to split; must already be reduced")
     parser.add_argument(
         "mjd", nargs="+", type=float, help="where to cut; N of them give N + 1 segments"
@@ -768,12 +767,8 @@ def main(argv=None):
             "labelled in civil time"
         ),
     )
-    parser.add_argument(
-        "--no-spectra", action="store_true", help="do not re-extract the spectra"
-    )
-    parser.add_argument(
-        "--no-events", action="store_true", help="do not split the event lists"
-    )
+    parser.add_argument("--no-spectra", action="store_true", help="do not re-extract the spectra")
+    parser.add_argument("--no-events", action="store_true", help="do not split the event lists")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     import logging

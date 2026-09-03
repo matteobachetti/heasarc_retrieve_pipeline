@@ -167,9 +167,7 @@ def segment_families(obsid, config):
         parent = os.path.join(products, stem + "_sr.pha")
         if not os.path.exists(parent):
             continue
-        families.setdefault(stem, (parent, []))[1].append(
-            (int(match.group("number")), path)
-        )
+        families.setdefault(stem, (parent, []))[1].append((int(match.group("number")), path))
 
     return {
         stem: (parent, [path for _, path in sorted(numbered)])
@@ -294,14 +292,11 @@ def compare_events(parent, segments):
 
     return {
         "times_match": bool(
-            len(joined) == parent_times.size
-            and np.array_equal(joined, np.sort(parent_times))
+            len(joined) == parent_times.size and np.array_equal(joined, np.sort(parent_times))
         ),
         "parent_events": int(parent_times.size),
         "segment_events": int(len(joined)),
-        "gti_match": abs(parent_gti - segment_gti) <= EXPOSURE_TOLERANCE * max(
-            parent_gti, 1.0
-        ),
+        "gti_match": abs(parent_gti - segment_gti) <= EXPOSURE_TOLERANCE * max(parent_gti, 1.0),
         "parent_gti": parent_gti,
         "segment_gti": segment_gti,
     }
@@ -559,9 +554,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     out_data_path = os.path.abspath(args.out_data_path)
-    workdir = args.workdir or os.path.join(
-        os.path.dirname(out_data_path), "roundtrip"
-    )
+    workdir = args.workdir or os.path.join(os.path.dirname(out_data_path), "roundtrip")
 
     result = check_roundtrip(
         args.obsid,

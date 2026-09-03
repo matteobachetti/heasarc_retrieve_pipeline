@@ -283,9 +283,7 @@ def separation_figure(record, arrays):
     fluxes = np.asarray(arrays.get("peak_fluxes", np.zeros(len(peaks))), dtype=float)
     threshold = (record.get("values") or {}).get("acceptance_threshold")
     if len(peaks):
-        accepted = (
-            fluxes >= threshold if threshold is not None else np.ones(len(peaks), bool)
-        )
+        accepted = fluxes >= threshold if threshold is not None else np.ones(len(peaks), bool)
         for keep, name, symbol in (
             (accepted, "accepted", "circle"),
             (~accepted, "below the threshold", "circle-open"),
@@ -298,8 +296,9 @@ def separation_figure(record, arrays):
                     y=peaks[keep, 0],
                     mode="markers",
                     name=name,
-                    marker=dict(symbol=symbol, size=11, color="#e76f51",
-                                line=dict(width=2, color="#e76f51")),
+                    marker=dict(
+                        symbol=symbol, size=11, color="#e76f51", line=dict(width=2, color="#e76f51")
+                    ),
                     hovertext=[
                         f"X {peak[0]:.0f}, Y {peak[1]:.0f}<br>{flux:.0f} counts"
                         for peak, flux in zip(peaks[keep], fluxes[keep])
@@ -361,8 +360,13 @@ def radial_profile_figure(record, arrays):
     )
     if np.any(psf):
         fig.add_trace(
-            go.Scatter(x=radius, y=psf, mode="lines", name="expected PSF",
-                       line=dict(width=1.5, color="#e9c46a", dash="dash"))
+            go.Scatter(
+                x=radius,
+                y=psf,
+                mode="lines",
+                name="expected PSF",
+                line=dict(width=1.5, color="#e9c46a", dash="dash"),
+            )
         )
 
     values = record.get("values") or {}
@@ -375,8 +379,11 @@ def radial_profile_figure(record, arrays):
             annotation_position="top right",
         )
 
-    fig.update_layout(xaxis_title="radius (arcsec)", yaxis_title="surface brightness",
-                      legend=dict(orientation="h", y=1.12, x=0))
+    fig.update_layout(
+        xaxis_title="radius (arcsec)",
+        yaxis_title="surface brightness",
+        legend=dict(orientation="h", y=1.12, x=0),
+    )
     fig.update_yaxes(type="log")
     return _blank(fig)
 
@@ -493,8 +500,7 @@ def gti_figure(record, arrays):
         if f"gti_{fpm}_out" in arrays:
             rows.append((f"FPM{fpm} merged (OR)", arrays[f"gti_{fpm}_out"], "#219ebc"))
     if "gti_combined" in arrays:
-        rows.append((values.get("combined", "combined (AND)"),
-                     arrays["gti_combined"], "#023047"))
+        rows.append((values.get("combined", "combined (AND)"), arrays["gti_combined"], "#023047"))
 
     rows = [(name, np.atleast_2d(gti), colour) for name, gti, colour in rows]
     rows = [row for row in rows if row[1].size]
@@ -521,8 +527,9 @@ def gti_figure(record, arrays):
             )
         )
 
-    fig.update_layout(barmode="overlay",
-                      xaxis_title="seconds since the earliest good time interval")
+    fig.update_layout(
+        barmode="overlay", xaxis_title="seconds since the earliest good time interval"
+    )
     fig.update_yaxes(
         tickmode="array",
         tickvals=list(range(len(rows))),
@@ -560,26 +567,33 @@ def flare_figure(record, arrays):
     if not arrays or not any(key.startswith("lc_") for key in arrays):
         return None
 
-    bands = [("3_10", "3–10 keV (solar stray light)"),
-             ("10_79", "10–79 keV (control)")]
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                        row_heights=[0.26, 0.37, 0.37])
+    bands = [("3_10", "3–10 keV (solar stray light)"), ("10_79", "10–79 keV (control)")]
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.26, 0.37, 0.37]
+    )
 
     if "goes_time" in arrays:
-        for column, colour, name in (("goes_xrsb", "#e76f51", "GOES 1–8 Å"),
-                                     ("goes_xrsa", "#264653", "GOES 0.5–4 Å")):
+        for column, colour, name in (
+            ("goes_xrsb", "#e76f51", "GOES 1–8 Å"),
+            ("goes_xrsa", "#264653", "GOES 0.5–4 Å"),
+        ):
             if column in arrays:
                 fig.add_trace(
-                    go.Scatter(x=arrays["goes_time"], y=arrays[column], mode="lines",
-                               name=name, line=dict(width=1, color=colour)),
-                    row=1, col=1,
+                    go.Scatter(
+                        x=arrays["goes_time"],
+                        y=arrays[column],
+                        mode="lines",
+                        name=name,
+                        line=dict(width=1, color=colour),
+                    ),
+                    row=1,
+                    col=1,
                 )
         fig.update_yaxes(type="log", title_text="W m<sup>-2</sup>", row=1, col=1)
 
     values = record.get("values") or {}
     for row, (band, title) in enumerate(bands, start=2):
-        for when, colour, name in (("before", "#aaa", "before"),
-                                   ("after", "#2a9d8f", "after")):
+        for when, colour, name in (("before", "#aaa", "before"), ("after", "#2a9d8f", "after")):
             time = arrays.get(f"lc_{band}_{when}_time")
             if time is None:
                 continue
@@ -587,13 +601,15 @@ def flare_figure(record, arrays):
                 go.Scatter(
                     x=time,
                     y=arrays[f"lc_{band}_{when}_rate"],
-                    error_y=dict(array=arrays.get(f"lc_{band}_{when}_rate_err"),
-                                 thickness=0.7, width=0),
+                    error_y=dict(
+                        array=arrays.get(f"lc_{band}_{when}_rate_err"), thickness=0.7, width=0
+                    ),
                     mode="markers",
                     name=f"{title} {name}",
                     marker=dict(size=4, color=colour),
                 ),
-                row=row, col=1,
+                row=row,
+                col=1,
             )
         chi2 = values.get(f"chi2_dof_{band}")
         label = f"{title} rate (s<sup>-1</sup>)"
@@ -603,8 +619,9 @@ def flare_figure(record, arrays):
 
     removed = np.atleast_2d(np.asarray(arrays.get("removed", np.zeros((0, 2))), float))
     for start, stop in removed.reshape(-1, 2):
-        fig.add_vrect(x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16,
-                      line_width=0, layer="below")
+        fig.add_vrect(
+            x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16, line_width=0, layer="below"
+        )
 
     fig.update_xaxes(title_text="mission elapsed time (s)", row=3, col=1)
     fig.update_layout(legend=dict(orientation="h", y=1.06, x=0, font=dict(size=10)))
@@ -660,8 +677,12 @@ def _figure_html(fig):
     a page one directory below the bundle points at a file that does not exist.
     """
     _, pio = _plotly()
-    return pio.to_html(fig, full_html=False, include_plotlyjs=False,
-                       config=dict(displaylogo=False, responsive=True))
+    return pio.to_html(
+        fig,
+        full_html=False,
+        include_plotlyjs=False,
+        config=dict(displaylogo=False, responsive=True),
+    )
 
 
 def read_step_stamps(obsid, outdir):
@@ -836,8 +857,7 @@ def observation_body(summary, directory):
     title = metadata.get("source_name") or summary["manifest"].get("mission") or ""
     parts = [
         f"<h1>{html.escape(str(obsid))}</h1>",
-        f'<p class="subtitle">{html.escape(str(title))} &mdash; '
-        f"{_badge(summary['outcome'])}</p>",
+        f'<p class="subtitle">{html.escape(str(title))} &mdash; {_badge(summary["outcome"])}</p>',
         "<h2>Observation</h2>",
         _table(_parameter_rows(summary)),
         "<h2>Steps</h2>",
@@ -890,8 +910,10 @@ def observation_body(summary, directory):
 
     parts.append("<h2>Skipped inputs</h2>")
     parts.append(
-        _table([(item, reason) for item, reason in summary["skipped"]],
-               header=("input", "why it was skipped"))
+        _table(
+            [(item, reason) for item, reason in summary["skipped"]],
+            header=("input", "why it was skipped"),
+        )
         if summary["skipped"]
         else '<p class="empty">nothing was skipped</p>'
     )
@@ -900,8 +922,10 @@ def observation_body(summary, directory):
         parts.append("<h2>What each step produced</h2>")
         parts.append(
             _table(
-                [(name, ", ".join(map(str, stamp.get("outputs", []))) or "")
-                 for name, stamp in summary["stamps"]],
+                [
+                    (name, ", ".join(map(str, stamp.get("outputs", []))) or "")
+                    for name, stamp in summary["stamps"]
+                ],
                 header=("step", "outputs"),
             )
         )
@@ -929,7 +953,6 @@ def _safe(builder, *args):
     except Exception as error:
         get_logger().warning(f"Could not build the {builder.__name__} figure: {error}")
         return None
-
 
 
 def run_timeline_figure(summaries):
@@ -978,9 +1001,11 @@ def run_timeline_figure(summaries):
             )
         )
 
-    fig.update_layout(barmode="overlay",
-                      xaxis_title="seconds since the first observation started",
-                      legend=dict(orientation="h", y=1.06, x=0))
+    fig.update_layout(
+        barmode="overlay",
+        xaxis_title="seconds since the first observation started",
+        legend=dict(orientation="h", y=1.06, x=0),
+    )
     # An OBSID is a number as far as a plotting library is concerned, and 30702012004 on a
     # numeric axis comes out labelled 30.702012004B. It is a name.
     fig.update_yaxes(type="category", autorange="reversed", automargin=True)
@@ -1044,10 +1069,23 @@ def index_body(summaries):
         parts.append("$FIGURE")
         figures.append(fig)
 
-    header = ("OBSID", "target", "outcome", "exposure (s)", "took (s)", "steps",
-              "skipped steps", "failed steps", "skipped inputs", "")
-    out = ["<h2>Observations</h2>", "<table>",
-           "<tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in header) + "</tr>"]
+    header = (
+        "OBSID",
+        "target",
+        "outcome",
+        "exposure (s)",
+        "took (s)",
+        "steps",
+        "skipped steps",
+        "failed steps",
+        "skipped inputs",
+        "",
+    )
+    out = [
+        "<h2>Observations</h2>",
+        "<table>",
+        "<tr>" + "".join(f"<th>{html.escape(name)}</th>" for name in header) + "</tr>",
+    ]
     for row in rows:
         link = f"{row['obsid']}/diagnostics.html"
         out.append(
@@ -1107,8 +1145,10 @@ def write_index(outdir, obsids=None):
 
     path = os.path.join(outdir, "index.html")
     os.makedirs(outdir, exist_ok=True)
-    _write(path, PAGE.substitute(title="Reduction run", bundle=PLOTLY_BUNDLE,
-                                 body=index_body(summaries)))
+    _write(
+        path,
+        PAGE.substitute(title="Reduction run", bundle=PLOTLY_BUNDLE, body=index_body(summaries)),
+    )
     return path
 
 
@@ -1155,9 +1195,9 @@ def write_observation_page(obsid, outdir, recover=True):
     path = os.path.join(outdir, obsid, "diagnostics.html")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # The bundle lives at the run root, one level up from the observation directory.
-    page = PAGE.substitute(title=f"{obsid} diagnostics",
-                           bundle=os.path.join("..", PLOTLY_BUNDLE),
-                           body=body)
+    page = PAGE.substitute(
+        title=f"{obsid} diagnostics", bundle=os.path.join("..", PLOTLY_BUNDLE), body=body
+    )
     _write(path, page)
     return path
 
@@ -1271,10 +1311,7 @@ def observation_directories(outdir):
         if (
             os.path.isdir(os.path.join(path, "diagnostics"))
             or os.path.exists(os.path.join(path, "skipped_inputs.txt"))
-            or any(
-                os.path.isdir(os.path.join(path, sub))
-                for sub in OBSERVATION_SUBDIRECTORIES
-            )
+            or any(os.path.isdir(os.path.join(path, sub)) for sub in OBSERVATION_SUBDIRECTORIES)
             or glob.glob(os.path.join(path, "*.evt"))
         ):
             obsids.append(name)

@@ -300,9 +300,7 @@ class StepRecord:
 
     def as_dict(self):
         """The record as it will be written."""
-        inherited = self._earlier or (
-            not self.arrays and os.path.exists(self.arrays_path)
-        )
+        inherited = self._earlier or (not self.arrays and os.path.exists(self.arrays_path))
         duration = None
         if self._monotonic is not None:
             duration = round(time.monotonic() - self._monotonic, 3)
@@ -323,11 +321,7 @@ class StepRecord:
             ),
             "duration_s": duration,
             "values": _jsonable({**self._inherited_values, **self.values}),
-            "arrays": (
-                os.path.basename(self.arrays_path)
-                if self.arrays or inherited
-                else None
-            ),
+            "arrays": (os.path.basename(self.arrays_path) if self.arrays or inherited else None),
             "arrays_from_earlier_run": inherited,
         }
 

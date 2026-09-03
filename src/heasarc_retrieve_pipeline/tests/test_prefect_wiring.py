@@ -34,7 +34,9 @@ def function_objects_in_wait_for(source):
     []
     """
     tree = ast.parse(source)
-    defined = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    defined = {
+        n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
     offenders = []
     for node in ast.walk(tree):
@@ -43,7 +45,11 @@ def function_objects_in_wait_for(source):
         for keyword in node.keywords:
             if keyword.arg != "wait_for":
                 continue
-            elements = keyword.value.elts if isinstance(keyword.value, (ast.List, ast.Tuple)) else [keyword.value]
+            elements = (
+                keyword.value.elts
+                if isinstance(keyword.value, (ast.List, ast.Tuple))
+                else [keyword.value]
+            )
             for element in elements:
                 if isinstance(element, ast.Name) and element.id in defined:
                     offenders.append(element.id)
@@ -81,7 +87,11 @@ def test_every_wait_for_argument_comes_from_submit(path):
         for keyword in node.keywords:
             if keyword.arg != "wait_for":
                 continue
-            elements = keyword.value.elts if isinstance(keyword.value, (ast.List, ast.Tuple)) else [keyword.value]
+            elements = (
+                keyword.value.elts
+                if isinstance(keyword.value, (ast.List, ast.Tuple))
+                else [keyword.value]
+            )
             for element in elements:
                 assert isinstance(element, ast.Name), f"{path.name}: wait_for takes a name"
                 assert element.id in submitted, (
@@ -132,9 +142,7 @@ def test_run_name_templates_only_name_real_parameters(path):
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             args = node.args
-            parameters[node.name] = {
-                a.arg for a in args.posonlyargs + args.args + args.kwonlyargs
-            }
+            parameters[node.name] = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
 
     for function, template, roots in run_name_fields(path.read_text()):
         for root in roots:

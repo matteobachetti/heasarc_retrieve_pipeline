@@ -439,9 +439,7 @@ class TestAFigureFromAnEarlierRun:
         summary = report.observation_summary(OBSID, str(tmp_path))
         (record,) = [r for r in summary["records"] if r["step"] == "separate_sources"]
 
-        fig = report.separation_figure(
-            record, read_arrays(observation(tmp_path), record)
-        )
+        fig = report.separation_figure(record, read_arrays(observation(tmp_path), record))
 
         assert fig is not None
         assert fig.data[0].z.shape == (99, 99)
@@ -597,9 +595,10 @@ class TestPagesThatCouldGoWrong:
         summary = report.observation_summary(OBSID, str(tmp_path))
 
         assert summary["outcome"] == "running"
-        assert "Spectral extraction" in soup(
-            report.write_observation_page(OBSID, str(tmp_path))
-        ).get_text()
+        assert (
+            "Spectral extraction"
+            in soup(report.write_observation_page(OBSID, str(tmp_path))).get_text()
+        )
 
     def test_an_unreadable_array_payload_does_not_lose_the_page(self, tmp_path):
         a_separation(tmp_path)
@@ -711,16 +710,12 @@ class TestTheRunIndex:
     def a_run(self, tmp_path):
         """Three observations: one finished, one failed, one that never started."""
         a_full_observation(tmp_path, obsid="90901333002")
-        with record_step(
-            observation(tmp_path, "90901333002"), "90901333002", "observation"
-        ) as rec:
+        with record_step(observation(tmp_path, "90901333002"), "90901333002", "observation") as rec:
             rec.value(mission="nustar")
 
         a_manifest(tmp_path, obsid="80002092008", name="NGC 253")
         try:
-            with record_step(
-                observation(tmp_path, "80002092008"), "80002092008", "observation"
-            ):
+            with record_step(observation(tmp_path, "80002092008"), "80002092008", "observation"):
                 raise ValueError("nupipeline died")
         except ValueError:
             pass
@@ -815,9 +810,7 @@ class TestTheRunIndex:
 
         assert os.path.exists(os.path.join(tmp_path, "index.html"))
         assert os.path.exists(os.path.join(tmp_path, "plotly.min.js"))
-        assert os.path.exists(
-            os.path.join(tmp_path, "90901333002", "diagnostics.html")
-        )
+        assert os.path.exists(os.path.join(tmp_path, "90901333002", "diagnostics.html"))
 
     def test_the_command_line_says_how_to_use_it(self, tmp_path, capsys):
         assert report.main([]) == 2
