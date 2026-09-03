@@ -1,0 +1,23 @@
+# Install once with `pre-commit install`; after that these run on every `git commit`.
+# To check the whole tree by hand: `pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-toml
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        # ARCHIVE_INDEX_HTML is a verbatim capture of a HEASARC directory index;
+        # its trailing whitespace is part of the fixture. See the matching
+        # per-file-ignore in pyproject.toml.
+        exclude: ^src/heasarc_retrieve_pipeline/tests/test_core\.py$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format

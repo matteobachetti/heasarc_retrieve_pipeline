@@ -87,6 +87,28 @@ include = ["heasarc_retrieve_pipeline*"]
 [tool.setuptools_scm]
 version_file = "src/heasarc_retrieve_pipeline/_version.py"
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["docs/_build"]
+
+[tool.ruff.lint]
+# A deliberately small, flake8-shaped surface: pycodestyle errors and warnings plus
+# pyflakes. Widen it only with a reason.
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.pycodestyle]
+# `ruff format` wraps code at 100 columns, but it cannot split a string literal. Lines
+# that are long because of one -- a log message, a URL, an expected doctest output --
+# are tolerated up to 120 rather than being contorted by hand.
+max-line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+# ARCHIVE_INDEX_HTML in this file is a verbatim capture of a HEASARC Apache directory
+# index, trailing whitespace and 344-character lines and all. Reflowing it would change
+# what is being tested.
+"src/heasarc_retrieve_pipeline/tests/test_core.py" = ["W291", "E501"]
+
 [tool.pytest.ini_options]
 testpaths = [
   "src/heasarc_retrieve_pipeline",
