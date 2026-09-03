@@ -78,6 +78,7 @@ import sys
 from .coadd import (
     GROUPING_COMMAND,
     apply_case_b_scaling,
+    repair_addspec_background,
     run_addspec,
     stage_inputs,
     working_directory,
@@ -286,6 +287,7 @@ def combine_merged_modules(name, config, roots, rec=None):
         inputs[suffix] = [os.path.basename(path) for path in spectra]
         logger.info(f"Co-adding the modules of {name} into {root}.pha")
         run_addspec(spectra, outdir, root, f"_inputs_{suffix}")
+        repair_addspec_background(os.path.join(outdir, root + ".bak"), spectra)
         # addspec added the two modules' exposures as though they had observed one after
         # the other. They did not. See coadd.apply_case_b_scaling.
         apply_case_b_scaling(

@@ -1128,6 +1128,14 @@ background itself, through the ``mathpha`` expression that builds it. That backg
 to avoid rounding errors") and is left alone: the correction cancels out of the background
 term, so touching it would gain nothing and only obscure ``addspec``'s bookkeeping.
 
+When the inputs to the module combination are themselves ``addspec`` outputs -- as the
+merged per-module spectra are -- their backgrounds carry the thousand-fold inflation
+already. ``mathpha`` inflates again, overflowing a 32-bit integer in the ``EXPOSURE``
+keyword and multiplying every channel's counts by a thousand. The pipeline repairs the
+output background after ``addspec`` finishes: it reads the input backgrounds, sums their
+``COUNTS`` arrays and ``EXPOSURE`` values, and overwrites the broken file.  The result is
+exact and deterministic, bypassing ``mathpha``'s double inflation entirely.
+
 
 Splitting and merging observations
 ----------------------------------

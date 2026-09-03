@@ -329,3 +329,52 @@ def apply_case_b_scaling(paths, n_modules):
         changed.append(path)
         logger.debug(f"Rescaled {os.path.basename(path)} for {n_modules} modules")
     return changed
+
+
+def repair_addspec_background(bak_path, input_spectra):
+    """
+    Replace a combined background with the sum of the per-module backgrounds.
+
+    ``addspec`` delegates background combination to ``mathpha``, which inflates the output
+    counts and exposure by a factor of a thousand relative to the inputs. When the inputs
+    are themselves ``addspec`` outputs -- as the merged per-module spectra are -- the
+    backgrounds have already been inflated once, and the second inflation overflows a
+    32-bit integer in the exposure keyword and multiplies every count by a thousand. Rather
+    than try to undo the inflation, this function rebuilds the background from the input
+    backgrounds directly: it sums their ``COUNTS`` arrays and ``EXPOSURE`` values, which is
+    what ``addspec`` would do if it treated them honestly.
+
+    Parameters
+    ----------
+    bak_path : str
+        Path to the combined ``.bak`` file that ``addspec`` wrote.
+    input_spectra : list of str
+        Source spectra whose ``BACKFILE`` keywords name the per-module backgrounds.
+    """
+    logger = get_logger()
+    counts = None
+    exposure = 0.0
+    for pha in input_spectra:
+        with fits.open(pha) as hdul:
+            backfile = str(hdul[1].header.get("BACKFILE", "none")).strip()
+            if not backfile or backfile.lower() in ("none", "no"):
+                continue
+        bkg_path = os.path.join(os.path.dirname(pha), backfile)
+        if not os.path.exists(bkg_path):
+            continue
+        with fits.open(bkg_path) as hdul:
+            if counts is None:
+                counts = hdul[1].data["COUNTS"].copy()
+            else:
+                counts += hdul[1].data["COUNTS"]
+            exposure += hdul[1].header["EXPOSURE"]
+    if counts is None:
+        return
+    with fits.open(bak_path, mode="update") as hdul:
+        hdul[1].data["COUNTS"][:] = counts
+        hdul[1].header["EXPOSURE"] = exposure
+        hdul[1].header.add_history(
+            "Background rebuilt from per-module inputs to bypass "
+            "mathpha's double inflation of pre-merged backgrounds"
+        )
+    logger.debug(f"Repaired {os.path.basename(bak_path)}: EXPOSURE={exposure:.1f}")

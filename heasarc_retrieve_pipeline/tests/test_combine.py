@@ -86,9 +86,9 @@ class StubAddspec:
                 respfile=root + ".rsp",
                 ancrfile="none",
             )
-            for suffix in (".bak", ".rsp"):
-                with open(root + suffix, "w") as fobj:
-                    fobj.write(root + suffix)
+            make_spectrum(root + ".bak", root, exposure=2000000.0)
+            with open(root + ".rsp", "w") as fobj:
+                fobj.write(root + ".rsp")
         elif name == "grppha":
             make_spectrum(kwargs["outfile"].lstrip("!"), "grouped", exposure=2000.0)
 
@@ -412,6 +412,25 @@ class TestCombiningMergedModules:
         written = combine.merge_spectra(OBSIDS, tree, "vela", spectra=spectra)
 
         assert sorted(written) == ["A01", "A06", "B01", "comb01"]
+
+    def test_combined_background_is_rebuilt_from_the_inputs(self, tree, stub):
+        """addspec/mathpha inflates backgrounds by 1000; on pre-inflated inputs that
+        overflows. The repair replaces the combined .bak with the sum of the per-module
+        backgrounds.
+        """
+        combine.merge_spectra(OBSIDS, tree, "vela")
+
+        products = self.products(tree)
+        with fits.open(os.path.join(products, "vela_comb01.bak")) as hdul:
+            bak = hdul[1]
+            # Two inputs (A01, B01) each with EXPOSURE=2000000 → sum = 4000000
+            assert bak.header["EXPOSURE"] == 4000000.0
+            # COUNTS = sum of the two per-module backgrounds
+            expected_counts = np.zeros(16, dtype=np.int32)
+            for fn in ("vela_A01.bak", "vela_B01.bak"):
+                with fits.open(os.path.join(products, fn)) as h:
+                    expected_counts += h[1].data["COUNTS"]
+            np.testing.assert_array_equal(bak.data["COUNTS"], expected_counts)
 
     def test_it_records_what_it_combined(self, tree, stub):
         from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, record_step
