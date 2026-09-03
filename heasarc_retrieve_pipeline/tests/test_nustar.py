@@ -40,8 +40,10 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     mode_01_input_files,
     nu_goes_gti_file,
     nu_goes_lc_file,
+    paired_spectral_inputs,
     position_is_consistent,
     spectral_input_files,
+    spectral_input_key,
 )
 from heasarc_retrieve_pipeline.utils import (  # noqa: E402
     intersect_intervals,
@@ -140,6 +142,56 @@ def test_observation_without_mode_01_data(tmp_path):
 def test_empty_observation_yields_nothing(tmp_path):
     config = make_obsid_tree(tmp_path)
     assert list(spectral_input_files(OBSID, config)) == []
+
+
+def test_the_key_drops_the_module_letter():
+    assert spectral_input_key(OBSID, "A", f"nu{OBSID}A01_cl.evt") == "01"
+    assert spectral_input_key(OBSID, "B", f"x/nu{OBSID}B06_chu12_N_cl.evt.gz") == "06_chu12_N"
+
+
+def test_the_two_modules_see_the_same_thing_under_one_key(full_observation):
+    """The key is what FPMA and FPMB are matched on, so it must not carry the module."""
+    keys = {
+        spectral_input_key(OBSID, fpm, f)
+        for fpm, f in spectral_input_files(OBSID, full_observation)
+    }
+    assert "01" in keys
+    assert "06_chu1_N" in keys
+
+
+def test_files_present_for_both_modules_are_paired(full_observation):
+    pairs, _ = paired_spectral_inputs(OBSID, full_observation)
+
+    assert set(pairs) == {"01", "06_chu1_N"}
+    for key, modules in pairs.items():
+        assert set(modules) == {"A", "B"}
+        assert os.path.basename(modules["A"]) == f"nu{OBSID}A{key}_cl.evt"
+        assert os.path.basename(modules["B"]) == f"nu{OBSID}B{key}_cl.evt"
+
+
+def test_mode_01_is_paired_first(full_observation):
+    """Mode 01 leads, as it does out of spectral_input_files."""
+    pairs, _ = paired_spectral_inputs(OBSID, full_observation)
+    assert list(pairs)[0] == "01"
+
+
+def test_a_file_without_a_counterpart_is_not_paired(full_observation):
+    """80002092008 has A06_chu12_N but no B06_chu12_N. It cannot be half of a pair."""
+    pairs, unpaired = paired_spectral_inputs(OBSID, full_observation)
+
+    assert "06_chu12_N" not in pairs
+    assert [(fpm, os.path.basename(f)) for fpm, f in unpaired] == [
+        ("A", f"nu{OBSID}A06_chu12_N_cl.evt")
+    ]
+
+
+def test_an_observation_with_one_module_pairs_nothing(tmp_path):
+    config = make_obsid_tree(tmp_path, pipe_files=[f"nu{OBSID}A01_cl.evt"])
+
+    pairs, unpaired = paired_spectral_inputs(OBSID, config)
+
+    assert pairs == {}
+    assert [fpm for fpm, _ in unpaired] == ["A"]
 
 
 def write_region_files(directory, root, ra, dec, radius_arcsec):
@@ -2077,6 +2129,120 @@ class TestTheStepsRecordThemselves:
             f"nu{OBSID}B01_cl.evt",
         ]
         assert record["values"]["spectra"] == []
+
+    def gti_watching_tree(self, tmp_path, monkeypatch, split_files=()):
+        """A spectral tree that records the GTI merges and the nuproducts parameters."""
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        indir = nu_pipeline_output_path(OBSID, config=config)
+        splitdir = split_path(OBSID, config=config)
+        os.makedirs(indir, exist_ok=True)
+        os.makedirs(splitdir, exist_ok=True)
+        for directory, names in (
+            (indir, [f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt"]),
+            (splitdir, list(split_files)),
+        ):
+            for name in names:
+                infile = os.path.join(directory, name)
+                open(infile, "w").close()
+                for kind in ("src", "bkg"):
+                    open(infile.replace(".evt", f"_{kind}.reg"), "w").close()
+
+        merges = []
+        products = []
+
+        def stub_merge(files, outfile, **kwargs):
+            merges.append((list(files), outfile, kwargs.get("gti_operation")))
+            open(outfile, "w").close()
+
+        def stub_run(name, params=None, **kwargs):
+            if name == "nuproducts":
+                products.append(dict(params))
+
+        monkeypatch.setattr(nustar, "get_best_source_region", lambda *a, **k: None)
+        monkeypatch.setattr(nustar, "merge_gtis", stub_merge)
+        monkeypatch.setattr(nustar.heasoft, "run", stub_run)
+        return config, merges, products
+
+    def test_both_modules_are_extracted_over_one_shared_good_time(
+        self, tmp_path, monkeypatch
+    ):
+        """The whole point: co-adding A and B is only honest if they cover the same time."""
+        config, merges, products = self.gti_watching_tree(tmp_path, monkeypatch)
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        assert len(merges) == 1
+        files, outfile, operation = merges[0]
+        assert [os.path.basename(f) for f in files] == [
+            f"nu{OBSID}A01_cl.evt",
+            f"nu{OBSID}B01_cl.evt",
+            "goes.gti",
+        ]
+        assert operation == "AND"
+        assert os.path.basename(outfile) == f"nu{OBSID}_01_noflares.gti"
+        assert {params["usrgtifile"] for params in products} == {outfile}
+
+    def test_an_unpaired_file_keeps_its_own_good_time(self, tmp_path, monkeypatch):
+        """Nothing to intersect with, so this is the two-way AND the pipeline always did."""
+        config, merges, products = self.gti_watching_tree(
+            tmp_path, monkeypatch, split_files=[f"nu{OBSID}A06_chu1_N_cl.evt"]
+        )
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        alone = [m for m in merges if len(m[0]) == 2]
+        assert len(alone) == 1
+        files, outfile, operation = alone[0]
+        assert [os.path.basename(f) for f in files] == [
+            f"nu{OBSID}A06_chu1_N_cl.evt",
+            "goes.gti",
+        ]
+        assert operation == "AND"
+        assert os.path.basename(outfile) == f"nu{OBSID}A06_chu1_N_cl_noflares.gti"
+
+    def test_an_unpaired_file_is_named_in_the_record(self, tmp_path, monkeypatch):
+        """It is still extracted; it just cannot become part of a combined product."""
+        config, _, products = self.gti_watching_tree(
+            tmp_path, monkeypatch, split_files=[f"nu{OBSID}A06_chu1_N_cl.evt"]
+        )
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["values"]["unpaired"] == [f"nu{OBSID}A06_chu1_N_cl.evt"]
+        assert len(products) == 3
+
+    def test_the_record_says_which_good_time_convention_was_used(
+        self, tmp_path, monkeypatch
+    ):
+        """An archive holds observations reduced both ways, so this has to be visible."""
+        config, _, _ = self.gti_watching_tree(tmp_path, monkeypatch)
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["values"]["gti_convention"] == "shared_between_modules"
+
+    def test_a_module_without_a_region_leaves_the_other_unpaired(
+        self, tmp_path, monkeypatch
+    ):
+        """Pairing is over what survives the region check, not over what is on disk."""
+        config, merges, _ = self.gti_watching_tree(tmp_path, monkeypatch)
+        for kind in ("src", "bkg"):
+            os.unlink(
+                os.path.join(
+                    nu_pipeline_output_path(OBSID, config=config),
+                    f"nu{OBSID}B01_cl_{kind}.reg",
+                )
+            )
+
+        nustar.calculate_spectra.fn(OBSID, config, goes_gti_file="goes.gti")
+
+        assert len(merges) == 1
+        files, _, _ = merges[0]
+        assert [os.path.basename(f) for f in files] == [f"nu{OBSID}A01_cl.evt", "goes.gti"]
+        record = self.only(tmp_path, "calculate_spectra")
+        assert record["values"]["unpaired"] == [f"nu{OBSID}A01_cl.evt"]
 
     def test_a_rerun_of_the_spectra_says_the_sentinel_stopped_it(self, tmp_path):
         config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))

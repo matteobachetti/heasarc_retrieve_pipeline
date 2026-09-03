@@ -370,6 +370,82 @@ def spectral_input_files(obsid, config):
             yield fpm, infile
 
 
+def spectral_input_key(obsid, fpm, path):
+    """
+    What an event file *is*, with the focal-plane module taken out.
+
+    ``nu80002092006A06_chu12_N_cl.evt`` and ``nu80002092006B06_chu12_N_cl.evt`` are the same
+    stretch of sky and time seen by the two modules, so they share a key -- here
+    ``06_chu12_N``. A mode-01 file gives ``01``. This is what
+    :func:`paired_spectral_inputs` matches FPMA against FPMB on.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    fpm : {"A", "B"}
+        Focal-plane module the file belongs to.
+    path : str
+        Path of the cleaned event file.
+
+    Returns
+    -------
+    str
+
+    Examples
+    --------
+    >>> spectral_input_key("80002092006", "A", "nu80002092006A01_cl.evt")
+    '01'
+    >>> spectral_input_key("80002092006", "B", "x/nu80002092006B06_chu12_N_cl.evt.gz")
+    '06_chu12_N'
+    """
+    root_name = rootname(os.path.basename(path))
+    stem = root_name[: -len("_cl")] if root_name.endswith("_cl") else root_name
+    prefix = f"nu{obsid}{fpm}"
+    return stem[len(prefix) :] if stem.startswith(prefix) else stem
+
+
+def paired_spectral_inputs(obsid, config):
+    """
+    The observation's event files, matched between the two focal-plane modules.
+
+    FPMA and FPMB see the same source at the same time, so almost every file has a
+    counterpart. A pair is what :func:`calculate_spectra` extracts over one shared good-time
+    interval and what :mod:`heasarc_retrieve_pipeline.combine` may afterwards co-add; a file
+    without a counterpart is still extracted, on its own, but can be no part of a combined
+    product.
+
+    Measured on ``90901333002``, the two modules' good times differ by at most three seconds
+    out of three thousand, so intersecting them costs nothing. See ``technical_details.rst``.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    pairs : dict
+        Key, as :func:`spectral_input_key` builds it, to ``{"A": path, "B": path}``. Mode 01
+        comes first, as it does from :func:`spectral_input_files`.
+    unpaired : list of tuple
+        ``(fpm, path)`` for every file whose counterpart is not there.
+    """
+    found = {}
+    for fpm, infile in spectral_input_files(obsid, config):
+        found.setdefault(spectral_input_key(obsid, fpm, infile), {})[fpm] = infile
+    pairs = {key: modules for key, modules in found.items() if len(modules) == 2}
+    unpaired = [
+        (fpm, path)
+        for modules in found.values()
+        if len(modules) < 2
+        for fpm, path in modules.items()
+    ]
+    return pairs, unpaired
+
+
 #: Observing modes that carry usable science. 01 is normal science, with the aspect
 #: solution from CHU4 on the optics bench; 06 is "spacecraft science", recorded while CHU4
 #: was blinded and reconstructed from CHU1-3 by :func:`recover_spacecraft_science_data`.
@@ -2464,6 +2540,15 @@ def calculate_spectra(
     usable event files is a clean outcome -- nothing was produced and nothing failed -- and
     is marked done; a missing region or GTI file that should have been there is not, so the
     next run retries instead of the observation being marked done forever.
+
+    The good time interval is worked out **per pair of modules**, not per file: FPMA's file,
+    FPMB's counterpart and the flare-free GTI are intersected, and the result is handed to
+    both extractions. The two modules' spectra then cover exactly the same time, which is
+    what makes them safe to co-add, and it is the same intersection
+    :func:`join_source_data` has always applied to the combined event list. It is very
+    nearly free -- on ``90901333002`` the two modules' good times differ by at most three
+    seconds out of three thousand. A file whose counterpart is missing keeps its own good
+    time and is recorded as ``unpaired``; it cannot become part of a combined product.
     """
     with record_step(diagnostics_path(obsid, config), obsid, "calculate_spectra") as rec:
         return _calculate_spectra(
@@ -2497,6 +2582,11 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
     inputs = []
     without_region = []
     spectra = []
+
+    # First pass: the extraction regions, which decide which files can be used at all. The
+    # pairing below has to be done over what survives this rather than over what is on
+    # disk, because a module whose region could not be measured cannot be half of a pair.
+    usable = []
     for fpm, infile in spectral_input_files(obsid, config):
         inputs.append(os.path.basename(infile))
         root_name = rootname(os.path.basename(infile))
@@ -2533,9 +2623,52 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
             without_region.append(os.path.basename(infile))
             continue
 
-        outfile_gti_temp = os.path.join(filedir, root_name + "_noflares.gti")
-        merge_gtis([infile, goes_gti_file], outfile_gti_temp, gti_operation="AND")
-        if not os.path.exists(outfile_gti_temp):
+        usable.append(
+            dict(
+                key=spectral_input_key(obsid, fpm, infile),
+                fpm=fpm,
+                infile=infile,
+                root_name=root_name,
+                stem=stem,
+                filedir=filedir,
+                src=this_src,
+                bkg=this_bkg,
+            )
+        )
+
+    # Second pass: one flare-free GTI per key, shared by both modules where both are there.
+    # FPMA and FPMB then see exactly the same good time, which is what lets their spectra be
+    # co-added afterwards, and it is the same intersection the combined event list has always
+    # used. It costs nothing: measured on 90901333002, the two modules' good times differ by
+    # at most three seconds out of three thousand.
+    by_key = {}
+    for entry in usable:
+        by_key.setdefault(entry["key"], []).append(entry)
+
+    unpaired = []
+    gti_files = {}
+    for key, entries in by_key.items():
+        if len(entries) == 2:
+            gti_file = os.path.join(entries[0]["filedir"], f"nu{obsid}_{key}_noflares.gti")
+        else:
+            # No counterpart, so nothing to intersect with: this is the two-way AND the
+            # pipeline has always done, and the file is barred from the combined products.
+            unpaired.extend(os.path.basename(entry["infile"]) for entry in entries)
+            gti_file = os.path.join(
+                entries[0]["filedir"], entries[0]["root_name"] + "_noflares.gti"
+            )
+        merge_gtis(
+            [entry["infile"] for entry in entries] + [goes_gti_file],
+            gti_file,
+            gti_operation="AND",
+        )
+        gti_files[key] = gti_file
+
+    for entry in usable:
+        infile = entry["infile"]
+        stem = entry["stem"]
+        gti_file = gti_files[entry["key"]]
+        if not os.path.exists(gti_file):
             logger.warning(f"Flare-free GTI file missing for {infile}, skipping")
             problems += 1
             continue
@@ -2544,11 +2677,11 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
         params = dict(
             indir=indir,
             infile=infile,
-            instrument=f"FPM{fpm}",
+            instrument=f"FPM{entry['fpm']}",
             steminputs="nu" + obsid,
             stemout=stem,
-            srcregionfile=this_src,
-            bkgregionfile=this_bkg,
+            srcregionfile=entry["src"],
+            bkgregionfile=entry["bkg"],
             outdir=outdir,
             clobber="yes",
             runmkarf="yes",
@@ -2558,7 +2691,7 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
             grpmincounts=20,
             grppibadlow=35,
             grppibadhigh=1909,
-            usrgtifile=outfile_gti_temp,
+            usrgtifile=gti_file,
             grpphafile=os.path.join(outdir, stem + "_grp.pha"),
         )
         logger.debug("nuproducts " + " ".join(f"{k}={v}" for k, v in params.items()))
@@ -2580,6 +2713,11 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
         without_region=without_region,
         spectra=spectra,
         missing_flare_free_gti=problems,
+        unpaired=unpaired,
+        # Which convention produced these spectra. Observations reduced before this was
+        # introduced kept a good time per module, and PRODUCTS_DONE.TXT stops them being
+        # redone, so an archive holds both and the difference has to be visible.
+        gti_convention="shared_between_modules",
     )
 
     if problems > 0:
