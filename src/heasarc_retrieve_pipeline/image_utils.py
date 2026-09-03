@@ -48,11 +48,11 @@ import numpy as np
 import copy
 from astropy.table import Table
 from astropy.io import fits
-from skimage.feature import peak_local_max
-from scipy.ndimage import gaussian_filter
-from statsmodels.robust import mad
-
 from .diagnostics import no_record
+
+# ``scikit-image``, ``scipy`` and ``statsmodels`` are only needed by the two functions
+# below, and are imported there so that the rest of the package -- which imports this
+# module at module scope, through nustar.py -- works without the ``imaging`` extra.
 
 
 def image_from_table(table, bins, gaussian_filter_sigma=1.0):
@@ -82,6 +82,8 @@ def image_from_table(table, bins, gaussian_filter_sigma=1.0):
     transposed, so the axis conventions need care when relating image indices back to sky
     coordinates.
     """
+    from scipy.ndimage import gaussian_filter
+
     hist, xbins, ybins = np.histogram2d(table["Y"], table["X"], bins=bins)
 
     img = gaussian_filter(hist, sigma=gaussian_filter_sigma)
@@ -333,6 +335,9 @@ def measure_sources_in_image(table, region_size=30, back_region_size=50, rec=Non
     refers to a different aperture than the extraction does. The energy conversion is
     NuSTAR-specific. See the science caveats in ``docs/known_issues.rst``.
     """
+    from skimage.feature import peak_local_max
+    from statsmodels.robust import mad
+
     if rec is None:
         rec = no_record()
 

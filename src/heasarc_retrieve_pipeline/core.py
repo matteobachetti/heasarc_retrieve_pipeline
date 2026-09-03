@@ -20,13 +20,9 @@ See ``docs/technical_details.rst`` for a description of the whole pipeline, and
 import os
 import re
 import shutil
-import sys
 import glob
-import traceback
-import pytest
-import warnings
 import typing
-from astropy.table import hstack, Table
+from astropy.table import Table
 from astroquery.heasarc import Heasarc
 import pyvo
 from astropy.coordinates import SkyCoord

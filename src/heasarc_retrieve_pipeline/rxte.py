@@ -26,13 +26,9 @@ import glob
 import gzip
 import os
 import shutil
-import re
-import boto3
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
-from botocore import UNSIGNED
-from botocore.config import Config
 from prefect import flow, get_run_logger, task
 
 from .utils import absolute_config
