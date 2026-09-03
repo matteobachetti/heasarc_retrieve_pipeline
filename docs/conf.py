@@ -7,6 +7,8 @@
 # http://www.sphinx-doc.org/en/master/config
 
 
+from heasarc_retrieve_pipeline import __version__
+
 # -- Project information -----------------------------------------------------
 
 project = 'heasarc_retrieve_pipeline'
@@ -14,7 +16,6 @@ copyright = '2022, Matteo Bachetti'
 author = 'Matteo Bachetti'
 
 # The full version, including alpha/beta/rc tags
-from heasarc_retrieve_pipeline import __version__
 release = __version__
 
 # -- General configuration ---------------------------------------------------
@@ -67,9 +68,9 @@ html_theme = 'alabaster'
 # so a file named "default.css" will overwrite the builtin "default.css".
 # html_static_path = ['_static']
 
-# By default, when rendering docstrings for classes, sphinx.ext.autodoc will 
-# make docs with the class-level docstring and the class-method docstrings, 
-# but not the __init__ docstring, which often contains the parameters to 
+# By default, when rendering docstrings for classes, sphinx.ext.autodoc will
+# make docs with the class-level docstring and the class-method docstrings,
+# but not the __init__ docstring, which often contains the parameters to
 # class constructors across the scientific Python ecosystem. The option below
 # will append the __init__ docstring to the class-level docstring when rendering
 # the docs. For more options, see:

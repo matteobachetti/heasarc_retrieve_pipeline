@@ -3011,8 +3011,6 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     logger = get_run_logger()
     logger.info(f"Processing NuSTAR observation {obsid}")
     os.makedirs(os.path.join(nu_base_output_path(obsid, config=config)), exist_ok=True)
-    basedir = nu_base_output_path(obsid, config=config)
-    # splitdir = split_path(obsid, config=config)
     pipedir = nu_pipeline_output_path(obsid, config=config)
 
     # A future declares a dependency; resolving it is what makes the dependency bite.

@@ -46,7 +46,6 @@ Coordinates are NuSTAR sky pixels throughout (1 pixel = 2.45 arcsec).
 from collections.abc import Iterable
 import numpy as np
 import copy
-from astropy.table import Table
 from astropy.io import fits
 from .diagnostics import no_record
 
@@ -527,7 +526,7 @@ def filter_sources_in_images(eventfile, region_size=30, back_region_size=50, rec
     hdul[1].data = fits.BinTableHDU(table_filt).data
     # hdul[1].header = header
     hdul.writeto(
-        eventfile.replace(".gz", "").replace(".evt", f"_back.evt"),
+        eventfile.replace(".gz", "").replace(".evt", "_back.evt"),
         overwrite=True,
     )
     rec.value(n_events_background=int(len(table_filt)))

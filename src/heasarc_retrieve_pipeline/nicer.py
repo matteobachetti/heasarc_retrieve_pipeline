@@ -25,7 +25,6 @@ import re
 
 from astropy.time import Time
 
-import glob
 
 from datetime import timedelta
 
