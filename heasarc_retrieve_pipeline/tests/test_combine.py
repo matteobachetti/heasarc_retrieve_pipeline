@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from heasarc_retrieve_pipeline import combine
+from heasarc_retrieve_pipeline import coadd, combine
 
 OBSIDS = ["80002092002", "80002092004"]
 
@@ -87,7 +87,8 @@ class StubAddspec:
 @pytest.fixture
 def stub(monkeypatch):
     stub = StubAddspec()
-    monkeypatch.setattr(combine.heasoft, "run", stub)
+    # coadd is what actually spawns the tools now; combine only decides what to add.
+    monkeypatch.setattr(coadd.heasoft, "run", stub)
     return stub
 
 
@@ -439,3 +440,47 @@ class TestMergingAnExplicitListOfSpectra:
         written = combine.merge_spectra(OBSIDS, tree, "explicit", spectra=spectra)
 
         assert sorted(written) == ["A", "B"]
+
+
+class TestCaseBScaling:
+    """addspec adds exposures; two modules observing at once add effective area instead."""
+
+    def spectrum(self, tmp_path, exposure=1000.0):
+        path = str(tmp_path / "nu1_comb01.pha")
+        make_spectrum(path, "nu1_comb01", exposure=exposure)
+        return path
+
+    def test_the_exposure_is_divided_by_the_number_of_modules(self, tmp_path):
+        path = self.spectrum(tmp_path, exposure=1000.0)
+
+        coadd.apply_case_b_scaling([path], 2)
+
+        assert fits.getheader(path, 1)["EXPOSURE"] == 500.0
+
+    def test_the_area_is_multiplied_by_the_number_of_modules(self, tmp_path):
+        path = self.spectrum(tmp_path)
+
+        coadd.apply_case_b_scaling([path], 2)
+
+        assert fits.getheader(path, 1)["AREASCAL"] == 2
+
+    def test_what_xspec_folds_is_left_exactly_as_it_was(self, tmp_path):
+        """The whole correction is a relabelling: no fit may change by a digit."""
+        path = self.spectrum(tmp_path, exposure=103961.35432021158)
+        before = fits.getheader(path, 1)
+        product = before["EXPOSURE"] * before.get("AREASCAL", 1)
+
+        coadd.apply_case_b_scaling([path], 2)
+
+        after = fits.getheader(path, 1)
+        assert after["EXPOSURE"] * after["AREASCAL"] == product
+
+    def test_it_says_in_the_file_what_it_did(self, tmp_path):
+        path = self.spectrum(tmp_path)
+
+        coadd.apply_case_b_scaling([path], 2)
+
+        assert any("AREASCAL=2" in str(card) for card in fits.getheader(path, 1)["HISTORY"])
+
+    def test_a_missing_file_is_not_an_error(self, tmp_path):
+        assert coadd.apply_case_b_scaling([str(tmp_path / "nope.pha")], 2) == []

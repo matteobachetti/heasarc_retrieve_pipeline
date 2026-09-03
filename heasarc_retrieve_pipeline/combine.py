@@ -49,16 +49,17 @@ See ``docs/technical_details.rst`` for the scientific rationale, and
 """
 
 import argparse
-import contextlib
 import glob
 import os
 import re
-import shutil
 import sys
 
-from astropy.io import fits
-
-from . import heasoft
+from .coadd import (
+    GROUPING_COMMAND,
+    run_addspec,
+    stage_inputs,
+    working_directory,
+)
 from .diagnostics import diagnostics_path, record_step, write_manifest
 from .nustar import (
     merge_event_files,
@@ -92,12 +93,6 @@ SPECTRUM_RE = re.compile(r"^nu(?P<obsid>\d+)(?P<fpm>[AB])(?P<mode>\d\d)(?P<rest>
 #: input as an arithmetical expression, so a name carrying ``+``, ``-``, ``*`` or brackets
 #: is refused rather than left to fail three tools deep.
 MERGE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
-
-#: The grouping :func:`~heasarc_retrieve_pipeline.nustar.calculate_spectra` applies, in
-#: the form ``grppha`` takes it. 20 counts per bin is the usual minimum for chi-squared
-#: to be approximately valid; channels outside 3.0-78.0 keV are marked bad, via
-#: ``E = 0.04 * PI + 1.6``.
-GROUPING_COMMAND = "group min 20 & bad 0-34 & bad 1910-4095 & exit"
 
 
 def merge_name(obsids, name=None):
@@ -176,132 +171,6 @@ def source_spectra(obsid, config, mode01_only=False):
     return found
 
 
-@contextlib.contextmanager
-def working_directory(path):
-    """
-    Run a block with the process's working directory somewhere else.
-
-    The working directory belongs to the whole process, and steering a pipeline step by
-    changing it is exactly what ``test_prefect_wiring`` forbids. This is the one exception,
-    and it is forced by the ``addspec`` bug described in :func:`stage_inputs`: a background
-    spectrum has to be named without a directory, so the only way to say *which* background
-    spectrum is to be standing in its directory.
-
-    :data:`~heasarc_retrieve_pipeline.heasoft.HEASOFT_LOCK` is held throughout, which is
-    what makes it safe: every HEASOFT call in this package goes through that lock, so no
-    other tool can run while the directory is moved. It is re-entrant, so the
-    :func:`~heasarc_retrieve_pipeline.heasoft.run` calls inside the block take it again
-    without deadlocking.
-
-    Parameters
-    ----------
-    path : str
-        Directory to change into.
-    """
-    with heasoft.HEASOFT_LOCK:
-        previous = os.getcwd()
-        os.chdir(path)
-        try:
-            yield path
-        finally:
-            os.chdir(previous)
-
-
-def stage_inputs(spectra, stagedir):
-    """
-    Gather the spectra of a merge into one directory, with pointers ``addspec`` can read.
-
-    This exists to work around one specific ``addspec`` bug, and the shape of the
-    workaround follows exactly from the shape of the bug. ``addspec`` co-adds the
-    backgrounds by building a ``mathpha`` expression out of the ``BACKFILE`` values and
-    spawning it -- but, unlike the expression it builds for the source spectra, it does
-    **not** quote the operands::
-
-        mathpha "expr='/path/nu..._sr.pha'+'/path/nu..._sr.pha'"          quoted, fine
-        mathpha "expr=(/path/nu..._bk.pha*31.5)+(/path/nu..._bk.pha*31.5)"  not quoted
-
-    ``mathpha`` reads the second as arithmetic, so every ``/`` in the path is a division
-    operator and the run dies on ``fitsio 4.060 error message: could not open the named
-    file``. A ``BACKFILE`` must therefore contain no directory at all, which leaves being
-    in the right directory as the only way to say which file is meant.
-
-    That is the whole of the constraint, so the staging is no wider than it. Measured, not
-    assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and writes its
-    ``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
-    absolute too.
-
-    So each source spectrum is *copied* -- the originals must not be touched -- and in the
-    copy ``BACKFILE`` is reduced to a bare name while ``RESPFILE`` and ``ANCRFILE`` are
-    made absolute, pointing back at the parent's own responses. Only the background
-    spectra are linked into the directory; the 68 MB ``.rmf`` files are never linked or
-    copied at all.
-
-    The file names already carry the OBSID, so spectra from different observations cannot
-    collide here.
-
-    Parameters
-    ----------
-    spectra : list of str
-        Source spectra to stage.
-    stagedir : str
-        Directory to build. Created if it is not there.
-
-    Returns
-    -------
-    list of str
-        Base names of the staged spectra, in the order given, for the list file
-        ``addspec`` reads.
-    """
-    os.makedirs(stagedir, exist_ok=True)
-    logger = get_logger()
-    staged = []
-
-    for path in spectra:
-        source = os.path.dirname(path)
-        name = os.path.basename(path)
-        destination = os.path.join(stagedir, name)
-        shutil.copy(path, destination)
-
-        with fits.open(destination, mode="update") as hdul:
-            for hdu in hdul:
-                for keyword in ("BACKFILE", "RESPFILE", "ANCRFILE"):
-                    value = str(hdu.header.get(keyword, "none")).strip()
-                    if not value or value.lower() in ("none", "no"):
-                        continue
-                    referenced = os.path.basename(value)
-                    original = os.path.join(source, referenced)
-                    if keyword == "BACKFILE":
-                        # Bare, and linked in beside us: mathpha would read a path as
-                        # arithmetic. This is the only keyword that has to be handled.
-                        hdu.header[keyword] = referenced
-                        _link(original, os.path.join(stagedir, referenced))
-                    else:
-                        hdu.header[keyword] = os.path.abspath(original)
-
-        staged.append(name)
-        logger.debug(f"Staged {name} for merging")
-
-    return staged
-
-
-def _link(source, destination):
-    """
-    Point ``destination`` at ``source``, quietly doing nothing if it is already there.
-
-    A symbolic link rather than a copy: a merge only reads the background spectra. Falls
-    back to copying where linking is not available.
-    """
-    if os.path.exists(destination) or os.path.islink(destination):
-        return
-    if not os.path.exists(source):
-        get_logger().warning(f"{source} is named by a spectrum but is not there")
-        return
-    try:
-        os.symlink(os.path.abspath(source), destination)
-    except OSError:  # pragma: no cover - only on filesystems without symbolic links
-        shutil.copy(source, destination)
-
-
 def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=None):
     """
     Co-add the observations' spectra with ``addspec``, one output per module.
@@ -358,51 +227,10 @@ def merge_spectra(obsids, config, name, mode01_only=False, rec=None, spectra=Non
             )
             continue
 
-        stagedir = os.path.join(outdir, f"_inputs_FPM{fpm}")
-        staged = stage_inputs(spectra, stagedir)
-
-        listfile = os.path.join(stagedir, f"merge_FPM{fpm}.lis")
-        with open(listfile, "w") as fobj:
-            fobj.write("".join(f"{basename}\n" for basename in staged))
-
         root = f"{name}_{fpm}"
-        logger.info(f"Co-adding {len(staged)} FPM{fpm} spectra into {root}.pha")
-
-        # addspec resolves the files its inputs name against the working directory, so
-        # this is the only place it can be run from. See the module documentation.
-        with working_directory(stagedir):
-            heasoft.run(
-                "addspec",
-                produces=os.path.join(stagedir, root + ".pha"),
-                infil=os.path.basename(listfile),
-                outfil=root,
-                qaddrmf="yes",
-                qsubback="yes",
-                clobber="yes",
-                noprompt=True,
-            )
-
-            # grppha writes the pointers through from its input, so the grouped spectrum
-            # comes out naming the .bak and .rsp addspec just made.
-            heasoft.run(
-                "grppha",
-                produces=os.path.join(stagedir, root + "_grp.pha"),
-                infile=root + ".pha",
-                outfile="!" + root + "_grp.pha",
-                comm=GROUPING_COMMAND,
-                noprompt=True,
-            )
-
-        for suffix in (".pha", ".bak", ".rsp", "_grp.pha"):
-            source = os.path.join(stagedir, root + suffix)
-            if os.path.exists(source):
-                shutil.move(source, os.path.join(outdir, root + suffix))
-
-        # The list file is the record of what was co-added, so it is kept; the rest of
-        # the staging directory is copies and symbolic links that would only confuse
-        # anyone reading the products directory later.
-        shutil.move(listfile, os.path.join(outdir, f"{root}_inputs.lis"))
-        shutil.rmtree(stagedir, ignore_errors=True)
+        # Case A -- the same detector at different times -- so addspec's own convention of
+        # adding the exposures is the right one and nothing is rescaled afterwards.
+        run_addspec(spectra, outdir, root, f"_inputs_FPM{fpm}")
         written[fpm] = root + "_grp.pha"
 
     if rec is not None:
