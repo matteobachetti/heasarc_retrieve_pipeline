@@ -43,6 +43,7 @@ from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from .barycenter import barycenter_file
+from .coadd import apply_case_b_scaling, run_addspec
 from .diagnostics import diagnostics_path, no_record, record_step
 from .image_utils import filter_sources_in_images
 from .utils import (
@@ -2457,7 +2458,16 @@ def read_spectrum(pha_file):
     )
 
 
-def spectrum_arrays(outdir, stem):
+#: How ``nuproducts`` names the source and background spectra of one extraction.
+NUPRODUCTS_SPECTRA = (("src", "_sr.pha"), ("bkg", "_bk.pha"))
+
+#: How ``addspec`` names them. A co-added product is a different family of files, which is
+#: why the combined spectra do not end in ``_sr.pha`` -- see
+#: :mod:`heasarc_retrieve_pipeline.coadd`.
+ADDSPEC_SPECTRA = (("src", ".pha"), ("bkg", ".bak"))
+
+
+def spectrum_arrays(outdir, stem, suffixes=NUPRODUCTS_SPECTRA):
     """
     The source and background spectra of one extraction, ready to record.
 
@@ -2466,7 +2476,10 @@ def spectrum_arrays(outdir, stem):
     outdir : str
         The observation's products directory.
     stem : str
-        ``stemout`` as handed to ``nuproducts``.
+        ``stemout`` as handed to ``nuproducts``, or the root of an ``addspec`` product.
+    suffixes : sequence of tuple, optional
+        ``(which, suffix)`` pairs saying what the two spectra are called.
+        :data:`NUPRODUCTS_SPECTRA` by default; :data:`ADDSPEC_SPECTRA` for a co-added one.
 
     Returns
     -------
@@ -2475,7 +2488,7 @@ def spectrum_arrays(outdir, stem):
         ``nuproducts`` is allowed to have failed for a single file.
     """
     arrays = {}
-    for which, suffix in (("src", "_sr.pha"), ("bkg", "_bk.pha")):
+    for which, suffix in suffixes:
         path = os.path.join(outdir, stem + suffix)
         if not os.path.exists(path):
             continue
@@ -2735,6 +2748,184 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
     open(product_done_file, "w").close()
 
 
+#: The combined products, and which observing modes go into each. ``comb01`` is the
+#: conservative one -- normal science only, the best-understood aspect solution. ``comb06``
+#: is the spacecraft-science data on its own. ``comb0106`` is everything, for when exposure
+#: matters more than homogeneity; it is written only when there is mode-06 data to add,
+#: since otherwise it would be a second copy of ``comb01``.
+COMBINED_PRODUCTS = {
+    "comb01": ("01",),
+    "comb06": ("06",),
+    "comb0106": ("01", "06"),
+}
+
+
+def _mode_of(key):
+    """Which of :data:`SCIENCE_MODES` a :func:`spectral_input_key` belongs to."""
+    return "01" if key.startswith("01") else "06"
+
+
+def combined_spectrum_inputs(obsid, config):
+    """
+    The source spectra each combined product is to be built from.
+
+    Only spectra whose module counterpart is there as well, because a combined product is a
+    sum over both modules and nothing else: see
+    :func:`~heasarc_retrieve_pipeline.coadd.apply_case_b_scaling` for why letting an
+    unpaired file in would silently break the exposure of the result.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    dict
+        Key of :data:`COMBINED_PRODUCTS` to the list of spectra to co-add. A product with
+        nothing to add, or one of whose modes produced nothing, is left out.
+    """
+    products = nu_product_output_path(obsid, config=config)
+    pairs, _ = paired_spectral_inputs(obsid, config)
+
+    by_mode = {}
+    for key in pairs:
+        paths = [os.path.join(products, f"nu{obsid}{fpm}{key}_sr.pha") for fpm in ("A", "B")]
+        if not all(os.path.exists(path) for path in paths):
+            # The pair was extractable but one of the two extractions did not produce a
+            # spectrum. Half a pair is no pair.
+            continue
+        by_mode.setdefault(_mode_of(key), []).extend(paths)
+
+    found = {}
+    for suffix, modes in COMBINED_PRODUCTS.items():
+        if not all(mode in by_mode for mode in modes):
+            continue
+        found[suffix] = [path for mode in modes for path in by_mode[mode]]
+    return found
+
+
+def mode_06_exposure_fraction(spectra, obsid):
+    """
+    How much of a combined product's exposure came from spacecraft science.
+
+    Mode-06 data has a reconstructed aspect solution, and ``addspec`` weights by exposure
+    alone -- it has no notion of one input being less trusted than another. Recording the
+    fraction is what lets a reader of the report see what they would be fitting.
+
+    Parameters
+    ----------
+    spectra : list of str
+        Paths of the co-added spectra.
+    obsid : str
+        Observation identifier, needed to find the mode in each file name.
+
+    Returns
+    -------
+    float
+        Between 0 and 1, or 0.0 if no exposure could be read at all.
+    """
+    from astropy.io import fits
+
+    total = 0.0
+    from_mode_06 = 0.0
+    for path in spectra:
+        try:
+            exposure = float(fits.getheader(path, 1).get("EXPOSURE", 0.0) or 0.0)
+        except Exception as error:  # pragma: no cover - unreadable input
+            get_logger().warning(f"Could not read the exposure of {path}: {error}")
+            continue
+        total += exposure
+        # nu<OBSID><FPM><key>_sr.pha, so the mode is what follows the module letter.
+        key = os.path.basename(path)[len(f"nu{obsid}") + 1 :]
+        if _mode_of(key) == "06":
+            from_mode_06 += exposure
+    return from_mode_06 / total if total else 0.0
+
+
+@task(task_run_name="nu_combine_modules_{obsid}")
+def combine_module_spectra(obsid, config):
+    """
+    Co-add FPMA and FPMB into one spectrum per observing mode.
+
+    Three products, named for what went into them and written beside the per-module spectra
+    they were built from::
+
+        nu<OBSID>_comb01.pha    .bak  .rsp  _grp.pha    normal science only
+        nu<OBSID>_comb06.pha    .bak  .rsp  _grp.pha    spacecraft science only
+        nu<OBSID>_comb0106.pha  .bak  .rsp  _grp.pha    both, for maximum exposure
+
+    The per-module spectra are untouched and remain the ones to use for a joint fit with a
+    cross-normalisation constant between the modules, which is the more correct thing to do
+    when the source is bright enough to allow it. These are for when it is not.
+
+    Runs on the pairs :func:`paired_spectral_inputs` found, so both modules always
+    contribute equally and :func:`~heasarc_retrieve_pipeline.coadd.apply_case_b_scaling` can
+    correct the exposure by a factor it knows. Writes a ``COMBINE_DONE.TXT`` sentinel of its
+    own -- not ``PRODUCTS_DONE.TXT``, which belongs to :func:`calculate_spectra` and would
+    make this step unreachable on any observation reduced before it existed.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    list of str
+        Base names of the files written.
+    """
+    with record_step(diagnostics_path(obsid, config), obsid, "combine_modules") as rec:
+        return _combine_module_spectra(obsid, config, rec)
+
+
+def _combine_module_spectra(obsid, config, rec):
+    """The body of :func:`combine_module_spectra`, with its diagnostics record open."""
+    logger = get_logger()
+    outdir = nu_product_output_path(obsid, config=config)
+    done_file = os.path.join(outdir, "COMBINE_DONE.TXT")
+    if os.path.exists(done_file):
+        logger.info(f"Modules for {obsid} already combined")
+        rec.skip("COMBINE_DONE.TXT already exists")
+        return []
+    os.makedirs(outdir, exist_ok=True)
+
+    found = combined_spectrum_inputs(obsid, config)
+    if not found:
+        # An observation with only one module, or with no pair whose extraction succeeded.
+        # Nothing was produced and nothing failed.
+        logger.warning(f"No pair of module spectra to combine for {obsid}")
+        rec.value(spectra=[], inputs={})
+        rec.skip("no pair of module spectra to combine")
+        open(done_file, "w").close()
+        return []
+
+    written = []
+    inputs = {}
+    fractions = {}
+    for suffix, spectra in found.items():
+        root = f"nu{obsid}_{suffix}"
+        inputs[suffix] = [os.path.basename(path) for path in spectra]
+        fractions[suffix] = mode_06_exposure_fraction(spectra, obsid)
+        logger.info(f"Combining {len(spectra)} spectra into {root}.pha")
+        written.extend(run_addspec(spectra, outdir, root, f"_inputs_{suffix}"))
+
+        # addspec added the two modules' exposures as though they had observed one after the
+        # other. They did not. See coadd.apply_case_b_scaling.
+        apply_case_b_scaling(
+            [os.path.join(outdir, root + end) for end in (".pha", "_grp.pha")], 2
+        )
+        rec.array(**spectrum_arrays(outdir, root, suffixes=ADDSPEC_SPECTRA))
+
+    rec.value(spectra=written, inputs=inputs, mode06_exposure_fraction=fractions)
+    open(done_file, "w").close()
+    return written
+
+
 @flow
 def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     """
@@ -2854,3 +3045,7 @@ def process_nustar_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     # ra and dec come from get_best_source_regions, and filter_from_solar_flares is a
     # subflow, which runs synchronously and raises: both dependencies already hold.
     calculate_spectra(obsid, config, ra=ra, dec=dec, goes_gti_file=goes_gti_file)
+
+    # Its own step, with its own sentinel, so that an observation reduced before this
+    # existed can be combined without redoing the extraction.
+    combine_module_spectra(obsid, config)

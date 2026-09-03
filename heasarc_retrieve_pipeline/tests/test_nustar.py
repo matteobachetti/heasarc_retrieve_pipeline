@@ -12,12 +12,13 @@ os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
 
 import glob  # noqa: E402
 import numpy as np  # noqa: E402
+from astropy.io import fits  # noqa: E402
 import pytest  # noqa: E402
 
 from astropy.coordinates import SkyCoord  # noqa: E402
 import astropy.units as u  # noqa: E402
 
-from heasarc_retrieve_pipeline import heasoft, nustar  # noqa: E402
+from heasarc_retrieve_pipeline import coadd, heasoft, nustar  # noqa: E402
 from heasarc_retrieve_pipeline.diagnostics import (  # noqa: E402
     diagnostics_path,
     read_arrays,
@@ -40,6 +41,9 @@ from heasarc_retrieve_pipeline.nustar import (  # noqa: E402
     mode_01_input_files,
     nu_goes_gti_file,
     nu_goes_lc_file,
+    combine_module_spectra,
+    combined_spectrum_inputs,
+    mode_06_exposure_fraction,
     paired_spectral_inputs,
     position_is_consistent,
     spectral_input_files,
@@ -2426,3 +2430,187 @@ class TestTheCombinedFileHoldsOnlyItsOwnGoodTime:
         stub, _outfile = self.merge(tmp_path, monkeypatch)
 
         assert [name for name, _ in stub.calls] == ["ftmerge", "ftsort", "fappend"]
+
+
+class TestCombiningTheModules:
+    """FPMA and FPMB co-added, one product per observing mode."""
+
+    def tree(self, tmp_path, keys=("01", "06_chu12_N"), missing=()):
+        """An observation with event files and the spectra nuproducts made from them."""
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        pipedir = nu_pipeline_output_path(OBSID, config=config)
+        splitdir = split_path(OBSID, config=config)
+        products = nu_product_output_path(OBSID, config=config)
+        for directory in (pipedir, splitdir, products):
+            os.makedirs(directory, exist_ok=True)
+
+        for key in keys:
+            for fpm in "AB":
+                stem = f"nu{OBSID}{fpm}{key}"
+                if f"{fpm}{key}" in missing:
+                    continue
+                directory = pipedir if key == "01" else splitdir
+                open(os.path.join(directory, stem + "_cl.evt"), "w").close()
+                self.write_spectrum(os.path.join(products, stem + "_sr.pha"), stem)
+        return config, products
+
+    def write_spectrum(self, path, stem, exposure=1000.0):
+        spectrum = fits.BinTableHDU.from_columns(
+            [
+                fits.Column(name="CHANNEL", format="J", array=np.arange(8)),
+                fits.Column(name="COUNTS", format="J", array=np.ones(8, dtype=int)),
+            ],
+            name="SPECTRUM",
+        )
+        spectrum.header["EXPOSURE"] = exposure
+        spectrum.header["BACKFILE"] = stem + "_bk.pha"
+        spectrum.header["DETCHANS"] = 8
+        fits.HDUList([fits.PrimaryHDU(), spectrum]).writeto(path, overwrite=True)
+
+    @pytest.fixture
+    def stub(self, monkeypatch):
+        """addspec and grppha, writing spectra real enough to be rescaled afterwards."""
+        calls = []
+
+        def run(name, params=None, **kwargs):
+            calls.append((name, dict(kwargs)))
+            if name == "addspec":
+                root = kwargs["outfil"]
+                self.write_spectrum(root + ".pha", root, exposure=2000.0)
+                for suffix in (".bak", ".rsp"):
+                    open(root + suffix, "w").close()
+            elif name == "grppha":
+                self.write_spectrum(
+                    kwargs["outfile"].lstrip("!"), "grouped", exposure=2000.0
+                )
+
+        monkeypatch.setattr(coadd.heasoft, "run", run)
+        return calls
+
+    # ------------------------------------------------------------------ what goes in
+
+    def test_each_mode_gets_its_own_product(self, tmp_path):
+        config, _ = self.tree(tmp_path)
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert set(found) == {"comb01", "comb06", "comb0106"}
+        assert len(found["comb01"]) == 2
+        assert len(found["comb06"]) == 2
+        assert len(found["comb0106"]) == 4
+
+    def test_without_mode_06_there_is_no_combined_product(self, tmp_path):
+        """comb0106 would only be a second copy of comb01, so it is not written."""
+        config, _ = self.tree(tmp_path, keys=("01",))
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert set(found) == {"comb01"}
+
+    def test_an_unpaired_chu_combination_is_left_out(self, tmp_path):
+        """Only both modules together, so the exposure correction stays a known factor."""
+        config, _ = self.tree(tmp_path, keys=("01", "06_chu12_N"), missing=("B06_chu12_N",))
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert set(found) == {"comb01"}
+
+    def test_a_pair_whose_extraction_failed_is_left_out(self, tmp_path):
+        """The event files pair, but nuproducts produced only one of the two spectra."""
+        config, products = self.tree(tmp_path)
+        os.unlink(os.path.join(products, f"nu{OBSID}B06_chu12_N_sr.pha"))
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert set(found) == {"comb01"}
+
+    def test_only_source_spectra_are_ever_inputs(self, tmp_path):
+        config, _ = self.tree(tmp_path)
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert all(p.endswith("_sr.pha") for paths in found.values() for p in paths)
+
+    # -------------------------------------------------------------- what comes out
+
+    def test_it_writes_one_product_per_mode(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        for suffix in ("comb01", "comb06", "comb0106"):
+            for end in (".pha", "_grp.pha", "_inputs.lis"):
+                assert os.path.exists(os.path.join(products, f"nu{OBSID}_{suffix}{end}"))
+
+    def test_the_products_do_not_look_like_nuproducts_output(self, tmp_path, stub):
+        """_sr.pha is nuproducts' naming; these come from addspec and must not collide."""
+        config, products = self.tree(tmp_path)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        combined = [n for n in os.listdir(products) if "_comb" in n]
+        assert combined
+        assert not [n for n in combined if n.endswith("_sr.pha")]
+
+    def test_the_exposure_is_corrected_for_two_modules(self, tmp_path, stub):
+        """addspec handed back 2000 s for two 1000 s modules that observed at once."""
+        config, products = self.tree(tmp_path)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        header = fits.getheader(os.path.join(products, f"nu{OBSID}_comb01.pha"), 1)
+        assert header["EXPOSURE"] == 1000.0
+        assert header["AREASCAL"] == 2
+
+    def test_the_staging_directories_are_cleaned_up(self, tmp_path, stub):
+        config, products = self.tree(tmp_path)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        assert [n for n in os.listdir(products) if n.startswith("_inputs")] == []
+
+    def test_a_combined_product_is_never_itself_an_input(self, tmp_path, stub):
+        """Re-running must not co-add comb01 into comb01 and double-count everything."""
+        config, _ = self.tree(tmp_path)
+        combine_module_spectra.fn(OBSID, config)
+
+        found = combined_spectrum_inputs(OBSID, config)
+
+        assert all("comb" not in os.path.basename(p) for ps in found.values() for p in ps)
+
+    def test_a_rerun_is_stopped_by_the_sentinel(self, tmp_path, stub):
+        config, _ = self.tree(tmp_path)
+        combine_module_spectra.fn(OBSID, config)
+        before = len(stub)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        assert len(stub) == before
+
+    def test_an_observation_with_one_module_is_a_clean_skip(self, tmp_path, stub):
+        config, _ = self.tree(tmp_path, keys=("01",), missing=("B01",))
+
+        assert combine_module_spectra.fn(OBSID, config) == []
+        assert stub == []
+
+    # ------------------------------------------------------- what the report is told
+
+    def test_the_mode_06_share_of_the_exposure_is_recorded(self, tmp_path, stub):
+        """addspec weights by exposure alone; a reader has to see how much is mode 06."""
+        config, _ = self.tree(tmp_path)
+
+        combine_module_spectra.fn(OBSID, config)
+
+        records = [
+            r
+            for r in read_records(diagnostics_path(OBSID, config))
+            if r["step"] == "combine_modules"
+        ]
+        fractions = records[0]["values"]["mode06_exposure_fraction"]
+        assert fractions["comb01"] == 0.0
+        assert fractions["comb06"] == 1.0
+        assert fractions["comb0106"] == pytest.approx(0.5)
+
+
+def test_the_mode_06_fraction_of_nothing_is_zero():
+    assert mode_06_exposure_fraction([], OBSID) == 0.0
