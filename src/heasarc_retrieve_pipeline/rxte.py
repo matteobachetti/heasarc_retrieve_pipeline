@@ -1,41 +1,91 @@
+"""
+RXTE/PCA reduction: a partial, pure-astropy re-implementation of the standard screening.
+
+Unlike the NuSTAR and NICER modules, this one does not use HEASOFT at all. It reads the
+standard filter file, builds good time intervals from three housekeeping conditions,
+and applies them to an event-mode file with numpy masking.
+
+The entry point is :func:`process_rxte_obsid`, which runs
+:func:`setup_workspace`, :func:`create_gti_with_astropy` and
+:func:`apply_gti_with_astropy` in sequence. Only event-mode data can be processed;
+observations that contain only binned modes are skipped with a warning.
+
+The screening implemented here is a *reduced* version of the standard PCA screening.
+It omits the South Atlantic Anomaly cut, the electron-ratio (detector breakdown) cut,
+and any per-PCU selection, and it applies no deadtime correction. The resulting event
+files are a first look at the data, not calibrated products: because the number of
+active PCUs can change within a good time interval, the effective area is not constant
+and no valid response can be attached. RXTE data are also not barycentred by this
+pipeline.
+
+See ``docs/technical_details.rst`` for the screening criteria and what they omit, and
+``docs/known_issues.rst`` for known defects.
+"""
+
 import glob
 import gzip
 import os
 import shutil
-import re
-import boto3
 import numpy as np
 from astropy.io import fits
 from astropy.table import Table
-from botocore import UNSIGNED
-from botocore.config import Config
 from prefect import flow, get_run_logger, task
-from prefect.tasks import task_input_hash
-from datetime import timedelta
+
+from .utils import absolute_config
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
 
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="rxte_remote_raw_path_{obsid}",
-)
-def rxte_heasarc_raw_data_path(obsid, cycle=None, prnb=None):
-    return os.path.normpath(f"/FTP/rxte/data/archive/AO{cycle}/P{prnb}/{obsid}/")
-
-
-@task(
-    cache_key_fn=task_input_hash,
-    cache_expiration=timedelta(days=1000),
-    task_run_name="rxte_base_output_{obsid}",
-)
 def rxte_base_output_path(config, obsid):
+    """
+    Top-level output directory of an observation.
+
+    Parameters
+    ----------
+    config : dict
+        Must contain ``out_data_path``.
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>``, which is also where the raw data were downloaded.
+    """
     return os.path.join(config["out_data_path"], obsid)
 
 
 @task(name="setup_workspace_rxte")
 def setup_workspace(raw_data_dir: str, obsid: str):
+    """
+    Find and uncompress an event-mode file, and create the Level-2 output directory.
+
+    Searches the observation tree for the first match of ``GX*.evt.gz``, then
+    ``SE*.evt.gz``, then ``FS*.evt.gz`` -- GoodXenon, Science Event, and standard FITS
+    science files respectively -- and gunzips it. If none is found the observation contains
+    only binned-mode data, which this module cannot process, and ``None`` is returned so
+    that the flow can stop cleanly.
+
+    Parameters
+    ----------
+    raw_data_dir : str
+        Directory holding the downloaded observation.
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    dict or None
+        ``{"l2_dir", "raw_data_dir", "obsid", "unzipped_event_file"}``, or ``None`` if no
+        event-mode file was found.
+
+    Notes
+    -----
+    Only the first matching file is used. GoodXenon observations always produce two files
+    (``GX1_*`` and ``GX2_*``) that need merging, and observations often contain several
+    event files; the rest are silently discarded. See issue 8 in
+    ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     l2_dir = os.path.join(raw_data_dir, "l2_files")
     os.makedirs(l2_dir, exist_ok=True)
@@ -67,6 +117,46 @@ def setup_workspace(raw_data_dir: str, obsid: str):
 @task(name="create_gti_rxte")
 def create_gti_with_astropy(paths: dict) -> str:
     # Make a "keep" list of all the good parts.
+    """
+    Build good time intervals from the standard filter file.
+
+    Reads ``stdprod/*.xfl.gz``, which samples the spacecraft housekeeping every ``TIMEDEL``
+    seconds (16 s for RXTE), and keeps the samples that satisfy all three of:
+
+    ``ELV > 10``
+        Earth elevation angle above 10 degrees. Closer to the limb, the atmosphere
+        contributes absorption and albedo background.
+    ``OFFSET < 0.02``
+        Pointing offset below 0.02 degrees (1.2 arcmin). The PCA collimator response falls
+        off over about a degree, so this keeps the effective area essentially constant and
+        rejects slews and unsettled pointing.
+    ``NUM_PCU_ON > 0``
+        At least one Proportional Counter Unit active.
+
+    Contiguous runs of good samples become intervals, each starting at its first good
+    sample's ``Time`` and stopping at its last good sample's ``Time`` plus one ``TIMEDEL``.
+
+    Parameters
+    ----------
+    paths : dict
+        As returned by :func:`setup_workspace`.
+
+    Returns
+    -------
+    str
+        Path of the GTI file written into the Level-2 directory.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no standard filter file is present.
+
+    Notes
+    -----
+    This omits the standard SAA and electron-ratio cuts, and ``NUM_PCU_ON`` records how
+    many PCUs were on but not which, so the effective area can vary within an interval.
+    See the science caveats in ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     raw_data_dir = paths["raw_data_dir"]
     l2_dir = paths["l2_dir"]
@@ -122,6 +212,31 @@ def create_gti_with_astropy(paths: dict) -> str:
 @task(name="apply_gti_rxte")
 def apply_gti_with_astropy(paths: dict, gti_file: str) -> str | None:
     # Edit using the "keep" list.
+    """
+    Filter an event file with a GTI file, by masking event times.
+
+    Event times are made absolute by adding the events extension's ``TIMEZERO`` before
+    being compared with the GTI boundaries.
+
+    Parameters
+    ----------
+    paths : dict
+        As returned by :func:`setup_workspace`.
+    gti_file : str
+        GTI file, as written by :func:`create_gti_with_astropy`.
+
+    Returns
+    -------
+    str or None
+        Path of the cleaned event file, or ``None`` if no events survived.
+
+    Notes
+    -----
+    The output carries the original header, so its ``EXPOSURE`` and ``ONTIME`` still
+    describe the unscreened observation, and the GTI extension itself is not copied into
+    the file. Rates computed from this file's header will be wrong. See issue 7 in
+    ``docs/known_issues.rst``.
+    """
     logger = get_run_logger()
     event_file_path = paths["unzipped_event_file"]
     l2_dir = paths["l2_dir"]
@@ -165,11 +280,28 @@ def apply_gti_with_astropy(paths: dict, gti_file: str) -> str | None:
 
 @flow
 def process_rxte_obsid(obsid: str, config={}, flags=None, ra: float = None, dec: float = None):
-    DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
-    current_config = DEFAULT_CONFIG if config is None else config
+    """
+    Reduce one RXTE/PCA observation: find the event file, build GTIs, apply them.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict, optional
+        Pipeline configuration. Must contain ``out_data_path``; note that the default is
+        an empty dict rather than ``None``, so the fallback to ``DEFAULT_CONFIG`` never
+        fires (issue 27 in ``docs/known_issues.rst``).
+    flags : dict, optional
+        Accepted for signature compatibility with the other missions' processing flows,
+        and ignored.
+    ra, dec : float, optional
+        Accepted for signature compatibility, and ignored: RXTE data are not barycentred
+        by this pipeline.
+    """
+    current_config = absolute_config(config, DEFAULT_CONFIG)
     logger = get_run_logger()
     logger.info(f"Processing RXTE observation {obsid}")
-    raw_data_dir = rxte_base_output_path.fn(config=current_config, obsid=obsid)
+    raw_data_dir = rxte_base_output_path(config=current_config, obsid=obsid)
     os.makedirs(raw_data_dir, exist_ok=True)
 
     paths = setup_workspace(raw_data_dir, obsid)

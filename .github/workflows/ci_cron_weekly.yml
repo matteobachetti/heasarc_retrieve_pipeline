@@ -1,0 +1,48 @@
+# Jobs that depend on something outside this repository, and so should not be able to
+# fail a pull request: the links in the documentation, and the tests that talk to the
+# HEASARC archive and to AWS. Running them weekly means an outage is noticed without a
+# blameless red cross on someone's branch.
+
+name: Weekly Scheduled CI
+
+on:
+  schedule:
+    # 6am UTC on Mondays
+    - cron: "0 6 * * 1"
+  # ...and on demand, from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  cron_tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Links in the documentation
+            toxenv: linkcheck
+          - name: The tests that need the network
+            toxenv: py312-test-alldeps-remote
+          - name: Against the development version of astropy and astroquery
+            toxenv: py312-test-devdeps
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install base dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install tox
+
+      - name: Run with tox
+        run: tox -e ${{ matrix.toxenv }}

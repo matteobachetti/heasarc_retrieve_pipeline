@@ -1,0 +1,148 @@
+# Testing and continuous integration. Every job below is a tox environment defined in
+# tox.ini, so anything CI runs can be reproduced locally with `tox -e <name>`.
+#
+# The one exception is the HEASOFT job, which needs a conda environment rather than a
+# plain virtualenv and so installs and runs pytest directly.
+
+name: CI Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# A new push to the same branch cancels the runs still going for the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci_tests:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Code style checks
+            os: ubuntu-latest
+            python: "3.x"
+            toxenv: codestyle
+
+          # Deliberately installed without any extra: if an optional dependency is ever
+          # imported at module scope again, this job is what says so.
+          - name: Python 3.10 with no optional dependencies
+            os: ubuntu-latest
+            python: "3.10"
+            toxenv: py310-test
+
+          - name: Python 3.12 with all optional dependencies and coverage
+            os: ubuntu-latest
+            python: "3.12"
+            toxenv: py312-test-alldeps-cov
+
+          - name: Python 3.14 with all optional dependencies
+            os: ubuntu-latest
+            python: "3.14"
+            toxenv: py314-test-alldeps
+
+          # The tests deselected by default everywhere else. They are about half the
+          # runtime of the suite, and they are the ones that prove several observations
+          # can be reduced at once, so they run on their own here rather than never.
+          - name: The slow tests, and only those
+            os: ubuntu-latest
+            python: "3.12"
+            toxenv: py312-test-alldeps-slow
+
+          - name: macOS - Python 3.12 with all optional dependencies
+            os: macos-latest
+            python: "3.12"
+            toxenv: py312-test-alldeps
+
+          - name: Documentation build
+            os: ubuntu-latest
+            python: "3.12"
+            toxenv: build_docs
+
+          - name: Source distribution and metadata
+            os: ubuntu-latest
+            python: "3.12"
+            toxenv: check-build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # setuptools_scm derives the version from the git history, and a shallow
+          # checkout has none.
+          fetch-depth: 0
+
+      - name: Set up python ${{ matrix.python }} on ${{ matrix.os }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install base dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install tox
+
+      - name: Test with tox
+        run: tox -e ${{ matrix.toxenv }}
+
+      - name: Upload coverage to codecov
+        if: contains(matrix.toxenv, '-cov')
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+        continue-on-error: true
+
+  # The only job with real ftools. HEASOFT is a conda package on HEASARC's own channel;
+  # it brings the tools but no CALDB, which is exactly the line the `heasoft` marker
+  # draws: tests marked with it call CALDB-free tools and check what came out.
+  heasoft:
+    name: Python 3.13 with a real HEASOFT
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up micromamba with HEASOFT
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          init-shell: bash
+          environment-name: heasoft-env
+          # The heasoft package is about 300 MB; caching it keeps this job from
+          # dominating the run time of the whole workflow.
+          cache-environment: true
+          condarc: |
+            channels:
+              - https://heasarc.gsfc.nasa.gov/FTP/software/conda/
+              - conda-forge
+            channel_priority: strict
+          create-args: >-
+            python=3.13
+            pip
+            heasoft
+
+      - name: Install the package with its optional and test dependencies
+        shell: bash -leo pipefail {0}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install '.[test,all]'
+
+      - name: Show what HEASOFT we got
+        shell: bash -leo pipefail {0}
+        run: |
+          echo "HEADAS=$HEADAS"
+          python -c "import heasoftpy; print('heasoftpy', heasoftpy.__version__)"
+
+      - name: Run the test suite, slow tests included
+        shell: bash -leo pipefail {0}
+        run: |
+          pytest -c pyproject.toml --pyargs heasarc_retrieve_pipeline docs --run-slow

@@ -49,7 +49,6 @@ def test_retrieve_heasarc_data_by_obsid_nicer(host):
 @pytest.mark.parametrize("host", ["aws", "heasarc"])
 def test_recursive_download(host):
     import shutil
-    import re
 
     if host == "aws":
         path = "s3://nasa-heasarc"
