@@ -300,7 +300,12 @@ class StepRecord:
 
     def as_dict(self):
         """The record as it will be written."""
-        inherited = self._earlier or (not self.arrays and os.path.exists(self.arrays_path))
+        # Only ever name a payload that is really on disk. A record can be marked as
+        # describing an earlier run's work and still measure nothing -- recover.py marks
+        # every record it opens, and a CHU-split file with too few events records no
+        # arrays -- and a name pointing at nothing makes every later read warn.
+        has_payload = bool(self.arrays) or os.path.exists(self.arrays_path)
+        inherited = has_payload and (self._earlier or not self.arrays)
         duration = None
         if self._monotonic is not None:
             duration = round(time.monotonic() - self._monotonic, 3)
@@ -321,7 +326,7 @@ class StepRecord:
             ),
             "duration_s": duration,
             "values": _jsonable({**self._inherited_values, **self.values}),
-            "arrays": (os.path.basename(self.arrays_path) if self.arrays or inherited else None),
+            "arrays": (os.path.basename(self.arrays_path) if has_payload else None),
             "arrays_from_earlier_run": inherited,
         }
 
