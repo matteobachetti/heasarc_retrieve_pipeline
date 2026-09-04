@@ -22,6 +22,7 @@ import re
 import shutil
 import glob
 import typing
+from datetime import datetime
 from astropy.table import Table
 from astroquery.heasarc import Heasarc
 import pyvo
@@ -1521,7 +1522,6 @@ def download_and_process_observation(
             if pgp_passphrase is not None:
                 decrypt_obsid_directory(obsid_dir, pgp_passphrase)
                 # Create sentinel after successful decryption to mark this step as done
-                from datetime import datetime
                 with open(pgp_decryption_sentinel, "w") as f:
                     f.write(f"Decryption completed at {datetime.now().isoformat()}\n")
 
