@@ -385,6 +385,24 @@ class TestWhatTheFiguresContain:
         assert not [trace for trace in fig.data if "GOES" in (trace.name or "")]
         assert len(fig.data) == 4, "both bands, before and after"
 
+    def test_the_flare_figure_survives_a_chi2_that_could_not_be_measured(self, tmp_path):
+        """
+        Fewer than two light-curve bins gives ``nan``, which reaches JSON as ``null``.
+
+        A pair with a hole in it is not a before-and-after comparison, so the axis says
+        nothing about it -- but the panels themselves are still worth drawing.
+        """
+        a_flare_filtering(tmp_path)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        record["values"]["chi2_dof_3_10"] = [None, None]
+        record["values"]["chi2_dof_10_79"] = [1.2, None]
+
+        fig = report.flare_figure(record, arrays)
+
+        labels = [fig.layout[f"yaxis{n}"].title.text for n in (2, 3)]
+        assert not [label for label in labels if "dof" in label]
+        assert len(fig.data) == 6, "GOES pair, both bands, before and after"
+
     def test_a_region_read_back_from_disk_has_no_profile_to_draw(self, tmp_path):
         """A rerun measures nothing, so there is nothing to plot. That is not a failure."""
         with record_step(observation(tmp_path), OBSID, "source_region", key="A01") as rec:

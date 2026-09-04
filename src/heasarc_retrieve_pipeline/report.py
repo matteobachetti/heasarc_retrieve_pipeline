@@ -611,9 +611,11 @@ def flare_figure(record, arrays):
                 row=row,
                 col=1,
             )
-        chi2 = values.get(f"chi2_dof_{band}")
+        # A light curve with fewer than two bins has no chi2, which arrives here as
+        # None: half a before-and-after is not a comparison, so say nothing at all.
+        chi2 = values.get(f"chi2_dof_{band}") or []
         label = f"{title} rate (s<sup>-1</sup>)"
-        if chi2:
+        if len(chi2) == 2 and all(value is not None for value in chi2):
             label += f"<br>χ²/dof {chi2[0]:.2f} → {chi2[1]:.2f}"
         fig.update_yaxes(title_text=label, title_font_size=10, row=row, col=1)
 
