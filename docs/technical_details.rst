@@ -2330,7 +2330,7 @@ Building the pages
 
 Plotly, with a hand-written ``string.Template`` shell rather than jinja2, and imported
 inside the figure builders so that ``import heasarc_retrieve_pipeline`` still works
-without it. Four measurements shaped the rest:
+without it. Five measurements shaped the rest:
 
 * ``to_html(..., include_plotlyjs="directory")`` emits a **bare** ``src="plotly.min.js"``
   with no directory part, and ``to_html`` never copies the bundle -- only ``write_html``
@@ -2342,6 +2342,36 @@ without it. Four measurements shaped the rest:
   theme boilerplate saved per page.
 * dtype drives page size linearly, so arrays are cast before they reach plotly: a
   100x100 image is 110.7 kB as float64, 55.9 as float32 and 27.1 as uint16.
+* ``add_vrect`` is not usable in a loop. On a subplot figure it spans every row by
+  default, and before adding each shape it scans the shapes already present to find the
+  empty subplots. Drawing the removed intervals of ``flare_figure`` one call at a time
+  therefore cost more than the square of their number:
+
+  .. list-table::
+     :header-rows: 1
+
+     * - intervals
+       - one ``add_vrect`` each
+       - one ``update_layout``
+     * - 100
+       - 21.7 s
+       - 0.045 s
+     * - 200
+       - 110.4 s
+       - 0.074 s
+     * - 400
+       - 662.4 s
+       - 0.150 s
+     * - 800
+       - 4285.9 s
+       - 0.260 s
+
+  This was the batch hang: a solar-flare filtering that removed several hundred intervals
+  left ``write_page`` drawing for the best part of an hour, holding a worker of the
+  process pool, and with two workers gone that way a four-wide run looked stopped. The
+  shapes are now built by ``_row_spans`` and assigned in one call, which is linear -- 800
+  intervals in 0.3 s. ``_row_spans`` reproduces ``add_vrect`` exactly, empty-row
+  exclusion included, and the tests assert that against ``add_vrect`` itself.
 
 The figure data is inline in the page, deliberately. Moving it to sidecar files the page
 fetched would be smaller, but ``fetch()`` against ``file://`` is blocked, and these pages

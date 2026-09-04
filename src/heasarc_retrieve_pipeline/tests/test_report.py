@@ -15,6 +15,7 @@ Three layers, none of which needs a browser:
 
 import json
 import os
+import time
 
 import numpy as np
 import pytest
@@ -375,6 +376,55 @@ class TestWhatTheFiguresContain:
 
         shaded = [(shape.x0, shape.x1) for shape in fig.layout.shapes]
         assert shaded == [(400.0, 600.0)] * 3, "one band per panel"
+
+    @pytest.mark.parametrize("goes", [True, False])
+    def test_the_shading_is_exactly_what_add_vrect_would_have_drawn(self, tmp_path, goes):
+        """
+        The rectangles are assigned in one go rather than added one at a time, because
+        ``add_vrect`` is quadratic in the number of shapes already on the figure. This
+        pins the result to what plotly itself would have produced, panel for panel --
+        including its habit of leaving out panels that have no traces, which is why the
+        GOES row is switched off and on here.
+        """
+        import plotly.graph_objects as go
+
+        a_flare_filtering(tmp_path, goes=goes)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        arrays["removed"] = np.array([[100.0, 150.0], [400.0, 600.0], [800.0, 820.0]])
+
+        fig = report.flare_figure(record, arrays)
+
+        reference = go.Figure(fig)
+        reference.layout.shapes = ()
+        for start, stop in arrays["removed"]:
+            reference.add_vrect(
+                x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16, line_width=0, layer="below"
+            )
+        assert [shape.to_plotly_json() for shape in fig.layout.shapes] == [
+            shape.to_plotly_json() for shape in reference.layout.shapes
+        ]
+        assert len(fig.layout.shapes) == 3 * (3 if goes else 2)
+
+    def test_a_thousand_removed_intervals_still_draw_promptly(self, tmp_path):
+        """
+        Adding the rectangles one at a time cost more than the square of their number:
+        800 intervals took 71 minutes, and two M82 observations sat inside a page write
+        for half an hour each, holding a worker of the pool the whole time. Assigning
+        the list in one call is linear -- a thousand intervals in well under a second.
+
+        The bound is a couple of orders of magnitude above the measured time, so it is a
+        regression guard rather than a benchmark, and will not flap on a busy machine.
+        """
+        a_flare_filtering(tmp_path)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        arrays["removed"] = np.arange(2000.0).reshape(-1, 2)
+
+        began = time.perf_counter()
+        fig = report.flare_figure(record, arrays)
+        elapsed = time.perf_counter() - began
+
+        assert len(fig.layout.shapes) == 3000, "a thousand intervals across three panels"
+        assert elapsed < 10.0, f"a thousand intervals took {elapsed:.1f} s to draw"
 
     def test_the_flare_figure_leaves_the_goes_panel_out_when_there_is_none(self, tmp_path):
         a_flare_filtering(tmp_path, goes=False)

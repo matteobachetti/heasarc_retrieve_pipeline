@@ -540,6 +540,47 @@ def gti_figure(record, arrays):
     return _blank(fig, height=max(200, 30 * len(rows) + 90))
 
 
+def _row_spans(fig, intervals, **style):
+    """
+    Rectangles spanning the full height of every populated row of a subplot figure.
+
+    ``Figure.add_vrect`` does this one rectangle at a time, and before each one it walks
+    the shapes already on the figure to decide which subplots are empty. The cost of a
+    whole list therefore grows faster than its square: on the three-row flare figure, 800
+    intervals took 71 minutes to draw, against a quarter of a second for the identical
+    shapes assigned in a single ``update_layout``. Two M82 observations were last seen
+    inside one of these, half an hour in, each holding a worker of the pool. So the rows
+    are worked out here and the caller assigns the lot at once.
+
+    Rows carrying no traces are skipped, which is what ``add_vrect`` does of its own
+    accord (``exclude_empty_subplots``), and an interval's rectangles come out in row
+    order -- both pinned by the tests against ``add_vrect`` itself.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A subplot figure whose traces have already been added.
+    intervals : iterable of (float, float)
+        Start and stop along the x axis.
+    **style
+        Passed through to every shape: ``fillcolor``, ``opacity``, ``layer`` and so on.
+
+    Returns
+    -------
+    list of dict
+        Ready for ``fig.update_layout(shapes=...)``.
+    """
+    axes = dict.fromkeys((trace.xaxis or "x", trace.yaxis or "y") for trace in fig.data)
+    # "x" is row one, "x2" row two: order by the number so the result does not depend on
+    # the order the traces happened to be added in.
+    rows = sorted(axes, key=lambda ref: int(ref[0][1:] or 1))
+    return [
+        dict(type="rect", xref=xref, yref=f"{yref} domain", x0=start, x1=stop, y0=0, y1=1, **style)
+        for start, stop in intervals
+        for xref, yref in rows
+    ]
+
+
 def flare_figure(record, arrays):
     """
     The three panels of the solar-flare filtering, on one shared time axis.
@@ -620,10 +661,16 @@ def flare_figure(record, arrays):
         fig.update_yaxes(title_text=label, title_font_size=10, row=row, col=1)
 
     removed = np.atleast_2d(np.asarray(arrays.get("removed", np.zeros((0, 2))), float))
-    for start, stop in removed.reshape(-1, 2):
-        fig.add_vrect(
-            x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16, line_width=0, layer="below"
+    fig.update_layout(
+        shapes=_row_spans(
+            fig,
+            removed.reshape(-1, 2),
+            fillcolor="#e76f51",
+            opacity=0.16,
+            line=dict(width=0),
+            layer="below",
         )
+    )
 
     fig.update_xaxes(title_text="mission elapsed time (s)", row=3, col=1)
     fig.update_layout(legend=dict(orientation="h", y=1.06, x=0, font=dict(size=10)))
