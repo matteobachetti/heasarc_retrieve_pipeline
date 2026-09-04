@@ -551,3 +551,62 @@ class TestWalkRemoteDirectory:
         self.serve(monkeypatch, {BASE_URL: index_page(BASE_URL, "a.evt")})
 
         assert get_remote_directory_listing.fn(BASE_URL) == [BASE_URL + "a.evt"]
+
+
+class TestThePageWriteIsTimed:
+    """
+    A worker that stalls writing a page has to say so.
+
+    Batch runs have sat for hours between an observation's last step and its task run
+    finishing, with nothing in the log in between. That window holds exactly two things:
+    :func:`~heasarc_retrieve_pipeline.core.write_page` and Prefect's own finalisation of
+    the task run, and nothing told them apart. These two lines bracket ours.
+    """
+
+    OBSID = "90202038002"
+
+    def a_page_writer(self, monkeypatch, page):
+        """Put ``page`` in place of the real page builder, which needs plotly."""
+        from heasarc_retrieve_pipeline import report
+
+        monkeypatch.setattr(report, "write_observation_page", page)
+
+    def test_the_start_is_logged_before_the_page_is_built(self, monkeypatch, caplog):
+        """Said first, so that a stall inside the builder still names the observation."""
+        seen = []
+
+        def page(obsid, outdir):
+            seen.append(caplog.text)
+
+        self.a_page_writer(monkeypatch, page)
+
+        with caplog.at_level("INFO", logger="heasarc_retrieve_pipeline"):
+            core.write_page(self.OBSID, "/nowhere")
+
+        assert f"Writing the diagnostics page for {self.OBSID}" in seen[0]
+
+    def test_the_end_says_how_long_it_took(self, monkeypatch, caplog):
+        self.a_page_writer(monkeypatch, lambda obsid, outdir: None)
+
+        with caplog.at_level("INFO", logger="heasarc_retrieve_pipeline"):
+            core.write_page(self.OBSID, "/nowhere")
+
+        assert re.search(rf"Wrote the diagnostics page for {self.OBSID} in \d+\.\d s", caplog.text)
+
+    def test_a_page_that_raises_is_still_timed_and_still_passed_over(self, monkeypatch, caplog):
+        """The reduction goes on: a reporting failure must not fail the observation."""
+
+        def page(obsid, outdir):
+            raise ValueError("no records")
+
+        self.a_page_writer(monkeypatch, page)
+
+        with caplog.at_level("INFO", logger="heasarc_retrieve_pipeline"):
+            core.write_page(self.OBSID, "/nowhere")
+
+        assert re.search(
+            rf"Could not write the diagnostics page for {self.OBSID} after \d+\.\d s: "
+            r"ValueError: no records",
+            caplog.text,
+        )
+        assert "Wrote the diagnostics page" not in caplog.text

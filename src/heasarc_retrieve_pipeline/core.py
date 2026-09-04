@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import glob
+import time
 import typing
 from datetime import datetime
 from astropy.table import Table
@@ -1550,6 +1551,13 @@ def write_page(obsid, outdir):
     never replace the exception an observation raised -- which is what an exception
     escaping a ``finally`` would do. So everything is caught, and the reduction goes on.
 
+    Both ends are logged, with how long the page took. This is the last thing an
+    observation does, and batch runs have sat in here for hours -- 43108 seconds for one
+    observation of the run of 2026-09-03 -- holding a pool worker while the flow waited on
+    its future. Nothing distinguished that from Prefect's own finalisation of the task run,
+    which happens in the same silent window. Now a start with no end names the observation
+    that is stuck, and an end names the cost.
+
     Parameters
     ----------
     obsid : str
@@ -1557,14 +1565,20 @@ def write_page(obsid, outdir):
     outdir : str
         Run output directory.
     """
+    logger = get_logger()
+    logger.info(f"Writing the diagnostics page for {obsid}")
+    started = time.monotonic()
     try:
         from .report import write_observation_page
 
         write_observation_page(obsid, outdir)
     except Exception as error:
-        get_logger().warning(
-            f"Could not write the diagnostics page for {obsid}: {type(error).__name__}: {error}"
+        logger.warning(
+            f"Could not write the diagnostics page for {obsid} after "
+            f"{time.monotonic() - started:.1f} s: {type(error).__name__}: {error}"
         )
+        return
+    logger.info(f"Wrote the diagnostics page for {obsid} in {time.monotonic() - started:.1f} s")
 
 
 @flow(flow_run_name="process_{mission}_observations")

@@ -2256,9 +2256,14 @@ killed after the first observation still has a manifest for every one.
 writes the page in a ``finally``, which is the only place that knows both the OBSID and
 the output directory *and* still runs when the observation raises. That write has its own
 ``try/except`` that logs: a reporting failure must never turn a good observation into a
-failed one, or replace the exception that was already on its way up. The index and the
-plotly bundle are written at the head and tail of ``process_observations``, inside
-``short_workspace``, so the bytes land in the real tree while the symlink is still alive.
+failed one, or replace the exception that was already on its way up. Both ends of that
+write are logged, with how long it took: it is the last thing an observation does, and
+batch runs have sat in it for hours -- 43108 seconds for one observation of the run of
+2026-09-03 -- holding a pool worker while the flow waited on its future, with nothing in
+the log to tell it apart from Prefect's own finalisation of the task run, which happens in
+the same silent window. The index and the plotly bundle are written at the head and tail
+of ``process_observations``, inside ``short_workspace``, so the bytes land in the real
+tree while the symlink is still alive.
 
 And everything can be rebuilt from what is on disk::
 
