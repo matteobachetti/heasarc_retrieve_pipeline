@@ -2154,6 +2154,17 @@ one-writer-one-file-name rule below is untouched.
 draws the figure and says, next to it, that this run did not run the step -- the timeline
 goes on reporting ``skipped``, because a page must never claim work that did not happen.
 
+That flag is about *provenance*, not about existence, and conflating the two cost a
+second bug. ``recover.py`` sets it by hand, through ``rec.from_earlier_outputs()``,
+because it measures now but measures an old run's output -- and ``as_dict()`` took the
+flag alone as reason enough to name a payload. A recovered step that records no arrays,
+which is the ordinary fate of a CHU-split event file with fewer than twenty usable
+events, then wrote down the name of an ``.npz`` that had never been created, and every
+later read of that record logged ``Ignoring unreadable array payload``. Forty lines of it
+per run. ``as_dict()`` now decides the two questions separately: the record names a
+payload only when one is really on disk, and only such a record can be marked as coming
+from an earlier run.
+
 Source separation needed one more change to fit this. It skips per *directory* and used
 to ``continue`` in silence, opening no record at all, so the step was missing from the
 timeline and every focal-plane image with it. A skipped directory now writes one
