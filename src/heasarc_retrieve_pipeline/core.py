@@ -1499,14 +1499,31 @@ def download_and_process_observation(
     # observation ended rather than showing it as still running.
     try:
         with record_step(diagnostics_path(obsid, config), obsid, "observation") as rec:
+            obsid_dir = os.path.join(outdir, obsid)
+            pgp_decryption_sentinel = os.path.join(obsid_dir, ".pgp_decrypted")
+
+            # If decryption sentinel exists, files were already downloaded and decrypted;
+            # skip re-downloading them
+            if os.path.exists(pgp_decryption_sentinel):
+                logger = get_logger()
+                logger.info(
+                    f"Decryption sentinel found at {pgp_decryption_sentinel}; "
+                    f"skipping download and decryption"
+                )
+                rec.skip("files already downloaded and decrypted in a prior run")
+                return None
+
             recursive_download(url, outdir, test_str=".", test=test)
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None
 
             if pgp_passphrase is not None:
-                obsid_dir = os.path.join(outdir, obsid)
                 decrypt_obsid_directory(obsid_dir, pgp_passphrase)
+                # Create sentinel after successful decryption to mark this step as done
+                from datetime import datetime
+                with open(pgp_decryption_sentinel, "w") as f:
+                    f.write(f"Decryption completed at {datetime.now().isoformat()}\n")
 
             # recursive_download is a flow, and a subflow call is synchronous and raises,
             # so the ordering is already guaranteed by the line above. Prefect 3 has no
