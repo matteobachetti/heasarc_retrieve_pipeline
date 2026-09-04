@@ -1831,10 +1831,32 @@ that module calls ``heasoftpy`` directly. The lock costs nothing measurable: a H
 is an external process doing seconds to minutes of work, and two of them within one
 observation have nothing to gain from overlapping.
 
-``heasoft.run`` also **raises on a non-zero return code**. ``heasoftpy`` defaults to
-``allow_failure=True``, so a tool that fails comes back as an ordinary result and the
-caller carries on with a file that was never written. That is how ``ftsort`` came to fail on
-every single run of ``merge_gtis``, unnoticed, for as long as the code existed.
+``heasoft.run`` also **raises on a non-zero return code**, whatever ``heasoftpy`` would
+have done on its own. Left to itself a tool that fails comes back as an ordinary result and
+the caller carries on with a file that was never written; that is how ``ftsort`` came to
+fail on every single run of ``merge_gtis``, unnoticed, for as long as the code existed.
+
+Which of the two things ``heasoftpy`` does is controlled by ``allow_failure``: ``True``
+hands the failure back as a result carrying the return code, ``False`` raises
+``HSPTaskException``. The installed builds disagree about the unset default -- ``True`` in
+``heasoftpy`` 1.5, with a deprecation warning on every single call announcing the change,
+and already ``False`` on the HEASARC conda channel -- so neither the module nor its tests
+inherit it. ``_calling`` asks for ``True`` explicitly, as a keyword on every call:
+
+* **Per call, not** ``heasoftpy.Config``. ``Config`` is process-wide, so setting it there
+  would also stop anything else sharing the interpreter -- a notebook, another package --
+  from getting the exceptions it expects. ``heasoftpy`` gives an explicit keyword
+  precedence over ``Config``, and a test in ``tests/test_heasoft_tools.py`` exercises that
+  precedence against a real HEASOFT rather than trusting the source.
+* **Why** ``True``. The result object carries the return code, the output and the stderr
+  separately, which is what ``_checked`` turns into a message naming the tool.
+  ``HSPTaskException`` carries the same text but never says which task raised it.
+* **And the exception is translated anyway.** ``heasoftpy`` silently discards keywords that
+  do not name a real tool parameter, so a version that renames or drops this one would go
+  back to raising without a word. ``_calling`` catches ``HSPTaskException`` and re-raises it
+  as a ``RuntimeError`` naming the tool, which is what actually holds the contract. If a
+  future ``heasoftpy`` renames the exception too, the module says so in a warning at import
+  instead of letting the first failed tool discover it.
 
 **What each observation gets to itself.** GOES solar X-ray files are fetched into the
 observation's own directory (``goes_download_path``) rather than sunpy's shared download

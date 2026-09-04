@@ -20,6 +20,7 @@ Everything here is skipped unless ``HEADAS`` is set and ``heasoftpy`` imports; s
 """
 
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -177,15 +178,18 @@ class TestFtmerge:
         assert "105" in str(excinfo.value)
         assert "already exists" in str(excinfo.value)
 
-    def test_it_still_refuses_when_heasoftpy_raises_instead_of_returning(
+    def test_it_still_refuses_when_heasoftpy_is_set_to_raise_instead(
         self, tmp_path, two_event_files, monkeypatch
     ):
-        """The same refusal, with ``heasoftpy`` configured the way CI has it.
+        """The same refusal, with ``heasoftpy``'s global set the way CI has it.
 
         ``allow_failure`` decides whether a non-zero exit is returned or raised, and the
-        two ``heasoftpy`` builds in use disagree about the default. This sets it the way
-        the HEASARC conda channel's build does -- which is what made the test above fail
-        there -- and asks for the same ``RuntimeError`` anyway.
+        two ``heasoftpy`` builds in use disagree about the default -- the disagreement that
+        made the test above fail on the HEASARC conda channel. :mod:`heasarc_retrieve_pipeline.heasoft`
+        asks for it per call rather than setting ``Config``, and ``heasoftpy`` gives the
+        keyword precedence. Here is that precedence exercised against a real HEASOFT,
+        rather than merely read in the source: the global says raise, the call says do not,
+        and the same ``RuntimeError`` comes out either way.
         """
         monkeypatch.setattr(heasoft.hsp.Config, "allow_failure", False)
 
@@ -229,6 +233,29 @@ def test_ftsort_puts_the_rows_in_order(tmp_path, two_event_files):
         times = list(hdul["EVENTS"].data["TIME"])
     assert times == sorted(times)
     assert times == [1.0, 2.0, 5.0, 6.0, 9.0]
+
+
+class TestNoDeprecationWarningPerCall:
+    """The other thing asking for ``allow_failure`` buys, against the real library.
+
+    ``heasoftpy`` 1.5 warns on *every* call that leaves ``allow_failure`` unset -- a run of
+    this pipeline makes hundreds of tool calls, and a warning on each one is how a real
+    message gets lost. Asking for it silences that. On a build where the parameter is gone
+    there is nothing to warn about and this passes for a different reason, which is fine:
+    what it guards against is the warning coming back.
+    """
+
+    def test_a_call_does_not_warn_about_allow_failure(self, tmp_path, two_event_files):
+        first, second = two_event_files
+        out = str(tmp_path / "m.evt")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            heasoft.run(
+                "ftmerge", produces=out, infile=f"{first},{second}", outfile=out, copyall="NO"
+            )
+
+        assert not [w for w in caught if "allow_failure" in str(w.message)]
 
 
 class TestFtmgtime:

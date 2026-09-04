@@ -34,42 +34,36 @@ except ImportError:
     HAS_HEASOFT = False
 
 
-#: What ``heasoftpy`` raises when a tool exits non-zero and it has been told not to
-#: tolerate that. An empty tuple when ``heasoftpy`` is absent, which an ``except`` clause
-#: accepts and never matches.
-HSP_FAILURE = getattr(hsp, "HSPTaskException", ()) if HAS_HEASOFT else ()
-
-
-def _pin_allow_failure():
+def _hsp_failure():
     """
-    Make ``heasoftpy`` hand back failures instead of raising, on every version.
+    What ``heasoftpy`` raises for a tool that exited non-zero, if anything.
 
-    ``allow_failure`` decides what a non-zero exit does: ``True`` returns an ordinary
-    result object carrying the return code, ``False`` raises ``HSPTaskException``. In
-    ``heasoftpy`` 1.5 the unset default is ``True``, with a deprecation warning on *every
-    call* saying it will become ``False``; in the build on the HEASARC conda channel it
-    already has. The two are not interchangeable here: with ``False``, :func:`_checked`
-    never runs, and the error that reaches the pipeline no longer names the tool that
-    produced it -- which is the entire reason :func:`_checked` exists.
-
-    So pin it rather than inherit it. The result is one behaviour to reason about, and no
-    deprecation warning per call.
+    Whether it raises at all is :func:`_calling`'s business; this is only about being able
+    to recognise it when it does. A ``heasoftpy`` that renames the exception would leave
+    nothing to catch, so say so once rather than let the first failed tool discover it.
 
     Returns
     -------
-    bool
-        True if the setting was applied.
+    type or tuple
+        The exception class, or an empty tuple -- which an ``except`` clause accepts and
+        never matches -- when there is nothing to catch.
     """
     if not HAS_HEASOFT:
-        return False
-    try:
-        hsp.Config.allow_failure = True
-    except AttributeError:  # pragma: no cover - a heasoftpy predating Config
-        return False
-    return True
+        return ()
+    failure = getattr(hsp, "HSPTaskException", None)
+    if failure is None:
+        get_logger().warning(
+            "heasoftpy is installed but has no HSPTaskException. If it reports a failed "
+            "tool by raising, that exception will now reach callers unchanged instead of "
+            "as a RuntimeError naming the tool. heasarc_retrieve_pipeline.heasoft needs "
+            "to learn the new name."
+        )
+        return ()
+    return failure
 
 
-_pin_allow_failure()
+#: Caught in :func:`_calling` and translated. Resolved once, at import.
+HSP_FAILURE = _hsp_failure()
 
 #: Held while any HEASOFT tool runs in this process. Re-entrant, so a tool that is invoked
 #: from inside another lock-holding call cannot deadlock.
@@ -164,11 +158,11 @@ def _checked(name, result):
     """
     Return ``result``, or raise if the tool reported failure.
 
-    :func:`_pin_allow_failure` makes ``heasoftpy`` return rather than raise: a tool that
-    exits non-zero comes back as an ordinary result object with a non-zero ``returncode``,
-    and a caller that does not look carries on with a file that was never written. That is not hypothetical -- a real
-    run had ``fappend`` fail quietly, and the merged event file travelled several steps
-    downstream before anything noticed it had no GTI extension.
+    :func:`_calling` asks ``heasoftpy`` to return rather than raise: a tool that exits
+    non-zero comes back as an ordinary result object with a non-zero ``returncode``, and a
+    caller that does not look carries on with a file that was never written. That is not
+    hypothetical -- a real run had ``fappend`` fail quietly, and the merged event file
+    travelled several steps downstream before anything noticed it had no GTI extension.
 
     Raises
     ------
@@ -189,18 +183,33 @@ def _calling(name, task, *args, **kwargs):
     """
     Call one ``heasoftpy`` task, reporting a failed tool the way this module promises.
 
-    :func:`_pin_allow_failure` normally means a failed tool comes back as a result and
-    :func:`_checked` turns it into the ``RuntimeError`` every caller here expects. But the
-    pin is a ``heasoftpy`` implementation detail, and a version that drops or renames it
-    would silently go back to raising ``HSPTaskException`` -- an exception that is not a
-    ``RuntimeError`` and does not say which tool it came from. Translating it here means
-    the promise in :func:`run` holds whatever ``heasoftpy`` decides to do next.
+    Two things happen here, and the second is the one that has to hold.
+
+    ``allow_failure`` decides what ``heasoftpy`` does with a non-zero exit: ``True`` hands
+    back an ordinary result carrying the return code, ``False`` raises
+    ``HSPTaskException``. The unset default is ``True`` in ``heasoftpy`` 1.5 -- with a
+    deprecation warning on every call announcing that it will become ``False`` -- and is
+    already ``False`` in the build on the HEASARC conda channel. Neither this module nor
+    its tests should depend on which one is installed, so it is asked for explicitly, on
+    every call. Not through ``heasoftpy.Config``, which is process-wide: that would also
+    stop anyone else sharing this interpreter from getting the exceptions they expect.
+
+    ``True`` is the one worth asking for. The result object carries the return code, the
+    output and the stderr separately, which is what :func:`_checked` turns into a message
+    naming the tool; ``HSPTaskException`` carries the same text but never says which task
+    raised it.
+
+    Asking is not enough, though. ``heasoftpy`` only forwards the keywords that name real
+    tool parameters and discards the rest, so a version that drops or renames this one
+    would ignore it in silence and go back to raising. Translating the exception here as
+    well means the promise in :func:`run` holds whatever ``heasoftpy`` does next.
 
     Raises
     ------
     RuntimeError
-        If ``heasoftpy`` raised for a tool that exited non-zero.
+        If ``heasoftpy`` raised rather than returning a failed result.
     """
+    kwargs.setdefault("allow_failure", True)
     try:
         return task(*args, **kwargs)
     except HSP_FAILURE as error:
@@ -300,7 +309,8 @@ def run(name, *args, produces, **kwargs):
     name : str
         Tool name, as ``heasoftpy`` exposes it -- ``"ftmerge"``, ``"barycorr"``.
     *args, **kwargs
-        Passed to the tool unchanged.
+        Passed to the tool unchanged, except that ``allow_failure=True`` is added when the
+        caller has not asked for something else -- see :func:`_calling`.
     produces : str or IN_PLACE or list, keyword-only, required
         What the call must leave behind -- see :func:`_check_outputs`. Mandatory on
         purpose: every tool in this package has a nameable output, and a caller that has

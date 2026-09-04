@@ -94,7 +94,10 @@ class TestOneToolAtATime:
         monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(ftlist=lambda **kw: kw), raising=False)
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft.run("ftlist", produces=[], infile="x") == {"infile": "x"}
+        assert heasoft.run("ftlist", produces=[], infile="x") == {
+            "infile": "x",
+            "allow_failure": True,
+        }
 
     def test_without_heasoftpy_the_error_says_so(self, monkeypatch):
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", False)
@@ -104,10 +107,11 @@ class TestOneToolAtATime:
 
 
 class TestFailuresAreNoticed:
-    """``heasoft`` pins ``allow_failure=True``: a tool that exits non-zero comes back as
-    an ordinary result, and the caller carries on with a file that was never written.
-    Measured on a real run: ``fappend`` returned quietly, and the merged event file went
-    downstream with no GTI extension until something much later tripped over it.
+    """``heasoft`` asks for ``allow_failure=True``: a tool that exits non-zero comes back
+    as an ordinary result, and a caller that does not look carries on with a file that was
+    never written. Measured on a real run: ``fappend`` returned quietly, and the merged
+    event file went downstream with no GTI extension until something much later tripped
+    over it.
     """
 
     def result(self, returncode, stdout="", stderr=""):
@@ -159,14 +163,71 @@ class TestFailuresAreNoticed:
         assert heasoft.run("ftlist", produces=[], infile="a") is None
 
 
+class TestAskingForTheBehaviourRatherThanInheritingIt:
+    """``allow_failure`` is asked for on every call, not set once on ``heasoftpy.Config``.
+
+    ``Config`` is process-wide: setting it there would change what happens for every other
+    user of ``heasoftpy`` in the same interpreter, who would stop getting the exceptions
+    they expect. A keyword changes this module's calls and nothing else -- and ``heasoftpy``
+    gives an explicit keyword precedence over ``Config``, which is what makes that work.
+    """
+
+    def test_run_asks_for_it(self, monkeypatch):
+        seen = {}
+
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(ftlist=lambda **kw: seen.update(kw)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        heasoft.run("ftlist", produces=[], infile="a")
+
+        assert seen["allow_failure"] is True
+
+    def test_the_task_interface_asks_for_it_too(self, monkeypatch):
+        seen = {}
+
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(HSPTask=lambda name: lambda **kw: seen.update(kw)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        heasoft.run_task("nupipeline", produces=[], indir="x")
+
+        assert seen["allow_failure"] is True
+
+    def test_a_caller_who_asks_for_something_else_gets_it(self, monkeypatch):
+        """``setdefault``, not an override: ``"warn"`` is a third thing ``heasoftpy`` takes."""
+        seen = {}
+
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(ftlist=lambda **kw: seen.update(kw)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+        heasoft.run("ftlist", produces=[], infile="a", allow_failure="warn")
+
+        assert seen["allow_failure"] == "warn"
+
+
 class TestAHeasoftpyThatRaisesInstead:
-    """The other half of ``allow_failure``, and the reason it is pinned.
+    """The other half of ``allow_failure``, and why asking for it is not enough.
 
     ``heasoftpy`` 1.5 warns that the default is becoming ``False``; on the HEASARC conda
     channel it already has, and there a failed tool raises ``HSPTaskException`` -- which is
     an ``Exception``, not a ``RuntimeError``, and never names the tool. That broke a CI job
-    on the very case these tests exist for. Pinning fixes it, but the pin is somebody
-    else's implementation detail, so the translation below is what actually holds the
+    on the very case these tests exist for. The keyword settles it today, but ``heasoftpy``
+    discards keywords it does not recognise, so a version that renames or drops it would go
+    back to raising without a word. The translation below is what actually holds the
     contract.
     """
 
@@ -223,17 +284,29 @@ class TestAHeasoftpyThatRaisesInstead:
         with pytest.raises(KeyError):
             heasoft.run("ftlist", produces=[], infile="a")
 
-    def test_pinning_is_skipped_when_heasoftpy_has_no_Config(self, monkeypatch):
-        """An older ``heasoftpy`` without ``Config`` is not a reason to fail to import."""
+    def test_nothing_to_catch_without_heasoftpy(self, monkeypatch):
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", False)
+
+        assert heasoft._hsp_failure() == ()
+
+    def test_a_heasoftpy_that_renamed_the_exception_says_so(self, monkeypatch, caplog):
+        """Nothing left to catch is a thing to be told about, not to discover in a run."""
         monkeypatch.setattr(heasoft, "hsp", SimpleNamespace(), raising=False)
         monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft._pin_allow_failure() is False
+        assert heasoft._hsp_failure() == ()
+        assert "HSPTaskException" in caplog.text
 
-    def test_pinning_does_nothing_without_heasoftpy(self, monkeypatch):
-        monkeypatch.setattr(heasoft, "HAS_HEASOFT", False)
+    def test_the_exception_is_found_when_it_is_there(self, monkeypatch):
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(HSPTaskException=self.FakeHSPTaskException),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
 
-        assert heasoft._pin_allow_failure() is False
+        assert heasoft._hsp_failure() is self.FakeHSPTaskException
 
 
 class TestAToolMustProduceWhatItPromised:
