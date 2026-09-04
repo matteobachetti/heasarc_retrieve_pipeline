@@ -1855,15 +1855,18 @@ def retrieve_and_process_data(
 
         runner = ProcessPoolTaskRunner(max_workers=n_workers)
         logger.info(f"Reducing {len(items)} observations, {n_workers} at a time")
-        process_observations.with_options(task_runner=runner)(
-            items,
-            outdir=workspace.data,
-            mission=mission,
-            pfiles_root=workspace.pfiles,
-            work_root=workspace.work,
-            flags=flags,
-            test=test,
-        )
+        try:
+            process_observations.with_options(task_runner=runner)(
+                items,
+                outdir=workspace.data,
+                mission=mission,
+                pfiles_root=workspace.pfiles,
+                work_root=workspace.work,
+                flags=flags,
+                test=test,
+            )
+        finally:
+            runner.shutdown()
 
     return result_table
 
