@@ -1718,6 +1718,46 @@ The one place this can newly fail is ``nuproducts``. If a spectrum has too few c
 ``rungrppha`` to write the grouped file, an observation that used to pass in silence now
 raises. That is the intent, and it is the thing to watch in the next cluster run.
 
+Where a tool's own output goes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``heasoftpy``'s verbosity level 1 -- what ``verbose=True`` asks for -- captures the tool's
+output *and* writes every line of it to ``sys.stdout``, without flushing. Under a batch
+scheduler ``sys.stdout`` is a file rather than a terminal, so Python block buffers it and
+the lines arrive in bursts, arbitrarily later than the pipeline's own messages, which the
+logging handler flushes as it goes. Two things follow, and both were measured on the 2026
+M82 runs: the cluster log is mostly tool output -- 98% of the 530798 lines of one 40 MB
+run, 95% of another -- and a message printed at the end of a run can be buried under
+several megabytes of ``nupipeline`` chatter that logically preceded it.
+
+Level **20** captures the output and writes it to a file instead of the screen. So
+``heasoft.run`` and ``heasoft.run_task`` take an optional ``log_to``, and the three calls
+that were noisy -- ``nupipeline`` once per observation, ``nuproducts`` once per spectral
+stem in both ``nustar.py`` and ``segments.py`` -- pass
+``utils.tool_log_file(name, obsid, config)``::
+
+    <out_data_path>/<OBSID>/logs/nupipeline.log
+    <out_data_path>/<OBSID>/logs/nuproducts.log
+
+One file per tool per observation: ``nuproducts`` runs a dozen times for one observation
+and reading those in the order they ran is what makes a failed extraction legible. This is
+the shape NICER already used for ``nicerl2_process_<OBSID>.log``, above.
+
+Three details are load-bearing:
+
+* the output is still on the result, so the ``RuntimeError`` that names a failed tool
+  still carries the tool's own words -- nothing is traded away for the quiet;
+* the path is made absolute before the call. A worker reduces its observation from a
+  private working directory, and ``heasoftpy`` opens the log relative to wherever the
+  process is standing;
+* ``heasoftpy`` opens it in append mode, which is what a tool called once per stem needs
+  and what a rerun must not inherit. ``heasoft`` therefore truncates each path the first
+  time this process writes to it and leaves the rest to append, and says once, in the run
+  log, where a tool's output has gone.
+
+Every other HEASOFT call already runs at level 0 -- captured, never printed -- so nothing
+else was polluting the log and nothing else changed.
+
 Inputs the reduction had to skip
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

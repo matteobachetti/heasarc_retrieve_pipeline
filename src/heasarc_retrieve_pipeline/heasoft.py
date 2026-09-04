@@ -78,6 +78,46 @@ _EXPECTED_PFILES = None
 #: Whether the repair below has already been reported. Once is enough for the log.
 _PFILES_REPAIRED = False
 
+#: Log files this process has already started. ``heasoftpy`` opens one in append mode,
+#: which is what a tool called once per spectral stem needs and what a rerun must not
+#: inherit, so the first call of a run truncates and the rest append.
+_LOG_STARTED = set()
+
+
+def _log_file(name, path):
+    """
+    Prepare a file for one tool's output, and say how to ask ``heasoftpy`` for it.
+
+    ``heasoftpy``'s verbosity level 1 -- what ``verbose=True`` means -- writes every line
+    the tool prints to ``sys.stdout`` and never flushes it. Under a batch scheduler that
+    is a file rather than a terminal, so it is block buffered and arrives in bursts long
+    after the pipeline messages it belongs between: in a real 40 MB run, 98% of the lines
+    were tool output and the closing summary was buried in it. Level 20 captures the
+    output and writes it to a file instead of the screen. It is still on the result
+    either way, so :func:`_checked` can still let a failed tool speak for itself.
+
+    Parameters
+    ----------
+    name : str
+        Tool name, for the line that says where its output went.
+    path : str
+        Where to write, normally :func:`~heasarc_retrieve_pipeline.utils.tool_log_file`.
+
+    Returns
+    -------
+    dict
+        The keywords that send this tool's output to ``path`` and nowhere else.
+    """
+    # Resolved before the tool runs: a worker reduces its observation from a private
+    # working directory, and ``heasoftpy`` opens the log relative to wherever that is.
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if path not in _LOG_STARTED:
+        _LOG_STARTED.add(path)
+        open(path, "w").close()
+        get_logger().info(f"Output of {name} for this observation goes to {path}")
+    return dict(verbose=20, logfile=path)
+
 
 def use_private_pfiles(directory):
     """
@@ -300,7 +340,7 @@ def _check_outputs(name, produces):
             raise RuntimeError(f"{name} returned success but {path} is empty")
 
 
-def run(name, *args, produces, **kwargs):
+def run(name, *args, produces, log_to=None, **kwargs):
     """
     Run one HEASOFT tool through ``heasoftpy``, one at a time in this process.
 
@@ -315,6 +355,9 @@ def run(name, *args, produces, **kwargs):
         What the call must leave behind -- see :func:`_check_outputs`. Mandatory on
         purpose: every tool in this package has a nameable output, and a caller that has
         to write it down cannot forget that a zero return code proves nothing.
+    log_to : str, optional
+        Send the tool's own output to this file instead of the screen -- see
+        :func:`_log_file`. ``None``, the default, leaves the call exactly as it was.
 
     Returns
     -------
@@ -331,6 +374,8 @@ def run(name, *args, produces, **kwargs):
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
+    if log_to is not None:
+        kwargs.update(_log_file(name, log_to))
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
         result = _checked(name, _calling(name, getattr(hsp, name), *args, **kwargs))
@@ -338,7 +383,7 @@ def run(name, *args, produces, **kwargs):
         return result
 
 
-def run_task(name, *, produces, **params):
+def run_task(name, *, produces, log_to=None, **params):
     """
     Run a HEASOFT tool through ``heasoftpy``'s ``HSPTask``, one at a time in this process.
 
@@ -351,6 +396,9 @@ def run_task(name, *, produces, **params):
         Tool name, for example ``"nupipeline"``.
     produces : str or IN_PLACE or list, keyword-only, required
         What the call must leave behind -- see :func:`_check_outputs`.
+    log_to : str, optional
+        Send the tool's own output to this file instead of the screen -- see
+        :func:`_log_file`. ``None``, the default, leaves the call exactly as it was.
     **params
         Tool parameters.
 
@@ -369,6 +417,8 @@ def run_task(name, *, produces, **params):
     """
     if not HAS_HEASOFT:
         raise ImportError("heasoftpy not installed")
+    if log_to is not None:
+        params.update(_log_file(name, log_to))
     with HEASOFT_LOCK:
         _hold_on_to_private_pfiles()
         result = _checked(name, _calling(name, hsp.HSPTask(name), **params))

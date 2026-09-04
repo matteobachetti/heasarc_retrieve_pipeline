@@ -1408,6 +1408,36 @@ def skipped_inputs_file(obsid, config):
     return os.path.join(config["out_data_path"], obsid, "skipped_inputs.txt")
 
 
+def tool_log_file(name, obsid, config):
+    """
+    Path of the file one HEASOFT tool's output goes to, for one observation.
+
+    One file per tool per observation. ``nuproducts`` runs once per spectral stem, a
+    dozen times for a single observation, and reading those in the order they ran is what
+    makes a failed extraction legible; a file each would only scatter them.
+
+    Parameters
+    ----------
+    name : str
+        Tool name, as ``heasoftpy`` exposes it -- ``"nupipeline"``, ``"nuproducts"``.
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/logs/<name>.log``.
+
+    Examples
+    --------
+    >>> tool_log_file("nuproducts", "90202038002", {"out_data_path": "out"})
+    'out/90202038002/logs/nuproducts.log'
+    """
+    return os.path.join(config["out_data_path"], obsid, "logs", f"{name}.log")
+
+
 def read_skipped_inputs(obsid, config):
     """
     What an observation's reduction skipped, as ``(item, reason)`` pairs.

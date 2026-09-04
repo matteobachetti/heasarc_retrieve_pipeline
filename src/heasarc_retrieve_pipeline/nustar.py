@@ -67,6 +67,7 @@ from .utils import (
     rootname,
     splitext_improved,
     time_reference,
+    tool_log_file,
 )
 
 from . import heasoft
@@ -843,7 +844,6 @@ def _run_l2_pipeline(obsid, config, flags, rec):
         "instrument": "ALL",
         "clobber": "yes",
         "noprompt": True,
-        "verbose": True,
     }
 
     if flags:
@@ -852,7 +852,12 @@ def _run_l2_pipeline(obsid, config, flags, rec):
 
     # No return-code check here: heasoft.run_task raises on a non-zero code, with the
     # tool's own output in the message.
-    heasoft.run_task("nupipeline", produces=ev_dir, **params)
+    heasoft.run_task(
+        "nupipeline",
+        produces=ev_dir,
+        log_to=tool_log_file("nupipeline", obsid, config),
+        **params,
+    )
 
     open(pipe_done_file, "a").close()
 
@@ -2704,7 +2709,7 @@ def _calculate_spectra(obsid, config, src_reg, bkg_reg, ra, dec, goes_gti_file, 
             produces=params["grpphafile"],
             noprompt=True,
             clobber=True,
-            verbose=True,
+            log_to=tool_log_file("nuproducts", obsid, config),
         )
         spectra.append(os.path.basename(params["grpphafile"]))
         # The spectrum itself, so the page can show what came out rather than only its

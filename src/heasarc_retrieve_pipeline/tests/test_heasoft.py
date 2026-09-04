@@ -527,3 +527,121 @@ class TestPrivatePfilesAreHeldOnTo:
         heasoft.run_task("nupipeline", produces=[], indir="a")
 
         assert seen == [expected]
+
+
+class TestToolOutputCanGoToAFile:
+    """
+    A tool's own chatter belongs beside the observation, not in the batch log.
+
+    ``heasoftpy`` writes every line a tool prints to ``sys.stdout`` and never flushes it.
+    Under a scheduler that is a file rather than a terminal, so it is block buffered and
+    arrives in bursts long after the pipeline messages it belongs between. In a real
+    40 MB run, 98% of the lines were tool output and the closing summary was buried in
+    it. Level 20 is ``heasoftpy``'s "capture, and write to a file rather than the
+    screen"; the output still comes back on the result, so a failed tool still names
+    itself with its own words.
+    """
+
+    def a_tool(self, monkeypatch, seen):
+        monkeypatch.setattr(heasoft, "_LOG_STARTED", set())
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(nuproducts=lambda **kw: seen.update(kw)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+
+    def test_a_log_asks_for_the_level_that_does_not_print(self, monkeypatch, tmp_path):
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        path = tmp_path / "90202038002" / "logs" / "nuproducts.log"
+
+        heasoft.run("nuproducts", produces=[], log_to=str(path), infile="a")
+
+        assert seen["verbose"] == 20
+        assert seen["logfile"] == str(path)
+
+    def test_a_call_with_no_log_is_left_exactly_as_it_was(self, monkeypatch):
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+
+        heasoft.run("nuproducts", produces=[], infile="a")
+
+        assert "verbose" not in seen
+        assert "logfile" not in seen
+
+    def test_the_directory_is_made(self, monkeypatch, tmp_path):
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        path = tmp_path / "90202038002" / "logs" / "nuproducts.log"
+
+        heasoft.run("nuproducts", produces=[], log_to=str(path), infile="a")
+
+        assert path.parent.is_dir()
+
+    def test_a_relative_path_is_resolved_before_the_worker_moves(self, monkeypatch, tmp_path):
+        """A worker runs in a private working directory, so ``heasoftpy``'s ``open`` is
+        relative to somewhere the caller did not mean."""
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        monkeypatch.chdir(tmp_path)
+
+        heasoft.run("nuproducts", produces=[], log_to="logs/nuproducts.log", infile="a")
+
+        assert os.path.isabs(seen["logfile"])
+        assert seen["logfile"] == str(tmp_path / "logs" / "nuproducts.log")
+
+    def test_the_first_call_of_a_run_starts_the_file_again(self, monkeypatch, tmp_path):
+        """``heasoftpy`` opens the log in append mode, which is wrong across runs."""
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        path = tmp_path / "logs" / "nuproducts.log"
+        path.parent.mkdir()
+        path.write_text("what an earlier run wrote\n")
+
+        heasoft.run("nuproducts", produces=[], log_to=str(path), infile="a")
+
+        assert path.read_text() == ""
+
+    def test_a_later_call_of_the_same_run_is_left_to_append(self, monkeypatch, tmp_path):
+        """``nuproducts`` runs once per stem: the second must not erase the first."""
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        path = tmp_path / "logs" / "nuproducts.log"
+
+        heasoft.run("nuproducts", produces=[], log_to=str(path), infile="a")
+        path.write_text("what the first call wrote\n")
+        heasoft.run("nuproducts", produces=[], log_to=str(path), infile="b")
+
+        assert path.read_text() == "what the first call wrote\n"
+
+    def test_the_batch_log_is_told_where_the_output_went(self, monkeypatch, tmp_path, caplog):
+        """Once per file, so the run log stays navigable without carrying the output."""
+        seen = {}
+        self.a_tool(monkeypatch, seen)
+        path = tmp_path / "logs" / "nuproducts.log"
+
+        with caplog.at_level("INFO", logger="heasarc_retrieve_pipeline"):
+            heasoft.run("nuproducts", produces=[], log_to=str(path), infile="a")
+            heasoft.run("nuproducts", produces=[], log_to=str(path), infile="b")
+
+        assert caplog.text.count(str(path)) == 1
+        assert "nuproducts" in caplog.text
+
+    def test_the_task_interface_takes_one_too(self, monkeypatch, tmp_path):
+        seen = {}
+        monkeypatch.setattr(heasoft, "_LOG_STARTED", set())
+        monkeypatch.setattr(
+            heasoft,
+            "hsp",
+            SimpleNamespace(HSPTask=lambda name: lambda **kw: seen.update(kw)),
+            raising=False,
+        )
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+        path = tmp_path / "logs" / "nupipeline.log"
+
+        heasoft.run_task("nupipeline", produces=[], log_to=str(path), indir="x")
+
+        assert seen["verbose"] == 20
+        assert seen["logfile"] == str(path)

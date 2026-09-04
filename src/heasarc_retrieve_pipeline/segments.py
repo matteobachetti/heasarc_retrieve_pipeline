@@ -88,6 +88,7 @@ from .utils import (
     segment_bounds,
     splitext_improved,
     time_system,
+    tool_log_file,
     update_time_bounds,
 )
 
@@ -399,7 +400,7 @@ def split_spectra(obsid, config, bounds, rec=None):
                 produces=params["grpphafile"],
                 noprompt=True,
                 clobber=True,
-                verbose=True,
+                log_to=tool_log_file("nuproducts", obsid, config),
             )
 
             point_at_parent_response(
