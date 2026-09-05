@@ -1393,13 +1393,45 @@ operator and the run dies on ``fitsio 4.060 error message: could not open the na
 file``. A ``BACKFILE`` must therefore carry no directory at all, and being in the right
 directory is then the only way to say which file is meant.
 
-The staging is no wider than that constraint, which was established by experiment rather
-than assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and builds its
-``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
-absolute too. So each spectrum is copied -- the originals are never touched -- with
-``BACKFILE`` reduced to a bare name and ``RESPFILE``/``ANCRFILE`` made absolute, and only
-the background spectra are linked in beside it. The 68 MB ``.rmf`` files are neither
-copied nor linked.
+``RESPFILE`` and ``ANCRFILE`` survive a path, but only a short one. ``DO_ADDSPEC`` reads
+them into an 80-character buffer -- ``coadd.ADDSPEC_NAME_LIMIT`` -- and truncates anything
+longer without a word about having done so. Measured on
+``merged_80002092002_80002092004``: a 94-character absolute ``RESPFILE`` was handed to
+``cp`` as its first 80 characters, so the working copies of the responses were never made,
+and ``ftaddrmf`` then died on files that were not there:
+
+.. code-block:: text
+
+    cp: cannot stat '.../products/merged_80002092002_80002'
+    terminate called after throwing an instance of 'CCfits::FITS::CantOpen'
+    ** DO_ADDSPEC 1.2.1   ERROR:   Problem with FTADDRMF spawn
+     ... CSPAWN Error flag =            6
+
+Nothing in that names a length, and the path it complains about is one nobody ever wrote.
+
+That limit cannot be met by keeping paths tidy, because merging spends the dataset name
+twice, once as the directory and once as the file:
+
+.. code-block:: text
+
+    <root>/merged_80002092002_80002092004/products/merged_80002092002_80002092004_A01.rsp
+            └──────────── 30 ────────────┘          └──────────── 30 ────────────┘
+
+That is 79 characters before the output root contributes anything, leaving room for an
+output root of exactly one character. Giving the tree a short name under ``/tmp``, which
+is what ``short_workspace`` buys against the 128-character limit elsewhere, does not help
+here: the root in the failing run was already only ``/tmp/mergesplit``.
+
+So no pointer this package writes into a FITS header is ever a path. Each spectrum is
+copied -- the originals are never touched -- with all three keywords reduced to bare names
+and the files they name symbolically linked in beside them. A link costs nothing even for
+a 68 MB ``.rmf``, and ``addspec`` resolves it while making the working copy of the response
+it would have made anyway.
+
+That makes the staging directory one flat namespace, so a bare name has to mean one file.
+NuSTAR file names carry the OBSID and cannot collide; a collision would mean something
+upstream is already wrong, and ``coadd._link`` raises rather than let one spectrum be
+co-added against another observation's response.
 
 Changing the working directory is otherwise forbidden in this package, and
 ``test_prefect_wiring`` enforces that by walking the AST for ``os.chdir``. The one

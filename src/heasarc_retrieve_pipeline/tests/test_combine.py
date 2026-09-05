@@ -169,16 +169,16 @@ class TestStageInputs:
         with fits.open(os.path.join(stage, staged[0])) as hdul:
             assert os.sep not in hdul["SPECTRUM"].header["BACKFILE"]
 
-    def test_the_responses_stay_absolute(self, tree, tmp_path):
-        """Only ``BACKFILE`` has the problem, so only ``BACKFILE`` is narrowed. Verified
-        against HEASOFT: ``addspec`` builds its ``.rsp`` from absolute pointers."""
+    def test_the_responses_become_bare_names_too(self, tree, tmp_path):
+        """No pointer out of a FITS header is ever a path. ``DO_ADDSPEC`` reads
+        ``RESPFILE`` into an 80-character buffer and chops anything longer without a
+        word; a bare name cannot reach that length."""
         stage = str(tmp_path / "stage")
         staged = combine.stage_inputs(self.spectra(tree), stage)
         with fits.open(os.path.join(stage, staged[0])) as hdul:
             header = hdul["SPECTRUM"].header
             for keyword in ("RESPFILE", "ANCRFILE"):
-                assert os.path.isabs(header[keyword])
-                assert os.path.exists(header[keyword])
+                assert os.sep not in header[keyword]
 
     def test_everything_named_is_there_to_be_found(self, tree, tmp_path):
         stage = str(tmp_path / "stage")
@@ -206,12 +206,79 @@ class TestStageInputs:
         background = [n for n in os.listdir(stage) if n.endswith("_bk.pha")][0]
         assert os.path.islink(os.path.join(stage, background))
 
-    def test_the_big_responses_are_never_brought_in(self, tree, tmp_path):
-        """An rmf is 68 MB. Nothing needs it here, so nothing links or copies it."""
+    def test_the_big_responses_are_linked_never_copied(self, tree, tmp_path):
+        """An rmf is 68 MB. It has to be reachable under a bare name, so it is linked --
+        which costs nothing, and which ``addspec`` resolves before making the working
+        copy it would have made anyway."""
         stage = str(tmp_path / "stage")
         combine.stage_inputs(self.spectra(tree), stage)
-        brought_in = [n for n in os.listdir(stage) if n.endswith((".rmf", ".arf"))]
-        assert brought_in == []
+        responses = [n for n in os.listdir(stage) if n.endswith((".rmf", ".arf"))]
+        assert responses
+        assert all(os.path.islink(os.path.join(stage, name)) for name in responses)
+
+    def test_nothing_addspec_reads_is_longer_than_its_buffer(self, tmp_path):
+        """The failure this replaced. Merging two observations spends the dataset name
+        twice -- once as the directory, once as the file -- which leaves one character
+        for the output root before ``DO_ADDSPEC``'s buffer overflows. Measured on
+        ``merged_80002092002_80002092004``, where a 94-character ``RESPFILE`` reached
+        ``cp`` as its first 80 characters and ``ftaddrmf`` then died on the copies that
+        were never made."""
+        name = "merged_" + "_".join(OBSIDS)
+        products = os.path.join(str(tmp_path), name, "products")
+        os.makedirs(products)
+        spectra = []
+        for fpm in "AB":
+            stem = f"{name}_{fpm}01"
+            path = os.path.join(products, stem + ".pha")
+            make_spectrum(
+                path,
+                stem,
+                backfile=stem + ".bak",
+                respfile=stem + ".rsp",
+                ancrfile="none",
+            )
+            for suffix in (".bak", ".rsp"):
+                with open(os.path.join(products, stem + suffix), "w") as fobj:
+                    fobj.write(stem + suffix)
+            spectra.append(path)
+
+        stage = os.path.join(products, "_inputs_comb01")
+        assert len(os.path.join(products, name + "_A01.rsp")) > coadd.ADDSPEC_NAME_LIMIT
+
+        staged = combine.stage_inputs(spectra, stage)
+        for basename in staged:
+            with fits.open(os.path.join(stage, basename)) as hdul:
+                header = hdul["SPECTRUM"].header
+                for keyword in ("BACKFILE", "RESPFILE", "ANCRFILE"):
+                    value = str(header[keyword])
+                    if value.lower() == "none":
+                        continue
+                    assert len(value) <= coadd.ADDSPEC_NAME_LIMIT
+                    # Short is only useful if it still points at the right file.
+                    assert os.path.exists(os.path.join(stage, value))
+
+    def test_one_bare_name_for_two_different_files_is_refused(self, tree, tmp_path):
+        """Bare names are only safe while they stay unique. Two observations' responses
+        collide only if something has gone wrong upstream -- NuSTAR names carry the
+        OBSID -- and co-adding one spectrum against another's response would be a wrong
+        answer delivered quietly."""
+        first = self.spectra(tree)[0]
+        with fits.open(first) as hdul:
+            shared = hdul["SPECTRUM"].header["RESPFILE"]
+
+        # A different spectrum, in a different directory, naming a different file under
+        # the name the first one's response already occupies.
+        elsewhere = str(tmp_path / "elsewhere")
+        os.makedirs(elsewhere)
+        impostor = os.path.join(elsewhere, "nu99999999999A01_sr.pha")
+        make_spectrum(impostor, "nu99999999999A01", respfile=shared, ancrfile="none")
+        for name in ("nu99999999999A01_bk.pha", shared):
+            with open(os.path.join(elsewhere, name), "w") as fobj:
+                fobj.write("a different file wearing the same name")
+
+        with pytest.raises(ValueError) as raised:
+            combine.stage_inputs([first, impostor], str(tmp_path / "stage"))
+        assert shared in str(raised.value)
 
     def test_spectra_from_two_observations_do_not_collide(self, tree, tmp_path):
         both = self.spectra(tree) + [path for _, path in combine.source_spectra(OBSIDS[1], tree)]
