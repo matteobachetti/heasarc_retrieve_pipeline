@@ -63,7 +63,7 @@ from astropy.io import fits
 from .combine import merge_spectra
 from .nustar import nu_base_output_path, nu_product_output_path
 from .segments import SEGMENT_RE, split_obsid
-from .utils import get_logger, gti_to_array, read_gti, rootname
+from .utils import get_logger, gti_to_array, read_gti, rootname, short_workspace
 
 __all__ = [
     "COUNTS_TOLERANCE",
@@ -556,17 +556,22 @@ def main(argv=None):
     out_data_path = os.path.abspath(args.out_data_path)
     workdir = args.workdir or os.path.join(os.path.dirname(out_data_path), "roundtrip")
 
-    result = check_roundtrip(
-        args.obsid,
-        {"out_data_path": out_data_path},
-        args.mjd,
-        workdir,
-        scale="utc" if args.utc else None,
-        with_mode06=args.with_mode06,
-        addspec=not args.no_addspec,
-    )
-    print(f"\nWorked in {result['config']['out_data_path']}")
-    return _report(result)
+    # The copy is where every HEASOFT call in the check happens, so it is the name that
+    # has to be short -- not the real tree, which is only read from. Same reason as
+    # heasarc_retrieve_pipeline.utils.short_workspace gives for the reduction flow; this
+    # is what the --workdir help means by "keep it short".
+    with short_workspace(workdir) as workspace:
+        result = check_roundtrip(
+            args.obsid,
+            {"out_data_path": out_data_path},
+            args.mjd,
+            workspace.data,
+            scale="utc" if args.utc else None,
+            with_mode06=args.with_mode06,
+            addspec=not args.no_addspec,
+        )
+        print(f"\nWorked in {workdir}")
+        return _report(result)
 
 
 if __name__ == "__main__":  # pragma: no cover

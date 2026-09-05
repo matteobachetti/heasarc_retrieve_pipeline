@@ -2021,6 +2021,16 @@ step (``ftmerge``, ``ftmgtime``, ``ftsort``, ``fappend``) both succeeded, and th
 per-CHU event files came out with the same event counts and the same exposure, to the
 microsecond, as a reduction of the same observation through the real path.
 
+The three post-processing entry points take the same link. ``hrp-merge-obsids``,
+``hrp-split-obsid`` and ``hrp-check-roundtrip`` are run by hand against a finished tree,
+so they build their own configuration rather than inheriting the flow's, and until they
+were wrapped they ran against the real path however long it was. ``hrp-check-roundtrip``
+shortens the *copy* it works in rather than the tree it reads from -- every HEASOFT call
+in the check happens inside the copy, and the read side is the one measured good to 247
+characters. This is insurance against the 128-character limit only; it does nothing for
+``addspec``'s 80-character ``RESPFILE`` buffer, which is why the staging above makes bare
+names instead.
+
 The workspace also has to survive being where the temporary directory is long.
 ``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is 48 characters under
 ``/var/folders``; ``short_workspace`` therefore takes the shortest writable choice among

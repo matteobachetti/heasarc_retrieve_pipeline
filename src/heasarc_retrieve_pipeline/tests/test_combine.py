@@ -550,6 +550,25 @@ class TestCommandLine:
         assert status == 0
         assert "vela" in capsys.readouterr().out
 
+    def test_the_merge_is_given_a_short_name_for_the_tree(self, tmp_path, monkeypatch):
+        """Merging spends the dataset name twice, so it starts closer to HEASOFT's file
+        name limit than anything else in the package. See utils.short_workspace."""
+        seen = {}
+
+        def fake_merge(obsids, config, **kwargs):
+            # Resolved here, not in the assertion: short_workspace removes the link on
+            # the way out, and realpath of a name that is gone is the name itself.
+            seen.update(config, real=os.path.realpath(config["out_data_path"]))
+            return {"name": "x", "spectra": {}, "event_files": []}
+
+        monkeypatch.setattr(combine, "merge_obsids", fake_merge)
+        deep = tmp_path / ("d" * 60) / "out"
+        combine.main([str(deep)] + OBSIDS)
+
+        assert len(seen["out_data_path"]) < len(str(deep))
+        # Shorter, but the same directory: the work has to land in the real tree.
+        assert seen["real"] == os.path.realpath(deep)
+
 
 class TestMergingAnExplicitListOfSpectra:
     """Co-adding files named by the caller rather than found by globbing.

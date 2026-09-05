@@ -86,6 +86,7 @@ from .utils import (
     record_skipped_input,
     rootname,
     segment_bounds,
+    short_workspace,
     splitext_improved,
     time_system,
     tool_log_file,
@@ -776,15 +777,19 @@ def main(argv=None):
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    config = {"out_data_path": os.path.abspath(args.data_dir)}
-    result = split_obsid(
-        args.obsid,
-        config,
-        args.mjd,
-        scale="utc" if args.utc else None,
-        spectra=not args.no_spectra,
-        events=not args.no_events,
-    )
+    # The same short name for the tree that the reduction flow gives its workers: some
+    # HEASOFT builds truncate file names at 128 characters without saying so, and this is
+    # post-processing on a tree whose own name is already spent. The bytes never move.
+    # See heasarc_retrieve_pipeline.utils.short_workspace.
+    with short_workspace(os.path.abspath(args.data_dir)) as workspace:
+        result = split_obsid(
+            args.obsid,
+            {"out_data_path": workspace.data},
+            args.mjd,
+            scale="utc" if args.utc else None,
+            spectra=not args.no_spectra,
+            events=not args.no_events,
+        )
     print(
         f"{len(result['bounds'])} segment(s): "
         f"{len(result['spectra'])} spectra, {len(result['event_files'])} event file(s)"
