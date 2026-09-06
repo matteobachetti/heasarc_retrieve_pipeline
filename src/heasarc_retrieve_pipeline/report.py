@@ -41,7 +41,7 @@ from .diagnostics import (
     read_manifest,
     read_records,
 )
-from .utils import get_logger, read_skipped_inputs
+from .utils import get_logger, log_version, read_skipped_inputs
 
 
 PLOTLY_BUNDLE = "plotly.min.js"
@@ -1315,6 +1315,11 @@ def main(argv=None):
         print(__doc__.strip().splitlines()[0])
         print("usage: hrp-report <output directory>")
         return 2
+
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
     outdir = os.path.abspath(argv[0])
     obsids = observation_directories(outdir)

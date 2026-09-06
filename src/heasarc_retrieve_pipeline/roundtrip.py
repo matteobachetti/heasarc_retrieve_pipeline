@@ -63,7 +63,7 @@ from astropy.io import fits
 from .combine import merge_spectra
 from .nustar import nu_base_output_path, nu_product_output_path
 from .segments import SEGMENT_RE, split_obsid
-from .utils import get_logger, gti_to_array, read_gti, rootname, short_workspace
+from .utils import get_logger, gti_to_array, log_version, read_gti, rootname, short_workspace
 
 __all__ = [
     "COUNTS_TOLERANCE",
@@ -552,6 +552,7 @@ def main(argv=None):
     import logging
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
     out_data_path = os.path.abspath(args.out_data_path)
     workdir = args.workdir or os.path.join(os.path.dirname(out_data_path), "roundtrip")

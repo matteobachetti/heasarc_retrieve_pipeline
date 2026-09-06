@@ -90,7 +90,7 @@ from .nustar import (
     nu_base_output_path,
     nu_product_output_path,
 )
-from .utils import get_logger, short_workspace
+from .utils import get_logger, log_version, short_workspace
 
 __all__ = [
     "GROUPING_COMMAND",
@@ -508,6 +508,7 @@ def main(argv=None):
     import logging
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
     # The same short name for the tree that the reduction flow gives its workers: some
     # HEASOFT builds truncate file names at 128 characters without saying so, and this is

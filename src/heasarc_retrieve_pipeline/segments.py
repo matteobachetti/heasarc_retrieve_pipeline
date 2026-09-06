@@ -80,6 +80,7 @@ from .utils import (
     gti_extension_index,
     gti_to_array,
     intersect_intervals,
+    log_version,
     met_from_mjd,
     mjd_from_met,
     read_gti,
@@ -776,6 +777,7 @@ def main(argv=None):
     import logging
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
     # The same short name for the tree that the reduction flow gives its workers: some
     # HEASOFT builds truncate file names at 128 characters without saying so, and this is

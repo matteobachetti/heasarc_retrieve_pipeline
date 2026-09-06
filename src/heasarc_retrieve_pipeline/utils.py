@@ -13,6 +13,8 @@ from collections import namedtuple
 import numpy as np
 from prefect import get_run_logger
 
+from ._version import version as __version__
+
 __all__ = [
     "NoGoesCoverage",
     "NoSourceInScienceData",
@@ -28,6 +30,7 @@ __all__ = [
     "intersect_intervals",
     "intervals_above_threshold",
     "intervals_removed",
+    "log_version",
     "merge_intervals",
     "mask_from_gti",
     "met_from_mjd",
@@ -122,6 +125,19 @@ def get_logger():
         return get_run_logger()
     except Exception:
         return logging.getLogger("heasarc_retrieve_pipeline")
+
+
+def log_version():
+    """
+    Log the installed package version at info level.
+
+    Every ``hrp-*`` script calls this right after it configures logging, so a run's log
+    always says which version produced it. Logging it eagerly at import time instead does
+    not work: a logger with no level of its own defaults to the root logger's, which is
+    ``WARNING`` until something calls ``logging.basicConfig``, so an info-level record
+    emitted before that point is dropped at the source, not merely unhandled.
+    """
+    get_logger().info("heasarc_retrieve_pipeline version %s", __version__)
 
 
 def absolute_config(config, default):
