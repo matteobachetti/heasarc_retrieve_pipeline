@@ -15,7 +15,7 @@ dependencies = [
   "numpy",
   "astroquery",
   "pyvo",
-  "prefect",
+  "prefect>3",
   "pysmartdl",
   "beautifulsoup4",
   "pyyaml",
