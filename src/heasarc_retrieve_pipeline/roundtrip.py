@@ -551,7 +551,7 @@ def main(argv=None):
 
     import logging
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
     out_data_path = os.path.abspath(args.out_data_path)
     workdir = args.workdir or os.path.join(os.path.dirname(out_data_path), "roundtrip")

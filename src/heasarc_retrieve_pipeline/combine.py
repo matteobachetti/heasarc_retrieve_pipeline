@@ -507,7 +507,7 @@ def main(argv=None):
 
     import logging
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
 
     # The same short name for the tree that the reduction flow gives its workers: some
     # HEASOFT builds truncate file names at 128 characters without saying so, and this is
