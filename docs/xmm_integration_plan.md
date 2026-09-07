@@ -1057,6 +1057,81 @@ Shapiro terms astropy's geometric light-travel time does not include, and a cons
 offset shifts no pulse profile. The agreement in the *time-dependent* part, which is the
 only part a period search can see, is 0.3 ms in 27 ks.
 
+## What changed while implementing step 10
+
+> **Not yet verified against a real SAS run.** Everything below is written and tested
+> offline, 21 tests over the four new pieces, and `epproc` has not been run once. Step 10
+> is the only part of this integration in that state; steps 1–9 and 11–12 were each checked
+> on real data before being called done. Treat the ODF route as untested until an
+> observation has been through it.
+
+**The ODF route reads header keywords where the PPS route parses names.** PPS product
+names are a published archive convention and parsing them is safe. `epproc` and `emproc`
+name their outputs themselves and have changed those names between SAS releases, so
+`xmm_exposures_from_odf` globs `*Evts.ds` and takes the identity from `INSTRUME`,
+`EXPIDSTR` and `DATAMODE` — keywords SAS writes from the same code whichever route made
+the file, confirmed against the PPS event lists of `0870940101`. A release that renames
+its outputs then costs nothing. One of the tests asserts this directly: a file named
+`..._EMOS1_S004_TimingEvts.ds` whose header says pn imaging comes back as pn imaging.
+
+**The two tasks are run separately and one failing does not stop the other.** An
+observation with no pn is ordinary and a MOS-only reduction is worth having. What *is* an
+error is both tasks failing. What is **not** an error is both running cleanly and producing
+nothing: that is an observation with no EPIC science in it, which the PPS route reports as
+`NO_SCIENCE_DATA`, and the two routes have to agree on what an empty observation is. The
+first draft raised on "no event list" regardless and would have turned four of the twenty
+M82 pointings into failures.
+
+**The flare threshold had to learn about the route.** The ODF has no `FBKTSR`, so
+`xmm_odf_flare_lightcurve` builds the curve with `evselect` over the high-energy full
+field — and *that* is the curve the SAS cookbook's 0.4 and 0.35 counts/s were measured on.
+`xmm_flare_threshold` now falls back to `odf_flare_rate_limit` when the route is `odf` and
+nothing was set explicitly. On the PPS route it deliberately does not: those numbers
+against an `FBKTSR` would throw away whole exposures, which is the measurement recorded
+under step 6.
+
+**A timing exposure shares its own exposure's imaging curve**, exactly as on the PPS route
+and for the same reason — a flare illuminates the whole detector. One `evselect` per
+imaging exposure, not one per mode.
+
+**The ordering is forced, and differs from the PPS route.** `cifbuild` has to run before
+`odfingest` and `epproc`, but there is no event list yet to take `DATE-OBS` from. It comes
+from the ODF housekeeping instead, which on `0870940101` reads 2021-04-06 against the
+science exposure's 2021-04-07 — the housekeeping starts before the cameras do. A day is
+immaterial to a CCF validity period and the earlier of the two is the conservative choice.
+
+**The staging was already written.** Step 11 needed the same `.FIT`/`.ASC` staging and the
+same `odfingest` call for barycentring, so step 10 reuses `xmm_stage_odf` and
+`xmm_odf_summary` rather than writing its own — and inherits the `.FTZ` finding with them.
+
+**The flow now dispatches between two front ends.** `xmm_pps_front_end` and
+`xmm_odf_front_end` each return `(exposures, env, summary)`; everything after them is
+shared, which is what the plan's "two front ends, one back end" was for. The calibration
+index is read back out of `env["SAS_CCF"]` for the diagnostics record rather than passed
+alongside it, so the recorded index cannot drift from the one the tasks actually used.
+
+### What step 10 still needs
+
+One ODF-route run on a real observation, checking that: `epproc` and `emproc` produce event
+lists this code recognises; `DATE-OBS` from the housekeeping satisfies `cifbuild`; the
+`evselect` curve is on the scale `odf_flare_rate_limit` expects; and the back end reduces
+those event lists as it does PPS ones. `0870940101` is the natural candidate, its ODF being
+already characterised.
+
+## What changed while implementing step 13
+
+Docs only. `docs/technical_details.rst` gained an **XMM-Newton / EPIC** section covering
+both routes and the table of how they differ, the built calibration index, the flare
+threshold measurement, the extraction-window check and its two load-bearing details, the
+pile-up policy, the spectra, and the barycentring with its two traps. `docs/api.rst` gained
+`xmm` and `sas`; `xmm` is listed **without** `:undoc-members:`, because the dataclass
+fields are documented in the classes' `Attributes:` sections and autodoc otherwise
+describes them twice, which `sphinx-build -W` counts as 27 errors. The README now names
+XMM as the second most complete mission and says plainly that SAS is an environment
+requirement rather than a dependency. The science caveats went into
+`docs/known_issues.rst` as caveats rather than numbered bugs — including the M82 X-1 blend,
+which is a property of the sky and not of this code.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):
