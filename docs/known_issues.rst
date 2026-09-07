@@ -1534,6 +1534,24 @@ reading the outputs, and they are described in more detail in :ref:`technical_de
 * **The default cone-search radius is 0.1 degrees**, i.e. 6 arcmin on the *pointing*
   position. NuSTAR's field of view is 12x12 arcmin, so serendipitous coverage of a target
   by an observation pointed elsewhere in the field will be missed at the default radius.
+* **XMM's EPIC spectra are not co-added across cameras, deliberately.** pn, MOS1 and MOS2
+  are different detectors with different responses, so ``addspec``'s case B does not apply
+  and ``coadd.apply_case_b_scaling`` would be wrong on them. An observation therefore
+  yields one spectrum per camera, per exposure and per mode, each with its own ARF and
+  RMF, and they are meant to be fitted jointly. SAS's ``epicspeccombine`` is the right tool
+  if a single file is ever wanted; it is not run here.
+* **XMM's EPIC background is an annulus around the source**, as NuSTAR's is, with the same
+  caveat and one of its own: on pn the annulus can cross chip gaps and it collects the
+  out-of-time events that the read-out smears along a column. In timing mode the
+  "background" is a strip of detector columns some way from the source, which on a bright
+  target still contains source photons from the wings of the point spread function.
+* **XMM MOS Timing exposures get no spectrum.** Only pn has a ``RAWX`` extraction strip
+  worth trusting by default, so a MOS timing exposure is cleaned, warned about and left
+  there. Setting ``timing_src_rawx`` and ``timing_bkg_rawx`` for that camera extracts it.
+* **XMM pile-up is measured and never corrected.** ``epatplot`` writes the
+  observed-to-model pattern ratios onto the page; excluding the core of the point spread
+  function to remove pile-up changes which photons the science is done with, and is left
+  to the reader.
 
 Testing and infrastructure
 --------------------------

@@ -1,10 +1,10 @@
 # Adding XMM-Newton (EPIC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-07 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `bc12c41`). **Commits 1–8 of the sequence below have landed**
+> `various_fixes` (HEAD `bc12c41`). **Commits 1–9 of the sequence below have landed**
 > (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`, `1e0db70`,
-> step 7 and step 8, 2026-09-07); the rest is still the agreed design, not a report on work
-> done. It is
+> step 7, step 8 and step 9, 2026-09-07); the rest is still the agreed design, not a
+> report on work done. It is
 > written to be picked up cold, by a person or a session with no memory of the
 > conversation that produced it. Every number in
 > it was measured against the live HEASARC archive on that date; the snippets under
@@ -343,7 +343,9 @@ Report the offset, do not act on it.
 you fit. Step `"calculate_spectra"` — title already exists.
 
 *`especget`'s output names are version-dependent; pin them by running it once and record
-them as a module constant, as `NUPRODUCTS_SPECTRA` (`nustar.py:2458`) does.*
+them as a module constant, as `NUPRODUCTS_SPECTRA` (`nustar.py:2458`) does.* — **not what
+was done.** `withfilestem=no` names all four outputs outright, which makes the version
+irrelevant instead of pinned. See *What changed while implementing step 9*.
 
 `SAS_CCF` comes from the PPS `CALIND`, which is the CIF the SOC used. If a constituent it
 names is missing from the local `SAS_CCFPATH`, the fallback costs nothing and needs no ODF:
@@ -464,7 +466,9 @@ One commit each, tests first in every case.
    **Done, in four commits** — `b0b1a79` the mode-aware screening, `73b719c` the `RAWX`
    strips, `59d8bf0` the pile-up check, `e31cd3e` the plot name the real run corrected.
    Verified end to end against Her X-1; see below.
-9. `especget` spectra and grouping.
+9. ~~`especget` spectra and grouping.~~ **Done, in two commits** — `c589274` the
+   extraction, `8347a31` the working directory the real run forced. Verified end to end,
+   including a load in XSPEC; see below.
 10. ODF front end — staging, `cifbuild`, `odfingest`, `epproc`, `emproc`.
 11. Barycentring, once one of the three candidates is verified.
 12. `MISSION_CONFIG` entry, report titles and subdirectories.
@@ -766,6 +770,71 @@ their mirror.
 and `has_sas` is still right not to probe for it — but a machine whose `PYTHONPATH` loses
 `$SAS_DIR/lib/python` will run every other task and fail this one.
 
+## What changed while implementing step 9
+
+**The output names are dictated, not pinned.** The plan said to run `especget` once and
+record its `filestem` convention as a constant. There is a better answer in its own
+parameters: `withfilestem=no` with `srcspecset`, `bckspecset`, `srcarfset` and `srcrmfset`
+names every output outright, so no convention has to be trusted at all. After `epatplot`'s
+`.ps` that is really a `.pdf`, taking a name from a task rather than giving it one is a
+habit worth avoiding.
+
+**The tasks run in the products directory, and this is a bug fix rather than a tidy-up.**
+`especget` writes the names it is *given* into the spectrum's `BACKFILE`, `RESPFILE` and
+`ANCRFILE`, and a FITS header card holds 80 characters. The first real run wrote 140-character
+absolute paths into all three — the same trap that truncated file names in an `addspec`
+merge. `sas.run` gained a `cwd` argument; the two tasks are handed bare file names and run
+where those names belong. The keywords now read `mos2S005_imaging_bkg.pi`, which is also
+what a fitting program looks for beside the spectrum, and what survives the tree being
+moved.
+
+**The position asked for is handed to `arfgen` explicitly**, with `withsourcepos=yes
+sourcecoords=eqpos`. Left alone `arfgen` takes the source position from the centre of the
+extraction region — right for a circle on the sky, meaningless for a strip of columns,
+where in timing mode it would otherwise fall back on the `SRCPOS` keyword or on
+`RAWY=190`. The vignetting and encircled-energy corrections depend on that position.
+
+**The recorded spectrum takes its energy scale from its own response.** NuSTAR's
+`read_spectrum` converts channel to energy with `E = 0.04 * PI + 1.6`, that mission's own
+linear relation. XMM needs no such constant: `read_xmm_spectrum` reads the `EBOUNDS`
+extension of the RMF `especget` has just made, which is exact and survives a change of
+spectral binning. Verified on real data — 4096 channels over 0–20.48 keV on pn, 2400 over
+0–12 keV on MOS.
+
+### Verified against a real SAS run
+
+Her X-1 `0153950401` again, through `xmm_calculate_spectra`:
+
+| exposure | wall clock | source spectrum | energies |
+|---|---|---|---|
+| pn `S003` timing | **524 s** | 131 568 counts in 3814 s, `BACKSCAL` ratio 5.17 | 0.003–20.477 keV |
+| MOS2 `S005` imaging | **77 s** | 14 893 counts in 5105 s | 0.002–11.997 keV |
+| MOS1 `S004` timing | 0 s | skipped, no strip | — |
+
+The `BACKSCAL` ratio is worth a second look: 20 274 248 to 3 923 520 is 5.17, against the
+5.00 the strips imply (15 columns of source to 3 of background). The difference is the bad
+columns `arfgen` corrects for, which is the whole reason `BACKSCAL` is computed rather
+than assumed.
+
+**A pn Timing extraction is seven times slower than a MOS imaging one** — 524 s against
+77 s, nearly all of it `arfgen`, since `rmfgen` finished in about a minute. Worth knowing
+before a run over many observations: the slow camera is the one bright-source science
+wants.
+
+**The acceptance test in *Verification* below passes.** The grouped spectrum loads in
+XSPEC and brings the other three with it:
+
+```
+Spectrum 1  Spectral Data File: mos2S005_imaging_grp.pi
+Net count rate (cts/s) for Spectrum:1  2.730e+00 +/- 2.382e-02 (95.0 % total)
+  Telescope: XMM Instrument: EMOS2  Channel Type: PI
+ Using Background File                mos2S005_imaging_bkg.pi
+ Using Response (RMF) File            mos2S005_imaging.rmf for Source 1
+ Using Auxiliary Response (ARF) File  mos2S005_imaging.arf
+```
+
+594 groups from 2400 channels at `mincounts=25`, `oversample=3`; 1374 from 4096 on pn.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):
@@ -965,7 +1034,8 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
 ## Open items, to settle on the first run with SAS
 
 * Barycentring — which of the three candidates in step 8 works.
-* `especget`'s output file names, pinned as a constant.
+* ~~`especget`'s output file names, pinned as a constant.~~ **Settled** — dictated with
+  `withfilestem=no` rather than pinned, so there is nothing left to pin.
 * ~~**`ecoordconv` against a real observation.**~~ **Settled** — run on Her X-1's MOS1 and
   MOS2 event lists, 24332.842, 24621.217 on both; see *What changed while implementing
   step 8*. The mirror never did reach `XMM_BORESIGHT_0029.CCF`, because ESA's current
@@ -975,7 +1045,10 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
   and the direct consequence of the item above: an archival observation's own index can
   name calibration issues a current mirror does not hold. The fallback is verified to
   work; whether the pipeline should reach for it unasked is Matteo's call.
-* Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.
+* ~~Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.~~
+  **Settled** — neither was given `SAS_ODF` and both produced a valid ARF and RMF on Her
+  X-1, in imaging and in timing. `useodfatt=yes` exists for the rare case where the
+  attitude in the spectrum header is not enough; it was not needed here.
 * The `.FIT.gz` → `.FTZ` staging rule on the ODF route.
 * ~~Default flare-rate thresholds.~~ **Settled** — PPS's own `FLCUTTHR`, see above.
 * The pn Timing `RAWX` defaults — `[31:45]` source, `[3:5]` background are the cookbook's
