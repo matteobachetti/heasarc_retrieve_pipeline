@@ -2819,3 +2819,118 @@ class TestBarycentringAnExposure:
 
         assert rec.values["barycentered"] is True
         assert rec.values["barycentered_file"] == "pnS003_imaging_cl_bary.evt"
+
+
+def an_odf_event_list(
+    path, instrument="EPN", expid="S003", datamode="IMAGING", submode="PrimeFullWindow"
+):
+    """
+    An ``epproc``/``emproc`` output, carrying the header keywords SAS writes on one.
+
+    The name is deliberately not one the code may parse: the point of reading headers is
+    that the name is SAS's business and has changed between releases.
+    """
+    path = str(path)
+    an_event_file(
+        path,
+        INSTRUME=instrument,
+        EXPIDSTR=expid,
+        DATAMODE=datamode,
+        SUBMODE=submode,
+    )
+    return path
+
+
+class TestWhatTheOdfPipelineProduced:
+    """
+    ``xmm_exposures_from_odf``: identity from header keywords, not from file names.
+    """
+
+    def events_dir(self, tmp_path):
+        config = dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+        directory = xmm.xmm_odf_events_path("0153950401", config)
+        os.makedirs(directory, exist_ok=True)
+        return config, directory
+
+    def test_the_camera_exposure_and_mode_come_from_the_header(self, tmp_path):
+        config, directory = self.events_dir(tmp_path)
+        an_odf_event_list(
+            os.path.join(directory, "whatever_SAS_calls_it_ImagingEvts.ds"),
+            instrument="EMOS2",
+            expid="S018",
+            datamode="IMAGING",
+            submode="PrimePartialW3",
+        )
+
+        (exposure,) = xmm.xmm_exposures_from_odf("0153950401", config)
+
+        assert exposure.instrument == "mos2"
+        assert exposure.expid == "S018"
+        assert exposure.mode == xmm.IMAGING
+        assert exposure.submode == "PrimePartialW3"
+
+    def test_the_file_name_is_never_parsed(self, tmp_path):
+        # A name that says MOS1 timing while the header says pn imaging. The header wins,
+        # which is the whole reason this route does not parse names.
+        config, directory = self.events_dir(tmp_path)
+        an_odf_event_list(
+            os.path.join(directory, "0405_0153950401_EMOS1_S004_TimingEvts.ds"),
+            instrument="EPN",
+            expid="U002",
+            datamode="IMAGING",
+        )
+
+        (exposure,) = xmm.xmm_exposures_from_odf("0153950401", config)
+
+        assert (exposure.instrument, exposure.expid, exposure.mode) == ("pn", "U002", xmm.IMAGING)
+
+    def test_the_cameras_come_back_in_the_order_the_pps_route_uses(self, tmp_path):
+        config, directory = self.events_dir(tmp_path)
+        for name, instrument in (("c.ds", "EMOS2"), ("a.ds", "EPN"), ("b.ds", "EMOS1")):
+            an_odf_event_list(
+                os.path.join(directory, name.replace(".ds", "Evts.ds")), instrument=instrument
+            )
+
+        exposures = xmm.xmm_exposures_from_odf("0153950401", config)
+
+        assert [e.instrument for e in exposures] == ["pn", "mos1", "mos2"]
+
+    def test_imaging_precedes_timing_within_one_exposure(self, tmp_path):
+        config, directory = self.events_dir(tmp_path)
+        an_odf_event_list(os.path.join(directory, "tEvts.ds"), expid="S004", datamode="TIMING")
+        an_odf_event_list(os.path.join(directory, "iEvts.ds"), expid="S004", datamode="IMAGING")
+
+        modes = [e.mode for e in xmm.xmm_exposures_from_odf("0153950401", config)]
+
+        assert modes == [xmm.IMAGING, xmm.TIMING]
+
+    def test_the_rgs_and_the_optical_monitor_are_not_epic(self, tmp_path):
+        config, directory = self.events_dir(tmp_path)
+        an_odf_event_list(os.path.join(directory, "rgsEvts.ds"), instrument="RGS1")
+        an_odf_event_list(os.path.join(directory, "omEvts.ds"), instrument="OM")
+
+        assert xmm.xmm_exposures_from_odf("0153950401", config) == []
+
+    def test_an_observation_the_pipeline_produced_nothing_for_is_empty(self, tmp_path):
+        config, _ = self.events_dir(tmp_path)
+
+        assert xmm.xmm_exposures_from_odf("0153950401", config) == []
+
+    def test_there_is_no_flare_curve_because_the_odf_has_none(self, tmp_path):
+        config, directory = self.events_dir(tmp_path)
+        an_odf_event_list(os.path.join(directory, "aEvts.ds"))
+
+        (exposure,) = xmm.xmm_exposures_from_odf("0153950401", config)
+
+        assert exposure.flare_lightcurve is None
+
+    def test_an_unreadable_file_is_skipped_with_a_warning(self, tmp_path, caplog):
+        config, directory = self.events_dir(tmp_path)
+        open(os.path.join(directory, "brokenEvts.ds"), "w").write("not FITS\n")
+        an_odf_event_list(os.path.join(directory, "goodEvts.ds"))
+
+        with caplog.at_level("WARNING"):
+            exposures = xmm.xmm_exposures_from_odf("0153950401", config)
+
+        assert len(exposures) == 1
+        assert "brokenEvts.ds" in caplog.text

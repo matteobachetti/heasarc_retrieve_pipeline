@@ -143,6 +143,24 @@ BARYCENTRED_TIMESYS = "TDB"
 #: And what the reference position becomes.
 BARYCENTRED_TIMEREF = "SOLARSYSTEM"
 
+#: What ``epproc`` and ``emproc`` leave behind. Their file names are not parsed: SAS has
+#: changed them between releases, and every event list carries the same identity in its
+#: header anyway -- see :func:`xmm_exposures_from_odf`.
+ODF_EVENT_LIST_GLOB = "*Evts.ds"
+
+#: SAS's own instrument names, to the camera names this module reasons in. Written by the
+#: same code path in a PPS product and in an ``epproc`` one, which is what makes reading
+#: them safer than parsing either route's file names.
+SAS_INSTRUMENTS = {"EPN": "pn", "EMOS1": "mos1", "EMOS2": "mos2"}
+
+#: ``DATAMODE``, to :data:`IMAGING` and :data:`TIMING`.
+SAS_DATA_MODES = {"IMAGING": IMAGING, "TIMING": TIMING}
+
+#: Header keywords naming an event list's camera, exposure and mode.
+INSTRUMENT_KEYWORD = "INSTRUME"
+EXPOSURE_ID_KEYWORD = "EXPIDSTR"
+DATA_MODE_KEYWORD = "DATAMODE"
+
 #: Suffix of the summary file ``odfingest`` writes and ``barycen`` reads through
 #: ``SAS_ODF``. The one the archive ships is ``SUM.ASC``, which is a different file in a
 #: different format: ``barycen`` rejects it by name.
@@ -2687,6 +2705,118 @@ def _time_system(event_list):
             if "TIMESYS" in hdu.header:
                 return hdu.header.get("TIMESYS"), hdu.header.get("TIMEREF")
     return None, None
+
+
+def _event_list_identity(event_list):
+    """
+    ``(instrument, expid, mode, submode)`` read from an event list's header.
+
+    Returns ``None`` for a file that names a camera this pipeline does not reduce -- the
+    RGS spectrometers and the Optical Monitor -- or a mode it does not know.
+
+    Parameters
+    ----------
+    event_list : str
+        Event file to read.
+
+    Returns
+    -------
+    tuple or None
+    """
+    from astropy.io import fits
+
+    with fits.open(event_list) as hdul:
+        for hdu in hdul:
+            header = hdu.header
+            if INSTRUMENT_KEYWORD not in header or DATA_MODE_KEYWORD not in header:
+                continue
+            instrument = SAS_INSTRUMENTS.get(str(header[INSTRUMENT_KEYWORD]).strip())
+            mode = SAS_DATA_MODES.get(str(header[DATA_MODE_KEYWORD]).strip().upper())
+            if instrument is None or mode is None:
+                continue
+            return (
+                instrument,
+                str(header.get(EXPOSURE_ID_KEYWORD, "")).strip(),
+                mode,
+                read_submode(event_list),
+            )
+    return None
+
+
+def xmm_exposures_from_odf(obsid, config):
+    """
+    What an observation holds, read from the event lists ``epproc`` and ``emproc`` made.
+
+    The ODF route's twin of :func:`xmm_exposures_from_pps`, and deliberately *not* its
+    mirror image. That one parses PPS file names, which are an archive product with a
+    published, stable convention. These names are SAS's own and have changed between
+    releases, so the identity is taken from the header keywords instead -- ``INSTRUME``,
+    ``EXPIDSTR``, ``DATAMODE`` -- which SAS writes from the same code whichever route made
+    the file. A release that renames its outputs then costs nothing here.
+
+    There is no flare light curve: the ODF has no ``FBKTSR``, and one is built per exposure
+    by :func:`xmm_odf_flare_lightcurve` once the exposures are known.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    list of Exposure
+        Ordered pn, MOS1, MOS2, then by exposure and mode, as the PPS route orders them.
+        Empty when the pipeline produced no EPIC event list at all.
+    """
+    found = []
+    for path in sorted(
+        glob.glob(os.path.join(xmm_odf_events_path(obsid, config), ODF_EVENT_LIST_GLOB))
+    ):
+        try:
+            identity = _event_list_identity(path)
+        except OSError:
+            get_logger().warning(f"{obsid}: could not read {os.path.basename(path)}, skipping it")
+            continue
+        if identity is not None:
+            found.append((identity, path))
+
+    cameras = list(SAS_INSTRUMENTS.values())
+    found.sort(key=lambda item: (cameras.index(item[0][0]), item[0][1], item[0][2] != IMAGING))
+
+    return [
+        Exposure(
+            instrument=instrument,
+            expid=expid,
+            mode=mode,
+            event_list=path,
+            flare_lightcurve=None,
+            submode=submode,
+        )
+        for (instrument, expid, mode, submode), path in found
+    ]
+
+
+def xmm_odf_events_path(obsid, config):
+    """
+    Where ``epproc`` and ``emproc`` write their event lists.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/odf_events``. Its own directory rather than
+        beside the cleaned lists: the tasks write several files per exposure and a glob
+        over ``event_cl`` would then have to tell them apart from our own outputs.
+    """
+    return os.path.join(xmm_pipeline_output_path(obsid, config), "odf_events")
 
 
 def xmm_staged_odf_path(obsid, config):
