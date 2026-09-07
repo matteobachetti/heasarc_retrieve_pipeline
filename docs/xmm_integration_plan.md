@@ -1151,12 +1151,14 @@ catalogue's mode strings.
 
 | Era | pn | MOS1 / MOS2 |
 |---|---|---|
-| Six **M82 X-2** pointings, 2021–22 — `0870940101`, `0870940401`, `0891060101`, `0891060401`, plus `0891060501` and `0891060601` | **`PrimeLargeWindow`** | **`PrimePartialW3`** |
-| Eight **M82** / **M82 X-1** pointings, 2001–2011 — `0112290201`, `0206080101`, `0560181301`, `0560590101/201/301`, `0657800101`, `0657801701`, `0657801901`, `0657802101`, `0657802301` | `PrimeFullWindow` | `PrimeFullWindow` |
+| Four **M82 X-2** pointings with EPIC data, 2021–22 — `0870940101`, `0870940401`, `0891060101`, `0891060401` | **`PrimeLargeWindow`** | **`PrimePartialW3`** |
+| Eleven **M82** / **M82 X-1** pointings, 2001–2011 — `0112290201`, `0206080101`, `0560181301`, `0560590101/201/301`, `0657800101`, `0657801701`, `0657801901`, `0657802101`, `0657802301` | `PrimeFullWindow` | `PrimeFullWindow` |
 | `0932391001` (GRB 231115A, 2023) | `PrimeFullWindow`, thin filter | same |
 
 Four of the twenty — `0112290401`, `0870940501`, `0891060501`, `0891060601` — carry no
-EPIC exposure time at all in `xmmmaster`. They are a free live test of the
+EPIC exposure time at all in `xmmmaster`, leaving **sixteen to reduce**. (An earlier
+version of this table listed `0891060501` and `0891060601` in the X-2 row as well; they
+have no EPIC data and belong only here. Re-queried 2026-09-08.) They are a free live test of the
 `NO_SCIENCE_DATA` path, which until now has only ever been exercised offline.
 
 Three things follow, and they simplify the acceptance targets rather than complicating
