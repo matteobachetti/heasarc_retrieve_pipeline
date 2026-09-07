@@ -103,6 +103,57 @@ class TestTheArgumentVector:
         assert calls[0].argv[1:] == ["timebinsize=10.0", "ccdnr=4"]
 
 
+class TestWhetherSasIsThere:
+    """
+    What ``has_sas`` may and may not ask.
+
+    The probe used to require that ``import pysas`` succeed. It does not any more, and
+    the reason is a real machine: SAS 22.1.0, every task on ``PATH``, and ESA's own pysas
+    unable to import because ``beautifultable`` -- a third-party table formatter this
+    package never touches -- was not installed in the environment. The pipeline called
+    that "no SAS" and refused to reduce anything. Since ``sas.run`` reaches the tasks
+    through :func:`subprocess.run` and never through pysas, whether pysas imports says
+    nothing about whether a task can be run.
+    """
+
+    def a_machine(self, monkeypatch, sas_dir=None, on_path=None):
+        monkeypatch.delenv("SAS_DIR", raising=False)
+        if sas_dir is not None:
+            monkeypatch.setenv("SAS_DIR", sas_dir)
+        monkeypatch.setattr(sas.shutil, "which", lambda name: on_path)
+
+    def test_an_initialised_sas_is_found(self, monkeypatch):
+        self.a_machine(monkeypatch, sas_dir="/opt/sas", on_path="/opt/sas/bin/evselect")
+
+        assert sas.has_sas() is True
+
+    def test_without_sas_dir_there_is_no_sas(self, monkeypatch):
+        self.a_machine(monkeypatch, sas_dir=None, on_path="/opt/sas/bin/evselect")
+
+        assert sas.has_sas() is False
+
+    def test_an_empty_sas_dir_is_no_sas_either(self, monkeypatch):
+        self.a_machine(monkeypatch, sas_dir="", on_path="/opt/sas/bin/evselect")
+
+        assert sas.has_sas() is False
+
+    def test_a_stale_sas_dir_with_no_task_on_path_is_not_sas(self, monkeypatch):
+        """The failure mode ``SAS_DIR`` alone cannot catch: a variable left over from
+        another shell, in a process ``setsas.sh`` never reached."""
+        self.a_machine(monkeypatch, sas_dir="/opt/sas", on_path=None)
+
+        assert sas.has_sas() is False
+
+    def test_it_is_evselect_that_is_looked_for(self, monkeypatch):
+        asked = []
+        monkeypatch.setenv("SAS_DIR", "/opt/sas")
+        monkeypatch.setattr(sas.shutil, "which", lambda name: asked.append(name) or "/x")
+
+        sas.has_sas()
+
+        assert asked == ["evselect"]
+
+
 class TestAFailedTaskIsNoticed:
     def test_a_non_zero_return_code_raises_naming_the_task(self, monkeypatch, tmp_path):
         a_sas_that_records_its_calls(monkeypatch, returncode=1, writes=[tmp_path / "out.fits"])
@@ -317,13 +368,37 @@ def test_produces_is_a_required_argument():
 MODULES = sorted(
     p
     for p in pathlib.Path(sas.__file__).parent.glob("*.py")
-    if p.name not in ("__init__.py", "_version.py", "sas.py")
+    if p.name not in ("__init__.py", "_version.py")
 )
 
 
+def imported_modules(source):
+    """
+    Top-level names every ``import`` in the source brings in.
+
+    Read from the syntax tree rather than by searching the text, so that prose about an
+    import -- of which there is a good deal in ``sas.py`` -- is not mistaken for one.
+    """
+    names = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    return names
+
+
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
-def test_only_one_module_imports_pysas(path):
-    assert "import pysas" not in path.read_text(), f"{path.name} imports pysas"
+def test_no_module_imports_pysas(path):
+    """
+    ESA's pysas is not a dependency of this package, not even an optional one.
+
+    It was imported once, as the probe for "is there a SAS installation here". It is a
+    poor probe -- see :class:`TestWhetherSasIsThere` -- and every other reason to reach
+    for it is answered in the module docstring of :mod:`heasarc_retrieve_pipeline.sas`.
+    An import that is used for nothing can still fail, and this one did.
+    """
+    assert "pysas" not in imported_modules(path.read_text()), f"{path.name} imports pysas"
 
 
 def sas_task_calls(source):

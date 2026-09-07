@@ -42,8 +42,8 @@ opinions about::
     #XMMEA_EP && (PATTERN<=4) && (PI in [200:12000]) && FLAG==0
 
 An argument vector has no such problem: the list goes to the task, one element per
-argument, and nothing in between reinterprets it. ``pysas`` is still imported, as the probe
-that says whether a SAS installation is present at all.
+argument, and nothing in between reinterprets it. ``pysas`` is therefore never imported
+here -- see :func:`has_sas` for why it is not even used as a probe.
 """
 
 import os
@@ -53,30 +53,30 @@ import threading
 
 from .utils import get_logger
 
-try:
-    import pysas  # noqa: F401
-
-    HAS_PYSAS = True
-except ImportError:
-    pysas = None
-    HAS_PYSAS = False
-
 
 def has_sas():
     """
     Whether a real SAS is available to call.
 
-    Three questions, because each of them has been the answer on somebody's machine:
-    ``pysas`` imports only from inside a SAS installation, ``SAS_DIR`` is what
-    ``setsas.sh`` sets and what the tasks read, and a task on ``PATH`` is the only proof
-    that the initialisation actually reached this process. A stale ``SAS_DIR`` left over
-    from another shell is a real failure mode.
+    Two questions, and each of them has been the answer on somebody's machine.
+    ``SAS_DIR`` is what ``setsas.sh`` sets and what the tasks read; a task on ``PATH`` is
+    the only proof that the initialisation actually reached *this* process, and a stale
+    ``SAS_DIR`` left over from another shell is a real failure mode.
+
+    A third question used to be asked -- whether ``import pysas`` succeeds -- and it was
+    the wrong one. ESA's pysas ships inside a SAS installation, so importing it does
+    prove one is there; but failing to import it proves nothing, because it pulls in
+    third-party packages this pipeline never touches. On the first machine this was tried
+    on, a complete SAS 22.1.0 with every task on ``PATH`` was reported as "no SAS"
+    because ``beautifultable`` was missing from the environment. Since :func:`run`
+    reaches the tasks through :func:`subprocess.run`, pysas is not on the path between
+    this package and a reduction, and it has no say in whether one can happen.
 
     Returns
     -------
     bool
     """
-    return HAS_PYSAS and bool(os.environ.get("SAS_DIR")) and shutil.which("evselect") is not None
+    return bool(os.environ.get("SAS_DIR")) and shutil.which("evselect") is not None
 
 
 #: Whether SAS can be called. Resolved once, at import, as ``heasoft.HAS_HEASOFT`` is.
