@@ -889,6 +889,78 @@ situation for anyone reanalysing archival data with current SAS, and the alterna
 superseded calibration Matteo has just ruled out. Both index files should be named in the
 report so the choice is visible.
 
+## What changed while implementing step 12
+
+**`process_xmm_obsid` builds the calibration index once per observation, not once per
+exposure.** The index depends only on `DATE-OBS`, which every exposure of an observation
+shares, and `cifbuild` costs 26 s. It is built after the exposures are listed and before
+the loop, and the SAS environment made from it is passed down to every task.
+
+**The submode is read from the event list, not from the master table.** `xmmmaster` carries
+`pn_mode`/`mos1_mode`/`mos2_mode`, but those name the *mode* (imaging, timing), not the
+*submode* (`PrimeFullWindow`, `PrimePartialW3`), and the submode is what says how much sky
+the camera actually covers. `xmm_with_submodes` reads the `SUBMODE` keyword from each event
+list and returns replaced `Exposure` records; an unreadable file leaves the submode `None`
+rather than failing the observation.
+
+**The window check measures the window rather than looking it up.** The plan proposed a
+table of submode to window size in arcseconds. A table would have to be maintained against
+SAS, and it cannot answer the question actually being asked, which is not "how big is a
+`PrimePartialW3` window" but "does the background annulus for *this* source at *this*
+position fall off the chip". `xmm_window_reach_arcsec` reads the events, picks the chip the
+source lands on, and measures how far the events reach from the source in each direction.
+This is a deviation from the plan Matteo endorsed and is flagged as one.
+
+**The window edge is a percentile, not a minimum and maximum.** Measured on `0870940101`:
+taking the extreme events put MOS1's `PrimePartialW3` chip at 8.80′ × 11.43′ when the
+window is 300 × 300 pixels ≈ 5.5′, and put pn at 102.5″ — comfortably past the 90″ the
+annulus needs — where the honest figure is 87.6″. A handful of stray events, some of them
+far outside the window, were setting the answer. Clipping 0.1% from each end fixes it, with
+a floor of two events so that a small test file is clipped at all. `BACKSCAL` confirms the
+robust figure independently: the pn background annulus measures 6.01 against a geometric
+6.75, an 11% deficit, which is a clipped annulus and not a full one.
+
+**The window check reads the cleaned events, and getting this wrong is easy.** The first
+implementation measured `exposure.event_list`, the archive's unscreened list. That list
+carries flagged events out to the chip edges: on `0870940101`'s pn it reads 96.06″ from
+576 146 events, against 87.61″ from the 401 788 that survive cleaning — on either side of
+the 90″ threshold, so the raw list silently passed an annulus that is in fact clipped. The
+extraction runs on the cleaned events, so the cleaned events define the window. Fixed in
+`ed85047`; the test now passes a non-existent path as the exposure's own `event_list`, so a
+regression fails loudly instead of measuring the wrong file.
+
+**Recorded spectra are keyed by exposure.** `calculate_spectra` originally recorded flat
+`energy`/`rate` arrays, so three cameras in one observation overwrote each other and the
+report drew nothing. The keys are now `spec_<stem>_<src|bkg>_<energy|rate|rate_err>`, and
+`report.spectrum_figure` reads the band from a recorded `energy_band` rather than assuming
+NuSTAR's 3–79 keV.
+
+**Two report bugs surfaced only because a real XMM run was rendered.** The page was drawing
+NuSTAR's three-panel solar-flare figure empty for XMM's single light curve, and omitting
+the Spectra section entirely — both silently, with nothing failing. `flare_figure` now
+dispatches to a single-band builder when the record holds `lc_time`. The page for
+`0870940101` went from 13 kB to 480 kB.
+
+### Acceptance target 1: a pn imaging run, met
+
+`0870940101` — M82, pn `PrimeLargeWindow`, MOS `PrimePartialW3` — end to end, PPS route:
+
+| exposure | submode | net rate (c/s) | source fraction | pile-up |
+|---|---|---|---|---|
+| pn `U002` imaging | `PrimeLargeWindow` | 4.316 ± 0.014 | 92.2% | none |
+| MOS1 `S017` imaging | `PrimePartialW3` | 1.444 ± 0.007 | 93.6% | none |
+| MOS2 `S018` imaging | `PrimePartialW3` | 1.389 ± 0.007 | 93.8% | none |
+
+All three grouped spectra load in XSPEC with background, ARF and RMF attached. The pn/MOS
+ratio of 3.0 is the effective-area ratio these cameras should show, which is the cheapest
+available check that the responses are not nonsense.
+
+The window check reports pn's annulus as **clipped** at 87.6″ against the 90″ needed, and
+warns. That is correct and is the `BACKSCAL` deficit above, not a false alarm: at
+`PrimeLargeWindow` with the default 90″ annulus the background region really does run off
+the chip. It costs background counts, which `BACKSCAL` accounts for; it is not silently
+wrong, and the warning is the point.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):
