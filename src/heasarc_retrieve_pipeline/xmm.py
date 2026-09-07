@@ -1696,6 +1696,18 @@ def xmm_source_event_list_path(obsid, exposure, config):
     )
 
 
+#: Extension of the diagram ``epatplot`` draws, measured rather than assumed.
+#:
+#: The task's ``device`` parameter still offers PGPLOT devices and still defaults to
+#: ``/VCPS``, which is PostScript, but SAS 22.1.0 draws the plot from Python instead and
+#: warns "Only format supported now is pdf". Asked for ``..._pat.ps`` it writes
+#: ``..._pat.pdf`` and reports success, so a caller checking for the name it asked for
+#: fails on a run that worked -- which is how this was found, on ``0153950401``. Pinned
+#: here as ``especget``'s output names are to be: measured against one SAS version, named,
+#: and easy to find when a version changes it.
+PILEUP_PLOT_EXTENSION = "pdf"
+
+
 def xmm_pileup_plot_path(obsid, exposure, config):
     """
     Where one exposure's ``epatplot`` diagram goes, beside the events it describes.
@@ -1703,10 +1715,13 @@ def xmm_pileup_plot_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_pat.ps``.
+        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_pat.pdf`` -- see
+        :data:`PILEUP_PLOT_EXTENSION` for why the extension is not the ``.ps`` the task's
+        own parameters suggest.
     """
     return os.path.join(
-        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_pat.ps"
+        xmm_pipeline_output_path(obsid, config),
+        f"{_exposure_stem(exposure)}_pat.{PILEUP_PLOT_EXTENSION}",
     )
 
 
@@ -1865,10 +1880,12 @@ def xmm_pileup_check(obsid, exposure, config, events, sky=None, rec=None, env=No
         log_to=log_to,
         env=env,
         set=source_events,
-        device="/VCPS",
         outdir=os.path.dirname(plot),
         useplotfile="yes",
         plotfile=os.path.basename(plot),
+        # The default, said out loud: it is what writes the ratios onto the event set,
+        # and reading them back is the whole point of the call.
+        modifyinset="yes",
     )
 
     ratios = read_pileup_ratios(source_events)

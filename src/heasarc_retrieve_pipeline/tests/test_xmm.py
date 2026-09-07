@@ -1549,6 +1549,8 @@ class StubSas:
                     an_event_file(str(output))
                 else:
                     open(str(output), "w").write("stub\n")
+        if name == "epatplot":
+            assert params["modifyinset"] == "yes", "the ratios would not be written"
         if name == "epatplot" and self.keywords is not None:
             an_event_file(params["set"], **self.keywords)
         return None
@@ -1699,7 +1701,9 @@ class TestThePileupCheck:
             xmm.xmm_config(dict(out_data_path=str(tmp_path))),
         )
         assert os.path.exists(plot)
-        assert os.path.basename(plot) == "pnS004_timing_pat.ps"
+        # ``.pdf`` and not the ``.ps`` epatplot's own device parameter suggests: SAS
+        # 22.1.0 draws the plot from Python and writes PDF whatever it is asked for.
+        assert os.path.basename(plot) == "pnS004_timing_pat.pdf"
 
 
 class TestWhereTheCleanedFilesGo:
