@@ -15,10 +15,13 @@ File set) from scratch is available through ``config["products"] = "odf"``.
 The tasks themselves are run by :mod:`heasarc_retrieve_pipeline.sas`, which is also where
 the reason SAS is an environment requirement rather than a dependency is written down.
 
-This module holds the part that needs no SAS at all: what a PPS file name means, which
-exposures an observation contains, where everything goes, and what the configuration is.
-All of it is testable offline, which matters more here than for the other missions --
-there is no continuous-integration job anywhere that can run a real SAS task.
+Most of this module needs no SAS at all: what a PPS file name means, which exposures an
+observation contains, where everything goes, what the configuration is, and which stretches
+of an exposure survive the flare screening. That is deliberate. There is no
+continuous-integration job anywhere that can run a real SAS task, so everything that can be
+decided without one is, and the SAS calls that remain are kept thin -- build the argument,
+run the task, parse the answer -- with the arguments and the parsing themselves pure
+functions that the offline suite does cover.
 
 PPS file names
 --------------
@@ -77,6 +80,9 @@ DEFAULT_CONFIG = dict(
     odf_flare_rate_limit=dict(pn=0.4, mos=0.35),
     # Warn when the flare screening removes more than this much of an exposure.
     flare_warn_fraction=0.25,
+    # Warn when the nearest PPS detection is further than this from the position asked
+    # for. Only ever a warning -- see :func:`xmm_check_source_position`.
+    position_warn_arcsec=10.0,
 )
 
 #: The EPIC cameras, by the two-character instrument code PPS names them with. The codes
@@ -1003,3 +1009,529 @@ def xmm_exposures_from_pps(obsid, config):
         )
         for parsed, path in event_lists
     ]
+
+
+#: Extension of a PPS ``OBSMLI`` holding the detections.
+SOURCE_LIST_EXTENSION = "SRCLIST"
+
+#: Column of ``SRCLIST`` carrying the EPIC-combined flux, in erg cm^-2 s^-1. The table has
+#: 249 columns and no count rate anywhere, so brightness is reported as a flux or not at
+#: all.
+SOURCE_LIST_FLUX_COLUMN = "EP_TOT_FLUX"
+
+#: Size of one XMM sky pixel, in arcseconds, from the ``ecoordconv`` documentation
+#: (SAS 22.1.0, table 1). Every region radius passes through it, so it is named rather
+#: than written out: a bare ``0.05`` in an expression says nothing about what it is.
+SKY_PIXEL_ARCSEC = 0.05
+
+#: Standard EPIC event screening, by camera family.
+#:
+#: ``#XMMEA_EP`` and ``#XMMEA_EM`` are macros SAS expands from the calibration -- they
+#: stand for a list of event attributes that changes with the calibration, which is
+#: exactly why the screening is left to ``evselect`` instead of being reimplemented on the
+#: event table here.
+#:
+#: ``FLAG==0`` is applied to pn and not to MOS on purpose. It is the strictest possible
+#: cut, and on MOS it also throws away good events near the chip edges; the standard SAS
+#: threads apply it to pn alone.
+SCREENING_EXPRESSIONS = {
+    "pn": "#XMMEA_EP && (PATTERN<=4) && (PI in [200:12000]) && FLAG==0",
+    "mos": "#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000])",
+}
+
+#: Extension name of the good time interval files this module writes.
+GTI_EXTENSION = "STDGTI"
+
+
+def xmm_screening_expression(instrument, gti_file=None):
+    """
+    The ``evselect`` expression that cleans one camera's events.
+
+    Parameters
+    ----------
+    instrument : str
+        ``"pn"``, ``"mos1"`` or ``"mos2"``.
+    gti_file : str, optional
+        Good time intervals to apply as well, as written by :func:`write_gti_file`.
+        ``None`` screens on event attributes alone, which is what an exposure with no
+        background light curve gets.
+
+    Returns
+    -------
+    str
+
+    Examples
+    --------
+    >>> xmm_screening_expression("mos1")
+    '#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000])'
+    >>> xmm_screening_expression("mos1", gti_file="flare.gti")
+    '#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000]) && gti(flare.gti,TIME)'
+    """
+    expression = SCREENING_EXPRESSIONS[camera_family(instrument)]
+    if gti_file is None:
+        return expression
+    return f"{expression} && gti({gti_file},TIME)"
+
+
+def write_gti_file(path, gti):
+    """
+    Write good time intervals where ``evselect`` can read them.
+
+    ``evselect`` cannot be handed an array: its ``gti()`` selector names a file, and
+    ``selectlib`` requires that file to be an OGIP-standard good time interval table.
+    Writing the intervals :func:`xmm_flare_gti` already computed, rather than rebuilding
+    them inside SAS with ``tabgtigen``, keeps the intervals that get recorded on the report
+    and the intervals that get applied to the events the same intervals. Two derivations of
+    one answer is two answers waiting to disagree.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        File to write. Overwritten if it exists.
+    gti : numpy.ndarray
+        Shape ``(N, 2)``. May be empty, and an empty file is a meaningful one -- it says
+        keep nothing, which is what a wholly flared exposure earns.
+
+    Returns
+    -------
+    str
+        The path written, so a caller can pass it straight to
+        :func:`xmm_screening_expression`.
+    """
+    from astropy.io import fits
+
+    gti = np.atleast_2d(np.asarray(gti, dtype=float)).reshape(-1, 2)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="START", format="D", unit="s", array=gti[:, 0]),
+            fits.Column(name="STOP", format="D", unit="s", array=gti[:, 1]),
+        ],
+        name=GTI_EXTENSION,
+    )
+    hdu.header["HDUCLASS"] = ("OGIP", "File conforms to OGIP standards")
+    hdu.header["HDUCLAS1"] = ("GTI", "Extension contains good time intervals")
+    hdu.header["HDUCLAS2"] = ("STANDARD", "Standard good time intervals")
+    path = str(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return path
+
+
+def arcsec_to_sky_pixels(arcsec):
+    """
+    Convert an angle on the sky to XMM sky pixels.
+
+    Examples
+    --------
+    >>> arcsec_to_sky_pixels(30.0)
+    600.0
+    """
+    return arcsec / SKY_PIXEL_ARCSEC
+
+
+def circle_region(x, y, radius_arcsec):
+    """
+    A circular selection in sky coordinates, as SAS spells it.
+
+    Examples
+    --------
+    >>> circle_region(26000.0, 25000.0, 30.0)
+    '((X,Y) IN circle(26000.0000,25000.0000,600.0000))'
+    """
+    radius = arcsec_to_sky_pixels(radius_arcsec)
+    return f"((X,Y) IN circle({x:.4f},{y:.4f},{radius:.4f}))"
+
+
+def annulus_region(x, y, inner_arcsec, outer_arcsec):
+    """
+    An annular selection in sky coordinates, as SAS spells it.
+
+    Examples
+    --------
+    >>> annulus_region(26000.0, 25000.0, 45.0, 90.0)
+    '((X,Y) IN annulus(26000.0000,25000.0000,900.0000,1800.0000))'
+    """
+    inner = arcsec_to_sky_pixels(inner_arcsec)
+    outer = arcsec_to_sky_pixels(outer_arcsec)
+    return f"((X,Y) IN annulus({x:.4f},{y:.4f},{inner:.4f},{outer:.4f}))"
+
+
+def xmm_extraction_regions(x, y, config):
+    """
+    The source and background selections for a point source at a sky position.
+
+    The background is an annulus around the source rather than a circle elsewhere on the
+    detector, because EPIC's background varies across the field of view and a concentric
+    ring is the closest sample there is. It has to clear the point spread function, which
+    is what ``bkg_inner_factor`` is for.
+
+    Parameters
+    ----------
+    x, y : float
+        Sky coordinates, from :func:`xmm_source_sky_position`.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+
+    Returns
+    -------
+    tuple of str
+        ``(source, background)``, both ``evselect`` expressions.
+    """
+    radius = config["src_radius_arcsec"]
+    return (
+        circle_region(x, y, radius),
+        annulus_region(
+            x, y, radius * config["bkg_inner_factor"], radius * config["bkg_outer_factor"]
+        ),
+    )
+
+
+#: The line ``ecoordconv`` prints the sky position on. Anchored at the start of the line so
+#: that ``DETX:`` and ``IM_X:`` cannot be mistaken for it. The task's documentation states
+#: that these strings may be searched for in a script and that every effort is made to keep
+#: them constant between versions, which is what makes parsing standard output defensible
+#: here -- ``ecoordconv`` writes no file at all, so there is nothing else to read.
+ECOORDCONV_SKY_RE = re.compile(r"^\s*X:\s*Y:\s+(\S+)\s+(\S+)\s*$", re.MULTILINE)
+
+
+def parse_ecoordconv_sky_position(text):
+    """
+    The sky position out of what ``ecoordconv`` printed.
+
+    Parameters
+    ----------
+    text : str
+        Standard output of the task.
+
+    Returns
+    -------
+    tuple of float
+        ``(x, y)`` in sky pixels.
+
+    Raises
+    ------
+    ValueError
+        If no sky position was printed. This is deliberately loud: ``ecoordconv`` exits
+        zero when it cannot convert, so a quiet default would put the extraction region at
+        ``(0, 0)`` -- the corner of the detector -- and everything downstream would carry
+        on looking perfectly healthy.
+
+    Examples
+    --------
+    >>> parse_ecoordconv_sky_position(" Theta: Phi: 18.5 2.6\\n X: Y: 27010 26888\\n")
+    (27010.0, 26888.0)
+    """
+    match = ECOORDCONV_SKY_RE.search(text)
+    if match is None:
+        raise ValueError(f"ecoordconv printed no sky position:\n{text}")
+    return float(match.group(1)), float(match.group(2))
+
+
+def xmm_source_sky_position(event_list, ra, dec, env=None, log_to=None):
+    """
+    Where a celestial position falls on one exposure's sky image.
+
+    The sky frame is per-exposure -- it is tied to the attitude solution -- so this is
+    asked once per event list rather than once per observation.
+
+    **Timing exposures never come here.** A timing read-out has no sky image, only a
+    detector column, so the region is a ``RAWX`` strip instead and this conversion has
+    nothing to convert.
+
+    Parameters
+    ----------
+    event_list : str
+        Event list defining the sky frame.
+    ra, dec : float
+        The position asked for, in degrees.
+    env : dict, optional
+        Environment for the task, from :func:`heasarc_retrieve_pipeline.sas.sas_environment`.
+    log_to : str, optional
+        File the task's output is appended to, beside being read.
+
+    Returns
+    -------
+    tuple of float
+        ``(x, y)`` in sky pixels.
+    """
+    from . import sas
+
+    result = sas.run(
+        "ecoordconv",
+        produces=[],
+        capture=True,
+        log_to=log_to,
+        env=env,
+        imageset=event_list,
+        withcoords="yes",
+        coordtype="eqpos",
+        x=ra,
+        y=dec,
+    )
+    return parse_ecoordconv_sky_position(result.stdout)
+
+
+@dataclass(frozen=True)
+class NearestDetection:
+    """
+    The closest thing the archive's own source detection found to a given position.
+
+    Attributes
+    ----------
+    ra, dec : float
+        Position of the detection, in degrees.
+    offset_arcsec : float
+        How far it is from the position asked for.
+    flux : float or None
+        ``EP_TOT_FLUX``, in erg cm^-2 s^-1. ``None`` when the column is absent.
+    next_offset_arcsec : float or None
+        Offset of the second-nearest detection, or ``None`` when there is only one. This
+        is the number that says whether to believe the match: a detection 1.4 arcsec away
+        with the runner-up at 34 arcsec is unambiguous, and two at similar distances are
+        not.
+    """
+
+    ra: float
+    dec: float
+    offset_arcsec: float
+    flux: Optional[float] = None
+    next_offset_arcsec: Optional[float] = None
+
+
+def nearest_detection(source_list, ra, dec):
+    """
+    Find a position in a PPS source list.
+
+    Parameters
+    ----------
+    source_list : str or None
+        Path of an ``OBSMLI``, from :func:`xmm_source_list_file`.
+    ra, dec : float
+        The position asked for, in degrees.
+
+    Returns
+    -------
+    NearestDetection or None
+        ``None`` when there is no source list, or it holds no detections. Neither is a
+        failure -- see :func:`xmm_check_source_position`.
+    """
+    from astropy.io import fits
+    from astropy.coordinates import SkyCoord
+
+    if source_list is None or not os.path.exists(source_list):
+        return None
+
+    with fits.open(source_list) as hdul:
+        table = hdul[SOURCE_LIST_EXTENSION]
+        if table.data is None or len(table.data) == 0:
+            return None
+        detections = SkyCoord(
+            np.asarray(table.data["RA"], dtype=float),
+            np.asarray(table.data["DEC"], dtype=float),
+            unit="deg",
+        )
+        columns = table.columns.names
+        fluxes = (
+            np.asarray(table.data[SOURCE_LIST_FLUX_COLUMN], dtype=float)
+            if SOURCE_LIST_FLUX_COLUMN in columns
+            else None
+        )
+
+    offsets = SkyCoord(ra, dec, unit="deg").separation(detections).arcsec
+    order = np.argsort(offsets)
+    best = int(order[0])
+    return NearestDetection(
+        ra=float(detections.ra.deg[best]),
+        dec=float(detections.dec.deg[best]),
+        offset_arcsec=float(offsets[best]),
+        flux=None if fluxes is None else float(fluxes[best]),
+        next_offset_arcsec=float(offsets[order[1]]) if len(order) > 1 else None,
+    )
+
+
+def xmm_check_source_position(obsid, config, ra, dec, rec=None):
+    """
+    Cross-check the position asked for against the archive's own source detection.
+
+    **This warns and never fails, and that is the whole design.** The ``OBSMLI`` source
+    list misses real targets: on the Crab, ``0611180201``, the nearest detection is 328.79
+    arcsec from the pulsar, because the nebula is extended and piled up and
+    maximum-likelihood point-source detection does not find a point source there at all. A
+    pipeline that aborted on a large offset would refuse the Crab. Compare Her X-1,
+    ``0153950401``, where the nearest detection is 1.42 arcsec away with the next at 33.8
+    arcsec -- an unambiguous match. The offset separates those two cases for a reader; it
+    does not decide anything, and it never moves the extraction region.
+
+    What it does catch is the mistake worth catching: a position typed wrong, or a target
+    that is simply not in this observation.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    ra, dec : float
+        The position asked for, in degrees.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where the numbers go. ``None`` records nothing.
+
+    Returns
+    -------
+    NearestDetection or None
+    """
+    logger = get_logger()
+    if rec is None:
+        rec = no_record()
+
+    source_list = xmm_source_list_file(obsid, config)
+    if source_list is None:
+        reason = f"{obsid} has no EPIC source list to check the position against"
+        logger.info(reason)
+        rec.skip(reason)
+        return None
+
+    found = nearest_detection(source_list, ra, dec)
+    if found is None:
+        reason = f"{os.path.basename(source_list)} holds no detections"
+        logger.info(f"Not checking the position: {reason}")
+        rec.skip(reason)
+        return None
+
+    rec.value(
+        ra=ra,
+        dec=dec,
+        detection_ra=found.ra,
+        detection_dec=found.dec,
+        offset_arcsec=found.offset_arcsec,
+        flux=found.flux,
+        next_offset_arcsec=found.next_offset_arcsec,
+        source_list=os.path.basename(source_list),
+    )
+
+    if found.offset_arcsec > config["position_warn_arcsec"]:
+        logger.warning(
+            f"The nearest EPIC detection to the position asked for is "
+            f"{found.offset_arcsec:.2f} arcsec away in {os.path.basename(source_list)}. "
+            f"Extracting at the position asked for regardless -- the source list misses "
+            f"extended and piled-up sources."
+        )
+    else:
+        logger.info(
+            f"The position asked for matches an EPIC detection {found.offset_arcsec:.2f} "
+            f"arcsec away"
+        )
+    return found
+
+
+def _exposure_stem(exposure):
+    """
+    The name every output of one exposure is built on, ``"mos1S004_imaging"``.
+
+    The mode belongs in the name and is not decoration: MOS ``FastUncompressed`` writes an
+    imaging and a timing event list under one exposure identifier, so a stem without the
+    mode would have the second overwrite the first.
+    """
+    return f"{exposure.instrument}{exposure.expid}_{exposure.mode}"
+
+
+def xmm_cleaned_event_list_path(obsid, exposure, config):
+    """
+    Where one exposure's screened events go.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_cl.evt``.
+    """
+    return os.path.join(
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_cl.evt"
+    )
+
+
+def xmm_flare_gti_path(obsid, exposure, config):
+    """
+    Where one exposure's flare good time intervals go.
+
+    Beside the events they filtered, so that a reduction can be read off the directory
+    without a manifest.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_flare.gti``.
+    """
+    return os.path.join(
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_flare.gti"
+    )
+
+
+def xmm_clean_event_list(obsid, exposure, config, gti=None, env=None, log_to=None):
+    """
+    Screen one exposure's events with ``evselect``.
+
+    The screening stays inside SAS deliberately. ``#XMMEA_EP`` and ``#XMMEA_EM`` are
+    calibration-driven macros, not a fixed list of bits, so reimplementing them on the
+    event table here would freeze today's calibration into this file and quietly go stale.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode, and where its events are.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    gti : numpy.ndarray, optional
+        Good time intervals to apply as well, from :func:`xmm_flare_gti`. ``None`` -- which
+        is what an exposure with no background light curve gives -- screens on event
+        attributes alone.
+    env : dict, optional
+        Environment for the task, from :func:`heasarc_retrieve_pipeline.sas.sas_environment`.
+    log_to : str, optional
+        File the task's output goes to.
+
+    Returns
+    -------
+    str
+        Path of the cleaned event list.
+    """
+    from . import sas
+
+    output = xmm_cleaned_event_list_path(obsid, exposure, config)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+
+    gti_file = None
+    if gti is not None:
+        gti_file = write_gti_file(xmm_flare_gti_path(obsid, exposure, config), gti)
+
+    sas.run(
+        "evselect",
+        produces=output,
+        log_to=log_to,
+        env=env,
+        table=exposure.event_list,
+        withfilteredset="yes",
+        filteredset=output,
+        keepfilteroutput="yes",
+        expression=xmm_screening_expression(exposure.instrument, gti_file=gti_file),
+    )
+    return output

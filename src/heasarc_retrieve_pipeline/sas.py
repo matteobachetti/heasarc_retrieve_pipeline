@@ -290,7 +290,7 @@ def sas_environment(ccf=None, odf=None, ccfpath=None, verbosity=None):
     return environment
 
 
-def run(name, *, produces, log_to=None, env=None, **params):
+def run(name, *, produces, log_to=None, capture=False, env=None, **params):
     """
     Run one SAS task, one at a time in this process.
 
@@ -306,6 +306,12 @@ def run(name, *, produces, log_to=None, env=None, **params):
         Send the task's output to this file instead of the screen -- see
         :func:`_log_stream`. Standard error is merged into it, because SAS writes its
         warnings there and they belong beside the lines they refer to.
+    capture : bool, optional
+        Return the task's output as text on the result's ``stdout``, instead of letting it
+        go to the screen. ``ecoordconv`` is why this exists: it writes no output file at
+        all and answers on standard output, so reading it is the only way to have the
+        answer. With ``log_to`` as well the output is still written there, so a task whose
+        result is read keeps the same paper trail as one whose result is a file.
     env : dict, optional
         Environment for the task, normally from :func:`sas_environment`. ``None``, the
         default, inherits this process's own.
@@ -334,15 +340,17 @@ def run(name, *, produces, log_to=None, env=None, **params):
     argv = [name] + [_argument(key, value) for key, value in params.items()]
     get_logger().info(f"Running {' '.join(argv)}")
 
-    stream = _log_stream(name, log_to) if log_to is not None else None
+    stream = _log_stream(name, log_to) if log_to is not None and not capture else None
+    destination = subprocess.PIPE if capture else stream
     try:
         with SAS_LOCK:
             try:
                 result = subprocess.run(
                     argv,
                     env=env,
-                    stdout=stream,
-                    stderr=subprocess.STDOUT if stream is not None else None,
+                    stdout=destination,
+                    stderr=subprocess.STDOUT if destination is not None else None,
+                    text=capture,
                     check=False,
                 )
             except FileNotFoundError as error:
@@ -352,6 +360,10 @@ def run(name, *, produces, log_to=None, env=None, **params):
     finally:
         if stream is not None:
             stream.close()
+
+    if capture and log_to is not None:
+        with _log_stream(name, log_to) as stream:
+            stream.write(result.stdout)
 
     if result.returncode != 0:
         where = f" See {os.path.abspath(log_to)}." if log_to is not None else ""

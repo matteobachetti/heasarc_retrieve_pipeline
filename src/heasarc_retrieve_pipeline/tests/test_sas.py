@@ -20,12 +20,13 @@ import pytest
 from heasarc_retrieve_pipeline import sas
 
 
-def a_sas_that_records_its_calls(monkeypatch, returncode=0, writes=None):
+def a_sas_that_records_its_calls(monkeypatch, returncode=0, writes=None, stdout=None):
     """
     Replace ``subprocess.run`` with a double, and return the list of calls it saw.
 
     ``writes`` is a list of paths the pretend task creates, so that the output check has
-    something real to look at.
+    something real to look at. ``stdout`` is what the pretend task printed, for the tasks
+    whose answer is what they print.
     """
     calls = []
 
@@ -34,7 +35,7 @@ def a_sas_that_records_its_calls(monkeypatch, returncode=0, writes=None):
         for path in writes or []:
             with open(path, "w") as fobj:
                 fobj.write("something\n")
-        return subprocess.CompletedProcess(argv, returncode)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout)
 
     monkeypatch.setattr(sas.subprocess, "run", run)
     monkeypatch.setattr(sas, "HAS_SAS", True)
@@ -353,6 +354,49 @@ class TestTheTaskOutputGoesToAFile:
         sas.run("evselect", produces=[], log_to=str(log), table="two.fits")
 
         assert log.read_text() == "first\n"
+
+
+class TestReadingWhatATaskPrinted:
+    """
+    Some SAS tasks answer on standard output and write no file at all.
+
+    ``ecoordconv`` is the one this package needs: it converts a celestial position to sky
+    coordinates and prints the answer. There is no output file to check and none to read,
+    so the run has to hand the text back.
+    """
+
+    def test_the_output_comes_back_as_text(self, monkeypatch):
+        a_sas_that_records_its_calls(monkeypatch, stdout=" X: Y: 27010 26888\n")
+
+        result = sas.run("ecoordconv", produces=[], capture=True, imageset="e.fits")
+
+        assert result.stdout == " X: Y: 27010 26888\n"
+
+    def test_the_pipe_is_asked_for_in_text_mode(self, monkeypatch):
+        calls = a_sas_that_records_its_calls(monkeypatch, stdout="")
+
+        sas.run("ecoordconv", produces=[], capture=True, imageset="e.fits")
+
+        assert calls[0].kwargs["stdout"] is subprocess.PIPE
+        assert calls[0].kwargs["text"] is True
+
+    def test_a_captured_task_still_leaves_a_paper_trail(self, monkeypatch, tmp_path):
+        """Reading a task's answer should not cost the log every other task writes."""
+        log = tmp_path / "logs" / "ecoordconv.log"
+        monkeypatch.setattr(sas, "_LOG_STARTED", set())
+        a_sas_that_records_its_calls(monkeypatch, stdout=" X: Y: 27010 26888\n")
+
+        sas.run("ecoordconv", produces=[], capture=True, log_to=str(log), imageset="e.fits")
+
+        assert log.read_text() == " X: Y: 27010 26888\n"
+
+    def test_without_capture_nothing_is_piped(self, monkeypatch):
+        calls = a_sas_that_records_its_calls(monkeypatch)
+
+        sas.run("evselect", produces=[], table="e.fits")
+
+        assert calls[0].kwargs["stdout"] is None
+        assert calls[0].kwargs["text"] is False
 
 
 def test_produces_is_a_required_argument():

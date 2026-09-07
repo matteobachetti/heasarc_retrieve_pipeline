@@ -1,9 +1,9 @@
 # Adding XMM-Newton (EPIC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-07 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `bc12c41`). **Commits 1–6 of the sequence below have landed**
+> `various_fixes` (HEAD `bc12c41`). **Commits 1–7 of the sequence below have landed**
 > (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`, `1e0db70`,
-> 2026-09-07); the rest is still the agreed design, not a report on work done. It is
+> and step 7, 2026-09-07); the rest is still the agreed design, not a report on work done. It is
 > written to be picked up cold, by a person or a session with no memory of the
 > conversation that produced it. Every number in
 > it was measured against the live HEASARC archive on that date; the snippets under
@@ -455,7 +455,8 @@ One commit each, tests first in every case.
    `resolve_config` hook and `xmm_resolve_config`.
 6. ~~Flare GTI from the PPS light curve (pure Python).~~ **Done, `1e0db70`** — but not at
    the threshold this document proposed; see below.
-7. `evselect` cleaning and `ecoordconv` position, with the OBSMLI cross-check.
+7. ~~`evselect` cleaning and `ecoordconv` position, with the OBSMLI cross-check.~~
+   **Done** — and the first step verified against a real SAS run; see below.
 8. Timing mode — `RAWX` regions, timing screening, `epatplot` pile-up diagnostic.
 9. `especget` spectra and grouping.
 10. ODF front end — staging, `cifbuild`, `odfingest`, `epproc`, `emproc`.
@@ -603,6 +604,61 @@ different one — a single background curve with a threshold line and the remove
 shaded. The arrays are recorded under the same `flare_filtering` step name and in the same
 shape (`gti_before`, `gti_after`, `removed`, plus `lc_time`/`lc_rate`/`lc_rate_err`), so
 commit 12 has everything it needs.
+
+## What changed while implementing step 7
+
+**The flare GTI reaches `evselect` as a file we write, not via `tabgtigen`.** This was the
+step's one genuinely open design question and SAS's own documentation settles it:
+`selectlib`'s file-based filter is `gti(blockspec,Tcolumn)`, and the block it names must be
+an OGIP-standard GTI table. So `write_gti_file` writes the `(N, 2)` array step 6 already
+produced, and the screening expression ends `&& gti(<file>,TIME)`. The alternative,
+`tabgtigen`, would rebuild the same intervals inside SAS from a threshold we would have to
+hand it anyway — leaving the GTI shown on the report and the GTI applied to the events as
+two separate derivations of one answer, free to disagree. One writer, one truth.
+
+**`ecoordconv`'s output format is documented, not reverse-engineered.** The task writes no
+output file at all; it prints the answer. Its documentation page (SAS 22.1.0, *Output*)
+gives the exact lines and states that they "may be searched for in a script and every
+effort will be made to keep them constant between versions". The sky position is the line
+beginning `X: Y:`, and `ECOORDCONV_SKY_RE` is anchored at the start of the line so that
+`DETX:` and `IM_X:` cannot be mistaken for it. The same page's table 1 is where
+`SKY_PIXEL_ARCSEC = 0.05` comes from.
+
+**`sas.run` gained a `capture` argument.** It could send a task's output to a log or to the
+screen, and neither gives a caller the text. `ecoordconv` is the first task here whose
+result *is* its standard output. With `log_to` as well the output is still written to the
+log, so a task whose answer is read keeps the same paper trail as one whose answer is a
+file.
+
+**A new configuration key, `position_warn_arcsec`** (default 10). Only ever a warning
+threshold — see below.
+
+**Timing exposures are skipped by the cleaning, as planned.** Their screening expression and
+their `RAWX` regions are commit 8; `xmm_source_sky_position` is never called for them,
+because a timing read-out has no sky image to convert into.
+
+### Verified against a real SAS run
+
+Her X-1 `0153950401` was downloaded through the pipeline's own S3 transport and route probe
+(19 files, 39 MB — the filter's predicted mix), and cleaned with the code as committed. The
+CCF mirror on this machine is still incomplete, so this exercised `evselect` but **not**
+`ecoordconv`, which needs `XMM_BORESIGHT`:
+
+| exposure | events in → out | `ONTIME` in → out |
+|---|---|---|
+| MOS1 `S004` imaging | 421 539 → 272 768 | — (this file carries `ONTIME` 0) |
+| MOS2 `S005` imaging | 523 126 → 356 699 | 5221 s → 5156 s |
+
+Every clause was checked to have bitten, rather than assumed from a zero return code: in the
+cleaned MOS2 list `PI` spans exactly 200–12000, `PATTERN` reaches 12 and no further, and
+**0 of 356 699 events fall outside the flare GTI**. The flare cut had removed 78 s of MOS2's
+5538 s, and `ONTIME` fell by 65 s, which is the same cut seen through SAS's own bookkeeping.
+That `evselect` accepted the file at all is the point that mattered: the OGIP table
+`write_gti_file` produces is valid input to the `gti()` selector.
+
+Note that `evselect` needed no calibration access for this — `#XMMEA_EM` expanded from the
+event file itself — so the cleaning half of this step runs on an incomplete CCF. The
+`ecoordconv` half remains unverified on real data until the mirror finishes.
 
 ## Verification
 
@@ -804,6 +860,10 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
 
 * Barycentring — which of the three candidates in step 8 works.
 * `especget`'s output file names, pinned as a constant.
+* **`ecoordconv` against a real observation** — the parser matches the format the task's
+  own documentation publishes, and `xmm_source_sky_position` has not yet been run for real,
+  because the CCF mirror on this machine had not reached `XMM_BORESIGHT_0029.CCF`. Confirm
+  the sky position of Her X-1 once it has.
 * Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.
 * The `.FIT.gz` → `.FTZ` staging rule on the ODF route.
 * ~~Default flare-rate thresholds.~~ **Settled** — PPS's own `FLCUTTHR`, see above.
@@ -811,3 +871,5 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
   numbers, and the right background strip depends on how far the source wings spread.
 * ~~Whether flare screening on a Timing exposure should use `FBKTSR` at all.~~ **Settled**
   — yes, with the provenance recorded; see above.
+* ~~How the flare GTI reaches `evselect`.~~ **Settled** — a file we write, filtered with
+  `gti(file,TIME)`; verified on real data, see *What changed while implementing step 7*.

@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from heasarc_retrieve_pipeline import xmm
+from heasarc_retrieve_pipeline.diagnostics import record_step
 
 
 # Her X-1, the end-to-end test target. Every PPS file of it that this step cares about,
@@ -1083,3 +1084,338 @@ class TestTheConfiguration:
         first["odf_flare_rate_limit"]["pn"] = 99.0
 
         assert xmm.xmm_config(None)["odf_flare_rate_limit"]["pn"] == 0.4
+
+
+#: The output ``ecoordconv`` prints, copied from the examples page of the task's own
+#: documentation (SAS 22.1.0). The documentation states that these strings may be searched
+#: for in a script and that every effort is made to keep them constant between versions,
+#: which is what makes parsing them defensible.
+ECOORDCONV_OUTPUT = """ecoordconv:-  Region Centre:
+ Theta: Phi: 18.4712 2.59867
+ X: Y: 27010 26888
+ DETX: DETY: -353.754 160.874
+ IM_X: IM_Y: 101.90963 101.81583
+ RA: DEC: 275.505 64.3385
+ RAWX: RAWY: 43 186
+ CCD(s):  4 centred on CCD: 4
+"""
+
+
+def a_source_list(path, rows):
+    """
+    A stand-in for a PPS ``OBSMLI``, with the three columns the cross-check reads.
+
+    The real product has 249 columns and no count rate anywhere; ``EP_TOT_FLUX`` is the
+    EPIC-combined flux in erg cm^-2 s^-1, and is the brightness the check reports.
+    """
+    from astropy.io import fits
+
+    ra = [row[0] for row in rows]
+    dec = [row[1] for row in rows]
+    flux = [row[2] for row in rows]
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="RA", format="D", unit="deg", array=np.array(ra, dtype=float)),
+            fits.Column(name="DEC", format="D", unit="deg", array=np.array(dec, dtype=float)),
+            fits.Column(name="EP_TOT_FLUX", format="E", array=np.array(flux, dtype=float)),
+        ],
+        name=xmm.SOURCE_LIST_EXTENSION,
+    )
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestTheScreeningExpression:
+    """
+    The standard EPIC event screening, which stays a string handed to ``evselect``.
+
+    The expressions use ``#XMMEA_EP`` and ``#XMMEA_EM``, macros SAS expands from the
+    calibration rather than filters we could reimplement in numpy, so the whole point is
+    that this function builds a string and does no arithmetic of its own.
+    """
+
+    def test_pn_gets_the_pn_macro_and_the_single_pixel_patterns(self):
+        expression = xmm.xmm_screening_expression("pn")
+
+        assert "#XMMEA_EP" in expression
+        assert "PATTERN<=4" in expression
+
+    def test_pn_alone_rejects_the_flagged_events(self):
+        # FLAG==0 is deliberately not applied to MOS: on MOS it also throws away events
+        # near the chip edges that the standard threads keep.
+        assert "FLAG==0" in xmm.xmm_screening_expression("pn")
+        assert "FLAG==0" not in xmm.xmm_screening_expression("mos1")
+
+    def test_both_mos_cameras_get_the_mos_macro_and_the_wider_patterns(self):
+        for instrument in ("mos1", "mos2"):
+            expression = xmm.xmm_screening_expression(instrument)
+
+            assert "#XMMEA_EM" in expression
+            assert "PATTERN<=12" in expression
+
+    def test_every_camera_keeps_the_same_energy_band(self):
+        for instrument in ("pn", "mos1", "mos2"):
+            assert "(PI in [200:12000])" in xmm.xmm_screening_expression(instrument)
+
+    def test_a_good_time_interval_file_is_added_as_a_filter(self):
+        expression = xmm.xmm_screening_expression("pn", gti_file="flare.gti")
+
+        assert expression.endswith("&& gti(flare.gti,TIME)")
+
+    def test_without_a_file_nothing_about_time_is_said(self):
+        assert "gti(" not in xmm.xmm_screening_expression("pn")
+
+
+class TestWritingAGoodTimeIntervalFile:
+    """
+    Handing the flare intervals to SAS.
+
+    ``evselect`` cannot be given an array; its ``gti()`` selector reads a file, and
+    ``selectlib`` requires that file to be an OGIP-standard GTI table. Writing it here
+    rather than rebuilding it with ``tabgtigen`` keeps the intervals that get recorded and
+    the intervals that get applied the same intervals.
+    """
+
+    def test_the_intervals_come_back_out(self, tmp_path):
+        from astropy.io import fits
+
+        path = xmm.write_gti_file(tmp_path / "flare.gti", np.array([[10.0, 20.0], [30.0, 44.0]]))
+
+        with fits.open(path) as hdul:
+            table = hdul[xmm.GTI_EXTENSION]
+            assert table.data["START"].tolist() == [10.0, 30.0]
+            assert table.data["STOP"].tolist() == [20.0, 44.0]
+
+    def test_the_extension_says_it_is_a_standard_gti(self, tmp_path):
+        from astropy.io import fits
+
+        path = xmm.write_gti_file(tmp_path / "flare.gti", np.array([[10.0, 20.0]]))
+
+        with fits.open(path) as hdul:
+            header = hdul[xmm.GTI_EXTENSION].header
+            assert header["HDUCLASS"] == "OGIP"
+            assert header["HDUCLAS1"] == "GTI"
+
+    def test_the_times_are_seconds(self, tmp_path):
+        from astropy.io import fits
+
+        path = xmm.write_gti_file(tmp_path / "flare.gti", np.array([[10.0, 20.0]]))
+
+        with fits.open(path) as hdul:
+            columns = hdul[xmm.GTI_EXTENSION].columns
+            assert columns["START"].unit == "s"
+            assert columns["STOP"].unit == "s"
+
+    def test_an_exposure_that_was_all_flare_still_writes_a_file(self, tmp_path):
+        # An empty GTI is a real answer -- keep nothing -- and evselect can apply it. A
+        # missing file, by contrast, would fail the task with a confusing message.
+        from astropy.io import fits
+
+        path = xmm.write_gti_file(tmp_path / "flare.gti", np.zeros((0, 2)))
+
+        with fits.open(path) as hdul:
+            assert len(hdul[xmm.GTI_EXTENSION].data) == 0
+
+    def test_the_pipeline_can_read_its_own_file_back(self, tmp_path):
+        from astropy.io import fits
+
+        from heasarc_retrieve_pipeline.utils import read_gti
+
+        gti = np.array([[10.0, 20.0], [30.0, 44.0]])
+        path = xmm.write_gti_file(tmp_path / "flare.gti", gti)
+
+        with fits.open(path) as hdul:
+            assert np.allclose(read_gti(hdul), gti)
+
+
+class TestParsingTheCoordinateConversion:
+    """
+    Reading the sky position out of what ``ecoordconv`` prints.
+
+    The task has no output file at all -- it answers on standard output -- so the parser
+    is the interface, and it is a pure function tested against the documented format.
+    """
+
+    def test_the_sky_position_is_found(self):
+        assert xmm.parse_ecoordconv_sky_position(ECOORDCONV_OUTPUT) == (27010.0, 26888.0)
+
+    def test_the_detector_and_image_lines_are_not_mistaken_for_it(self):
+        x, y = xmm.parse_ecoordconv_sky_position(ECOORDCONV_OUTPUT)
+
+        assert (x, y) != (-353.754, 160.874)
+        assert (x, y) != (101.90963, 101.81583)
+
+    def test_a_position_off_the_boresight_can_be_negative(self):
+        text = "ecoordconv:-  Region Centre:\n X: Y: -1239.05 1711.11\n"
+
+        assert xmm.parse_ecoordconv_sky_position(text) == (-1239.05, 1711.11)
+
+    def test_output_without_a_sky_position_is_an_error(self):
+        # ecoordconv exits zero when it cannot convert, so silence here would be a
+        # position of (0, 0) and a region extracted from the corner of the detector.
+        with pytest.raises(ValueError, match="no sky position"):
+            xmm.parse_ecoordconv_sky_position("ecoordconv:-  Region Centre:\n RA: DEC: 1 2\n")
+
+
+class TestTheExtractionRegions:
+    """
+    The region strings, in sky coordinates, as ``evselect`` and ``especget`` want them.
+
+    XMM's sky pixel is 0.05 arcsec, from the ``ecoordconv`` documentation. It is a named
+    constant because a bare 20 in an expression is unreadable and a bare 0.05 is worse.
+    """
+
+    def test_arcseconds_become_sky_pixels(self):
+        assert xmm.arcsec_to_sky_pixels(30.0) == 600.0
+
+    def test_the_sky_pixel_is_the_documented_size(self):
+        assert xmm.SKY_PIXEL_ARCSEC == 0.05
+
+    def test_a_source_region_is_a_circle_in_sky_pixels(self):
+        region = xmm.circle_region(26000.0, 25000.0, 30.0)
+
+        assert region == "((X,Y) IN circle(26000.0000,25000.0000,600.0000))"
+
+    def test_a_background_region_is_an_annulus_around_the_same_point(self):
+        region = xmm.annulus_region(26000.0, 25000.0, 45.0, 90.0)
+
+        assert region == "((X,Y) IN annulus(26000.0000,25000.0000,900.0000,1800.0000))"
+
+    def test_the_configuration_radii_are_what_gets_used(self):
+        config = xmm.xmm_config(dict(src_radius_arcsec=20.0))
+
+        source, background = xmm.xmm_extraction_regions(26000.0, 25000.0, config)
+
+        assert "circle(26000.0000,25000.0000,400.0000)" in source
+        # 1.5 and 3.0 times the source radius, from the defaults.
+        assert "annulus(26000.0000,25000.0000,600.0000,1200.0000)" in background
+
+
+class TestFindingTheSourceInThePpsSourceList:
+    """
+    The ``OBSMLI`` cross-check.
+
+    It exists to make a mistyped position visible, and it is only ever a cross-check: the
+    detection never moves the region, because the source list misses real targets.
+    """
+
+    def test_the_nearest_detection_is_the_one_reported(self, tmp_path):
+        path = a_source_list(tmp_path / "obsmli.fits", [(10.0, 20.0, 1e-12), (10.01, 20.0, 5e-12)])
+
+        found = xmm.nearest_detection(path, 10.0001, 20.0)
+
+        assert found.offset_arcsec < 1.0
+
+    def test_the_flux_comes_back_and_not_a_count_rate(self, tmp_path):
+        path = a_source_list(tmp_path / "obsmli.fits", [(10.0, 20.0, 3.5e-12)])
+
+        found = xmm.nearest_detection(path, 10.0, 20.0)
+
+        assert found.flux == pytest.approx(3.5e-12)
+
+    def test_the_offset_is_in_arcseconds(self, tmp_path):
+        # One arcsecond of declination, which is one arcsecond of separation.
+        path = a_source_list(tmp_path / "obsmli.fits", [(10.0, 20.0 + 1.0 / 3600.0, 1e-12)])
+
+        found = xmm.nearest_detection(path, 10.0, 20.0)
+
+        assert found.offset_arcsec == pytest.approx(1.0, abs=1e-3)
+
+    def test_the_runner_up_is_reported_too(self, tmp_path):
+        # An unambiguous match is one where the second-nearest detection is far away, so
+        # the number that says whether to believe the match is the runner-up's offset.
+        path = a_source_list(tmp_path / "obsmli.fits", [(10.0, 20.0, 1e-12), (10.1, 20.0, 1e-12)])
+
+        found = xmm.nearest_detection(path, 10.0, 20.0)
+
+        assert found.next_offset_arcsec == pytest.approx(
+            0.1 * 3600.0 * np.cos(np.radians(20.0)), rel=1e-3
+        )
+
+    def test_a_single_detection_has_no_runner_up(self, tmp_path):
+        path = a_source_list(tmp_path / "obsmli.fits", [(10.0, 20.0, 1e-12)])
+
+        assert xmm.nearest_detection(path, 10.0, 20.0).next_offset_arcsec is None
+
+    def test_an_empty_source_list_finds_nothing(self, tmp_path):
+        path = a_source_list(tmp_path / "obsmli.fits", [])
+
+        assert xmm.nearest_detection(path, 10.0, 20.0) is None
+
+    def test_a_missing_source_list_finds_nothing(self, tmp_path):
+        assert xmm.nearest_detection(str(tmp_path / "absent.fits"), 10.0, 20.0) is None
+
+
+class TestWhatThePositionCheckRecords:
+    """
+    What the page shows about the position, and what the check refuses to do about it.
+    """
+
+    def test_the_offset_is_recorded(self, tmp_path):
+        obsid = "0153950401"
+        pps = tmp_path / obsid / "PPS"
+        pps.mkdir(parents=True)
+        a_source_list(pps / f"P{obsid}EPX000OBSMLI0000.FTZ", [(10.0, 20.0, 1e-12)])
+        config = xmm.xmm_config(dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path)))
+
+        with record_step(str(tmp_path / "diag"), obsid, "source_position") as rec:
+            xmm.xmm_check_source_position(obsid, config, 10.0, 20.0, rec=rec)
+
+        assert rec.values["offset_arcsec"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_a_wild_offset_warns_and_does_not_raise(self, tmp_path, caplog):
+        # The Crab: the nearest OBSMLI detection is 328.79 arcsec from the pulsar, because
+        # the nebula is extended and maximum-likelihood point-source detection does not
+        # find it. A pipeline that aborted here would refuse the Crab.
+        obsid = "0611180201"
+        pps = tmp_path / obsid / "PPS"
+        pps.mkdir(parents=True)
+        a_source_list(pps / f"P{obsid}EPX000OBSMLI0000.FTZ", [(10.1, 20.0, 1e-12)])
+        config = xmm.xmm_config(dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path)))
+
+        with caplog.at_level("WARNING"):
+            xmm.xmm_check_source_position(obsid, config, 10.0, 20.0)
+
+        assert "arcsec" in caplog.text
+
+    def test_no_source_list_is_a_skip_and_not_a_failure(self, tmp_path):
+        obsid = "0153950401"
+        (tmp_path / obsid / "PPS").mkdir(parents=True)
+        config = xmm.xmm_config(dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path)))
+
+        with record_step(str(tmp_path / "diag"), obsid, "source_position") as rec:
+            xmm.xmm_check_source_position(obsid, config, 10.0, 20.0, rec=rec)
+
+        assert rec.status == "skipped"
+
+
+class TestWhereTheCleanedFilesGo:
+    """
+    One exposure can hold two modes, so the names have to carry the mode.
+    """
+
+    def test_the_cleaned_event_list_is_named_for_camera_exposure_and_mode(self, tmp_path):
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
+        exposure = an_exposure(None, instrument="mos1", mode=xmm.IMAGING)
+
+        path = xmm.xmm_cleaned_event_list_path("0153950401", exposure, config)
+
+        assert os.path.basename(path) == "mos1S004_imaging_cl.evt"
+
+    def test_the_two_modes_of_one_exposure_do_not_collide(self, tmp_path):
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
+        imaging = an_exposure(None, instrument="mos1", mode=xmm.IMAGING)
+        timing = an_exposure(None, instrument="mos1", mode=xmm.TIMING)
+
+        assert xmm.xmm_cleaned_event_list_path(
+            "0153950401", imaging, config
+        ) != xmm.xmm_cleaned_event_list_path("0153950401", timing, config)
+
+    def test_the_flare_file_sits_beside_the_events_it_filtered(self, tmp_path):
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
+        exposure = an_exposure(None, instrument="pn", mode=xmm.IMAGING)
+
+        path = xmm.xmm_flare_gti_path("0153950401", exposure, config)
+
+        assert os.path.basename(path) == "pnS004_imaging_flare.gti"
+        assert os.path.dirname(path) == xmm.xmm_pipeline_output_path("0153950401", config)
