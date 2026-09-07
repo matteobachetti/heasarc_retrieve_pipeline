@@ -300,6 +300,15 @@ Diagnostics steps `"odf_ingest"` and `"l2_pipeline"` (the latter title already e
 *The `.FIT.gz` → `.FTZ` rule is the one thing here I cannot verify without SAS. It is
 isolated in a pure function with its own test, so the fix, if any, is one line.*
 
+> **Verified 2026-09-08, and the guess was wrong — it is `.FIT.gz` → `.FIT`.** Staging as
+> `.FTZ` makes `odfingest` behave as though the housekeeping were absent: it lists only the
+> `.ASC` files, finds no start/stop interval, and writes a truncated summary that `barycen`
+> then rejects. Decompressing to plain `.FIT` and `.ASC` works. SAS reads `.FTZ` when a file
+> is *named* to it but does not *discover* one while scanning an ODF directory. The rule was
+> indeed isolated, and the fix was indeed one line: :data:`ODF_STAGED_SUFFIXES`. Step 11
+> needed the same staging, so it is already written and tested — step 10 reuses
+> `xmm_stage_odf` and `xmm_odf_summary` rather than writing its own.
+
 ## Step 6 — shared back end: flares, cleaning, position
 
 **`xmm_flare_gti`** — read the light curve (PPS `FBKTSR`, or the `evselect` one), threshold
