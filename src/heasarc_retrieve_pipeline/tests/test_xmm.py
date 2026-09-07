@@ -11,6 +11,7 @@ on 2026-09-07, and the two observations behind them are the ones
 ``docs/xmm_integration_plan.md`` picked as test targets.
 """
 
+import copy
 import os
 import re
 import warnings
@@ -423,12 +424,12 @@ def a_flare_lightcurve(
     return str(path)
 
 
-def an_exposure(path, instrument="mos1", mode=xmm.IMAGING):
+def an_exposure(path, instrument="mos1", mode=xmm.IMAGING, event_list="events.FTZ"):
     return xmm.Exposure(
         instrument=instrument,
         expid="S004",
         mode=mode,
-        event_list="events.FTZ",
+        event_list=event_list,
         flare_lightcurve=path,
     )
 
@@ -2107,3 +2108,178 @@ class TestBuildingTheCalibrationIndex:
             xmm.xmm_build_calibration_index("0153950401", self.config(tmp_path), events)
 
         assert stub.task("cifbuild") == []
+
+
+def a_windowed_event_file(path, ccds, **keywords):
+    """
+    An event list with sky coordinates and a CCD number, the shape a window check reads.
+
+    ``ccds`` maps a CCD number to ``(x0, x1, y0, y1)``, the sky box its events fill. The
+    box is what a window looks like from the outside: a windowed CCD fills a small one, an
+    unwindowed CCD fills the whole chip.
+    """
+    from astropy.io import fits
+
+    ccd, x, y = [], [], []
+    for number, (x0, x1, y0, y1) in ccds.items():
+        for corner_x in np.linspace(x0, x1, 12):
+            for corner_y in np.linspace(y0, y1, 12):
+                ccd.append(number)
+                x.append(corner_x)
+                y.append(corner_y)
+    events = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="CCDNR", format="I", array=np.array(ccd, dtype=np.int16)),
+            fits.Column(name="X", format="E", array=np.array(x, dtype=np.float32)),
+            fits.Column(name="Y", format="E", array=np.array(y, dtype=np.float32)),
+        ],
+        name="EVENTS",
+    )
+    for key, value in keywords.items():
+        events.header[key] = value
+    fits.HDUList([fits.PrimaryHDU(), events]).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestReadingTheSubmode:
+    """
+    ``SUBMODE`` off the event list header, and onto the exposure.
+
+    The front end stays pure -- file names and a listing, no FITS -- so this is a separate
+    pass rather than something ``xmm_exposures_from_pps`` does. It is what tells Full
+    Frame from Small Window, which nothing in the file name does.
+    """
+
+    def test_the_submode_is_read_from_the_events_header(self, tmp_path):
+        path = an_event_file(tmp_path / "events.ds", SUBMODE="PrimePartialW3")
+
+        assert xmm.read_submode(path) == "PrimePartialW3"
+
+    def test_a_file_without_the_keyword_gives_nothing(self, tmp_path):
+        path = an_event_file(tmp_path / "events.ds", TELESCOP="XMM")
+
+        assert xmm.read_submode(path) is None
+
+    def test_the_exposures_come_back_carrying_it(self, tmp_path):
+        first = an_exposure(
+            None, event_list=an_event_file(tmp_path / "a.ds", SUBMODE="PrimeLargeWindow")
+        )
+        second = an_exposure(
+            None, event_list=an_event_file(tmp_path / "b.ds", SUBMODE="PrimePartialW3")
+        )
+
+        got = xmm.xmm_with_submodes([first, second])
+
+        assert [exposure.submode for exposure in got] == [
+            "PrimeLargeWindow",
+            "PrimePartialW3",
+        ]
+
+    def test_nothing_else_about_the_exposure_changes(self, tmp_path):
+        exposure = an_exposure(
+            None, event_list=an_event_file(tmp_path / "a.ds", SUBMODE="PrimeFullWindow")
+        )
+
+        (got,) = xmm.xmm_with_submodes([exposure])
+
+        assert (got.instrument, got.expid, got.mode) == (
+            exposure.instrument,
+            exposure.expid,
+            exposure.mode,
+        )
+        assert got.event_list == exposure.event_list
+
+    def test_an_unreadable_exposure_is_left_alone_rather_than_failing_the_run(self, tmp_path):
+        exposure = an_exposure(None, event_list=str(tmp_path / "never-written.ds"))
+
+        (got,) = xmm.xmm_with_submodes([exposure])
+
+        assert got.submode is None
+
+
+class TestWhetherTheBackgroundFitsTheWindow:
+    """
+    Whether the annulus the configuration asks for lands on exposed detector.
+
+    Measured from the events rather than looked up in a table of submodes. The reason is
+    that the number wanted is not really the window size: it is how far there is exposure
+    from *this* source in *this* observation, which a chip gap or a windowed CCD or the
+    edge of the field all bound. Measuring it needs no handbook constant and no list of
+    submodes to keep current.
+
+    It only ever warns. A background region clipped by the window is not silently wrong --
+    SAS's ``backscale`` measures the exposed area and ``BACKSCAL`` follows it, which is why
+    Her X-1's ratio came out 5.17 against the 5.00 its strips imply. What a clipped region
+    costs is counts, and that is a judgement for whoever reads the page.
+    """
+
+    #: A windowed central CCD 300 sky pixels each way from the source, and an untouched
+    #: outer CCD far off to one side. 300 sky pixels is 15 arcsec at 0.05 per pixel.
+    WINDOWED = {1: (25700, 26300, 25700, 26300), 2: (30000, 40000, 30000, 40000)}
+
+    def reach(self, tmp_path, ccds=None, x=26000, y=26000):
+        path = a_windowed_event_file(tmp_path / "events.ds", ccds or self.WINDOWED)
+        return xmm.xmm_window_reach_arcsec(path, x, y)
+
+    def test_the_reach_is_measured_on_the_ccd_the_source_lands_on(self, tmp_path):
+        assert self.reach(tmp_path) == pytest.approx(15.0)
+
+    def test_an_outer_ccd_does_not_widen_a_windowed_one(self, tmp_path):
+        wider = {**self.WINDOWED, 2: (0, 60000, 0, 60000)}
+
+        assert self.reach(tmp_path, wider) == pytest.approx(15.0)
+
+    def test_a_source_off_centre_reaches_less_on_its_near_side(self, tmp_path):
+        assert self.reach(tmp_path, x=25800) == pytest.approx(5.0)
+
+    def test_a_file_with_no_sky_columns_gives_nothing(self, tmp_path):
+        path = an_event_file(tmp_path / "plain.ds")
+
+        assert xmm.xmm_window_reach_arcsec(path, 26000, 26000) is None
+
+
+class TestWhatTheWindowCheckRecords:
+    """The warning itself: what it compares, and that it never stops the reduction."""
+
+    CONFIG = dict(out_data_path="/data")
+
+    def check(self, tmp_path, ccds, radius=30.0, mode=xmm.IMAGING, submode="PrimePartialW3"):
+        path = a_windowed_event_file(tmp_path / "events.ds", ccds, SUBMODE=submode)
+        exposure = an_exposure(None, mode=mode, event_list=path)
+        exposure = copy.replace(exposure, submode=submode)
+        config = xmm.xmm_config(dict(self.CONFIG, src_radius_arcsec=radius))
+        return xmm.xmm_check_extraction_window(exposure, config, 26000, 26000)
+
+    ROOMY = {1: (20000, 32000, 20000, 32000)}
+    TIGHT = {1: (25700, 26300, 25700, 26300)}
+
+    def test_a_default_annulus_inside_a_roomy_window_is_fine(self, tmp_path):
+        fit = self.check(tmp_path, self.ROOMY)
+
+        assert fit.fits is True
+        assert fit.needed_arcsec == pytest.approx(90.0)
+
+    def test_a_widened_radius_that_outgrows_the_window_is_flagged(self, tmp_path):
+        fit = self.check(tmp_path, self.TIGHT, radius=30.0)
+
+        assert fit.fits is False
+        assert fit.reach_arcsec == pytest.approx(15.0)
+        assert fit.needed_arcsec == pytest.approx(90.0)
+
+    def test_the_submode_is_carried_so_the_page_can_name_it(self, tmp_path):
+        assert self.check(tmp_path, self.TIGHT).submode == "PrimePartialW3"
+
+    def test_it_warns_and_does_not_raise(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            self.check(tmp_path, self.TIGHT)
+
+        assert "clipped" in caplog.text
+
+    def test_an_annulus_that_fits_says_nothing(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            self.check(tmp_path, self.ROOMY)
+
+        assert caplog.text == ""
+
+    def test_a_timing_exposure_has_no_window_to_check(self, tmp_path):
+        assert self.check(tmp_path, self.TIGHT, mode=xmm.TIMING) is None

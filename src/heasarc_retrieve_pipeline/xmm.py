@@ -1180,6 +1180,222 @@ def xmm_exposures_from_pps(obsid, config):
     ]
 
 
+#: Header keyword naming the read-out window: ``"PrimeFullWindow"``, ``"PrimePartialW3"``,
+#: ``"FastTiming"``. Nothing in a PPS file name carries it.
+SUBMODE_KEYWORD = "SUBMODE"
+
+#: Column holding which CCD an event landed on. The window is a property of one chip, so
+#: the reach measurement needs it to keep the outer chips from widening a windowed one.
+CCD_COLUMN = "CCDNR"
+
+
+def read_submode(event_list):
+    """
+    Which read-out window an exposure used, from its event list header.
+
+    Parameters
+    ----------
+    event_list : str
+        Path of the event list.
+
+    Returns
+    -------
+    str or None
+        ``"PrimeFullWindow"``, ``"PrimePartialW3"``, ``"FastTiming"``; ``None`` when no
+        header carries :data:`SUBMODE_KEYWORD`.
+    """
+    from astropy.io import fits
+
+    with fits.open(event_list) as hdul:
+        for hdu in hdul:
+            if SUBMODE_KEYWORD in hdu.header:
+                return str(hdu.header[SUBMODE_KEYWORD]).strip()
+    return None
+
+
+def xmm_with_submodes(exposures):
+    """
+    The same exposures, each carrying the submode read from its own event list.
+
+    A separate pass rather than something :func:`xmm_exposures_from_pps` does, and
+    deliberately: that function is pure parsing -- file names and a directory listing, no
+    FITS -- which is what lets the offline suite cover the whole front end. Opening the
+    files is a different kind of work and is kept where it can be skipped.
+
+    An exposure whose event list cannot be opened keeps ``submode=None`` rather than
+    failing the observation. The submode drives a warning and nothing else, so an
+    unreadable header is a reason to say less, not a reason to stop.
+
+    Parameters
+    ----------
+    exposures : list of Exposure
+        From :func:`xmm_exposures_from_pps`.
+
+    Returns
+    -------
+    list of Exposure
+        New objects; the ones passed in are not modified.
+    """
+    logger = get_logger()
+    filled = []
+    for exposure in exposures:
+        submode = None
+        try:
+            submode = read_submode(exposure.event_list)
+        except OSError as problem:
+            logger.warning(f"Could not read the submode of {exposure.event_list}: {problem}")
+        filled.append(copy.replace(exposure, submode=submode))
+    return filled
+
+
+@dataclass
+class WindowFit:
+    """
+    Whether the background annulus lands on exposed detector, and by how much.
+
+    Attributes
+    ----------
+    submode : str or None
+        The read-out window, for the page to name.
+    reach_arcsec : float
+        How far there is exposure from the source, measured from the events.
+    needed_arcsec : float
+        Outer radius of the background annulus the configuration asks for.
+    fits : bool
+        Whether the second is inside the first.
+    """
+
+    submode: Optional[str]
+    reach_arcsec: float
+    needed_arcsec: float
+    fits: bool
+
+
+def xmm_window_reach_arcsec(event_list, x, y):
+    """
+    How far from a sky position there is exposed detector, measured from the events.
+
+    **Measured rather than tabulated, and that is the design.** The obvious alternative is
+    a table of submodes and their window sizes out of the Users Handbook. The number
+    actually wanted is not the window size, though: it is how far there is exposure from
+    *this* source in *this* observation, which the window, a chip gap and the edge of the
+    field all bound. Measuring it needs no remembered constant and no list of submodes to
+    keep current as ESA adds them.
+
+    Only the CCD the source lands on is measured. On MOS ``PrimePartialW3`` the central
+    chip is windowed to about 5.5 arcmin while the outer six read out whole, so a bounding
+    box over all of them would report the full field and never warn about anything.
+
+    The measurement is conservative in one direction: a short exposure of a sparse field
+    does not fill its chip to the edges, so the reach comes out short and the check warns
+    when it need not have. Warning too often is the cheap error here.
+
+    Parameters
+    ----------
+    event_list : str
+        A cleaned event list with sky coordinates.
+    x, y : float
+        Sky position of the source, from :func:`xmm_source_sky_position`.
+
+    Returns
+    -------
+    float or None
+        Arcsec to the nearest edge of the source's chip; ``None`` when the file has no sky
+        columns, which is what a timing exposure looks like.
+    """
+    from astropy.io import fits
+
+    with fits.open(event_list) as hdul:
+        for hdu in hdul:
+            data = getattr(hdu, "data", None)
+            names = getattr(getattr(data, "columns", None), "names", None)
+            if names is not None and {"X", "Y", CCD_COLUMN} <= set(names):
+                break
+        else:
+            return None
+
+        sky_x = np.asarray(data["X"], dtype=float)
+        sky_y = np.asarray(data["Y"], dtype=float)
+        chip = np.asarray(data[CCD_COLUMN])
+        # The source's own chip is the one its nearest event landed on. Nothing hunts for
+        # the chip whose footprint contains the position: an event is direct evidence
+        # that there is exposure there, and a footprint would have to be looked up.
+        on_chip = chip == chip[np.argmin(np.hypot(sky_x - x, sky_y - y))]
+
+    sky_x, sky_y = sky_x[on_chip], sky_y[on_chip]
+    reach = min(x - sky_x.min(), sky_x.max() - x, y - sky_y.min(), sky_y.max() - y)
+    return float(max(reach, 0.0)) * SKY_PIXEL_ARCSEC
+
+
+def xmm_check_extraction_window(exposure, config, x, y, rec=None):
+    """
+    Warn when the background annulus asks for more detector than the exposure has.
+
+    **It warns and never fails**, and the reason is worth stating because it is not "we
+    are being lenient". A clipped background region is not silently wrong: SAS's
+    ``backscale`` measures the exposed area of a region, and ``BACKSCAL`` follows it --
+    which is why Her X-1's source-to-background ratio came out 5.17 against the 5.00 its
+    strips imply. What a clipped region costs is *counts*, so the background is noisier
+    than it looks, and in the limit there is nothing there at all. That is a judgement for
+    whoever reads the page, not a reason to refuse an observation.
+
+    Raised by the pn imaging acceptance target. M82's MOS exposures are
+    ``PrimePartialW3``, whose central chip is about 5.5 arcmin across, so the default
+    30 arcsec source radius and ``bkg_outer_factor=3.0`` fit with room -- and a caller who
+    widens the radius past roughly 55 arcsec stops fitting, with nothing to say so until
+    now.
+
+    Parameters
+    ----------
+    exposure : Exposure
+        Which camera, exposure and mode, and where its events are.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    x, y : float
+        Sky position of the source, from :func:`xmm_source_sky_position`.
+    rec : Recorder, optional
+        Diagnostics recorder.
+
+    Returns
+    -------
+    WindowFit or None
+        ``None`` for a timing exposure, which has no sky image and so no window to fall
+        off, and for an event list with no sky columns.
+    """
+    if exposure.mode != IMAGING:
+        return None
+
+    reach = xmm_window_reach_arcsec(exposure.event_list, x, y)
+    if reach is None:
+        return None
+
+    needed = config["src_radius_arcsec"] * config["bkg_outer_factor"]
+    fit = WindowFit(
+        submode=exposure.submode,
+        reach_arcsec=reach,
+        needed_arcsec=needed,
+        fits=needed <= reach,
+    )
+
+    rec = rec or no_record()
+    rec.value(
+        window_submode=fit.submode,
+        window_reach_arcsec=fit.reach_arcsec,
+        window_needed_arcsec=fit.needed_arcsec,
+        window_fits=fit.fits,
+    )
+
+    if not fit.fits:
+        get_logger().warning(
+            f"{exposure.instrument} {exposure.expid}: the background annulus reaches "
+            f"{needed:.1f} arcsec but this {fit.submode or 'exposure'} has exposure only "
+            f"to {reach:.1f} arcsec from the source. The region is clipped, so the "
+            "background is noisier than its area suggests; BACKSCAL still follows the "
+            "exposed area, so the scaling stays right."
+        )
+    return fit
+
+
 #: Extension of a PPS ``OBSMLI`` holding the detections.
 SOURCE_LIST_EXTENSION = "SRCLIST"
 
