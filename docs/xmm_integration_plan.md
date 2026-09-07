@@ -474,6 +474,22 @@ One commit each, tests first in every case.
 12. `MISSION_CONFIG` entry, report titles and subdirectories.
 13. Docs.
 
+**The remaining order is not 10, 11, 12, 13 — decided by Matteo, 2026-09-07.** After the
+M82 reconnaissance below, the sequence is
+
+> **12 → the pn imaging acceptance run → 11 → the M82 X-2 batch → 10 → 13**,
+
+with two pieces of step 12's neighbourhood pulled forward ahead of it because the
+acceptance run needs them: the `cifbuild` calibration index (*Building the calibration
+index*) and `Exposure.submode` with its window-fit warning.
+
+The reasoning, so it is not relitigated: nothing can be run end to end until the
+`MISSION_CONFIG` entry exists, which makes 12 the gate on both acceptance targets; the
+M82 science is the 1.37 s pulsation, which puts 11 before the batch; and **step 10 is the
+one remaining chunk neither acceptance target needs**, since every M82 observation has
+PPS. Deferring it puts the largest, least verifiable step — `epproc` and `emproc` are
+hours of CPU with no CI that can run them — after the work that proves the science.
+
 (The step numbers above are the *commit* order; the prose sections are numbered
 independently and Timing mode is folded into steps 4, 6 and 7 there.)
 
@@ -849,8 +865,8 @@ That reframes what the Her X-1 failure was. `0153950401`'s `CALIND` names
 the SOC's record of what it used in November 2024, and issue 0036 supersedes it. Fetching
 0029 would be *asking for worse calibration*.
 
-**Proposed, not yet agreed — needs Matteo's yes before implementing.** `SAS_CCF` should
-point at an index this pipeline builds, rather than at the downloaded `CALIND`:
+**Decided by Matteo, 2026-09-07 — build it always, as the normal path.** `SAS_CCF`
+points at an index this pipeline builds, rather than at the downloaded `CALIND`:
 
 ```bash
 cifbuild withobservationdate=yes observationdate=<DATE-OBS> fullpath=yes
@@ -981,6 +997,42 @@ unit-tested, and none of them has met real data.
      The submodes actually used across the M82 pointings have not been checked yet; that
      listing is a cheap first move, and it decides whether Small Window is on the path or
      only Full Frame.
+
+### M82: what the archive actually holds, measured 2026-09-07
+
+The "cheap first move" the acceptance target asked for, done. Twenty observations lie
+within 12′ of M82; the submodes were read from the PPS event list headers, not from the
+catalogue's mode strings.
+
+| Era | pn | MOS1 / MOS2 |
+|---|---|---|
+| Six **M82 X-2** pointings, 2021–22 — `0870940101`, `0870940401`, `0891060101`, `0891060401`, plus `0891060501` and `0891060601` | **`PrimeLargeWindow`** | **`PrimePartialW3`** |
+| Eight **M82** / **M82 X-1** pointings, 2001–2011 — `0112290201`, `0206080101`, `0560181301`, `0560590101/201/301`, `0657800101`, `0657801701`, `0657801901`, `0657802101`, `0657802301` | `PrimeFullWindow` | `PrimeFullWindow` |
+| `0932391001` (GRB 231115A, 2023) | `PrimeFullWindow`, thin filter | same |
+
+Four of the twenty — `0112290401`, `0870940501`, `0891060501`, `0891060601` — carry no
+EPIC exposure time at all in `xmmmaster`. They are a free live test of the
+`NO_SCIENCE_DATA` path, which until now has only ever been exercised offline.
+
+Three things follow, and they simplify the acceptance targets rather than complicating
+them.
+
+* **Small Window is on the path, and the annulus worry does not bite at the defaults.**
+  Measured on `0870940101` MOS1: the `PrimePartialW3` window is `RAWX` 150–452, `RAWY`
+  152–449 on CCD 1 — 300 × 300 pixels, about **5.5′ × 5.5′** — while the five outer CCDs
+  read out unwindowed, giving the event list a 9′ × 11′ sky extent overall. The default
+  30″ source radius and `bkg_outer_factor=3.0` ask for 90″, which fits inside the central
+  window with room to spare. It begins to fall off the window above roughly a **55″**
+  source radius, which is exactly the case the `submode` warning is for.
+* **No Full Frame pn among the X-2 pointings.** They are Large Window (27′ × 13.6′,
+  comfortably larger than any annulus this pipeline will ask for). Full Frame pn appears
+  only in the older M82 and M82 X-1 pointings — which still contain X-2 in the field, so
+  they belong in the batch.
+* **The two acceptance targets overlap.** An M82 pn imaging observation *is* the pn
+  imaging acceptance run, on the batch's own target, so target 1 costs one observation
+  rather than a separate campaign. `0870940101` is the one to use: it exercises pn
+  `PrimeLargeWindow` and MOS `PrimePartialW3` together, and its MOS1 event list is 4.9 MB.
+  Its pn is 48 MB, so the whole observation is an ordinary download.
 
 ## Prerequisites for whoever picks this up
 
@@ -1147,15 +1199,21 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
   numbers, and the right background strip depends on how far the source wings spread. They
   gave 131 568 of 299 677 pn events on Her X-1 and a pile-up measurement consistent with
   no pile-up, so they are at least not obviously wrong.
-* **A MOS Timing strip from `ecoordconv`.** Decided for now that MOS timing is skipped and
-  warned about rather than extracted at a guessed column. `ecoordconv` prints `RAWX:` for
-  the target position (311.08 on Her X-1's MOS1), which would centre the strip on SAS's own
-  conversion. Cheap, and not done without asking.
+* ~~**A MOS Timing strip from `ecoordconv`.**~~ **Asked and declined, 2026-09-07.** MOS
+  timing stays skipped with its loud warning; it is not extracted at a guessed column and
+  it is not centred on `ecoordconv`'s `RAWX:` either. The conversion would work — 311.08
+  on Her X-1's MOS1 — and the option stays on the table, but nothing on the critical path
+  needs it: every M82 observation is imaging, and pn, the camera bright-source timing
+  actually uses, already has the cookbook's strip. Revisit when a science target needs MOS
+  timing.
 * ~~Whether flare screening on a Timing exposure should use `FBKTSR` at all.~~ **Settled**
   — yes, with the provenance recorded; see above.
 * ~~How the flare GTI reaches `evselect`.~~ **Settled** — a file we write, filtered with
   `gti(file,TIME)`; verified on real data, see *What changed while implementing step 7*.
-* **Whether `Exposure.submode` should be populated and acted on.** It is declared and
-  never filled. Reading `SUBMODE` from the event list header is one keyword, and it is
-  what would let a Small Window exposure warn that a widened background annulus falls off
-  the edge of the window. Raised by the pn imaging acceptance target above.
+* ~~**Whether `Exposure.submode` should be populated and acted on.**~~ **Settled by
+  Matteo, 2026-09-07: populate it, and warn.** `SUBMODE` is read from the event list
+  header, carried on the `Exposure`, recorded on the report page, and checked against the
+  window geometry — a configured outer annulus radius larger than the window can give is
+  **warned about, never failed on**, in the same spirit as the flare cut that removes 39%
+  of Mkn 421. This lands before the pn imaging acceptance run, since that run is what
+  raised it.
