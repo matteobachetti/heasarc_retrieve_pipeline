@@ -1192,6 +1192,18 @@ SUBMODE_KEYWORD = "SUBMODE"
 #: the reach measurement needs it to keep the outer chips from widening a windowed one.
 CCD_COLUMN = "CCDNR"
 
+#: What fraction of the events on a chip :func:`xmm_window_reach_arcsec` discards at each
+#: end before calling the rest the edge, as a percentage. Not zero: the extremes are set
+#: by a few events with badly reconstructed sky coordinates, which inflated one real
+#: measurement by a third. At 0.1 a chip holding a hundred thousand events still keeps a
+#: hundred beyond the edge, so a genuine corner is not clipped away.
+WINDOW_EDGE_PERCENTILE = 0.1
+
+#: The fewest events discarded at each end whatever the percentage says. A percentage
+#: alone cannot clip two stray events out of a hundred, and a nearly empty exposure is
+#: exactly where one stray does the most damage.
+WINDOW_EDGE_MIN_CLIP = 2
+
 
 def read_submode(event_list):
     """
@@ -1290,9 +1302,20 @@ def xmm_window_reach_arcsec(event_list, x, y):
     chip is windowed to about 5.5 arcmin while the outer six read out whole, so a bounding
     box over all of them would report the full field and never warn about anything.
 
-    The measurement is conservative in one direction: a short exposure of a sparse field
-    does not fill its chip to the edges, so the reach comes out short and the check warns
-    when it need not have. Warning too often is the cheap error here.
+    **The edge is a percentile, not the extreme**, and that was measured rather than
+    guessed. Taking the minimum and maximum made MOS1's windowed chip on ``0870940101``
+    span 8.8 by 11.4 arcmin, when ``PrimePartialW3`` reads out 300 by 300 raw pixels --
+    about 5.5. A handful of events with badly reconstructed sky coordinates is enough to
+    do that, and the error runs the dangerous way: an inflated reach *suppresses* a
+    warning. On that observation's pn exposure the extremes said 102.5 arcsec, which
+    clears the 90 the annulus asks for, while :data:`WINDOW_EDGE_PERCENTILE` says 87.6,
+    which does not -- and ``BACKSCAL`` settles it independently, coming out 6.01 where the
+    radii imply 6.75, an 11 per cent area deficit that only exists if the annulus really
+    is clipped.
+
+    The remaining bias runs the safe way: a short exposure of a sparse field does not fill
+    its chip to the edges, so the reach comes out short and the check warns when it need
+    not have. Warning too often is the cheap error here.
 
     Parameters
     ----------
@@ -1327,7 +1350,22 @@ def xmm_window_reach_arcsec(event_list, x, y):
         on_chip = chip == chip[np.argmin(np.hypot(sky_x - x, sky_y - y))]
 
     sky_x, sky_y = sky_x[on_chip], sky_y[on_chip]
-    reach = min(x - sky_x.min(), sky_x.max() - x, y - sky_y.min(), sky_y.max() - y)
+    if sky_x.size == 0:
+        return None
+
+    clip = max(WINDOW_EDGE_MIN_CLIP, int(sky_x.size * WINDOW_EDGE_PERCENTILE / 100.0))
+    if 2 * clip >= sky_x.size:
+        # Too few events to discard any and still have a chip left. Whatever they say is
+        # all there is, and the caller is warned rather than told nothing.
+        clip = 0
+
+    def edges(values):
+        ordered = np.sort(values)
+        return ordered[clip], ordered[len(ordered) - 1 - clip]
+
+    x_low, x_high = edges(sky_x)
+    y_low, y_high = edges(sky_y)
+    reach = min(x - x_low, x_high - x, y - y_low, y_high - y)
     return float(max(reach, 0.0)) * SKY_PIXEL_ARCSEC
 
 

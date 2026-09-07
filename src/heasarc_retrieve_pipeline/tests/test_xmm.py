@@ -2385,3 +2385,49 @@ class TestReducingAnObservation:
 
         assert any(name.startswith("flare_filtering") for name in written)
         assert any(name.startswith("source_position") for name in written)
+
+
+class TestTheWindowEdgeIsRobustToStrayEvents:
+    """
+    A few events with bad sky coordinates must not widen the measured window.
+
+    Measured on ``0870940101``: taking the extremes made MOS1's ``PrimePartialW3`` chip
+    8.8 by 11.4 arcmin when it reads out about 5.5, and made that observation's pn reach
+    102.5 arcsec against a robust 87.6 -- the difference between clearing the 90 arcsec
+    annulus and not. The error runs the dangerous way, because an inflated reach suppresses
+    a warning rather than raising a spurious one.
+    """
+
+    def test_a_stray_event_does_not_widen_the_window(self, tmp_path):
+        honest = a_windowed_event_file(tmp_path / "honest.ds", {1: (25700, 26300, 25700, 26300)})
+        assert xmm.xmm_window_reach_arcsec(honest, 26000, 26000) == pytest.approx(15.0)
+
+        from astropy.io import fits
+
+        with fits.open(honest) as hdul:
+            events = hdul["EVENTS"].data
+            strays = fits.BinTableHDU.from_columns(
+                fits.ColDefs(
+                    [
+                        fits.Column(
+                            name="CCDNR",
+                            format="I",
+                            array=np.concatenate([events["CCDNR"], [1, 1]]),
+                        ),
+                        fits.Column(
+                            name="X", format="E", array=np.concatenate([events["X"], [0, 60000]])
+                        ),
+                        fits.Column(
+                            name="Y", format="E", array=np.concatenate([events["Y"], [0, 60000]])
+                        ),
+                    ]
+                ),
+                name="EVENTS",
+            )
+            fits.HDUList([fits.PrimaryHDU(), strays]).writeto(tmp_path / "strays.ds")
+
+        widened = xmm.xmm_window_reach_arcsec(str(tmp_path / "strays.ds"), 26000, 26000)
+
+        assert widened == pytest.approx(15.0, abs=1.0), (
+            "two bad events out of 146 moved the window edge"
+        )
