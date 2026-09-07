@@ -1027,6 +1027,20 @@ independently in astropy from the same `ORBTSR` positions and the source directi
 | 20 606 s | 64.2406 s | 64.2373 s | 3.3 ms |
 | 27 474 s | 63.8003 s | 63.7968 s | 3.5 ms |
 
+A second check, internal and free: the three cameras are three independent detectors
+writing three independent event lists, and the correction is a property of the spacecraft
+and the source, not of the camera. Interpolated to a common instant, all three agree:
+
+| camera | events | shift range | at t = 734150000 |
+|---|---|---|---|
+| pn `U002` | 401 788 | 63.800–65.590 s | **65.0096 s** |
+| MOS1 `S017` | 131 752 | 63.780–65.843 s | **65.0096 s** |
+| MOS2 `S018` | 146 858 | 63.780–65.843 s | **65.0096 s** |
+
+To 0.1 ms. The MOS range is wider than pn's because the MOS exposures are longer, which is
+what `xmmmaster` says of this observation. All three files read `TIMESYS=TDB`,
+`TIMEREF=SOLARSYSTEM`.
+
 The correction sweeps 1.79 s across the exposure, which is the quantity that matters: a
 1.37 s pulsation would smear completely without it. The residual against astropy is
 **3.3 ms and constant to 0.3 ms over 27 ks** — the constant part is the Einstein and
