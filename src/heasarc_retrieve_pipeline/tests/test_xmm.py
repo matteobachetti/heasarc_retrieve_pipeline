@@ -12,6 +12,7 @@ on 2026-09-07, and the two observations behind them are the ones
 """
 
 import os
+import re
 
 import pytest
 
@@ -59,6 +60,113 @@ MKN_421_PPS = [
     "P0123700101PNS003FBKTSR0000.FTZ",
     "P0123700101OBX000CALIND0000.FTZ",
 ]
+
+
+# What the download filter must keep out of Her X-1, and a sample of what it must drop.
+# Listed from the public S3 mirror on 2026-09-07: the whole observation is 461 files and
+# 205.8 MB, of which the filter keeps these 19 and 39.8 MB. The rejects below are not a
+# random sample -- every one of them is a near miss of some kind.
+HER_X_1_KEPT = [
+    # The four EPIC event lists. 33.9 MB of the 39.8, and the reason for all the rest.
+    "PPS/P0153950401M1S004MIEVLI0000.FTZ",
+    "PPS/P0153950401M1S004TIEVLI0000.FTZ",
+    "PPS/P0153950401M2S005MIEVLI0000.FTZ",
+    "PPS/P0153950401PNS003TIEVLI0000.FTZ",
+    # Background flare time series, one per exposure that has one. The RGS curve comes
+    # along: it is four kilobytes, and excluding it would mean naming the instruments in
+    # the regex as well as in the parser, in two places that could then disagree.
+    "PPS/P0153950401M1S004FBKTSR0000.FTZ",
+    "PPS/P0153950401M2S005FBKTSR0000.FTZ",
+    "PPS/P0153950401R1S001FBKTSR0000.FTZ",
+    # Observation-level: the calibration index that becomes SAS_CCF, and the attitude and
+    # orbit the reduction and the barycentring need.
+    "PPS/P0153950401OBX000ATTTSR0000.FTZ",
+    "PPS/P0153950401OBX000CALIND0000.FTZ",
+    "PPS/P0153950401OBX000ORBTSR0000.FTZ",
+    # EPIC, and only EPIC: the source list the position is cross-checked against, the
+    # regions PPS itself used, and the summary page a human opens.
+    "PPS/P0153950401EPX000OBSMLI0000.FTZ",
+    "PPS/P0153950401EPX000REGION0000.ASC",
+    "PPS/P0153950401EPX000SUMMAR0000.HTM",
+    # ODF housekeeping, 5.3 MB, downloaded on both routes.
+    "ODF/0420_0153950401_SCX00000ATS.FIT.gz",
+    "ODF/0420_0153950401_SCX00000RAS.ASC.gz",
+    "ODF/0420_0153950401_SCX00000ROS.ASC.gz",
+    "ODF/0420_0153950401_SCX00000SUM.ASC",
+    "ODF/0420_0153950401_SCX00000TCS.FIT.gz",
+    "ODF/0420_0153950401_SCX00000TCX.FIT.gz",
+]
+
+HER_X_1_DROPPED = [
+    # Companions of files that are kept. These are what the extension has to be pinned
+    # for: a PDF of a light curve is not a light curve.
+    "PPS/P0153950401M1S004FBKTSR0000.PDF",
+    "PPS/P0153950401EPX000OBSMLI0000.HTM",
+    # The Optical Monitor's own OBSMLI, under the same product code as EPIC's.
+    "PPS/P0153950401OMX000OBSMLI0000.ASC",
+    "PPS/P0153950401OMX000OBSMLI0000.FTZ",
+    # PPS products this pipeline makes for itself.
+    "PPS/P0153950401M1S004EXPMAP1000.FTZ",
+    "PPS/P0153950401M2S005SRCTSR8001.FTZ",
+    "PPS/P0153950401OBX000RADMON0000.FTZ",
+    # Not a PPS name at all, and one of them contains EVLI.
+    "PPS/P0153950401M1S004IMAGE_8000.FTZ",
+    "PPS/PP0153950401EEVLIS000_0.HTM",
+    # RGS, whose event list is EVENLI and not one of the three EPIC codes.
+    "PPS/P0153950401R1S001EVENLI0000.FTZ",
+    # Raw telemetry. 33.5 MB of it, and the PPS route has no use for any of it.
+    "ODF/0420_0153950401_PNS00304TIE.FIT.gz",
+    "ODF/0420_0153950401_M1S00400AUX.FIT.gz",
+    "ODF/MANIFEST.266826",
+    # Same SCX00000 prefix as the housekeeping, different file.
+    "ODF/0420_0153950401_SCX00000P3S.FIT.gz",
+    # The catalogue cutouts and the Optical Monitor mosaic, 5.3 MB of pictures.
+    "4XMM/C0153950401EPX000SRCIMG8010001.png",
+    "om_mosaic/0153950401_UVW2_E.fits.gz",
+]
+
+HER_X_1_ARCHIVE = HER_X_1_KEPT + HER_X_1_DROPPED
+
+# 0973390101 has pps_flag = "Y" in xmmmaster and no PPS directory at HEASARC: 103 files,
+# all of them under ODF/. It is the observation that proves the route has to be probed.
+NO_PPS_ARCHIVE = [
+    "ODF/4720_0973390101_M1U00200AUX.FIT.gz",
+    "ODF/4720_0973390101_M1U00210IME.FIT.gz",
+    "ODF/4720_0973390101_SCX00000ATS.FIT.gz",
+    "ODF/4720_0973390101_SCX00000RAS.ASC.gz",
+    "ODF/4720_0973390101_SCX00000ROS.ASC.gz",
+    "ODF/4720_0973390101_SCX00000SUM.ASC",
+    "ODF/4720_0973390101_SCX00000TCS.FIT.gz",
+    "ODF/4720_0973390101_SCX00000TCX.FIT.gz",
+]
+
+
+def what_a_filter_keeps(arguments, entries, obsid="0153950401"):
+    """
+    Run a download filter over a recorded listing, the way a transport would.
+
+    Both transports match against the whole remote name, not the basename: an HTTPS URL
+    for one, a bucket key for the other. They are spelled differently and the filter has
+    to work on either, so both are tried here and the answers must agree.
+    """
+    include = arguments.get("re_include", "")
+    exclude = arguments.get("re_exclude", "")
+    include = re.compile(include) if include else None
+    exclude = re.compile(exclude) if exclude else None
+
+    kept = {}
+    for flavour, base in [
+        ("https", f"https://heasarc.gsfc.nasa.gov/FTP/xmm/data/rev0/{obsid}/"),
+        ("s3", f"xmm/data/rev0/{obsid}/"),
+    ]:
+        kept[flavour] = [
+            entry
+            for entry in entries
+            if (include is None or include.search(base + entry))
+            and not (exclude is not None and exclude.search(base + entry))
+        ]
+    assert kept["https"] == kept["s3"], "the filter reads an S3 key and a URL differently"
+    return kept["s3"]
 
 
 def a_downloaded_observation(tmp_path, obsid, names):
@@ -329,6 +437,112 @@ class TestFindingTheObservationLevelProducts:
 
         assert xmm.xmm_calind_file("0153950401", config) is None
         assert xmm.xmm_source_list_file("0153950401", config) is None
+
+
+class TestWhatIsWorthDownloading:
+    """
+    An XMM observation is 200 MB to 1.2 GB, and a reduction of the EPIC cameras wants
+    about a fortieth of it. The filter is what makes a long observation an ordinary
+    download: *short* and *small* are different axes, and without it SAX J1808's 35 ks
+    would be 393 MB instead of 78.
+
+    Everything here runs against listings recorded from the real archive, because both
+    traps in this regex were found by listing observations and neither would have been
+    found by reasoning about the file naming scheme.
+    """
+
+    def test_the_pps_route_keeps_exactly_what_it_needs(self):
+        arguments = xmm.xmm_download_filter({"products": "pps"})
+
+        assert what_a_filter_keeps(arguments, HER_X_1_ARCHIVE) == HER_X_1_KEPT
+
+    def test_every_epic_event_list_survives(self):
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "pps"}), HER_X_1_ARCHIVE)
+
+        assert [name for name in kept if "EVLI" in name] == [
+            "PPS/P0153950401M1S004MIEVLI0000.FTZ",
+            "PPS/P0153950401M1S004TIEVLI0000.FTZ",
+            "PPS/P0153950401M2S005MIEVLI0000.FTZ",
+            "PPS/P0153950401PNS003TIEVLI0000.FTZ",
+        ]
+
+    def test_the_optical_monitor_source_list_is_left_behind(self):
+        """The trap that would cross-check an X-ray position against an optical catalogue:
+        OM emits an OBSMLI under the same product code EPIC does."""
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "pps"}), HER_X_1_ARCHIVE)
+
+        assert "PPS/P0153950401OMX000OBSMLI0000.FTZ" not in kept
+        assert "PPS/P0153950401EPX000OBSMLI0000.FTZ" in kept
+
+    def test_the_pictures_beside_a_product_are_not_the_product(self):
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "pps"}), HER_X_1_ARCHIVE)
+
+        assert not [name for name in kept if name.endswith((".PDF", ".PNG", ".png"))]
+
+    def test_the_housekeeping_comes_on_the_pps_route_too(self):
+        """Six files, 5.3 MB, and the barycentring needs them: the PPS products carry no
+        orbit or attitude of their own."""
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "pps"}), HER_X_1_ARCHIVE)
+
+        assert sorted(name.split("SCX00000")[-1] for name in kept if name.startswith("ODF/")) == [
+            "ATS.FIT.gz",
+            "RAS.ASC.gz",
+            "ROS.ASC.gz",
+            "SUM.ASC",
+            "TCS.FIT.gz",
+            "TCX.FIT.gz",
+        ]
+
+    def test_the_raw_telemetry_stays_at_the_archive(self):
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "pps"}), HER_X_1_ARCHIVE)
+
+        assert "ODF/0420_0153950401_PNS00304TIE.FIT.gz" not in kept
+        assert "ODF/0420_0153950401_SCX00000P3S.FIT.gz" not in kept
+
+    def test_the_odf_route_takes_the_whole_odf(self):
+        arguments = xmm.xmm_download_filter({"products": "odf"})
+
+        assert what_a_filter_keeps(arguments, HER_X_1_ARCHIVE) == [
+            name for name in HER_X_1_ARCHIVE if name.startswith("ODF/")
+        ]
+
+    def test_the_odf_route_wants_none_of_the_archive_reduction(self):
+        kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "odf"}), HER_X_1_ARCHIVE)
+
+        assert not [name for name in kept if name.startswith("PPS/")]
+
+    def test_an_observation_with_no_pps_yields_only_housekeeping(self):
+        """Which is the whole problem the route probe exists to solve: this succeeds, and
+        leaves nothing to reduce."""
+        kept = what_a_filter_keeps(
+            xmm.xmm_download_filter({"products": "pps"}), NO_PPS_ARCHIVE, obsid="0973390101"
+        )
+
+        assert len(kept) == 6
+        assert all("SCX00000" in name for name in kept)
+
+    def test_another_observation_is_not_swept_in(self):
+        """The filter is applied to a whole URL or bucket key, and the OBSID is part of
+        both. It must not match a neighbour's files if a listing ever straddles two."""
+        kept = what_a_filter_keeps(
+            xmm.xmm_download_filter({"products": "pps"}),
+            ["PPS/P0123700101PNS003PIEVLI0000.FTZ"] + HER_X_1_KEPT,
+        )
+
+        assert "PPS/P0123700101PNS003PIEVLI0000.FTZ" in kept
+
+    def test_the_filter_names_only_what_recursive_download_takes(self):
+        for products in ("pps", "odf"):
+            assert set(xmm.xmm_download_filter({"products": products})) <= {
+                "re_include",
+                "re_exclude",
+            }
+
+    def test_an_unknown_route_is_refused_rather_than_guessed(self):
+        """Silently downloading the whole 1.2 GB observation is not a good answer to a
+        typo in a configuration file."""
+        with pytest.raises(ValueError, match="pps"):
+            xmm.xmm_download_filter({"products": "PPS "})
 
 
 class TestTheConfiguration:

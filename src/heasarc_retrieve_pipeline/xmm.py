@@ -93,6 +93,138 @@ CALIBRATION_INDEX_PRODUCT = "CALIND"
 #: instrument field has to be checked as well -- see :func:`xmm_source_list_file`.
 SOURCE_LIST_PRODUCT = "OBSMLI"
 
+#: PPS products the reduction reads, and the extension each of them is the data in. Any
+#: instrument may carry these: the parser decides afterwards which camera a file belongs
+#: to, and the RGS light curve that comes along costs four kilobytes. Naming the cameras
+#: here as well as in :data:`EPIC_INSTRUMENTS` would be two lists that can disagree.
+PPS_PRODUCTS_WANTED = {
+    "PIEVLI": "FTZ",  # pn imaging event list
+    "MIEVLI": "FTZ",  # MOS imaging event list
+    "TIEVLI": "FTZ",  # timing event list, either camera
+    "FBKTSR": "FTZ",  # background flare time series, one per exposure
+    "CALIND": "FTZ",  # calibration index -- becomes SAS_CCF
+    "ATTTSR": "FTZ",  # attitude
+    "ORBTSR": "FTZ",  # orbit, which the barycentring needs
+}
+
+#: PPS products wanted only in their EPIC copy. ``OBSMLI`` is the reason this is a
+#: separate list: the Optical Monitor emits one too, so a filter matching the product code
+#: alone downloads an optical catalogue and the position cross-check compares an X-ray
+#: source with it. ``REGION`` and ``SUMMAR`` are here because the EPIC ones are the ones
+#: worth keeping, not because anything would break.
+EPIC_PRODUCTS_WANTED = {
+    "OBSMLI": "FTZ",  # maximum-likelihood source list
+    "REGION": "ASC",  # the regions PPS itself extracted with
+    "SUMMAR": "HTM",  # the summary page a human opens
+}
+
+#: ODF files downloaded on *both* routes: the observation's housekeeping. Five megabytes,
+#: almost all of it ``RAS.ASC``, and the PPS products carry no orbit or attitude of their
+#: own, so the barycentring has nowhere else to read them from. Named by the last part of
+#: the ODF file name, which is ``<revolution>_<OBSID>_SCX00000<CODE>.<EXT>``.
+ODF_HOUSEKEEPING_WANTED = (
+    "ATS.FIT",  # attitude history
+    "RAS.ASC",  # raw attitude
+    "ROS.ASC",  # reconstructed orbit
+    "SUM.ASC",  # the observation summary odfingest reads
+    "TCS.FIT",  # time correlation
+    "TCX.FIT",  # time correlation, extended
+)
+
+
+def _alternation(codes):
+    """``(?:A|B|C)`` from an iterable, in a fixed order so the regex is reproducible."""
+    return "(?:" + "|".join(sorted(codes)) + ")"
+
+
+def _pps_include_pattern():
+    """
+    The part of the download filter that matches PPS products.
+
+    Anchored at both ends: on ``/PPS/`` at the front, so nothing outside the archive's own
+    reduction can match, and on the extension at the back, so the ``.PDF`` and ``.PNG``
+    pictures PPS writes beside its data files are left at the archive. A picture of a
+    light curve has the same name as the light curve.
+    """
+    any_instrument = "".join(
+        [
+            r"[A-Z0-9]{2}[A-Z]\d{3}",
+            _alternation(PPS_PRODUCTS_WANTED),
+            r"\d{4}\.FTZ",
+        ]
+    )
+    epic_only = _alternation(
+        rf"{code}\d{{4}}\.{extension}" for code, extension in EPIC_PRODUCTS_WANTED.items()
+    )
+    return rf"/PPS/P\d{{10}}(?:{any_instrument}|EPX000{epic_only})$"
+
+
+def _odf_housekeeping_pattern():
+    """
+    The part of the download filter that matches the ODF housekeeping.
+
+    ``.gz`` is optional because the archive gzips most of these and not ``SUM.ASC``, and
+    because a local mirror may have unpacked them.
+    """
+    codes = _alternation(name.replace(".", r"\.") for name in ODF_HOUSEKEEPING_WANTED)
+    return rf"/ODF/\d{{4}}_\d{{10}}_SCX00000{codes}(?:\.gz)?$"
+
+
+#: What the PPS route downloads: the archive's own reduction of the EPIC cameras, and the
+#: housekeeping both routes need. Measured on the whole of Her X-1 ``0153950401``, this is
+#: 19 files and 39.8 MB out of 461 files and 205.8 MB.
+PPS_DOWNLOAD_RE = f"(?:{_pps_include_pattern()})|(?:{_odf_housekeeping_pattern()})"
+
+#: What the ODF route downloads: the raw telemetry, all of it. There is no cheaper answer
+#: -- ``odfingest`` wants the directory it was given, not a chosen part of it.
+ODF_DOWNLOAD_RE = r"/ODF/"
+
+
+def xmm_download_filter(config):
+    """
+    What of an XMM observation directory to download, for the route this run is taking.
+
+    An observation is 200 MB to 1.2 GB and a reduction of the EPIC cameras wants about a
+    fortieth of it, so this is what decides whether a long observation is an ordinary
+    download. It matters more than it looks: *short* and *small* are different axes, and
+    the filter decouples them. SAX J1808 ``0804330201`` is 35 ks and 393 MB in the
+    archive; on the PPS route it is a 77 MB download.
+
+    Called through ``core.mission_download_filter``, which is why it returns keyword
+    arguments for :func:`~heasarc_retrieve_pipeline.core.recursive_download` rather than a
+    pattern. The regular expression is matched against the whole remote name -- an HTTPS
+    URL or an S3 bucket key, depending on the transport -- so it is anchored on the
+    ``/PPS/`` and ``/ODF/`` the two spellings have in common.
+
+    Parameters
+    ----------
+    config : dict
+        The run's configuration. Only ``products`` is read.
+
+    Returns
+    -------
+    dict
+        ``re_include`` for :func:`~heasarc_retrieve_pipeline.core.recursive_download`.
+
+    Raises
+    ------
+    ValueError
+        If ``products`` is neither ``"pps"`` nor ``"odf"``. Falling back to "download
+        everything" would answer a typo in a configuration file with a gigabyte.
+
+    Examples
+    --------
+    >>> sorted(xmm_download_filter({"products": "odf"}))
+    ['re_include']
+    """
+    products = config.get("products", DEFAULT_CONFIG["products"])
+    if products == "pps":
+        return {"re_include": PPS_DOWNLOAD_RE}
+    if products == "odf":
+        return {"re_include": ODF_DOWNLOAD_RE}
+    raise ValueError(f"XMM has a 'pps' route and an 'odf' route, not {products!r}.")
+
+
 #: A PPS file name, field by field. Anchored at both ends on purpose: the summary pages
 #: are named ``PP<OBSID>EEVLIS000_0.HTM``, which contains ``EVLI`` and would otherwise be
 #: read as an event list of an observation called ``0153950401E``.
