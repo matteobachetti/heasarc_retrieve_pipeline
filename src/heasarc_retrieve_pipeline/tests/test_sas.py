@@ -42,6 +42,46 @@ def a_sas_that_records_its_calls(monkeypatch, returncode=0, writes=None, stdout=
     return calls
 
 
+class TestWhereTheTaskRuns:
+    """
+    The working directory a task is run from, which is not decoration.
+
+    A SAS task writes the names it was given into the headers of the files it makes:
+    ``especget`` puts ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE`` in a spectrum so that a
+    fitting program can follow them. Given absolute paths it writes absolute paths, and a
+    FITS header card holds 80 characters -- the same trap that truncated the file names in
+    an ``addspec`` merge. Running the task where its outputs belong lets the caller pass
+    plain names.
+    """
+
+    def test_the_task_runs_where_it_was_told_to(self, monkeypatch, tmp_path):
+        calls = a_sas_that_records_its_calls(monkeypatch, writes=[tmp_path / "out.fits"])
+
+        sas.run("evselect", produces=str(tmp_path / "out.fits"), cwd=str(tmp_path))
+
+        assert calls[0].kwargs["cwd"] == str(tmp_path)
+
+    def test_by_default_it_runs_where_this_process_is(self, monkeypatch, tmp_path):
+        calls = a_sas_that_records_its_calls(monkeypatch, writes=[tmp_path / "out.fits"])
+
+        sas.run("evselect", produces=str(tmp_path / "out.fits"))
+
+        assert calls[0].kwargs["cwd"] is None
+
+    def test_the_outputs_are_still_checked_by_their_full_path(self, monkeypatch, tmp_path):
+        # The task is handed a bare name; the caller still says where that lands, so a
+        # task that wrote nothing is caught wherever it ran.
+        a_sas_that_records_its_calls(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="did not create"):
+            sas.run(
+                "especget",
+                produces=str(tmp_path / "src.pi"),
+                cwd=str(tmp_path),
+                srcspecset="src.pi",
+            )
+
+
 class TestTheArgumentVector:
     """
     SAS takes ``keyword=value`` arguments, and they must reach it untouched.

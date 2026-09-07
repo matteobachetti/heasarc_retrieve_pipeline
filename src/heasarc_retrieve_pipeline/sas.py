@@ -290,7 +290,7 @@ def sas_environment(ccf=None, odf=None, ccfpath=None, verbosity=None):
     return environment
 
 
-def run(name, *, produces, log_to=None, capture=False, env=None, **params):
+def run(name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params):
     """
     Run one SAS task, one at a time in this process.
 
@@ -315,6 +315,16 @@ def run(name, *, produces, log_to=None, capture=False, env=None, **params):
     env : dict, optional
         Environment for the task, normally from :func:`sas_environment`. ``None``, the
         default, inherits this process's own.
+    cwd : str, optional
+        Directory to run the task in. It matters because a SAS task writes the names it
+        was *given* into the headers of the files it makes -- ``especget`` fills
+        ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE`` so that a fitting program can follow
+        them -- and a FITS header card holds 80 characters. Handed an absolute path a
+        hundred characters long, it writes one. Running the task in the directory its
+        outputs belong to lets the caller pass plain file names instead, which are
+        shorter, survive the tree being moved, and are what a fitting program looks for
+        beside the spectrum. ``produces`` is still checked by full path, so nothing about
+        the output check changes.
     **params
         Task parameters, passed as ``keyword=value`` -- see :func:`_argument`.
 
@@ -348,6 +358,7 @@ def run(name, *, produces, log_to=None, capture=False, env=None, **params):
                 result = subprocess.run(
                     argv,
                     env=env,
+                    cwd=cwd,
                     stdout=destination,
                     stderr=subprocess.STDOUT if destination is not None else None,
                     text=capture,

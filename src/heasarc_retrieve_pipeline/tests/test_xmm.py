@@ -1540,8 +1540,8 @@ class StubSas:
         self.calls = []
         self.keywords = keywords
 
-    def __call__(self, name, *, produces, log_to=None, capture=False, env=None, **params):
-        self.calls.append((name, params))
+    def __call__(self, name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params):
+        self.calls.append((name, dict(params, cwd=cwd)))
         for output in produces if isinstance(produces, (list, tuple)) else [produces]:
             os.makedirs(os.path.dirname(str(output)), exist_ok=True)
             if not os.path.exists(str(output)):
@@ -1647,10 +1647,29 @@ class TestExtractingTheSpectra:
 
         (call,) = stub.task("especget")
         assert call["withfilestem"] == "no"
-        assert call["srcspecset"] == paths.source
-        assert call["bckspecset"] == paths.background
-        assert call["srcarfset"] == paths.arf
-        assert call["srcrmfset"] == paths.rmf
+        assert call["srcspecset"] == os.path.basename(paths.source)
+        assert call["bckspecset"] == os.path.basename(paths.background)
+        assert call["srcarfset"] == os.path.basename(paths.arf)
+        assert call["srcrmfset"] == os.path.basename(paths.rmf)
+
+    def test_the_tasks_run_in_the_products_directory_and_are_given_bare_names(
+        self, tmp_path, stub_sas
+    ):
+        # especget writes the names it is given into BACKFILE, RESPFILE and ANCRFILE, and
+        # a FITS header card holds 80 characters -- which an absolute path here exceeds on
+        # its own. Measured on the real Her X-1 run: 140 characters before this, and the
+        # same trap that truncated the file names in an addspec merge.
+        paths, _, stub = self.a_run(tmp_path, stub_sas)
+        products = os.path.dirname(paths.source)
+
+        for task in ("especget", "specgroup"):
+            (call,) = stub.task(task)
+            assert call["cwd"] == products
+            assert not any(
+                isinstance(value, str) and value.startswith(products + "/")
+                for key, value in call.items()
+                if key != "table"
+            )
 
     def test_the_position_asked_for_is_handed_to_arfgen(self, tmp_path, stub_sas):
         # A timing spectrum's region is a strip of columns, so the centre of the region
@@ -1671,11 +1690,11 @@ class TestExtractingTheSpectra:
         paths, _, stub = self.a_run(tmp_path, stub_sas)
 
         (call,) = stub.task("specgroup")
-        assert call["spectrumset"] == paths.source
-        assert call["groupedset"] == paths.grouped
-        assert call["rmfset"] == paths.rmf
-        assert call["arfset"] == paths.arf
-        assert call["backgndset"] == paths.background
+        assert call["spectrumset"] == os.path.basename(paths.source)
+        assert call["groupedset"] == os.path.basename(paths.grouped)
+        assert call["rmfset"] == os.path.basename(paths.rmf)
+        assert call["arfset"] == os.path.basename(paths.arf)
+        assert call["backgndset"] == os.path.basename(paths.background)
         assert call["addfilenames"] == "yes"
 
     def test_the_grouping_numbers_come_from_the_configuration(self, tmp_path, stub_sas):

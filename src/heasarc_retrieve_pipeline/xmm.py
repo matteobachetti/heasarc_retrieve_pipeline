@@ -2061,7 +2061,14 @@ def xmm_calculate_spectra(
 
     source_region, background_region = regions
     paths = xmm_spectrum_paths(obsid, exposure, config)
-    os.makedirs(os.path.dirname(paths.source), exist_ok=True)
+    products = os.path.dirname(paths.source)
+    os.makedirs(products, exist_ok=True)
+
+    # The tasks run in the products directory and are given bare file names, because they
+    # write the names they are given into the spectrum's BACKFILE, RESPFILE and ANCRFILE
+    # -- and a FITS header card holds 80 characters, which an output path here exceeds on
+    # its own. See the ``cwd`` argument of :func:`heasarc_retrieve_pipeline.sas.run`.
+    name = {key: os.path.basename(value) for key, value in vars(paths).items()}
 
     logger.info(
         f"Extracting the spectrum of {exposure.instrument}{exposure.expid} from "
@@ -2072,14 +2079,15 @@ def xmm_calculate_spectra(
         produces=[paths.source, paths.background, paths.arf, paths.rmf],
         log_to=log_to,
         env=env,
-        table=events,
+        cwd=products,
+        table=os.path.abspath(events),
         srcexp=source_region,
         backexp=background_region,
         withfilestem="no",
-        srcspecset=paths.source,
-        bckspecset=paths.background,
-        srcarfset=paths.arf,
-        srcrmfset=paths.rmf,
+        srcspecset=name["source"],
+        bckspecset=name["background"],
+        srcarfset=name["arf"],
+        srcrmfset=name["rmf"],
         withsourcepos="yes",
         sourcecoords="eqpos",
         sourcex=ra,
@@ -2091,13 +2099,14 @@ def xmm_calculate_spectra(
         produces=paths.grouped,
         log_to=log_to,
         env=env,
-        spectrumset=paths.source,
-        groupedset=paths.grouped,
+        cwd=products,
+        spectrumset=name["source"],
+        groupedset=name["grouped"],
         mincounts=config["spectrum_min_counts"],
         oversample=config["spectrum_oversample"],
-        rmfset=paths.rmf,
-        arfset=paths.arf,
-        backgndset=paths.background,
+        rmfset=name["rmf"],
+        arfset=name["arf"],
+        backgndset=name["background"],
         # Fills BACKFILE, RESPFILE and ANCRFILE, so that the grouped spectrum is the only
         # file a fit has to be pointed at.
         addfilenames="yes",
