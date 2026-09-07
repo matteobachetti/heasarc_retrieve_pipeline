@@ -2021,3 +2021,89 @@ class TestWhereTheCleanedFilesGo:
 
         assert os.path.basename(path) == "pnS004_imaging_flare.gti"
         assert os.path.dirname(path) == xmm.xmm_pipeline_output_path("0153950401", config)
+
+
+class TestTheObservationDate:
+    """
+    ``DATE-OBS``, read off an event list and shaped for ``cifbuild``.
+
+    The date is the whole input to the calibration index: it selects the constituents
+    valid for the observation's epoch, at their current issue. It comes from a file we
+    have already downloaded, so building the index needs no ODF and no extra request.
+    """
+
+    def test_the_date_is_read_from_the_events_header(self, tmp_path):
+        path = an_event_file(tmp_path / "events.ds", **{"DATE-OBS": "2002-03-27T21:11:14"})
+
+        assert xmm.xmm_observation_date(path) == "2002-03-27"
+
+    def test_the_time_of_day_is_dropped(self):
+        assert xmm.cifbuild_date("2021-04-06T23:02:03") == "2021-04-06"
+
+    def test_a_date_with_no_time_of_day_survives(self):
+        assert xmm.cifbuild_date("2021-04-06") == "2021-04-06"
+
+    def test_a_file_without_the_keyword_gives_nothing(self, tmp_path):
+        path = an_event_file(tmp_path / "events.ds", TELESCOP="XMM")
+
+        assert xmm.xmm_observation_date(path) is None
+
+
+class TestBuildingTheCalibrationIndex:
+    """
+    ``cifbuild``, run as the normal path rather than as a fallback.
+
+    Matteo's ruling of 2026-09-07: the mirror is ESA's *Valid CCF Set*, which holds what
+    is needed to process any ODF at the current date, and a new analysis wants that rather
+    than the superseded issues an archival ``CALIND`` names. So ``SAS_CCF`` points at an
+    index built from the observation date, and ``CALIND`` is kept only as the record of
+    what ESA used.
+    """
+
+    CONFIG = dict(out_data_path=None)
+
+    def config(self, tmp_path):
+        return xmm.xmm_config(dict(self.CONFIG, out_data_path=str(tmp_path)))
+
+    def build(self, tmp_path, stub_sas, date="2002-03-27T21:11:14"):
+        events = an_event_file(tmp_path / "events.ds", **{"DATE-OBS": date})
+        stub = stub_sas()
+        built = xmm.xmm_build_calibration_index("0153950401", self.config(tmp_path), events)
+        return stub, built
+
+    def test_the_index_goes_beside_the_cleaned_events(self, tmp_path, stub_sas):
+        _, built = self.build(tmp_path, stub_sas)
+
+        assert built == xmm.xmm_calibration_index_path("0153950401", self.config(tmp_path))
+        assert os.path.dirname(built) == xmm.xmm_pipeline_output_path(
+            "0153950401", self.config(tmp_path)
+        )
+
+    def test_the_observation_date_is_what_selects_the_constituents(self, tmp_path, stub_sas):
+        stub, _ = self.build(tmp_path, stub_sas)
+        (params,) = stub.task("cifbuild")
+
+        assert params["withobservationdate"] == "yes"
+        assert params["observationdate"] == "2002-03-27"
+
+    def test_the_paths_it_records_are_absolute(self, tmp_path, stub_sas):
+        stub, _ = self.build(tmp_path, stub_sas)
+        (params,) = stub.task("cifbuild")
+
+        assert params["fullpath"] == "yes"
+
+    def test_it_runs_where_the_index_goes_and_is_given_a_bare_name(self, tmp_path, stub_sas):
+        stub, built = self.build(tmp_path, stub_sas)
+        (params,) = stub.task("cifbuild")
+
+        assert params["calindexset"] == os.path.basename(built)
+        assert params["cwd"] == os.path.dirname(built)
+
+    def test_an_observation_with_no_date_is_not_guessed_at(self, tmp_path, stub_sas):
+        events = an_event_file(tmp_path / "events.ds", TELESCOP="XMM")
+        stub = stub_sas()
+
+        with pytest.raises(ValueError, match="DATE-OBS"):
+            xmm.xmm_build_calibration_index("0153950401", self.config(tmp_path), events)
+
+        assert stub.task("cifbuild") == []

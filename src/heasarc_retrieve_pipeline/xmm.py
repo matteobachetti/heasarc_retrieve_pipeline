@@ -936,6 +936,161 @@ def xmm_calind_file(obsid, config):
     return _observation_level_file(obsid, config, CALIBRATION_INDEX_PRODUCT)
 
 
+#: What the index this pipeline builds is called. A bare name, not a path: ``cifbuild``
+#: runs in the directory the index belongs in, so nothing long reaches a header card.
+CALIBRATION_INDEX_NAME = "ccf.cif"
+
+#: Header keyword holding the start of an observation, and the whole input to
+#: :func:`xmm_build_calibration_index`.
+OBSERVATION_DATE_KEYWORD = "DATE-OBS"
+
+
+def cifbuild_date(value):
+    """
+    A ``DATE-OBS`` value as ``cifbuild``'s ``observationdate`` wants it.
+
+    Parameters
+    ----------
+    value : str
+        ``"2002-03-27T21:11:14"``, or a bare date.
+
+    Returns
+    -------
+    str
+        ``"2002-03-27"``. The time of day is dropped because calibration constituents are
+        valid over epochs measured in months, not seconds.
+
+    Examples
+    --------
+    >>> cifbuild_date("2021-04-06T23:02:03")
+    '2021-04-06'
+    """
+    return str(value).split("T")[0].strip()
+
+
+def xmm_observation_date(event_list):
+    """
+    When an observation started, read from an event list this pipeline already downloaded.
+
+    This is what makes building the calibration index free of the ODF: the date is in a
+    file the PPS route fetches anyway, so there is nothing extra to download.
+
+    Parameters
+    ----------
+    event_list : str
+        Any event list of the observation.
+
+    Returns
+    -------
+    str or None
+        ``"YYYY-MM-DD"``, or ``None`` when no header carries ``DATE-OBS``.
+    """
+    from astropy.io import fits
+
+    with fits.open(event_list) as hdul:
+        for hdu in hdul:
+            if OBSERVATION_DATE_KEYWORD in hdu.header:
+                return cifbuild_date(hdu.header[OBSERVATION_DATE_KEYWORD])
+    return None
+
+
+def xmm_calibration_index_path(obsid, config):
+    """
+    Where the calibration index this pipeline builds goes.
+
+    Beside the cleaned events rather than in the downloaded tree, because it is an output
+    of the reduction and not something the archive gave us.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/ccf.cif``.
+    """
+    return os.path.join(xmm_pipeline_output_path(obsid, config), CALIBRATION_INDEX_NAME)
+
+
+def xmm_build_calibration_index(obsid, config, event_list, env=None, log_to=None):
+    """
+    Build the calibration index ``SAS_CCF`` will point at, from the observation date.
+
+    **This is the normal path, not a fallback** -- decided by Matteo, 2026-09-07. The
+    reasoning is worth keeping next to the code, because the obvious alternative looks
+    better than it is.
+
+    An observation's downloaded ``CALIND`` is the index the SOC used for the November 2024
+    reprocessing, and it names the calibration issues current *then*: Her X-1's names
+    ``XMM_BORESIGHT_0029.CCF``, where ESA's set now holds 0036. A mirror of ESA's *Valid
+    CCF Set* -- which ESA assembles daily and describes as everything needed to process any
+    XMM-Newton ODF at the current date -- therefore cannot satisfy an archival ``CALIND``,
+    and ``ecoordconv`` fails outright. The fix is not to fetch the superseded issue. That
+    would be asking for worse calibration: the full ~1550-file history exists to reproduce
+    what was known at a past moment, and a new analysis wants what is known now.
+
+    So the index is built here instead, from the observation's own date, which selects the
+    constituents valid for its epoch at their current issue. Measured at 26 s on Her X-1,
+    against 524 s for a single pn ``arfgen``, and it happens once per observation rather
+    than once per exposure.
+
+    One consequence, stated rather than discovered: PPS event lists were generated with the
+    November 2024 calibration, so responses built against a newer index are marginally
+    inconsistent with the ``PI`` values in those events. That is the ordinary situation for
+    anyone reanalysing archival data with current SAS, and the alternative is the
+    superseded calibration just ruled out. ``CALIND`` is still downloaded -- it is about
+    90 kB -- so both indices can be named on the report page and the choice stays visible.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    event_list : str
+        Any event list of the observation, read for its ``DATE-OBS``.
+    env : dict, optional
+        Environment for the task, from :func:`heasarc_retrieve_pipeline.sas.sas_environment`.
+        ``SAS_CCFPATH`` has to reach the task through it, or through the inherited
+        environment; ``SAS_CCF`` is what this call produces and is not needed yet.
+    log_to : str, optional
+        File the task's output goes to.
+
+    Returns
+    -------
+    str
+        Path of the index, for ``SAS_CCF``.
+
+    Raises
+    ------
+    ValueError
+        When the event list carries no ``DATE-OBS``. Guessing a date would silently pick
+        the wrong calibration epoch, which is the one failure mode that does not announce
+        itself.
+    """
+    from . import sas
+
+    date = xmm_observation_date(event_list)
+    if date is None:
+        raise ValueError(
+            f"{event_list} carries no {OBSERVATION_DATE_KEYWORD}, so the calibration "
+            "epoch of this observation is unknown and the index cannot be built"
+        )
+
+    output = xmm_calibration_index_path(obsid, config)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+
+    sas.run(
+        "cifbuild",
+        produces=output,
+        log_to=log_to,
+        env=env,
+        cwd=os.path.dirname(output),
+        calindexset=os.path.basename(output),
+        withobservationdate="yes",
+        observationdate=date,
+        fullpath="yes",
+    )
+    return output
+
+
 def xmm_source_list_file(obsid, config):
     """
     The EPIC maximum-likelihood source list, or ``None`` if it was not downloaded.
