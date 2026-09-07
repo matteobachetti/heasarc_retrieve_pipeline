@@ -13,9 +13,11 @@ import pytest
 
 from heasarc_retrieve_pipeline import core
 from heasarc_retrieve_pipeline.core import (
+    MISSION_CONFIG,
     download_node,
     get_remote_directory_listing,
     file_needs_download,
+    obsid_query,
     parse_directory_index,
     recursive_download_s3,
     s3_key_destination,
@@ -610,3 +612,94 @@ class TestThePageWriteIsTimed:
             caplog.text,
         )
         assert "Wrote the diagnostics page" not in caplog.text
+
+
+# Recorded from the live HEASARC TAP service on 2026-09-07 with
+#
+#     SELECT column_name FROM TAP_SCHEMA.columns WHERE table_name='<table>'
+#
+# (the service quotes ``"time"`` and ``"__row"``; the quotes are stripped here). The
+# point of keeping the whole schema rather than the interesting parts is that the
+# assertion below is then exact: every column a mission asks for is one the catalogue
+# really has. ``xmmmaster`` is recorded before XMM is a mission, so the guard is in
+# place on the day the mission is added.
+CATALOGUE_COLUMNS = {
+    "numaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec abstract bii caldb_version category_code
+        comments coordinated copi_fname copi_lname country cycle data_gap dec end_time
+        exposure_a exposure_b instrument_mode issue_flag lii name nupsdout obs_type
+        observation_mode obsid ontime_a ontime_b pi_fname pi_lname priority prnb
+        processing_date public_date ra roll_angle slew_mode software_version
+        solar_activity spacecraft_mode status subject_category time title
+        """.split()
+    ),
+    "nicermastr": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec abstract bii caldb_version category_code
+        coordinated cycle dec end_time exposure facility galactic_nh lii mpu0_exposure
+        mpu1_exposure mpu2_exposure mpu3_exposure mpu4_exposure mpu5_exposure
+        mpu6_exposure name num_fpm num_processed obs_type obsid orig_target_id pi_fname
+        pi_lname prnb processing_date processing_status processing_version public_date ra
+        remarks software_version subject_category target_class target_dec target_id
+        target_ra time time_awarded title
+        """.split()
+    ),
+    "xtemaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec archived_date bii cycle dec duration
+        exposure hexte_anglea hexte_angleb hexte_dwella hexte_dwellb hexte_energya
+        hexte_energyb hexte_modea hexte_modeb lii observed_date obsid pca_config1
+        pca_config2 pca_config3 pca_config4 pca_config5 pca_config6 pi_fname pi_lname
+        pi_no priority prnb processed_date ra scheduled_date status subject_category
+        tar_no target_name time time_awarded
+        """.split()
+    ),
+    "xmmmaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec bii class data_in_heasarc dec
+        distribution_date duration end_time estimated_exposure lii mos1_mode mos1_num
+        mos1_time mos2_mode mos2_num mos2_time name obsid odf_date om_mode om_num om_time
+        pi_fname pi_lname pi_title pn_mode pn_num pn_time pno pps_flag pps_version
+        process_date process_status public_date ra rgs1_mode rgs1_num rgs1_time
+        rgs2_mode rgs2_num rgs2_time sas_version scheduled_duration status
+        subject_category time xmm_revolution
+        """.split()
+    ),
+}
+
+
+class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
+    """
+    The rest of the ``obsid_query`` tests are in ``test_concurrency.py``; this one is
+    here because it is a schema guard that costs nothing, and that file is deselected
+    unless ``--run-slow`` is given.
+
+    ``cycle`` is the reason the guard exists. It used to be written into the query text
+    for every mission, and ``xmmmaster`` does not have it, so the XMM query failed before
+    it reached the archive.
+    """
+
+    def selected_columns(self, mission):
+        query = obsid_query("1", mission)
+        selected = query.split("SELECT", 1)[1].split("FROM", 1)[0]
+        return [column.strip() for column in selected.split(",") if column.strip()]
+
+    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    def test_every_column_a_mission_asks_for_exists_in_its_catalogue(self, mission):
+        table = MISSION_CONFIG[mission]["table"]
+
+        assert set(self.selected_columns(mission)) <= CATALOGUE_COLUMNS[table]
+
+    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    def test_a_mission_asks_for_no_column_twice(self, mission):
+        """``rxte`` named ``cycle`` in "additional" while the query text named it too."""
+        columns = self.selected_columns(mission)
+
+        assert len(columns) == len(set(columns))
+
+    def test_a_new_mission_has_to_record_its_catalogue_schema(self):
+        """Otherwise the guard above silently passes over it."""
+        tables = {config["table"] for config in MISSION_CONFIG.values()}
+
+        assert tables <= set(CATALOGUE_COLUMNS)

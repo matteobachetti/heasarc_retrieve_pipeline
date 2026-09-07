@@ -895,7 +895,7 @@ MISSION_CONFIG = {
         # numaster means it: zero exposure_a is an observation with no data, and there is
         # no point downloading it.
         "zero_exposure_may_be_wrong": False,
-        "additional": "solar_activity",
+        "additional": "cycle, solar_activity",
         "obsid_processing": process_nustar_obsid,
         "default_config": NUSTAR_DEFAULT_CONFIG,
         "name_column": "name",
@@ -907,7 +907,7 @@ MISSION_CONFIG = {
         # nicermastr does not: it sometimes reports zero because NICER's own pipeline
         # filtered the data wrongly, and the data are fine. Download them and look.
         "zero_exposure_may_be_wrong": True,
-        "additional": "",
+        "additional": "cycle",
         "obsid_processing": process_nicer_obsid,
         "default_config": NICER_DEFAULT_CONFIG,
         "name_column": "name",
@@ -1085,6 +1085,11 @@ def obsid_query(obsid, mission: str = "nustar"):
     an OBSID has been named explicitly, returning nothing at all is more confusing than
     returning the row and letting the reduction say what it found.
 
+    Only the columns every master catalogue has are written into the query text. Anything
+    else, ``cycle`` included, belongs in the mission's ``"additional"`` string: ``cycle``
+    is in ``numaster``, ``nicermastr`` and ``xtemaster`` but not in ``xmmmaster``, so a
+    query that always asked for it could not reach XMM at all.
+
     Raises
     ------
     ValueError
@@ -1105,7 +1110,7 @@ def obsid_query(obsid, mission: str = "nustar"):
         additional = f", {additional}"
     wanted = ", ".join(f"'{one}'" for one in obsids)
 
-    return f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
+    return f"""SELECT {name_column}, obsid, time, {expo_name}, ra, dec, __row {additional}
         FROM public.{table} as cat
         where
         cat.obsid IN ({wanted})
@@ -1130,8 +1135,8 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     Returns
     -------
     astropy.table.Table
-        One row per OBSID found, with the mission's name, ``cycle``, ``obsid``, ``time``,
-        exposure, ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
+        One row per OBSID found, with the mission's name, ``obsid``, ``time``, exposure,
+        ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
 
     Notes
     -----
