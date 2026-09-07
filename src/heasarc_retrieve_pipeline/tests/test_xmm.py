@@ -3013,3 +3013,122 @@ class TestRunningTheOdfPipeline:
 
         with pytest.raises(RuntimeError, match="produced an event list"):
             xmm.xmm_run_odf_pipeline("0153950401", config)
+
+
+class TestTheOdfFlareCurve:
+    """
+    ``xmm_odf_flare_lightcurve`` and ``xmm_with_odf_flare_curves``: the curve PPS would
+    have supplied, built here.
+    """
+
+    def config(self, tmp_path):
+        return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+    def an_odf_exposure(self, instrument="pn", expid="S003", mode=xmm.IMAGING):
+        return xmm.Exposure(
+            instrument=instrument,
+            expid=expid,
+            mode=mode,
+            event_list=f"/events/{instrument}{expid}.ds",
+            flare_lightcurve=None,
+        )
+
+    def test_the_selection_is_the_cookbooks_for_that_camera(self, tmp_path, stub_sas):
+        stub = stub_sas()
+
+        xmm.xmm_odf_flare_lightcurve(
+            "0153950401", self.an_odf_exposure("mos1"), self.config(tmp_path)
+        )
+
+        (params,) = stub.task("evselect")
+        assert params["expression"] == "#XMMEA_EM && (PI>10000) && (PATTERN==0)"
+        assert params["timebinsize"] == xmm.ODF_FLARE_BIN_SECONDS
+
+    def test_pn_is_bounded_above_and_mos_is_not(self):
+        assert "12000" in xmm.ODF_FLARE_EXPRESSIONS["pn"]
+        assert "12000" not in xmm.ODF_FLARE_EXPRESSIONS["mos"]
+
+    def test_the_task_runs_where_its_output_goes(self, tmp_path, stub_sas):
+        stub = stub_sas()
+        config = self.config(tmp_path)
+
+        output = xmm.xmm_odf_flare_lightcurve("0153950401", self.an_odf_exposure(), config)
+
+        (params,) = stub.task("evselect")
+        assert params["cwd"] == os.path.dirname(output)
+        assert params["rateset"] == os.path.basename(output)
+
+    def test_a_timing_exposure_shares_its_own_imaging_curve(self, tmp_path, stub_sas):
+        stub = stub_sas()
+        exposures = [
+            self.an_odf_exposure("mos1", "S004", xmm.IMAGING),
+            self.an_odf_exposure("mos1", "S004", xmm.TIMING),
+        ]
+
+        result = xmm.xmm_with_odf_flare_curves("0153950401", exposures, self.config(tmp_path))
+
+        assert len(stub.task("evselect")) == 1, "one curve, not one per mode"
+        assert result[0].flare_lightcurve == result[1].flare_lightcurve
+        assert result[0].flare_lightcurve is not None
+
+    def test_a_timing_exposure_with_no_imaging_twin_is_not_screened(self, tmp_path, stub_sas):
+        stub = stub_sas()
+        exposures = [self.an_odf_exposure("pn", "S003", xmm.TIMING)]
+
+        (result,) = xmm.xmm_with_odf_flare_curves("0153950401", exposures, self.config(tmp_path))
+
+        assert stub.task("evselect") == [], "a timing list has no field to average over"
+        assert result.flare_lightcurve is None
+
+    def test_curves_are_not_shared_between_exposures(self, tmp_path, stub_sas):
+        stub_sas()
+        exposures = [
+            self.an_odf_exposure("pn", "S003", xmm.IMAGING),
+            self.an_odf_exposure("mos1", "S004", xmm.IMAGING),
+        ]
+
+        result = xmm.xmm_with_odf_flare_curves("0153950401", exposures, self.config(tmp_path))
+
+        assert result[0].flare_lightcurve != result[1].flare_lightcurve
+
+
+class TestWhichFlareThresholdTheOdfRouteUses:
+    """
+    The cookbook's fixed rates are right for the ODF curve and wrong for a PPS one.
+    """
+
+    def a_curve(self, pps_threshold=None):
+        return xmm.FlareLightCurve(
+            time=np.array([50.0, 150.0]),
+            rate=np.array([0.1, 0.2]),
+            rate_error=None,
+            cadence=100.0,
+            tstart=0.0,
+            tstop=200.0,
+            pps_threshold=pps_threshold,
+        )
+
+    def test_the_odf_route_falls_back_to_the_cookbook_numbers(self):
+        config = xmm.xmm_config({"products": "odf"})
+
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(), "pn", config)
+
+        assert threshold == pytest.approx(0.4)
+        assert source == "config"
+
+    def test_the_pps_route_does_not(self):
+        # The same curve, the same absent FLCUTTHR: on the PPS route there is simply no
+        # threshold to be had, and 0.4 counts/s would throw away a whole exposure.
+        config = xmm.xmm_config({"products": "pps"})
+
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(), "pn", config)
+
+        assert threshold is None
+        assert source is None
+
+    def test_an_explicit_limit_still_wins_on_the_odf_route(self):
+        config = xmm.xmm_config({"products": "odf", "flare_rate_limit": {"pn": 1.5}})
+
+        threshold, _ = xmm.xmm_flare_threshold(self.a_curve(), "pn", config)
+
+        assert threshold == pytest.approx(1.5)

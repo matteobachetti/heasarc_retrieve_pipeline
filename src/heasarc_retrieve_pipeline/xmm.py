@@ -148,6 +148,22 @@ BARYCENTRED_TIMEREF = "SOLARSYSTEM"
 #: header anyway -- see :func:`xmm_exposures_from_odf`.
 ODF_EVENT_LIST_GLOB = "*Evts.ds"
 
+#: The high-energy full-field selections the SAS cookbook screens flares with, keyed by
+#: camera family. Above 10 keV EPIC's effective area is negligible, so what is left is
+#: background: soft protons show as a rise over the whole field. ``PATTERN==0`` keeps
+#: single-pixel events, which is what the cookbook's rate limits were measured on -- so
+#: these expressions and :data:`DEFAULT_CONFIG`'s ``odf_flare_rate_limit`` have to change
+#: together or not at all. pn is bounded above because it has fluorescence lines past
+#: 12 keV that are not background in this sense.
+ODF_FLARE_EXPRESSIONS = {
+    "pn": "#XMMEA_EP && (PI in [10000:12000]) && (PATTERN==0)",
+    "mos": "#XMMEA_EM && (PI>10000) && (PATTERN==0)",
+}
+
+#: Light-curve bin, in seconds. The cookbook's, and the rate limits are per second, so a
+#: different bin changes the noise on each point but not the threshold it is compared to.
+ODF_FLARE_BIN_SECONDS = 100.0
+
 #: The two tasks that turn raw telemetry into event lists, and the camera family each
 #: covers. They are run separately and a failure of one does not stop the other: an
 #: observation with no pn is ordinary, and MOS data is worth reducing without it.
@@ -722,6 +738,12 @@ def xmm_flare_threshold(curve, instrument, config):
         when there is no threshold to be had and the exposure cannot be screened.
     """
     limits = config.get("flare_rate_limit") or {}
+    if not limits and config.get("products") == "odf":
+        # The ODF route builds its own curve with `evselect` over the high-energy full
+        # field, which is exactly the curve the cookbook's numbers were measured on. On
+        # the PPS route they would be meaningless -- see this function's table.
+        limits = config.get("odf_flare_rate_limit") or {}
+
     for key in (instrument, camera_family(instrument)):
         if key in limits:
             return float(limits[key]), "config"
@@ -2771,6 +2793,124 @@ def xmm_run_odf_pipeline(obsid, config, env=None, log_to=None):
         )
     logger.info(f"{obsid}: the ODF pipeline produced {len(produced)} event lists")
     return events
+
+
+def xmm_odf_flare_lightcurve_path(obsid, exposure, config):
+    """
+    Where one exposure's background light curve goes on the ODF route.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera and exposure.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<event_cl>/<stem>_flare.lc``.
+    """
+    return os.path.join(
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_flare.lc"
+    )
+
+
+def xmm_odf_flare_lightcurve(obsid, exposure, config, env=None, log_to=None):
+    """
+    Build the background light curve the ODF route screens flares with.
+
+    The ODF holds no ``FBKTSR``, so the curve PPS would have supplied is made here with
+    ``evselect`` over the high-energy full field -- see :data:`ODF_FLARE_EXPRESSIONS`.
+
+    It carries no ``FLCUTTHR``: that keyword is the SOC's per-exposure answer and there is
+    nobody to compute it here. :func:`xmm_flare_threshold` therefore falls back to
+    ``config["odf_flare_rate_limit"]``, the cookbook's fixed numbers, which are right for
+    *this* curve and wrong for a PPS one.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        The exposure to build the curve for. Must be an imaging exposure: a timing event
+        list has no field to average over.
+    config : dict
+        Must contain ``out_data_path``.
+    env : dict, optional
+        SAS environment.
+    log_to : str, optional
+        File to send the task's output to.
+
+    Returns
+    -------
+    str
+        Path of the light curve.
+    """
+    from . import sas
+
+    output = xmm_odf_flare_lightcurve_path(obsid, exposure, config)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    sas.run(
+        "evselect",
+        produces=output,
+        log_to=log_to,
+        env=env,
+        cwd=os.path.dirname(output),
+        table=exposure.event_list,
+        withrateset="yes",
+        rateset=os.path.basename(output),
+        maketimecolumn="yes",
+        makeratecolumn="yes",
+        timebinsize=ODF_FLARE_BIN_SECONDS,
+        expression=ODF_FLARE_EXPRESSIONS[camera_family(exposure.instrument)],
+    )
+    return output
+
+
+def xmm_with_odf_flare_curves(obsid, exposures, config, env=None, log_to=None):
+    """
+    Give every exposure the background curve its flare screening reads.
+
+    One curve is built per *imaging* exposure and shared with the timing exposure of the
+    same camera and exposure identifier, which is what the PPS route does with an
+    ``FBKTSR`` and for the same reason: a flare illuminates the whole detector, so a rise
+    seen in the imaging read-out is happening during the timing one too. A timing exposure
+    with no imaging twin keeps ``None`` and is not screened.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposures : list of Exposure
+        From :func:`xmm_exposures_from_odf`.
+    config : dict
+        Must contain ``out_data_path``.
+    env : dict, optional
+        SAS environment.
+    log_to : callable, optional
+        Called with an exposure stem, returning the file to log that task to.
+
+    Returns
+    -------
+    list of Exposure
+        New records; :class:`Exposure` is frozen.
+    """
+    curves = {}
+    for exposure in exposures:
+        if exposure.mode != IMAGING:
+            continue
+        stem = _exposure_stem(exposure)
+        curves[(exposure.instrument, exposure.expid)] = xmm_odf_flare_lightcurve(
+            obsid, exposure, config, env=env, log_to=log_to(stem) if log_to else None
+        )
+
+    return [
+        copy.replace(exposure, flare_lightcurve=curves.get((exposure.instrument, exposure.expid)))
+        for exposure in exposures
+    ]
 
 
 def _event_list_identity(event_list):
