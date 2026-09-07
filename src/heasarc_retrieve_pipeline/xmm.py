@@ -92,6 +92,11 @@ DEFAULT_CONFIG = dict(
     # How far from one an ``epatplot`` pattern ratio has to be, in its own error bars,
     # before the spectrum is called piled up -- see :class:`PileupRatios`.
     pileup_warn_sigma=3.0,
+    # Spectral grouping. 25 counts a bin is the usual minimum for chi-squared fitting to
+    # be approximately valid; ``oversample`` keeps a group from being narrower than 1/3 of
+    # the instrument's resolution there, so that the bins stay roughly independent.
+    spectrum_min_counts=25,
+    spectrum_oversample=3,
 )
 
 #: The EPIC cameras, by the two-character instrument code PPS names them with. The codes
@@ -1920,3 +1925,272 @@ def xmm_pileup_check(obsid, exposure, config, events, sky=None, rec=None, env=No
     else:
         logger.info(f"{exposure.instrument}{exposure.expid} shows no pile-up: {numbers}")
     return ratios
+
+
+@dataclass(frozen=True)
+class SpectrumProducts:
+    """
+    The five files one exposure's spectrum is made of.
+
+    Attributes
+    ----------
+    source, background : str
+        The two spectra, with ``BACKSCAL`` set to the geometric area of each region.
+    arf : str
+        Effective area -- the mirror vignetting, the encircled energy of the region, and
+        the area lost to bad pixels and chip gaps.
+    rmf : str
+        Redistribution matrix, from ``rmfgen``. The slow part of the extraction.
+    grouped : str
+        The source spectrum binned for fitting, and the file to open in XSPEC: it carries
+        ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, so the other four follow it.
+    """
+
+    source: str
+    background: str
+    arf: str
+    rmf: str
+    grouped: str
+
+
+def xmm_spectrum_paths(obsid, exposure, config):
+    """
+    Where one exposure's spectral products go, and what they are called.
+
+    The names are ours, not ``especget``'s. Its ``filestem`` convention writes
+    ``<stem>_src.ds``, ``<stem>_bgd.ds``, ``<stem>_src.arf`` and ``<stem>_src.rmf``, which
+    is a convention that could change between SAS versions -- the trap ``epatplot``'s
+    ``.ps`` that is really a ``.pdf`` sprang in step 8. Naming all four outright with
+    ``withfilestem=no`` makes the version irrelevant.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    SpectrumProducts
+        Paths under ``<out_data_path>/<OBSID>/products``.
+    """
+    products = xmm_product_output_path(obsid, config)
+    stem = os.path.join(products, _exposure_stem(exposure))
+    return SpectrumProducts(
+        source=f"{stem}_src.pi",
+        background=f"{stem}_bkg.pi",
+        arf=f"{stem}.arf",
+        rmf=f"{stem}.rmf",
+        grouped=f"{stem}_grp.pi",
+    )
+
+
+def xmm_calculate_spectra(
+    obsid, exposure, config, events, ra, dec, sky=None, rec=None, env=None, log_to=None
+):
+    """
+    Extract one exposure's source and background spectra with their responses.
+
+    ``especget`` is a metatask and does the whole extraction in one call: ``evselect``
+    for both spectra, ``arfgen`` for the effective area and for the ``BACKSCAL`` areas of
+    the two regions, and ``rmfgen`` for the redistribution matrix. ``specgroup`` then bins
+    the source spectrum for fitting and writes the names of the other three into its
+    header, so that opening the grouped spectrum in XSPEC brings the rest with it.
+
+    **The position asked for is handed to ``arfgen`` explicitly.** Left alone, ``arfgen``
+    takes the source position from the centre of the extraction region -- which is right
+    for a circle on the sky and meaningless for a strip of detector columns, where the
+    centre of the strip says nothing about where along it the source sits. In timing mode
+    it would otherwise fall back on the ``SRCPOS`` keyword or, failing that, on
+    ``RAWY=190``. The vignetting and encircled-energy corrections depend on that position,
+    so it is given rather than inferred.
+
+    **pn and MOS are not co-added.** They are different detectors with different
+    responses, so the three spectra of an observation are meant to be fitted jointly, each
+    with its own ARF and RMF. ``epicspeccombine`` is the tool for making one file of them
+    if that is ever wanted.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    events : str
+        The cleaned event list, from :func:`xmm_clean_event_list`.
+    ra, dec : float
+        The position to extract at, in degrees. The position asked for, never the
+        ``OBSMLI`` detection -- see :func:`xmm_check_source_position`.
+    sky : tuple of float, optional
+        ``(x, y)`` sky position, from :func:`xmm_source_sky_position`. Needed by imaging
+        exposures only.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where the numbers go. ``None`` records nothing.
+    env : dict, optional
+        Environment for the tasks, from
+        :func:`heasarc_retrieve_pipeline.sas.sas_environment`.
+    log_to : str, optional
+        File the tasks' output goes to.
+
+    Returns
+    -------
+    SpectrumProducts or None
+        ``None`` when the exposure has no extraction region -- see
+        :func:`xmm_timing_regions`.
+    """
+    from . import sas
+
+    logger = get_logger()
+    if rec is None:
+        rec = no_record()
+
+    regions = xmm_exposure_regions(exposure, config, sky=sky)
+    if regions is None:
+        reason = (
+            f"{exposure.instrument}{exposure.expid} has no extraction region in "
+            f"{exposure.mode} mode, so no spectrum is extracted"
+        )
+        logger.warning(reason)
+        rec.skip(reason)
+        return None
+
+    source_region, background_region = regions
+    paths = xmm_spectrum_paths(obsid, exposure, config)
+    os.makedirs(os.path.dirname(paths.source), exist_ok=True)
+
+    logger.info(
+        f"Extracting the spectrum of {exposure.instrument}{exposure.expid} from "
+        f"{source_region}. rmfgen is the slow part of this."
+    )
+    sas.run(
+        "especget",
+        produces=[paths.source, paths.background, paths.arf, paths.rmf],
+        log_to=log_to,
+        env=env,
+        table=events,
+        srcexp=source_region,
+        backexp=background_region,
+        withfilestem="no",
+        srcspecset=paths.source,
+        bckspecset=paths.background,
+        srcarfset=paths.arf,
+        srcrmfset=paths.rmf,
+        withsourcepos="yes",
+        sourcecoords="eqpos",
+        sourcex=ra,
+        sourcey=dec,
+    )
+
+    sas.run(
+        "specgroup",
+        produces=paths.grouped,
+        log_to=log_to,
+        env=env,
+        spectrumset=paths.source,
+        groupedset=paths.grouped,
+        mincounts=config["spectrum_min_counts"],
+        oversample=config["spectrum_oversample"],
+        rmfset=paths.rmf,
+        arfset=paths.arf,
+        backgndset=paths.background,
+        # Fills BACKFILE, RESPFILE and ANCRFILE, so that the grouped spectrum is the only
+        # file a fit has to be pointed at.
+        addfilenames="yes",
+    )
+
+    for which, path in (("src", paths.source), ("bkg", paths.background)):
+        curve = read_xmm_spectrum(path, paths.rmf)
+        if curve is not None:
+            rec.array(**{f"{which}_{key}": value for key, value in curve.items()})
+
+    rec.value(
+        source_spectrum=os.path.basename(paths.source),
+        background_spectrum=os.path.basename(paths.background),
+        arf=os.path.basename(paths.arf),
+        rmf=os.path.basename(paths.rmf),
+        grouped_spectrum=os.path.basename(paths.grouped),
+        source_region=source_region,
+        background_region=background_region,
+        min_counts=config["spectrum_min_counts"],
+        oversample=config["spectrum_oversample"],
+    )
+    return paths
+
+
+def read_xmm_spectrum(spectrum, rmf):
+    """
+    One spectrum as a drawable curve, with its energy scale taken from its response.
+
+    NuSTAR's equivalent converts channel to energy with that mission's linear relation.
+    XMM has no such number to hardcode and needs none: the ``EBOUNDS`` extension of the
+    RMF ``especget`` just produced says what each channel is worth, which is exact and
+    survives a change of spectral binning.
+
+    This is for looking at, not for fitting. The uncertainty is Poisson on the counts,
+    which is right for an ungrouped spectrum and an underestimate for a grouped one, so it
+    is the ungrouped ``_src.pi`` that the reduction records rather than the ``_grp.pi``
+    it also writes.
+
+    Parameters
+    ----------
+    spectrum : str
+        A PHA spectrum, carrying ``CHANNEL`` and either ``COUNTS`` or ``RATE``.
+    rmf : str
+        A response with an ``EBOUNDS`` extension.
+
+    Returns
+    -------
+    dict or None
+        ``energy`` (keV), ``rate`` (counts/s/keV) and ``rate_err``, or ``None`` if either
+        file is missing or does not hold what this needs. A diagnostic that cannot be
+        drawn is not a failed extraction.
+    """
+    from astropy.io import fits
+
+    logger = get_logger()
+    try:
+        with fits.open(rmf) as hdul:
+            bounds = hdul["EBOUNDS"].data
+            edges = {
+                int(channel): (float(low), float(high))
+                for channel, low, high in zip(bounds["CHANNEL"], bounds["E_MIN"], bounds["E_MAX"])
+            }
+
+        with fits.open(spectrum) as hdul:
+            data = hdul["SPECTRUM"].data
+            header = hdul["SPECTRUM"].header
+            columns = {name.upper() for name in data.columns.names}
+            exposure = float(header.get("EXPOSURE") or header.get("ONTIME") or 1.0)
+            if exposure <= 0:
+                exposure = 1.0
+            if "COUNTS" in columns:
+                counts = np.asarray(data["COUNTS"], dtype=float)
+            elif "RATE" in columns:
+                counts = np.asarray(data["RATE"], dtype=float) * exposure
+            else:
+                return None
+            channels = np.asarray(data["CHANNEL"], dtype=int)
+    except (OSError, KeyError, AttributeError) as error:
+        logger.warning(f"Could not read the spectrum {spectrum}: {error}")
+        return None
+
+    # Matched on channel number, not on row order: a spectrum need not start at channel
+    # zero, and a response may describe channels the spectrum does not carry.
+    described = np.array([channel in edges for channel in channels])
+    channels, counts = channels[described], counts[described]
+    if channels.size == 0:
+        return None
+    low = np.array([edges[channel][0] for channel in channels])
+    high = np.array([edges[channel][1] for channel in channels])
+    width = np.where(high > low, high - low, 1.0)
+
+    return dict(
+        energy=0.5 * (low + high),
+        rate=counts / exposure / width,
+        rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
+    )

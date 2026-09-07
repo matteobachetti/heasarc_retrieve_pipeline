@@ -1571,6 +1571,272 @@ def stub_sas(monkeypatch):
     return install
 
 
+class TestWhereTheSpectraGo:
+    """
+    The five files a fitted spectrum is made of, named by us rather than by the task.
+
+    ``especget``'s ``filestem`` convention (``<stem>_src.ds``, ``_bgd.ds``, ``_src.arf``,
+    ``_src.rmf``) is a naming scheme that could change between SAS versions. Setting
+    ``withfilestem=no`` and naming all four outright makes the version irrelevant, which
+    is better than pinning a convention and hoping.
+    """
+
+    CONFIG = dict(out_data_path="/data")
+
+    def paths(self, mode=None):
+        exposure = an_exposure(None, instrument="pn", mode=mode or xmm.TIMING)
+        return xmm.xmm_spectrum_paths("0153950401", exposure, xmm.xmm_config(self.CONFIG))
+
+    def test_the_five_products_are_named_for_the_exposure(self):
+        paths = self.paths()
+
+        assert os.path.basename(paths.source) == "pnS004_timing_src.pi"
+        assert os.path.basename(paths.background) == "pnS004_timing_bkg.pi"
+        assert os.path.basename(paths.arf) == "pnS004_timing.arf"
+        assert os.path.basename(paths.rmf) == "pnS004_timing.rmf"
+        assert os.path.basename(paths.grouped) == "pnS004_timing_grp.pi"
+
+    def test_they_go_in_the_products_directory_and_not_beside_the_events(self):
+        products = xmm.xmm_product_output_path("0153950401", xmm.xmm_config(self.CONFIG))
+
+        assert all(
+            os.path.dirname(path) == products for path in (self.paths().source, self.paths().rmf)
+        )
+
+    def test_the_two_modes_of_one_exposure_do_not_collide(self):
+        assert self.paths(xmm.IMAGING).source != self.paths(xmm.TIMING).source
+
+
+class TestExtractingTheSpectra:
+    """
+    ``especget`` and ``specgroup``, and what has to be true about how they are called.
+
+    ``especget`` is a metatask: it runs ``evselect`` for both spectra, ``arfgen`` for the
+    effective area and the ``BACKSCAL`` areas, and ``rmfgen`` for the response, which is
+    the slow part. ``specgroup`` then bins the source spectrum for fitting.
+    """
+
+    def a_run(self, tmp_path, stub_sas, exposure=None, **extra):
+        stub = stub_sas()
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path), **extra))
+        exposure = exposure or an_exposure(None, instrument="pn", mode=xmm.TIMING)
+        events = str(tmp_path / "cleaned.evt")
+        an_event_file(events)
+        with record_step(str(tmp_path / "diag"), "0153950401", "calculate_spectra") as rec:
+            paths = xmm.xmm_calculate_spectra(
+                "0153950401",
+                exposure,
+                config,
+                events,
+                ra=254.4574995,
+                dec=35.3423889,
+                sky=(26000.0, 25000.0),
+                rec=rec,
+            )
+        return paths, rec, stub
+
+    def test_the_source_and_background_expressions_are_the_regions(self, tmp_path, stub_sas):
+        _, _, stub = self.a_run(tmp_path, stub_sas)
+
+        (call,) = stub.task("especget")
+        assert call["srcexp"] == "(RAWX in [31:45])"
+        assert call["backexp"] == "(RAWX in [3:5])"
+
+    def test_the_four_outputs_are_named_and_the_filestem_is_refused(self, tmp_path, stub_sas):
+        paths, _, stub = self.a_run(tmp_path, stub_sas)
+
+        (call,) = stub.task("especget")
+        assert call["withfilestem"] == "no"
+        assert call["srcspecset"] == paths.source
+        assert call["bckspecset"] == paths.background
+        assert call["srcarfset"] == paths.arf
+        assert call["srcrmfset"] == paths.rmf
+
+    def test_the_position_asked_for_is_handed_to_arfgen(self, tmp_path, stub_sas):
+        # A timing spectrum's region is a strip of columns, so the centre of the region
+        # says nothing about where the source is. arfgen needs the real position for the
+        # vignetting and encircled-energy corrections, and this is where it gets it.
+        _, _, stub = self.a_run(tmp_path, stub_sas)
+
+        (call,) = stub.task("especget")
+        assert call["withsourcepos"] == "yes"
+        assert call["sourcecoords"] == "eqpos"
+        assert call["sourcex"] == 254.4574995
+        assert call["sourcey"] == 35.3423889
+
+    def test_the_grouping_is_told_which_response_it_is_grouping_against(self, tmp_path, stub_sas):
+        # oversample is a resolution criterion, so specgroup cannot honour it without the
+        # RMF; and addfilenames is what puts BACKFILE, RESPFILE and ANCRFILE in the
+        # grouped spectrum, which is what lets XSPEC open one file and find the rest.
+        paths, _, stub = self.a_run(tmp_path, stub_sas)
+
+        (call,) = stub.task("specgroup")
+        assert call["spectrumset"] == paths.source
+        assert call["groupedset"] == paths.grouped
+        assert call["rmfset"] == paths.rmf
+        assert call["arfset"] == paths.arf
+        assert call["backgndset"] == paths.background
+        assert call["addfilenames"] == "yes"
+
+    def test_the_grouping_numbers_come_from_the_configuration(self, tmp_path, stub_sas):
+        _, _, stub = self.a_run(tmp_path, stub_sas, spectrum_min_counts=50, spectrum_oversample=5)
+
+        (call,) = stub.task("specgroup")
+        assert call["mincounts"] == 50
+        assert call["oversample"] == 5
+
+    def test_an_imaging_exposure_is_extracted_from_its_sky_regions(self, tmp_path, stub_sas):
+        exposure = an_exposure(None, instrument="mos2", mode=xmm.IMAGING)
+
+        _, _, stub = self.a_run(tmp_path, stub_sas, exposure=exposure)
+
+        (call,) = stub.task("especget")
+        assert "circle(26000.0000,25000.0000" in call["srcexp"]
+        assert "annulus(26000.0000,25000.0000" in call["backexp"]
+
+    def test_a_camera_with_no_timing_strip_is_a_skip_and_not_a_failure(self, tmp_path, stub_sas):
+        exposure = an_exposure(None, instrument="mos1", mode=xmm.TIMING)
+
+        paths, rec, stub = self.a_run(tmp_path, stub_sas, exposure=exposure)
+
+        assert paths is None
+        assert rec.status == "skipped"
+        assert stub.calls == []
+
+    def test_what_was_extracted_is_recorded(self, tmp_path, stub_sas):
+        paths, rec, _ = self.a_run(tmp_path, stub_sas)
+
+        assert rec.values["source_spectrum"] == os.path.basename(paths.source)
+        assert rec.values["grouped_spectrum"] == os.path.basename(paths.grouped)
+        assert rec.values["source_region"] == "(RAWX in [31:45])"
+
+    def test_the_curves_are_recorded_so_the_page_can_draw_them(self, tmp_path, stub_sas):
+        stub_sas()
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
+        exposure = an_exposure(None, instrument="pn", mode=xmm.TIMING)
+        paths = xmm.xmm_spectrum_paths("0153950401", exposure, config)
+        os.makedirs(os.path.dirname(paths.source), exist_ok=True)
+        a_spectrum(paths.source, [10, 20])
+        a_spectrum(paths.background, [1, 2])
+        a_response(paths.rmf, [1.0, 2.0, 3.0])
+        events = str(tmp_path / "cleaned.evt")
+        an_event_file(events)
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "calculate_spectra") as rec:
+            xmm.xmm_calculate_spectra(
+                "0153950401", exposure, config, events, ra=254.4, dec=35.3, rec=rec
+            )
+
+        assert rec.arrays["src_energy"].tolist() == [1.5, 2.5]
+        assert rec.arrays["src_rate"].tolist() == [0.01, 0.02]
+        assert rec.arrays["bkg_rate"].tolist() == [0.001, 0.002]
+
+    def test_an_unreadable_spectrum_records_no_curve_and_does_not_raise(self, tmp_path, stub_sas):
+        # The stub writes files that are not spectra, so this is the "especget produced
+        # something this cannot read" case, and it must not lose the extraction.
+        _, rec, _ = self.a_run(tmp_path, stub_sas)
+
+        assert rec.arrays == {}
+        assert rec.status != "failed"
+
+
+def a_spectrum(path, counts, exposure=1000.0, first_channel=0):
+    """A PHA in the shape ``especget`` writes one: channels, counts, and a live time."""
+    from astropy.io import fits
+
+    counts = np.asarray(counts)
+    channel = np.arange(first_channel, first_channel + counts.size)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="CHANNEL", format="J", array=channel),
+            fits.Column(name="COUNTS", format="J", array=counts),
+        ],
+        name="SPECTRUM",
+    )
+    hdu.header["EXPOSURE"] = exposure
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+def a_response(path, edges, first_channel=0):
+    """A response whose ``EBOUNDS`` says what each channel is worth in keV."""
+    from astropy.io import fits
+
+    edges = np.asarray(edges, dtype=float)
+    channel = np.arange(first_channel, first_channel + edges.size - 1)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="CHANNEL", format="J", array=channel),
+            fits.Column(name="E_MIN", format="E", unit="keV", array=edges[:-1]),
+            fits.Column(name="E_MAX", format="E", unit="keV", array=edges[1:]),
+        ],
+        name="EBOUNDS",
+    )
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestReadingASpectrumForThePage:
+    """
+    Turning a spectrum into something that can be drawn.
+
+    The energy scale comes from the response, not from a formula. NuSTAR's
+    ``read_spectrum`` converts channel to energy with ``E = 0.04 * PI + 1.6``, which is
+    that mission's own linear relation; XMM has no such number to hardcode, and it does
+    not need one -- the ``EBOUNDS`` extension of the RMF ``especget`` just made says
+    exactly what each channel is worth.
+    """
+
+    def test_the_energies_are_the_channel_midpoints_of_the_response(self, tmp_path):
+        spectrum = a_spectrum(tmp_path / "src.pi", [10, 20, 30])
+        rmf = a_response(tmp_path / "src.rmf", [1.0, 2.0, 3.0, 4.0])
+
+        read = xmm.read_xmm_spectrum(spectrum, rmf)
+
+        assert read["energy"].tolist() == [1.5, 2.5, 3.5]
+
+    def test_counts_become_a_rate_per_kev(self, tmp_path):
+        # 10 counts in a 2 keV bin over 1000 s is 0.005 counts/s/keV. Dividing by the bin
+        # width is what stops the drawn shape depending on how the channels were binned.
+        spectrum = a_spectrum(tmp_path / "src.pi", [10], exposure=1000.0)
+        rmf = a_response(tmp_path / "src.rmf", [1.0, 3.0])
+
+        read = xmm.read_xmm_spectrum(spectrum, rmf)
+
+        assert read["rate"].tolist() == [0.005]
+        assert read["rate_err"][0] == pytest.approx(np.sqrt(10) / 1000.0 / 2.0)
+
+    def test_channels_the_response_does_not_describe_are_dropped(self, tmp_path):
+        spectrum = a_spectrum(tmp_path / "src.pi", [1, 2, 3, 4])
+        rmf = a_response(tmp_path / "src.rmf", [1.0, 2.0, 3.0])
+
+        read = xmm.read_xmm_spectrum(spectrum, rmf)
+
+        assert read["energy"].size == 2
+
+    def test_a_spectrum_that_starts_at_another_channel_still_lines_up(self, tmp_path):
+        # A grouped or truncated spectrum need not start at channel 0, so the two files
+        # are matched on channel number rather than on row order.
+        spectrum = a_spectrum(tmp_path / "src.pi", [7], first_channel=2)
+        rmf = a_response(tmp_path / "src.rmf", [1.0, 2.0, 3.0, 4.0])
+
+        read = xmm.read_xmm_spectrum(spectrum, rmf)
+
+        assert read["energy"].tolist() == [3.5]
+
+    def test_a_response_without_ebounds_is_no_answer_rather_than_a_wrong_one(self, tmp_path):
+        from astropy.io import fits
+
+        spectrum = a_spectrum(tmp_path / "src.pi", [1, 2])
+        empty = str(tmp_path / "empty.rmf")
+        fits.HDUList([fits.PrimaryHDU()]).writeto(empty, overwrite=True)
+
+        assert xmm.read_xmm_spectrum(spectrum, empty) is None
+
+    def test_a_missing_file_is_not_an_error(self, tmp_path):
+        assert xmm.read_xmm_spectrum(str(tmp_path / "gone.pi"), str(tmp_path / "gone.rmf")) is None
+
+
 class TestReadingThePileupNumbers:
     """
     Where ``epatplot``'s answer is, which is not its standard output.
