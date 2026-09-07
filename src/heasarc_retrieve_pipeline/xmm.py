@@ -42,8 +42,10 @@ and the exposure is what pairs an event list with its flare light curve.
 
 import copy
 import glob
+import gzip
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,6 +53,7 @@ import numpy as np
 
 from prefect import flow
 
+from .barycenter import barycentered_file_name
 from .diagnostics import diagnostics_path, no_record, record_step
 from .utils import (
     NO_SCIENCE_DATA,
@@ -130,6 +133,20 @@ FLARE_LIGHTCURVE_PRODUCT = "FBKTSR"
 #: Product code of the calibration index file: the CIF the SOC itself used to make the
 #: PPS products, and therefore the right value for ``SAS_CCF`` on the PPS route.
 CALIBRATION_INDEX_PRODUCT = "CALIND"
+
+#: Suffix of the summary file ``odfingest`` writes and ``barycen`` reads through
+#: ``SAS_ODF``. The one the archive ships is ``SUM.ASC``, which is a different file in a
+#: different format: ``barycen`` rejects it by name.
+ODF_SUMMARY_SUFFIX = "SUM.SAS"
+
+#: How the archive's compressed ODF constituents have to be renamed when staged.
+#: HEASARC serves ``.FIT.gz`` and ``.ASC.gz``; SAS reads ``.FIT`` and ``.ASC``. The
+#: obvious third option, SAS's own ``.FTZ`` for a gzipped ``.FIT``, is a trap here:
+#: ``odfingest`` reads ``.FTZ`` elsewhere but does not *find* one while scanning an ODF
+#: directory, so a ``.FTZ``-staged ODF ingests as though the housekeeping were absent and
+#: writes a truncated summary that ``barycen`` then rejects with ``UnexpectedEOF``.
+#: Measured on ``0870940101``; see docs/xmm_integration_plan.md.
+ODF_STAGED_SUFFIXES = {".FIT.gz": ".FIT", ".ASC.gz": ".ASC"}
 
 #: Product code of the maximum-likelihood source list, used only to cross-check the
 #: position the user gave. The Optical Monitor writes one under this code too, so the
@@ -2640,6 +2657,186 @@ def read_xmm_spectrum(spectrum, rmf):
     )
 
 
+def xmm_staged_odf_path(obsid, config):
+    """
+    Directory the ODF is staged into for ``odfingest``.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/odf``. Under the *output* tree, not beside the
+        download: staging decompresses, and the downloaded tree is the one thing a rerun
+        should be able to treat as read-only.
+    """
+    return os.path.join(xmm_pipeline_output_path(obsid, config), "odf")
+
+
+def xmm_stage_odf(obsid, config):
+    """
+    Copy the observation's ODF into a directory ``odfingest`` can read.
+
+    Decompresses ``.FIT.gz`` and ``.ASC.gz`` to plain ``.FIT`` and ``.ASC`` -- see
+    :data:`ODF_STAGED_SUFFIXES` for why the compression cannot simply be kept. Anything
+    already uncompressed is copied unchanged.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path`` and ``out_data_path``.
+
+    Returns
+    -------
+    str or None
+        The staging directory, or ``None`` if the observation has no ODF downloaded --
+        which is not an error here, only the end of the barycentring road.
+    """
+    source = xmm_odf_path(obsid, config)
+    if not os.path.isdir(source):
+        return None
+
+    staged = xmm_staged_odf_path(obsid, config)
+    os.makedirs(staged, exist_ok=True)
+    for path in sorted(glob.glob(os.path.join(source, "*"))):
+        name = os.path.basename(path)
+        for compressed, plain in ODF_STAGED_SUFFIXES.items():
+            if name.endswith(compressed):
+                target = os.path.join(staged, name[: -len(compressed)] + plain)
+                with gzip.open(path, "rb") as raw, open(target, "wb") as out:
+                    shutil.copyfileobj(raw, out)
+                break
+        else:
+            shutil.copy(path, os.path.join(staged, name))
+    return staged
+
+
+def xmm_odf_summary(obsid, config, env=None, log_to=None):
+    """
+    Ingest the staged ODF and return the summary file ``barycen`` needs.
+
+    ``odfingest`` warns ``NoScienceFiles`` here and that warning is expected, not a
+    failure: only the 3.8 MB of housekeeping is downloaded on the PPS route, and the
+    observation's start and stop are recoverable from it alone. What matters is the
+    ``SUM.SAS`` it writes, which is checked for rather than assumed.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path`` and ``out_data_path``.
+    env : dict, optional
+        SAS environment. ``SAS_ODF`` is set from the staging directory on a copy of it,
+        because ``odfingest`` reads the directory to scan from there.
+    log_to : str, optional
+        File to send the task's output to.
+
+    Returns
+    -------
+    str or None
+        Path of the ``SUM.SAS``, or ``None`` if there was no ODF to ingest.
+    """
+    from . import sas
+
+    staged = xmm_stage_odf(obsid, config)
+    if staged is None:
+        return None
+
+    ingest_env = dict(env or os.environ)
+    ingest_env["SAS_ODF"] = staged
+    sas.run(
+        "odfingest",
+        produces=[],
+        log_to=log_to,
+        env=ingest_env,
+        cwd=staged,
+        odfdir=staged,
+        outdir=staged,
+    )
+
+    summaries = sorted(glob.glob(os.path.join(staged, f"*{ODF_SUMMARY_SUFFIX}")))
+    if not summaries:
+        get_logger().warning(
+            f"{obsid}: odfingest wrote no {ODF_SUMMARY_SUFFIX}, so this observation "
+            "cannot be barycentred."
+        )
+        return None
+    return summaries[0]
+
+
+def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=None):
+    """
+    Write a barycentred copy of one cleaned event list.
+
+    Converts arrival times from the spacecraft to the solar system barycentre, which is
+    what makes a coherent timing search possible: over one XMM orbit the correction
+    changes by a couple of seconds, against the ~1 s periods this pipeline's targets pulse
+    at. The original file is left alone and the correction is applied to a copy, because
+    ``barycen`` edits in place and an event list whose times are silently no longer
+    spacecraft times is a trap for everything downstream.
+
+    HEASOFT ``barycorr`` is *not* usable here, which is worth stating because it is the
+    obvious thing to reach for and the pipeline already wraps it for NuSTAR. Its own help
+    limits it to RXTE, Swift, Chandra, NuSTAR and NICER; run on XMM data with the PPS
+    ``ORBTSR`` orbit it fails with "Invalid Observatory/Spacecraft position vector",
+    before reading a single event, and no renaming of columns or rescaling of units gets
+    past that. See docs/xmm_integration_plan.md.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Pipeline configuration.
+    events : str
+        Cleaned event list to barycentre.
+    summary : str
+        ODF summary file from :func:`xmm_odf_summary`, for ``SAS_ODF``.
+    env : dict, optional
+        SAS environment; ``SAS_ODF`` is overridden on a copy of it.
+    log_to : str, optional
+        File to send the task's output to.
+    rec : Recorder, optional
+        Diagnostics recorder.
+
+    Returns
+    -------
+    str or None
+        Path of the barycentred file, or ``None`` if there was no summary to work from.
+    """
+    from . import sas
+
+    rec = rec or no_record()
+    if summary is None:
+        rec.value(barycentered=False, reason="no ODF summary")
+        return None
+
+    output = barycentered_file_name(events)
+    shutil.copy(events, output)
+
+    bary_env = dict(env or os.environ)
+    bary_env["SAS_ODF"] = summary
+    sas.run(
+        "barycen",
+        produces=sas.IN_PLACE(output),
+        log_to=log_to,
+        env=bary_env,
+        table=f"{output}:EVENTS",
+        withtable="yes",
+    )
+
+    rec.value(barycentered=True, barycentered_file=os.path.basename(output), summary=summary)
+    return output
+
+
 @flow(flow_run_name="xmm_{obsid}")
 def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     """
@@ -2724,6 +2921,11 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     )
     env = sas.sas_environment(ccf=index, ccfpath=config["sas_ccfpath"])
 
+    # Once per observation, like the calibration index: every exposure shares the ODF.
+    summary = xmm_odf_summary(
+        obsid, config, env=env, log_to=tool_log_file("odfingest", obsid, config)
+    )
+
     with record_step(diagnostics, obsid, "source_position") as rec:
         rec.value(ra=ra, dec=dec, calibration_index=index)
         xmm_check_source_position(obsid, config, ra, dec, rec=rec)
@@ -2768,6 +2970,17 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
                 rec=rec,
                 env=env,
                 log_to=tool_log_file(f"epatplot_{stem}", obsid, config),
+            )
+
+        with record_step(diagnostics, obsid, "barycenter", key=stem) as rec:
+            xmm_barycenter(
+                obsid,
+                config,
+                events,
+                summary,
+                env=env,
+                rec=rec,
+                log_to=tool_log_file(f"barycen_{stem}", obsid, config),
             )
 
         with record_step(diagnostics, obsid, "calculate_spectra", key=stem) as rec:

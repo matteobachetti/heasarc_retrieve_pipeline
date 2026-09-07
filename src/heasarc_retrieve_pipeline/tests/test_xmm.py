@@ -12,6 +12,8 @@ on 2026-09-07, and the two observations behind them are the ones
 """
 
 import copy
+import glob
+import gzip
 import os
 import re
 import warnings
@@ -20,7 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from heasarc_retrieve_pipeline import xmm
+from heasarc_retrieve_pipeline import sas, xmm
 from heasarc_retrieve_pipeline.diagnostics import record_step
 from heasarc_retrieve_pipeline.utils import NO_SCIENCE_DATA
 
@@ -1564,6 +1566,12 @@ class StubSas:
             assert params["modifyinset"] == "yes", "the ratios would not be written"
         if name == "epatplot" and self.keywords is not None:
             an_event_file(params["set"], **self.keywords)
+        if name == "odfingest":
+            # The real task writes a summary whose name it chooses from the ODF it read,
+            # which is why the caller globs for the suffix instead of assuming a name.
+            open(os.path.join(params["outdir"], "3906_0153950401_SCX00000SUM.SAS"), "w").write(
+                "summary\n"
+            )
         if name == "ecoordconv":
             # The real task writes no file: its answer *is* its standard output, in the
             # two-line shape its documentation pins. Both lines carry the same numbers,
@@ -2372,6 +2380,29 @@ class TestReducingAnObservation:
         )
         return stub, result
 
+    def test_every_exposure_is_barycentred(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        corrected = [params["table"] for params in stub.task("barycen")]
+        assert len(corrected) == 3, "one barycentred copy per exposure"
+        assert all(t.endswith("_cl_bary.evt:EVENTS") for t in corrected), corrected
+
+    def test_the_odf_is_ingested_once_for_the_whole_observation(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        assert len(stub.task("odfingest")) == 1, "every exposure shares one ODF"
+
+    def test_an_observation_with_no_odf_still_reduces(self, tmp_path, stub_sas):
+        # No ODF downloaded: barycentring is the one thing that cannot be done, and it is
+        # not worth failing an otherwise complete reduction over.
+        stub, result = self.reduce(tmp_path, stub_sas)
+
+        assert result is None
+        assert stub.task("barycen") == []
+        assert len(stub.task("especget")) == 3, "the spectra are unaffected"
+
     def test_an_observation_with_no_epic_data_is_not_a_failure(self, tmp_path, stub_sas):
         stub, result = self.reduce(tmp_path, stub_sas, event_lists=[])
 
@@ -2570,3 +2601,190 @@ class TestTheFlareCurveIsDrawn:
         empty = dict(lc_time=np.array([]), lc_rate=np.array([]))
 
         assert report.flare_figure(dict(values={}), empty) is None
+
+
+def an_odf(tmp_path, obsid="0153950401", compressed=True):
+    """
+    The housekeeping the archive ships beside the PPS products, in miniature.
+
+    ``compressed`` writes the ``.FIT.gz``/``.ASC.gz`` HEASARC actually serves; ``False``
+    writes them already plain, the other case the staging has to handle.
+    """
+    odf = tmp_path / obsid / "ODF"
+    odf.mkdir(parents=True, exist_ok=True)
+    for name in (f"3906_{obsid}_SCX00000ATS.FIT", f"3906_{obsid}_SCX00000ROS.ASC"):
+        body = f"contents of {name}\n".encode()
+        if compressed:
+            with gzip.open(odf / (name + ".gz"), "wb") as out:
+                out.write(body)
+        else:
+            (odf / name).write_bytes(body)
+    return odf
+
+
+def staged_names(directory):
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(directory, "*")))
+
+
+class TestStagingTheOdf:
+    """``xmm_stage_odf``: the archive's names in, the names ``odfingest`` reads out."""
+
+    PLAIN = ["3906_0153950401_SCX00000ATS.FIT", "3906_0153950401_SCX00000ROS.ASC"]
+
+    def config(self, tmp_path):
+        return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+    def test_the_compressed_constituents_are_decompressed(self, tmp_path):
+        an_odf(tmp_path)
+
+        staged = xmm.xmm_stage_odf("0153950401", self.config(tmp_path))
+
+        # Not .FTZ and not .gz: odfingest does not find either while scanning an ODF
+        # directory, and ingests as though the housekeeping were absent.
+        assert staged_names(staged) == self.PLAIN
+
+    def test_the_contents_survive_the_decompression(self, tmp_path):
+        an_odf(tmp_path)
+
+        staged = xmm.xmm_stage_odf("0153950401", self.config(tmp_path))
+
+        body = open(os.path.join(staged, self.PLAIN[0])).read()
+        assert body == f"contents of {self.PLAIN[0]}\n"
+
+    def test_files_that_arrive_uncompressed_are_copied_unchanged(self, tmp_path):
+        an_odf(tmp_path, compressed=False)
+
+        staged = xmm.xmm_stage_odf("0153950401", self.config(tmp_path))
+
+        assert staged_names(staged) == self.PLAIN
+
+    def test_an_observation_with_no_odf_stages_nothing(self, tmp_path):
+        assert xmm.xmm_stage_odf("0153950401", self.config(tmp_path)) is None
+
+    def test_the_staging_directory_is_under_the_output_tree(self):
+        config = dict(input_data_path="/in", out_data_path="/out")
+
+        assert xmm.xmm_staged_odf_path("0153950401", config) == "/out/0153950401/event_cl/odf"
+
+
+class TestIngestingTheOdf:
+    """``xmm_odf_summary``: running ``odfingest`` and finding what it wrote."""
+
+    def config(self, tmp_path):
+        return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+    def test_odfingest_is_told_where_the_staged_odf_is(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub = stub_sas()
+
+        xmm.xmm_odf_summary("0153950401", self.config(tmp_path))
+
+        staged = xmm.xmm_staged_odf_path("0153950401", self.config(tmp_path))
+        (params,) = stub.task("odfingest")
+        assert params["odfdir"] == staged
+        assert params["outdir"] == staged
+
+    def test_sas_odf_points_at_the_directory_while_ingesting(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub = stub_sas()
+
+        xmm.xmm_odf_summary("0153950401", self.config(tmp_path), env={"SAS_CCF": "/c/ccf.cif"})
+
+        env = stub.environments[0]
+        assert env["SAS_ODF"] == xmm.xmm_staged_odf_path("0153950401", self.config(tmp_path))
+        assert env["SAS_CCF"] == "/c/ccf.cif", "the rest of the environment must survive"
+
+    def test_the_summary_file_is_found_by_suffix(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub_sas()
+
+        summary = xmm.xmm_odf_summary("0153950401", self.config(tmp_path))
+
+        assert os.path.basename(summary) == "3906_0153950401_SCX00000SUM.SAS"
+
+    def test_no_odf_means_no_summary_and_no_task(self, tmp_path, stub_sas):
+        stub = stub_sas()
+
+        assert xmm.xmm_odf_summary("0153950401", self.config(tmp_path)) is None
+        assert stub.calls == []
+
+
+class TestBarycentringAnExposure:
+    """
+    ``xmm_barycenter``: the copy, the environment, and what is recorded.
+
+    SAS ``barycen`` edits its input, so *which* file it is handed matters as much as what
+    it is told.
+    """
+
+    def setup_files(self, tmp_path):
+        events = tmp_path / "pnS003_imaging_cl.evt"
+        an_event_file(str(events))
+        return str(events), str(tmp_path / "sum.SAS")
+
+    def recorder(self, tmp_path):
+        return record_step(str(tmp_path / "diag"), "0153950401", "barycenter")
+
+    def test_the_original_event_list_is_not_the_one_corrected(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        output = xmm.xmm_barycenter("0153950401", {}, events, summary)
+
+        (params,) = stub.task("barycen")
+        assert params["table"] == f"{output}:EVENTS"
+        assert output != events, "barycen edits in place, so it must be given a copy"
+        assert output.endswith("pnS003_imaging_cl_bary.evt")
+
+    def test_the_copy_is_in_place_before_the_task_runs(self, tmp_path, stub_sas, monkeypatch):
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+        seen = {}
+
+        def run(name, **kwargs):
+            seen[name] = os.path.exists(str(kwargs["produces"].path))
+            return stub(name, **kwargs)
+
+        monkeypatch.setattr(sas, "run", run)
+        xmm.xmm_barycenter("0153950401", {}, events, summary)
+
+        assert seen["barycen"], "barycen corrects a file that must already be there"
+
+    def test_the_original_is_left_alone(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        before = open(events, "rb").read()
+        stub_sas()
+
+        xmm.xmm_barycenter("0153950401", {}, events, summary)
+
+        assert open(events, "rb").read() == before
+
+    def test_sas_odf_points_at_the_summary_file(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        xmm.xmm_barycenter("0153950401", {}, events, summary, env={"SAS_CCF": "/c.cif"})
+
+        assert stub.environments[0]["SAS_ODF"] == summary
+        assert stub.environments[0]["SAS_CCF"] == "/c.cif"
+
+    def test_without_a_summary_nothing_runs_and_the_reason_is_recorded(self, tmp_path, stub_sas):
+        events, _ = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            assert xmm.xmm_barycenter("0153950401", {}, events, None, rec=rec) is None
+
+        assert stub.calls == []
+        assert rec.values["barycentered"] is False
+        assert "no ODF summary" in rec.values["reason"]
+
+    def test_a_successful_correction_is_recorded(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, summary, rec=rec)
+
+        assert rec.values["barycentered"] is True
+        assert rec.values["barycentered_file"] == "pnS003_imaging_cl_bary.evt"
