@@ -1,9 +1,10 @@
 # Adding XMM-Newton (EPIC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-07 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `bc12c41`). **Commits 1–7 of the sequence below have landed**
+> `various_fixes` (HEAD `bc12c41`). **Commits 1–8 of the sequence below have landed**
 > (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`, `1e0db70`,
-> and step 7, 2026-09-07); the rest is still the agreed design, not a report on work done. It is
+> step 7 and step 8, 2026-09-07); the rest is still the agreed design, not a report on work
+> done. It is
 > written to be picked up cold, by a person or a session with no memory of the
 > conversation that produced it. Every number in
 > it was measured against the live HEASARC archive on that date; the snippets under
@@ -107,8 +108,10 @@ PPS covers Timing, so this costs a product code and a region builder, not a new 
 * **Regions are `RAWX` strips, not sky circles.** Timing mode collapses one dimension, so
   `ecoordconv` and the annulus do not apply. Source `RAWX in [31:45]`, background
   `RAWX in [3:5]` for pn; the numbers go in config, like the annulus factors.
-* **Screening differs**: `PATTERN<=4` and `FLAG==0` still hold for pn, but the imaging
-  `#XMMEA_EP` macro is replaced by the timing-appropriate expression.
+* **Screening differs** — though not the way this paragraph originally guessed. There is
+  no timing macro to replace `#XMMEA_EP` with: SAS applies the same expression to pn in
+  both modes, and it is MOS whose pattern cut changes, to `PATTERN==0`. See *What changed
+  while implementing step 8*.
 * **Pile-up is real** at these count rates. Run `epatplot` and record its output as a
   diagnostic; do not attempt automatic correction.
 
@@ -457,7 +460,10 @@ One commit each, tests first in every case.
    the threshold this document proposed; see below.
 7. ~~`evselect` cleaning and `ecoordconv` position, with the OBSMLI cross-check.~~
    **Done** — and the first step verified against a real SAS run; see below.
-8. Timing mode — `RAWX` regions, timing screening, `epatplot` pile-up diagnostic.
+8. ~~Timing mode — `RAWX` regions, timing screening, `epatplot` pile-up diagnostic.~~
+   **Done, in four commits** — `b0b1a79` the mode-aware screening, `73b719c` the `RAWX`
+   strips, `59d8bf0` the pile-up check, `e31cd3e` the plot name the real run corrected.
+   Verified end to end against Her X-1; see below.
 9. `especget` spectra and grouping.
 10. ODF front end — staging, `cifbuild`, `odfingest`, `epproc`, `emproc`.
 11. Barycentring, once one of the three candidates is verified.
@@ -660,6 +666,106 @@ Note that `evselect` needed no calibration access for this — `#XMMEA_EM` expan
 event file itself — so the cleaning half of this step runs on an incomplete CCF. The
 `ecoordconv` half remains unverified on real data until the mirror finishes.
 
+## What changed while implementing step 8
+
+**There is no timing screening macro, so the mode changes one number instead.** The plan
+said `#XMMEA_EP` would be "replaced by the timing-appropriate expression". No such
+expression exists: `#XMMEA_EP`, `#XMMEA_EM` and `#XMMEA_SM` are the only EPIC macros in
+the whole of SAS 22.1.0. The real difference is documented by SAS's own automatic
+reduction — `xmmextractor` (`doc/xmmextractor/node3.html`) applies `PATTERN<=4`, `FLAG==0`
+and `#XMMEA_EP` to pn *whatever mode it is in*, and `PATTERN<=12` (imaging) or
+`PATTERN==0` (timing) with `#XMMEA_EM` to MOS. `SCREENING_EXPRESSIONS` is therefore keyed
+on `(family, mode)` and `xmm_screening_expression` takes the mode as a required argument:
+a timing exposure screened as an image is wrong in a way nothing downstream would notice.
+
+**MOS Timing has no default `RAWX` strip, by decision (Matteo, 2026-09-07).** pn's
+`[31:45]` and `[3:5]` are the cookbook's, and they are trustworthy because a pn Timing
+read-out puts the source at a column fixed by the boresight. MOS has no equivalent
+constant — SAS's own driver (`lib/perl5/run_epatplot.pl`) builds the MOS strip around a
+source position it is *given* — so `xmm_timing_regions` returns `None` for MOS, warns
+loudly, and everything downstream skips rather than extracting at an invented column. A
+strip put in `timing_src_rawx`/`timing_bkg_rawx` is honoured for any camera.
+
+*And the way to lift that restriction turned up in the same run: `ecoordconv` prints
+`RAWX: RAWY:` alongside the sky position — 311.08 for Her X-1 on MOS1. So the MOS strip
+can be centred on SAS's own conversion of the target position, with no histogram and no
+guess. Left undone deliberately; it is a decision, not an oversight.*
+
+**`epatplot`'s answer is a header keyword, not its standard output.** The task documents
+appending the observed-to-model singles and doubles pattern fractions to the input event
+set as `SNGL_OTM` and `DBLE_OTM`, with one-sigma errors `ESGL_OTM` and `EDBL_OTM`. Reading
+keywords beats scraping a screen, and `ecoordconv` remains the only task here whose output
+is parsed — because it writes no file at all. Confirmed on real data: they land on the
+`EVENTS` extension.
+
+**`epatplot` writes PDF and says PostScript.** Its `device` parameter still offers PGPLOT
+devices and still defaults to `/VCPS`; SAS 22.1.0 draws the plot from Python instead and
+warns "Only format supported now is pdf". Asked for `..._pat.ps` it writes `..._pat.pdf`
+**and returns 0**. `sas.run`'s output check caught it — the task "returned success but did
+not create" the file — which is the second time that check has named a failure that a
+return code hid. `PILEUP_PLOT_EXTENSION` pins the measurement, as `especget`'s names are
+to be pinned in step 9.
+
+**The pile-up check measures and never corrects.** Correcting pile-up means excluding the
+core of the point spread function, which changes which photons the science is done with.
+That is a decision for whoever reads the plot.
+
+### Verified against a real SAS run
+
+Her X-1 `0153950401` again, with the CCF mirror now complete, on SAS 22.1.0. All four
+exposures, both modes, both routes through the region builder:
+
+| exposure | cleaned | source region | events in region | pile-up |
+|---|---|---|---|---|
+| pn `S003` timing | 299 677 | `(RAWX in [31:45])` | 131 568 | singles 1.012 ± 0.008, doubles 0.985 ± 0.019 |
+| MOS1 `S004` imaging | 272 768 | circle at 24332.8, 24621.2 | **0** | skipped |
+| MOS1 `S004` timing | 37 402 | — | — | skipped, no strip |
+| MOS2 `S005` imaging | 356 699 | circle at 24332.8, 24621.2 | 14 893 | singles 1.053 ± 0.024, doubles 0.838 ± 0.035 |
+
+Her X-1 is **not piled up** in this pn Timing exposure: both ratios sit within their errors
+of 1, which is the answer a 6 ks snapshot of a 9.9e-11 erg cm⁻² s⁻¹ source should give.
+
+The MOS1 imaging row is the interesting one, and it is right. `FastUncompressed` reads the
+central CCD in timing, so the *imaging* event list of that exposure holds no events at the
+target at all — 0 of 272 768 fall in the source circle. `epatplot` ran, fitted nothing,
+wrote no keywords, and `xmm_pileup_check` recorded a skip. An exposure that has nothing to
+say now says so instead of failing or, worse, reporting a ratio derived from nothing.
+
+**`ecoordconv` is settled, and its parser is right.** The open item from step 7 is closed:
+on the real MOS1 event list it printed
+
+```
+ X: Y: 24332.842 24621.217
+ IM_X: IM_Y: 24332.842 24621.217
+```
+
+— the same numbers on two lines, which is exactly the trap `ECOORDCONV_SKY_RE`'s
+start-of-line anchor was written for. MOS1 and MOS2 agree to the digit, as absolute sky
+coordinates must. The `OBSMLI` cross-check reports **1.35″**, against the 1.42″ this
+document predicted from the archive; the difference is that the pipeline compares against
+the position asked for rather than the catalogue's own.
+
+**A calibration lesson that is not about this code.** `ecoordconv` first failed with
+`Could not open file 'XMM_BORESIGHT_0029.CCF'`. The mirror at `SAS_CCFPATH` holds
+`XMM_BORESIGHT_0036.CCF` — the current issue — while the observation's `CALIND`, being the
+index the SOC used for the November 2024 reprocessing, names issue 0029. **A mirror of
+current issues only cannot satisfy an archival `CALIND`.** The fallback the plan predicted
+works exactly as predicted, and takes 26 seconds with no ODF:
+
+```bash
+cifbuild withobservationdate=yes observationdate=2002-03-27 fullpath=yes
+```
+
+Everything above was run with the index that produced. **This fallback is not implemented
+yet** — it belongs with the `SAS_CCF` handling in step 9 or 12, and it needs Matteo's
+verdict: rebuild the index whenever a constituent is missing, or tell the user to complete
+their mirror.
+
+**`epatplot` needs ESA's pysas**, unlike everything else here: it shells out to
+`$SAS_DIR/bin/epatplot_graph.py`, which imports `pysas.pyutils`. `sas.run` still does not,
+and `has_sas` is still right not to probe for it — but a machine whose `PYTHONPATH` loses
+`$SAS_DIR/lib/python` will run every other task and fail this one.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):
@@ -860,15 +966,26 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
 
 * Barycentring — which of the three candidates in step 8 works.
 * `especget`'s output file names, pinned as a constant.
-* **`ecoordconv` against a real observation** — the parser matches the format the task's
-  own documentation publishes, and `xmm_source_sky_position` has not yet been run for real,
-  because the CCF mirror on this machine had not reached `XMM_BORESIGHT_0029.CCF`. Confirm
-  the sky position of Her X-1 once it has.
+* ~~**`ecoordconv` against a real observation.**~~ **Settled** — run on Her X-1's MOS1 and
+  MOS2 event lists, 24332.842, 24621.217 on both; see *What changed while implementing
+  step 8*. The mirror never did reach `XMM_BORESIGHT_0029.CCF`, because ESA's current
+  issue is 0036 and an archival `CALIND` names the issue of its day; `cifbuild
+  withobservationdate=yes` is what closed it.
+* **Whether a missing `CALIND` constituent should trigger `cifbuild` automatically.** New,
+  and the direct consequence of the item above: an archival observation's own index can
+  name calibration issues a current mirror does not hold. The fallback is verified to
+  work; whether the pipeline should reach for it unasked is Matteo's call.
 * Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.
 * The `.FIT.gz` → `.FTZ` staging rule on the ODF route.
 * ~~Default flare-rate thresholds.~~ **Settled** — PPS's own `FLCUTTHR`, see above.
 * The pn Timing `RAWX` defaults — `[31:45]` source, `[3:5]` background are the cookbook's
-  numbers, and the right background strip depends on how far the source wings spread.
+  numbers, and the right background strip depends on how far the source wings spread. They
+  gave 131 568 of 299 677 pn events on Her X-1 and a pile-up measurement consistent with
+  no pile-up, so they are at least not obviously wrong.
+* **A MOS Timing strip from `ecoordconv`.** Decided for now that MOS timing is skipped and
+  warned about rather than extracted at a guessed column. `ecoordconv` prints `RAWX:` for
+  the target position (311.08 on Her X-1's MOS1), which would centre the strip on SAS's own
+  conversion. Cheap, and not done without asking.
 * ~~Whether flare screening on a Timing exposure should use `FBKTSR` at all.~~ **Settled**
   — yes, with the provenance recorded; see above.
 * ~~How the flare GTI reaches `evselect`.~~ **Settled** — a file we write, filtered with
