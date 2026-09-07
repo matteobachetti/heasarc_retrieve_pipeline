@@ -44,7 +44,16 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .utils import absolute_config, get_logger
+import numpy as np
+
+from .diagnostics import no_record
+from .utils import (
+    absolute_config,
+    get_logger,
+    good_intervals,
+    intervals_above_threshold,
+    intervals_removed,
+)
 
 #: Configuration a run starts from. ``products`` chooses the route: ``"pps"`` reads the
 #: archive's own reduction, ``"odf"`` reprocesses from the raw telemetry. See
@@ -57,7 +66,17 @@ DEFAULT_CONFIG = dict(
     src_radius_arcsec=30.0,
     bkg_inner_factor=1.5,
     bkg_outer_factor=3.0,
-    flare_rate_limit=dict(pn=0.4, mos=0.35),
+    # ``None`` means "use the threshold PPS itself chose for this exposure" -- see
+    # :func:`xmm_flare_threshold` for why there is no useful number to put here. A
+    # dictionary overrides it, keyed by camera (``pn``, ``mos1``, ``mos2``) or by family
+    # (``pn``, ``mos``).
+    flare_rate_limit=None,
+    # The SAS cookbook's numbers, which apply to the light curve the ODF route builds
+    # with ``evselect`` above 10 keV, and to nothing else. Kept here so that step 10 does
+    # not have to rediscover them.
+    odf_flare_rate_limit=dict(pn=0.4, mos=0.35),
+    # Warn when the flare screening removes more than this much of an exposure.
+    flare_warn_fraction=0.25,
 )
 
 #: The EPIC cameras, by the two-character instrument code PPS names them with. The codes
@@ -474,6 +493,270 @@ def parse_pps_name(name):
     """
     match = PPS_NAME_RE.match(os.path.basename(name))
     return PpsName(**match.groupdict()) if match else None
+
+
+#: Keyword PPS writes into a ``FBKTSR``'s ``RATE`` header: "Optimised flare cut
+#: threshold", in the same counts/s the ``RATE`` column is in. It is the SOC's own answer
+#: for that one exposure, and it is the default this module thresholds at.
+FLARE_THRESHOLD_KEYWORD = "FLCUTTHR"
+
+#: Extension of a ``FBKTSR`` holding the time series.
+FLARE_LIGHTCURVE_EXTENSION = "RATE"
+
+
+@dataclass(frozen=True)
+class FlareLightCurve:
+    """
+    One exposure's background time series, as much of it as the screening needs.
+
+    Attributes
+    ----------
+    time : numpy.ndarray
+        Bin *centres*, in the mission time of the event lists.
+    rate : numpy.ndarray
+        Background count rate. ``NaN`` in bins with no exposure, and real curves have
+        them -- 322 of the 6181 bins of Mkn 421's pn.
+    rate_error : numpy.ndarray or None
+        Its uncertainty, recorded for the figure and not used in the arithmetic.
+    cadence : float
+        Bin width, ``TIMEDEL``. 26 s for MOS and 10 s for pn on the observations measured.
+    tstart, tstop : float
+        Bounds of the exposure the curve covers.
+    pps_threshold : float or None
+        :data:`FLARE_THRESHOLD_KEYWORD`, if the file carries one.
+    """
+
+    time: np.ndarray
+    rate: np.ndarray
+    rate_error: Optional[np.ndarray]
+    cadence: float
+    tstart: float
+    tstop: float
+    pps_threshold: Optional[float]
+
+
+def read_flare_lightcurve(path):
+    """
+    Read a PPS ``FBKTSR`` background time series.
+
+    ``TIME`` holds bin *centres* -- verified against the archive, where the first sample
+    sits exactly half a ``TIMEDEL`` after ``TSTART`` and the spacing is exactly
+    ``TIMEDEL``. That is what :func:`~heasarc_retrieve_pipeline.utils.intervals_above_threshold`
+    assumes when it takes a sample to cover ``[t - cadence/2, t + cadence/2]``, so the
+    two agree without anything having to be shifted.
+
+    Parameters
+    ----------
+    path : str
+        The ``FBKTSR`` file.
+
+    Returns
+    -------
+    FlareLightCurve
+    """
+    from astropy.io import fits
+
+    with fits.open(path) as hdul:
+        table = hdul[FLARE_LIGHTCURVE_EXTENSION]
+        header = table.header
+        time = np.asarray(table.data["TIME"], dtype=float)
+        # PPS marks a bin with no exposure using a *signalling* NaN -- bit pattern
+        # 0x7f800001, not the 0x7fc00000 a quiet NaN has. Widening one of those to double
+        # raises the processor's invalid-operation flag, which numpy reports as
+        # "invalid value encountered in cast"; a real Mkn 421 light curve has 322 of them
+        # and would warn every time it was read. The value that comes out is an ordinary
+        # quiet NaN, so nothing downstream needs to know about any of this.
+        with np.errstate(invalid="ignore"):
+            rate = np.asarray(table.data["RATE"], dtype=float)
+            error = "ERROR" in table.columns.names
+            rate_error = np.asarray(table.data["ERROR"], dtype=float) if error else None
+
+    cadence = header.get("TIMEDEL")
+    if cadence is None:
+        cadence = float(np.median(np.diff(time))) if time.size > 1 else 0.0
+
+    return FlareLightCurve(
+        time=time,
+        rate=rate,
+        rate_error=rate_error,
+        cadence=float(cadence),
+        tstart=float(header["TSTART"]),
+        tstop=float(header["TSTOP"]),
+        pps_threshold=header.get(FLARE_THRESHOLD_KEYWORD),
+    )
+
+
+def camera_family(instrument):
+    """
+    ``"pn"`` or ``"mos"``, the two names the SAS documentation uses for these detectors.
+
+    Examples
+    --------
+    >>> camera_family("mos2")
+    'mos'
+    >>> camera_family("pn")
+    'pn'
+    """
+    return "mos" if instrument.startswith("mos") else instrument
+
+
+def xmm_flare_threshold(curve, instrument, config):
+    """
+    The background rate above which this exposure is counted as flaring, and where it
+    came from.
+
+    **The SAS cookbook's 0.4 and 0.35 counts/s do not belong here**, and this is the one
+    thing about the flare screening that had to be measured rather than reasoned about.
+    Those numbers are for a light curve you build yourself with ``evselect`` above 10 keV
+    over the whole field -- which is what the ODF route does, and what
+    ``config["odf_flare_rate_limit"]`` keeps them for. A PPS ``FBKTSR`` is made by
+    ``epiclccorr`` and is on quite another scale. Measured across the archive:
+
+    ==========================  ========  ======  =========
+    exposure                    median      max   FLCUTTHR
+    ==========================  ========  ======  =========
+    ``0153950401`` MOS1 S004        36.0    54.2       54.2
+    ``0153950401`` MOS2 S005        45.1   102.4       82.1
+    ``0123700101`` pn S003           2.2  1351.9        3.4
+    ``0123700101`` MOS1 S001         1.0   228.4        1.8
+    ``0123700101`` MOS1 U002        20.5    67.4       43.4
+    ``0804330201`` MOS1 S002         0.9     1.7        1.7
+    ==========================  ========  ======  =========
+
+    A fixed 0.35 would throw away every bin of the first row and none of the last. And
+    the third and fifth rows are the same camera in the same observation, twenty times
+    apart, which is why no single number can do this job at all.
+
+    PPS has already done it, per exposure, and written the answer into the file. When it
+    finds no flare it sets the keyword fractionally above the largest rate in the curve,
+    so nothing is cut -- and since the keyword is stored at full precision and the rates
+    are single precision, that comparison has no edge case.
+
+    Parameters
+    ----------
+    curve : FlareLightCurve
+        The exposure's background time series.
+    instrument : str
+        ``"pn"``, ``"mos1"`` or ``"mos2"``.
+    config : dict
+        ``flare_rate_limit`` is read: ``None`` to use PPS's own value, or a dictionary
+        keyed by camera or by camera family. The camera wins over its family.
+
+    Returns
+    -------
+    tuple
+        ``(threshold, source)``, where ``source`` is ``"config"``, ``"pps"``, or ``None``
+        when there is no threshold to be had and the exposure cannot be screened.
+    """
+    limits = config.get("flare_rate_limit") or {}
+    for key in (instrument, camera_family(instrument)):
+        if key in limits:
+            return float(limits[key]), "config"
+
+    if curve.pps_threshold is not None:
+        return float(curve.pps_threshold), "pps"
+    return None, None
+
+
+def xmm_flare_gti(exposure, config, rec=None):
+    """
+    The stretches of one exposure that the background was quiet enough to keep.
+
+    Soft protons funnelled by the mirrors raise EPIC's background by orders of magnitude
+    for minutes at a time, and the standard treatment is to cut on a background light
+    curve. All of that is arithmetic on numbers PPS has already produced, so no SAS task
+    is involved and the whole of it is testable offline.
+
+    Two things are recorded rather than decided here. The exposure that survives is
+    recorded because a cut that removed too much and a cut that removed nothing both
+    leave an output file that looks perfectly good, and the light curve is recorded
+    because the threshold only means something drawn against it.
+
+    **A timing exposure is screened with the imaging curve of the same exposure**, where
+    there is one. MOS ``FastUncompressed`` reads its central CCD in timing and its outer
+    six in imaging, so the background curve of ``M1S004`` is built from a field the timing
+    event list does not have. That is not a reason to skip the cut: soft-proton flares
+    illuminate the whole detector, so a flare seen in the outer CCDs is happening during
+    the timing readout too. The curve's provenance is recorded, so the choice is visible.
+
+    Parameters
+    ----------
+    exposure : Exposure
+        Which camera, and where its light curve is.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where the numbers go. ``None`` records nothing.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Shape ``(N, 2)``, sorted and disjoint. Empty when the whole exposure was flaring.
+        ``None`` when the exposure could not be screened at all, which is not a failure:
+        PPS wrote no ``FBKTSR`` for the pn timing exposure of Her X-1, and that is real
+        data rather than a broken download.
+    """
+    logger = get_logger()
+    if rec is None:
+        rec = no_record()
+
+    if exposure.flare_lightcurve is None:
+        reason = f"{exposure.instrument} {exposure.expid} has no background light curve"
+        logger.info(f"Not screening for flares: {reason}")
+        rec.skip(reason)
+        return None
+
+    curve = read_flare_lightcurve(exposure.flare_lightcurve)
+    threshold, source = xmm_flare_threshold(curve, exposure.instrument, config)
+    if threshold is None:
+        reason = f"{os.path.basename(exposure.flare_lightcurve)} carries no flare threshold"
+        logger.warning(f"Not screening for flares: {reason}")
+        rec.skip(reason)
+        return None
+
+    flaring = intervals_above_threshold(curve.time, curve.rate, threshold, cadence=curve.cadence)
+    # ``good_intervals`` merges, clips and sorts what it is given, so its result already
+    # has the three properties a GTI list must have and needs no tidying afterwards.
+    gti = good_intervals(flaring, curve.tstart, curve.tstop)
+
+    whole = np.array([[curve.tstart, curve.tstop]], dtype=float)
+    before = float(curve.tstop - curve.tstart)
+    after = float(np.sum(gti[:, 1] - gti[:, 0])) if gti.size else 0.0
+    removed_fraction = 1.0 - after / before if before > 0 else 0.0
+
+    rec.value(
+        instrument=exposure.instrument,
+        expid=exposure.expid,
+        mode=exposure.mode,
+        threshold=threshold,
+        threshold_source=source,
+        bin_seconds=curve.cadence,
+        light_curve=os.path.basename(exposure.flare_lightcurve),
+        exposure_before=before,
+        exposure_after=after,
+        removed_fraction=removed_fraction,
+        n_intervals_kept=len(gti),
+    )
+    arrays = dict(
+        lc_time=curve.time,
+        lc_rate=curve.rate,
+        gti_before=whole,
+        gti_after=gti,
+        removed=intervals_removed(whole, gti),
+    )
+    if curve.rate_error is not None:
+        arrays["lc_rate_err"] = curve.rate_error
+    rec.array(**arrays)
+
+    where = f"{exposure.instrument} {exposure.expid} {exposure.mode}"
+    if removed_fraction > config["flare_warn_fraction"]:
+        logger.warning(
+            f"Flare screening removed {removed_fraction:.0%} of {where} "
+            f"({before - after:.0f} s of {before:.0f} s) above {threshold:g} counts/s"
+        )
+    else:
+        logger.info(f"Flare screening kept {after:.0f} s of {before:.0f} s of {where}")
+    return gti
 
 
 def xmm_base_output_path(obsid, config):

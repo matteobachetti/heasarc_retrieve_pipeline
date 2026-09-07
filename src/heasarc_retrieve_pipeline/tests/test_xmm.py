@@ -13,7 +13,9 @@ on 2026-09-07, and the two observations behind them are the ones
 
 import os
 import re
+import warnings
 
+import numpy as np
 import pytest
 
 from heasarc_retrieve_pipeline import xmm
@@ -372,6 +374,373 @@ class TestFindingTheExposuresOfAnObservation:
         assert all(e.submode is None for e in exposures)
 
 
+def a_flare_lightcurve(
+    path,
+    rates,
+    tstart=133579244.991178,
+    cadence=26.0,
+    threshold=54.2379532,
+    instrument="EMOS1",
+    errors=None,
+):
+    """
+    Write a file shaped like a PPS ``FBKTSR``, with the numbers of a real one.
+
+    The layout is Her X-1's ``P0153950401M1S004FBKTSR0000.FTZ``: a ``RATE`` extension of
+    ``TIME``, ``RATE``, ``ERROR``, ``FRACEXP`` and ``T_ELAPSED``, times at bin *centres*
+    offset by half a bin from ``TSTART``, and the threshold PPS chose in ``FLCUTTHR``.
+    """
+    from astropy.io import fits
+
+    rates = np.asarray(rates, dtype=float)
+    times = tstart + cadence / 2 + cadence * np.arange(len(rates))
+    columns = fits.ColDefs(
+        [
+            fits.Column(name="TIME", format="D", unit="s", array=times),
+            fits.Column(name="RATE", format="E", unit="count/s", array=rates),
+            fits.Column(
+                name="ERROR",
+                format="E",
+                unit="count/s",
+                array=np.ones_like(rates) if errors is None else np.asarray(errors, float),
+            ),
+            fits.Column(name="FRACEXP", format="E", array=np.ones_like(rates)),
+            fits.Column(name="T_ELAPSED", format="D", array=times - tstart),
+        ]
+    )
+    rate_hdu = fits.BinTableHDU.from_columns(columns, name="RATE")
+    header = rate_hdu.header
+    header["TSTART"] = tstart
+    header["TSTOP"] = tstart + cadence * len(rates)
+    header["TIMEDEL"] = cadence
+    header["INSTRUME"] = instrument
+    header["HDUCLAS1"] = "LIGHTCURVE"
+    if threshold is not None:
+        header["FLCUTTHR"] = (threshold, "Optimised flare cut threshold")
+
+    fits.HDUList([fits.PrimaryHDU(), rate_hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+def an_exposure(path, instrument="mos1", mode=xmm.IMAGING):
+    return xmm.Exposure(
+        instrument=instrument,
+        expid="S004",
+        mode=mode,
+        event_list="events.FTZ",
+        flare_lightcurve=path,
+    )
+
+
+class TestReadingAFlareLightCurve:
+    """
+    What a ``FBKTSR`` holds, and what has to be read out of it rather than assumed.
+
+    ``epiclccorr`` writes the background rate of one exposure, and the header carries the
+    two things the thresholding needs beside the numbers: the bin width, and PPS's own
+    view of where the cut belongs.
+    """
+
+    def test_the_curve_comes_back(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 2.0, 3.0])
+
+        curve = xmm.read_flare_lightcurve(path)
+
+        assert curve.rate.tolist() == [1.0, 2.0, 3.0]
+
+    def test_the_times_are_bin_centres(self, tmp_path):
+        """Measured on the real file: the first TIME sits half a bin after TSTART, and
+        the spacing is exactly TIMEDEL. It matters, because the thresholding takes each
+        sample to cover ``[t - cadence/2, t + cadence/2]``."""
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 2.0], tstart=100.0, cadence=26.0)
+
+        curve = xmm.read_flare_lightcurve(path)
+
+        assert curve.time.tolist() == [113.0, 139.0]
+        assert curve.tstart == 100.0
+        assert curve.tstop == 152.0
+
+    def test_the_cadence_is_read_from_the_header(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 2.0], cadence=10.0)
+
+        assert xmm.read_flare_lightcurve(path).cadence == 10.0
+
+    def test_a_curve_without_timedel_falls_back_to_the_spacing(self, tmp_path):
+        from astropy.io import fits
+
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 2.0, 3.0], cadence=26.0)
+        with fits.open(path, mode="update") as hdul:
+            del hdul["RATE"].header["TIMEDEL"]
+
+        assert xmm.read_flare_lightcurve(path).cadence == 26.0
+
+    def test_the_threshold_pps_chose_is_read(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0], threshold=54.2379532)
+
+        assert xmm.read_flare_lightcurve(path).pps_threshold == 54.2379532
+
+    def test_a_curve_without_one_says_so(self, tmp_path):
+        """Every EPIC FBKTSR carries FLCUTTHR -- 41 of 41 across twelve observations --
+        and the RGS ones do not. RGS is not reduced here, so this is only ever reached by
+        something unexpected, and it must not be an exception."""
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0], threshold=None)
+
+        assert xmm.read_flare_lightcurve(path).pps_threshold is None
+
+    def test_a_signalling_nan_is_read_without_a_warning(self, tmp_path):
+        """
+        PPS writes dead bins as a *signalling* NaN, bit pattern ``0x7f800001``, and not as
+        the quiet ``0x7fc00000`` that astropy or numpy would produce. Widening one to
+        double raises the processor's invalid-operation flag, which numpy reports as a
+        warning -- once per dead bin, and Mkn 421's pn curve has 322 of them.
+        """
+        from astropy.io import fits
+
+        signalling = np.array([0x3F800000, 0x7F800001], dtype=">u4").view(">f4")
+        column = fits.Column(name="RATE", format="E", array=signalling)
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 1.0])
+        with fits.open(path, mode="update") as hdul:
+            hdul["RATE"].data["RATE"] = column.array
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            curve = xmm.read_flare_lightcurve(path)
+
+        assert np.isnan(curve.rate[1])
+        assert curve.rate[0] == 1.0
+
+
+class TestChoosingTheFlareThreshold:
+    """
+    Which number the light curve is cut at.
+
+    The SAS cookbook's 0.4 and 0.35 counts/s are *not* it, and this is the thing about
+    step 6 that had to be measured rather than reasoned about. Those numbers are for a
+    light curve you build yourself with ``evselect`` above 10 keV over the whole field.
+    ``FBKTSR`` is made by ``epiclccorr`` and is on quite another scale: the median rate is
+    36.0 counts/s on Her X-1's MOS1, 1.0 on Mkn 421's, and 20.5 on the *unscheduled*
+    exposure of that same camera in that same observation. A factor of twenty between two
+    exposures of one observation is the proof that no single number can do this job.
+
+    PPS has already done it, per exposure, in ``FLCUTTHR``.
+    """
+
+    def a_curve(self, threshold):
+        return xmm.FlareLightCurve(
+            time=np.array([0.0, 26.0]),
+            rate=np.array([1.0, 2.0]),
+            rate_error=None,
+            cadence=26.0,
+            tstart=-13.0,
+            tstop=39.0,
+            pps_threshold=threshold,
+        )
+
+    def test_the_default_is_what_pps_chose(self):
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(54.24), "mos1", xmm.xmm_config({}))
+
+        assert threshold == 54.24
+        assert source == "pps"
+
+    def test_a_configured_limit_wins(self):
+        config = xmm.xmm_config({"flare_rate_limit": {"mos1": 3.0}})
+
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(54.24), "mos1", config)
+
+        assert threshold == 3.0
+        assert source == "config"
+
+    def test_a_limit_may_name_the_camera_family(self):
+        """``mos`` is how the SAS documentation talks about the pair, and writing the same
+        number twice is how the two come to disagree."""
+        config = xmm.xmm_config({"flare_rate_limit": {"mos": 3.0}})
+
+        assert xmm.xmm_flare_threshold(self.a_curve(54.24), "mos1", config)[0] == 3.0
+        assert xmm.xmm_flare_threshold(self.a_curve(54.24), "mos2", config)[0] == 3.0
+
+    def test_the_camera_itself_beats_its_family(self):
+        config = xmm.xmm_config({"flare_rate_limit": {"mos": 3.0, "mos2": 9.0}})
+
+        assert xmm.xmm_flare_threshold(self.a_curve(54.24), "mos2", config)[0] == 9.0
+
+    def test_a_limit_for_another_camera_does_not_apply(self):
+        config = xmm.xmm_config({"flare_rate_limit": {"pn": 3.0}})
+
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(54.24), "mos1", config)
+
+        assert (threshold, source) == (54.24, "pps")
+
+    def test_with_neither_there_is_no_threshold(self):
+        threshold, source = xmm.xmm_flare_threshold(self.a_curve(None), "mos1", xmm.xmm_config({}))
+
+        assert threshold is None
+        assert source is None
+
+    def test_the_cookbook_numbers_are_kept_for_the_route_they_belong_to(self):
+        """They are right for the light curve step 10 builds with ``evselect``, and wrong
+        for this one. Losing them would mean rediscovering them."""
+        assert xmm.xmm_config({})["odf_flare_rate_limit"] == {"pn": 0.4, "mos": 0.35}
+
+
+class TestTheFlareGoodTimeIntervals:
+    """
+    Which stretches of an exposure survive the background cut.
+
+    Pure Python throughout -- ``evselect`` never sees a light curve -- so this is the part
+    of the XMM reduction with the most offline test value after the name parsing. The
+    interval arithmetic itself is ``utils``', already tested there; what is tested here is
+    that the right numbers are handed to it and the right thing recorded afterwards.
+    """
+
+    def test_a_quiet_exposure_keeps_all_of_itself(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 1.0, 1.0], tstart=0.0, threshold=5.0)
+
+        gti = xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}))
+
+        assert gti.tolist() == [[0.0, 78.0]]
+
+    def test_a_flare_in_the_middle_is_cut_out(self, tmp_path):
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0, 9.0, 1.0], tstart=0.0, cadence=10.0, threshold=5.0
+        )
+
+        gti = xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}))
+
+        assert gti.tolist() == [[0.0, 10.0], [20.0, 30.0]]
+
+    def test_a_bin_is_cut_over_its_own_width(self, tmp_path):
+        """Not from one sample time to the next: a sample stands for the bin around it,
+        so a single bad bin removes half a cadence on either side of its centre."""
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0, 9.0, 1.0, 1.0], tstart=0.0, cadence=10.0, threshold=5.0
+        )
+
+        removed = xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}))
+
+        assert removed.tolist() == [[0.0, 10.0], [20.0, 40.0]]
+
+    def test_an_exposure_that_is_all_flare_keeps_nothing(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [9.0, 9.0], tstart=0.0, threshold=5.0)
+
+        assert xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({})).tolist() == []
+
+    def test_a_gap_in_the_coverage_is_not_a_flare(self, tmp_path):
+        """Real curves carry NaN in dead bins -- 322 of 6181 in Mkn 421's pn. Missing
+        information is not evidence of a bright background."""
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits",
+            [1.0, np.nan, 1.0],
+            tstart=0.0,
+            cadence=10.0,
+            threshold=5.0,
+        )
+
+        assert xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({})).tolist() == [[0.0, 30.0]]
+
+    def test_an_exposure_with_no_light_curve_is_not_screened(self, tmp_path):
+        """PPS wrote no FBKTSR for the pn timing exposure of Her X-1. That is real data,
+        not a broken download, and it must not raise."""
+        exposure = xmm.Exposure(instrument="pn", expid="S003", mode=xmm.TIMING, event_list="e.FTZ")
+
+        assert xmm.xmm_flare_gti(exposure, xmm.xmm_config({})) is None
+
+    def test_an_exposure_with_no_threshold_is_not_screened(self, tmp_path):
+        path = a_flare_lightcurve(tmp_path / "lc.fits", [1.0, 9.0], threshold=None)
+
+        assert xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({})) is None
+
+    def test_the_configured_limit_is_the_one_applied(self, tmp_path):
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0, 9.0, 1.0], tstart=0.0, cadence=10.0, threshold=100.0
+        )
+        config = xmm.xmm_config({"flare_rate_limit": {"mos": 5.0}})
+
+        assert xmm.xmm_flare_gti(an_exposure(path), config).tolist() == [[0.0, 10.0], [20.0, 30.0]]
+
+
+class TestWhatTheFlareScreeningRecords:
+    """
+    The page has to show what was thrown away, because a cut that removed too much and a
+    cut that removed nothing both leave an output file that looks perfectly good.
+    """
+
+    def a_record(self, tmp_path, rates, **kwargs):
+        from heasarc_retrieve_pipeline.diagnostics import record_step
+
+        path = a_flare_lightcurve(tmp_path / "lc.fits", rates, tstart=0.0, cadence=10.0, **kwargs)
+        with record_step(str(tmp_path / "diag"), "0153950401", "flare_filtering") as rec:
+            gti = xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}), rec=rec)
+        return gti, rec
+
+    def test_the_threshold_and_where_it_came_from_are_recorded(self, tmp_path):
+        _, rec = self.a_record(tmp_path, [1.0, 9.0, 1.0], threshold=5.0)
+
+        assert rec.values["threshold"] == 5.0
+        assert rec.values["threshold_source"] == "pps"
+
+    def test_the_exposure_before_and_after_are_recorded(self, tmp_path):
+        _, rec = self.a_record(tmp_path, [1.0, 9.0, 1.0], threshold=5.0)
+
+        assert rec.values["exposure_before"] == 30.0
+        assert rec.values["exposure_after"] == 20.0
+        assert rec.values["removed_fraction"] == pytest.approx(1 / 3)
+
+    def test_the_curve_is_recorded_so_the_cut_can_be_drawn(self, tmp_path):
+        _, rec = self.a_record(tmp_path, [1.0, 9.0, 1.0], threshold=5.0)
+
+        assert rec.arrays["lc_time"].tolist() == [5.0, 15.0, 25.0]
+        assert rec.arrays["lc_rate"].tolist() == [1.0, 9.0, 1.0]
+
+    def test_what_was_removed_is_recorded_as_well_as_what_was_kept(self, tmp_path):
+        _, rec = self.a_record(tmp_path, [1.0, 9.0, 1.0], threshold=5.0)
+
+        assert rec.arrays["gti_after"].tolist() == [[0.0, 10.0], [20.0, 30.0]]
+        assert rec.arrays["removed"].tolist() == [[10.0, 20.0]]
+
+    def test_an_exposure_with_no_light_curve_is_a_skip_and_not_a_failure(self, tmp_path):
+        from heasarc_retrieve_pipeline.diagnostics import record_step
+
+        exposure = xmm.Exposure(instrument="pn", expid="S003", mode=xmm.TIMING, event_list="e.FTZ")
+        with record_step(str(tmp_path / "diag"), "0153950401", "flare_filtering") as rec:
+            xmm.xmm_flare_gti(exposure, xmm.xmm_config({}), rec=rec)
+
+        assert rec.status == "skipped"
+        assert "light curve" in rec.reason
+
+    def test_a_heavy_cut_is_warned_about(self, tmp_path, caplog):
+        """Mkn 421's pn loses 39% of itself to PPS's own threshold. That is very likely
+        right -- it is a famously flare-wrecked observation -- but nobody should have to
+        open the page to find out that it happened."""
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0, 9.0, 9.0, 1.0], tstart=0.0, cadence=10.0, threshold=5.0
+        )
+
+        with caplog.at_level("WARNING"):
+            xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}))
+
+        assert "50" in caplog.text
+
+    def test_a_light_cut_is_not_warned_about(self, tmp_path, caplog):
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0] * 19 + [9.0], tstart=0.0, cadence=10.0, threshold=5.0
+        )
+
+        with caplog.at_level("WARNING"):
+            xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({}))
+
+        assert caplog.text == ""
+
+    def test_the_fraction_that_warns_is_configurable(self, tmp_path, caplog):
+        path = a_flare_lightcurve(
+            tmp_path / "lc.fits", [1.0] * 19 + [9.0], tstart=0.0, cadence=10.0, threshold=5.0
+        )
+
+        with caplog.at_level("WARNING"):
+            xmm.xmm_flare_gti(an_exposure(path), xmm.xmm_config({"flare_warn_fraction": 0.01}))
+
+        assert "removed" in caplog.text
+
+
 class TestWhereTheFilesGo:
     OBSID = "0153950401"
     CONFIG = {"input_data_path": "/data/in", "out_data_path": "/data/out"}
@@ -635,7 +1004,7 @@ class TestChoosingTheRoute:
         resolved = xmm.xmm_resolve_config({"out_data_path": "/data"}, "https://x/0153950401/")
 
         assert resolved["src_radius_arcsec"] == 30.0
-        assert resolved["flare_rate_limit"] == {"pn": 0.4, "mos": 0.35}
+        assert resolved["odf_flare_rate_limit"] == {"pn": 0.4, "mos": 0.35}
 
     def test_the_caller_dictionary_is_not_modified(self, monkeypatch):
         self.an_archive_holding(monkeypatch, ["ODF/"])
@@ -707,10 +1076,10 @@ class TestTheConfiguration:
         assert given == {"products": "odf"}
 
     def test_a_nested_default_is_not_shared_between_runs(self):
-        """``flare_rate_limit`` is a dictionary of its own, so a shallow copy would hand
-        every run the same one."""
+        """``odf_flare_rate_limit`` is a dictionary of its own, so a shallow copy would
+        hand every run the same one."""
         first = xmm.xmm_config(None)
 
-        first["flare_rate_limit"]["pn"] = 99.0
+        first["odf_flare_rate_limit"]["pn"] = 99.0
 
-        assert xmm.xmm_config(None)["flare_rate_limit"]["pn"] == 0.4
+        assert xmm.xmm_config(None)["odf_flare_rate_limit"]["pn"] == 0.4
