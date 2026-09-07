@@ -359,6 +359,10 @@ tool if we ever want one file; noted in `known_issues.rst`, not built now.
 
 ## Step 8 — barycentring, the one open dependency
 
+> **Settled, 2026-09-08: candidate 1 wins and candidate 3 is impossible.** See
+> *What changed while implementing step 11* below for the measurements. The text below is
+> the plan as written, kept for the reasoning.
+
 SAS `barycen` edits in place and locates the orbit through `SAS_ODF`, which the PPS route
 does not produce. Three candidates, to be settled on the first real run — which is why the
 3.8 MB of ODF housekeeping is downloaded on both routes, and why this is the last step in
@@ -960,6 +964,75 @@ warns. That is correct and is the `BACKSCAL` deficit above, not a false alarm: a
 `PrimeLargeWindow` with the default 90″ annulus the background region really does run off
 the chip. It costs background counts, which `BACKSCAL` accounts for; it is not silently
 wrong, and the warning is the point.
+
+## What changed while implementing step 11
+
+**Candidate 3 is impossible, and this is documented rather than merely observed.**
+`barycorr`'s own help states it "is designed to apply to data from RXTE, Swift,
+Chandra/AXAF, NuSTAR and NICER". Run on XMM's PPS `ORBTSR` it fails with
+
+```
+barycorr: Invalid Observatory/Spacecraft position vector
+hdaxbary: Error -11 correcting TSTART/TSTOP in HDU 1
+```
+
+before reading a single event. This was not taken at face value: `hdaxbary` carries three
+orbit readers (`xtescorbit`, `swiftscorbit`, `nicerscorbit`), and the RXTE one wants
+`X,Y,Z` and `VX,VY,VZ` — which XMM half satisfies already, having `GEI_X/Y/Z` in km and
+`VX,VY,VZ` in km/s. Renaming the position columns, rescaling km to metres, rescaling to a
+low-Earth-orbit magnitude, and forging `TELESCOP=XTE` all produce the identical error. The
+orbit file is not the problem: it covers the exposure fully at 1 s cadence, 59 605 to
+99 159 km. `barycorr` simply does not dispatch a reader for XMM. **The cheapest candidate
+is out, and no amount of file surgery recovers it.**
+
+**Candidate 1 wins, and the reason it first appeared not to is a silent format trap.**
+`barycen` needs `SAS_ODF` pointing at a `SUM.SAS`, which only `odfingest` writes. Staging
+the housekeeping as SAS's own `.FTZ` — the natural choice, since SAS reads `.FTZ`
+everywhere else — makes `odfingest` behave as though the housekeeping were *absent*: it
+lists only the `.ASC` files, fails to find a start/stop interval, and writes a truncated
+summary that `barycen` then rejects with `UnexpectedEOF`. Staged as plain `.FIT` and
+`.ASC` the same files ingest and `barycen` runs to completion. `odfingest` finds `.FTZ`
+files when they are named to it, but does not *discover* them when scanning a directory.
+`ODF_STAGED_SUFFIXES` pins this; it cost an hour to find and would cost it again.
+
+**`odfingest` warns `NoScienceFiles` and that warning is correct and expected.** Only the
+3.8 MB of housekeeping is downloaded on the PPS route, and the observation's duration is
+recoverable from it alone. The code therefore checks for the `SUM.SAS` rather than
+trusting a return code — the same habit as `sas.run`'s `produces`.
+
+**The correction is applied to a copy.** `barycen` edits in place, and an event list whose
+times are silently no longer spacecraft times is a trap for everything downstream, so
+`barycenter.barycentered_file_name` names a copy and `produces=IN_PLACE(...)` checks it.
+Spectra continue to be extracted from the uncorrected list; the barycentred file is an
+additional product for timing.
+
+**An observation with no ODF still reduces.** Barycentring is the one thing that cannot be
+done without it, and it is not worth failing an otherwise complete reduction over: the
+step records `barycentered: false` with a reason and the run continues.
+
+### Verified against a real SAS run, and against an independent calculation
+
+`0870940101` pn, 401 788 cleaned events. `barycen` corrected the `EVENTS` table, the nine
+`EXPOSU` tables and the GTIs, and rewrote the headers to `TIMESYS=TDB`,
+`TIMEREF=SOLARSYSTEM`.
+
+That it *ran* proves nothing about whether it ran *correctly*, so the shift was recomputed
+independently in astropy from the same `ORBTSR` positions and the source direction:
+
+| offset into the exposure | SAS shift | astropy geometric | difference |
+|---|---|---|---|
+| 0 s | 65.5894 s | 65.5862 s | 3.2 ms |
+| 6 869 s | 65.1352 s | 65.1319 s | 3.3 ms |
+| 13 737 s | 64.6856 s | 64.6823 s | 3.3 ms |
+| 20 606 s | 64.2406 s | 64.2373 s | 3.3 ms |
+| 27 474 s | 63.8003 s | 63.7968 s | 3.5 ms |
+
+The correction sweeps 1.79 s across the exposure, which is the quantity that matters: a
+1.37 s pulsation would smear completely without it. The residual against astropy is
+**3.3 ms and constant to 0.3 ms over 27 ks** — the constant part is the Einstein and
+Shapiro terms astropy's geometric light-travel time does not include, and a constant
+offset shifts no pulse profile. The agreement in the *time-dependent* part, which is the
+only part a period search can see, is 0.3 ms in 27 ks.
 
 ## Verification
 
