@@ -1,8 +1,8 @@
 # Adding XMM-Newton (EPIC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-07 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `bc12c41`). **Commits 1–5 of the sequence below have landed**
-> (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`,
+> `various_fixes` (HEAD `bc12c41`). **Commits 1–6 of the sequence below have landed**
+> (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`, `1e0db70`,
 > 2026-09-07); the rest is still the agreed design, not a report on work done. It is
 > written to be picked up cold, by a person or a session with no memory of the
 > conversation that produced it. Every number in
@@ -54,7 +54,7 @@ grouping — with the same diagnostics records and HTML page every other mission
 | Instruments | EPIC pn + MOS1 + MOS2. No RGS, no OM. |
 | Modes | **Imaging and Timing both**, from the start. See *Timing mode* below. |
 | Ingest | **PPS by default**, full ODF reprocessing available by config. |
-| Flare GTI | Threshold the PPS `FBKTSR` light curve when present; `evselect` on the ODF route. |
+| Flare GTI | Threshold the PPS `FBKTSR` light curve when present; `evselect` on the ODF route. The threshold is PPS's own `FLCUTTHR`, **decided 2026-09-07** — see *What changed while implementing step 6*. |
 | Source list | Use PPS `OBSMLI` as a cross-check on the given position, never to override it. |
 | Background | Annulus around the given position, radii configurable, user can override. |
 | SAS access | Tasks run via `subprocess.run` with an argv list. (The probe was `import pysas`; it is now `SAS_DIR` plus `evselect` on `PATH` — see *What changed while implementing step 5*.) |
@@ -453,7 +453,8 @@ One commit each, tests first in every case.
    **Done, in three commits.** `b1c7df4` drops the `pysas` import from the SAS probe;
    `a122c21` is `xmm_download_filter`; `2cc6037` is `core.list_archive_directory`, the
    `resolve_config` hook and `xmm_resolve_config`.
-6. Flare GTI from the PPS light curve (pure Python).
+6. ~~Flare GTI from the PPS light curve (pure Python).~~ **Done, `1e0db70`** — but not at
+   the threshold this document proposed; see below.
 7. `evselect` cleaning and `ecoordconv` position, with the OBSMLI cross-check.
 8. Timing mode — `RAWX` regions, timing screening, `epatplot` pile-up diagnostic.
 9. `especget` spectra and grouping.
@@ -535,6 +536,73 @@ Step 5 became three commits, and one of them was not in the plan at all.
 Two further archive facts, verified live on both transports: `0973390101` really does hold
 only `ODF/` on the HTTPS mirror as well as in S3, and `0153950401` holds `4XMM/`, `ODF/`,
 `PPS/` and `om_mosaic/`.
+
+## What changed while implementing step 6
+
+**The flare threshold is not a number this pipeline picks.** This is the one thing about
+step 6 that had to be measured, and it overturns `DEFAULT_CONFIG`'s
+`flare_rate_limit=dict(pn=0.4, mos=0.35)`.
+
+Those are the SAS cookbook's numbers and they are correct — for a light curve you build
+yourself with `evselect` above 10 keV over the whole field, which is what the ODF route
+will do. A PPS `FBKTSR` is made by `epiclccorr` and is on quite another scale. Measured
+from the archive:
+
+| exposure | median | max | `FLCUTTHR` |
+|---|---|---|---|
+| `0153950401` MOS1 S004 | 36.0 | 54.2 | 54.2 |
+| `0153950401` MOS2 S005 | 45.1 | 102.4 | 82.1 |
+| `0123700101` pn S003 | 2.2 | 1351.9 | 3.4 |
+| `0123700101` MOS1 S001 | 1.0 | 228.4 | 1.8 |
+| `0123700101` MOS1 U002 | 20.5 | 67.4 | 43.4 |
+| `0804330201` MOS1 S002 | 0.9 | 1.7 | 1.7 |
+
+A fixed 0.35 would throw away every bin of the first row and nothing at all of the last.
+Rows three and five are the same camera in the same observation, twenty times apart, which
+is the proof that no single number can do this.
+
+**PPS has already chosen one, per exposure**, and writes it into the `RATE` header as
+`FLCUTTHR` — "Optimised flare cut threshold". Present on all 41 EPIC `FBKTSR` files across
+a twelve-observation sample; the only files without it are RGS, which is out of scope. When
+PPS finds no flare it sets the keyword fractionally above the largest rate in the curve, so
+nothing is cut, and because the keyword is stored at full precision while the rates are
+single precision there is no edge case at the comparison.
+
+So, **decided by Matteo on 2026-09-07**: `flare_rate_limit` defaults to `None`, meaning
+"use this exposure's own `FLCUTTHR`"; a dictionary keyed by camera (`pn`, `mos1`, `mos2`)
+or family (`pn`, `mos`) overrides it. The cookbook numbers move to
+`odf_flare_rate_limit`, kept for step 10 so they do not have to be rediscovered. A cut
+removing more than `flare_warn_fraction` (0.25) of an exposure is applied and warned about,
+never capped: Mkn 421's pn loses 39% of itself to PPS's own threshold, which is very likely
+right for a famously flare-wrecked observation, and capping it would be inventing science
+policy.
+
+Four smaller things:
+
+* **PPS writes dead bins as a *signalling* NaN**, bit pattern `0x7f800001` rather than the
+  quiet `0x7fc00000`. Widening one to double raises the invalid-operation flag, which numpy
+  2 reports as `invalid value encountered in cast` — once per read, and Mkn 421's pn curve
+  has 322 dead bins. `read_flare_lightcurve` casts under `np.errstate(invalid="ignore")`;
+  what comes out is an ordinary quiet NaN, so nothing downstream is affected. There is a
+  test that would fail if the guard were removed.
+* **`TIME` holds bin centres**, offset from `TSTART` by exactly `TIMEDEL/2`, with spacing
+  exactly `TIMEDEL` — so `utils.intervals_above_threshold`'s `[t ± cadence/2]` model is
+  already right and nothing has to be shifted.
+* **No `merge_intervals` call.** The plan asked for one after `good_intervals`, but
+  `good_intervals` already merges, clips and sorts what it is given, so it would be a no-op.
+* **A timing exposure is screened with the imaging curve of the same exposure**, one of the
+  *Open items* below, now settled. MOS `FastUncompressed` reads its central CCD in timing
+  and its outer six in imaging, so `M1S004`'s background curve comes from a field the
+  timing event list does not have. Soft-proton flares illuminate the whole detector, so a
+  flare seen in the outer CCDs is happening during the timing readout too — the cut is
+  applied, and the curve's provenance recorded so the choice is visible on the page.
+
+Not done here, and deliberately: **nothing draws this yet.** `report.flare_figure` is
+hardwired to NuSTAR's three panels (GOES, 3–10 keV, 10–79 keV), and XMM's picture is a
+different one — a single background curve with a threshold line and the removed intervals
+shaded. The arrays are recorded under the same `flare_filtering` step name and in the same
+shape (`gti_before`, `gti_after`, `removed`, plus `lc_time`/`lc_rate`/`lc_rate_err`), so
+commit 12 has everything it needs.
 
 ## Verification
 
@@ -738,9 +806,8 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
 * `especget`'s output file names, pinned as a constant.
 * Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.
 * The `.FIT.gz` → `.FTZ` staging rule on the ODF route.
-* Default flare-rate thresholds; the SAS cookbook's 0.4 and 0.35 counts/s are the starting
-  point and belong in config, not in the code.
+* ~~Default flare-rate thresholds.~~ **Settled** — PPS's own `FLCUTTHR`, see above.
 * The pn Timing `RAWX` defaults — `[31:45]` source, `[3:5]` background are the cookbook's
   numbers, and the right background strip depends on how far the source wings spread.
-* Whether flare screening on a Timing exposure should use `FBKTSR` at all, given that the
-  PPS background curve is built from an imaging field the Timing exposure does not have.
+* ~~Whether flare screening on a Timing exposure should use `FBKTSR` at all.~~ **Settled**
+  — yes, with the provenance recorded; see above.
