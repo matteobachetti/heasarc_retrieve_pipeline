@@ -1319,6 +1319,96 @@ class TestTheExtractionRegions:
         assert "annulus(26000.0000,25000.0000,600.0000,1200.0000)" in background
 
 
+class TestTheTimingStrips:
+    """
+    Timing mode's extraction regions, which are detector columns and not sky positions.
+
+    A timing read-out collapses one dimension to read the source faster, so there is no
+    sky image to put a circle on. The region is a strip of ``RAWX`` columns instead, and
+    the numbers come from the configuration exactly as the annulus factors do.
+    """
+
+    def test_a_strip_is_a_range_of_columns(self):
+        assert xmm.rawx_region(31, 45) == "(RAWX in [31:45])"
+
+    def test_pn_gets_the_cookbook_strips(self):
+        source, background = xmm.xmm_timing_regions("pn", xmm.xmm_config({}))
+
+        assert source == "(RAWX in [31:45])"
+        assert background == "(RAWX in [3:5])"
+
+    def test_the_configured_strips_are_what_gets_used(self):
+        config = xmm.xmm_config(dict(timing_src_rawx=dict(pn=(30, 46))))
+
+        source, _ = xmm.xmm_timing_regions("pn", config)
+
+        assert source == "(RAWX in [30:46])"
+
+    def test_mos_has_no_strip_and_says_so_loudly(self, caplog):
+        # Decided with Matteo, 2026-09-07: there is no published MOS timing strip worth
+        # trusting, so a MOS timing exposure is skipped rather than extracted at an
+        # invented position. SAS's own driver centres the strip on the source; doing the
+        # same here is a later step, not a guess made now.
+        with caplog.at_level("WARNING"):
+            assert xmm.xmm_timing_regions("mos1", xmm.xmm_config({})) is None
+
+        assert "mos1" in caplog.text
+        assert "timing_src_rawx" in caplog.text
+
+    def test_a_mos_strip_put_in_the_configuration_is_honoured(self):
+        config = xmm.xmm_config(
+            dict(timing_src_rawx=dict(mos=(300, 320)), timing_bkg_rawx=dict(mos=(100, 200)))
+        )
+
+        assert xmm.xmm_timing_regions("mos2", config) == (
+            "(RAWX in [300:320])",
+            "(RAWX in [100:200])",
+        )
+
+    def test_a_source_strip_without_a_background_one_is_not_half_an_answer(self, caplog):
+        config = xmm.xmm_config(dict(timing_src_rawx=dict(mos=(300, 320))))
+
+        with caplog.at_level("WARNING"):
+            assert xmm.xmm_timing_regions("mos1", config) is None
+
+
+class TestTheRegionsOfOneExposure:
+    """
+    One question -- where do the events come from -- answered for either mode.
+
+    Everything downstream of the cleaning wants a source and a background selection, and
+    nothing downstream should have to care which mode produced them.
+    """
+
+    def test_an_imaging_exposure_gets_the_sky_circle_and_annulus(self):
+        exposure = an_exposure(None, instrument="pn", mode=xmm.IMAGING)
+        config = xmm.xmm_config({})
+
+        source, background = xmm.xmm_exposure_regions(exposure, config, sky=(26000.0, 25000.0))
+
+        assert source == xmm.circle_region(26000.0, 25000.0, config["src_radius_arcsec"])
+        assert "annulus" in background
+
+    def test_a_timing_exposure_gets_the_strips_and_ignores_the_sky(self):
+        exposure = an_exposure(None, instrument="pn", mode=xmm.TIMING)
+
+        regions = xmm.xmm_exposure_regions(exposure, xmm.xmm_config({}), sky=(26000.0, 25000.0))
+
+        assert regions == ("(RAWX in [31:45])", "(RAWX in [3:5])")
+
+    def test_an_imaging_exposure_without_a_sky_position_is_a_programming_error(self):
+        exposure = an_exposure(None, instrument="pn", mode=xmm.IMAGING)
+
+        with pytest.raises(ValueError, match="sky position"):
+            xmm.xmm_exposure_regions(exposure, xmm.xmm_config({}))
+
+    def test_a_mos_timing_exposure_has_no_regions(self, caplog):
+        exposure = an_exposure(None, instrument="mos1", mode=xmm.TIMING)
+
+        with caplog.at_level("WARNING"):
+            assert xmm.xmm_exposure_regions(exposure, xmm.xmm_config({})) is None
+
+
 class TestFindingTheSourceInThePpsSourceList:
     """
     The ``OBSMLI`` cross-check.

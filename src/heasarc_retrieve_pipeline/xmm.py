@@ -83,6 +83,12 @@ DEFAULT_CONFIG = dict(
     # Warn when the nearest PPS detection is further than this from the position asked
     # for. Only ever a warning -- see :func:`xmm_check_source_position`.
     position_warn_arcsec=10.0,
+    # Timing-mode extraction, in inclusive ``RAWX`` detector columns, keyed by camera or
+    # camera family. pn's are the cookbook's; the absence of MOS is deliberate and is
+    # what makes a MOS timing exposure skip rather than extract at an invented column --
+    # see :func:`xmm_timing_regions`.
+    timing_src_rawx=dict(pn=(31, 45)),
+    timing_bkg_rawx=dict(pn=(3, 5)),
 )
 
 #: The EPIC cameras, by the two-character instrument code PPS names them with. The codes
@@ -1205,6 +1211,118 @@ def xmm_extraction_regions(x, y, config):
             x, y, radius * config["bkg_inner_factor"], radius * config["bkg_outer_factor"]
         ),
     )
+
+
+def rawx_region(first, last):
+    """
+    A strip of detector columns, as SAS spells it.
+
+    Examples
+    --------
+    >>> rawx_region(31, 45)
+    '(RAWX in [31:45])'
+    """
+    return f"(RAWX in [{first}:{last}])"
+
+
+def _configured_strip(setting, instrument, config):
+    """
+    One ``RAWX`` strip out of the configuration, by camera then by family.
+
+    The two-level lookup is :func:`xmm_flare_threshold`'s, for the same reason: the
+    physics is usually a property of the camera family and occasionally of one camera.
+    """
+    strips = config[setting] or {}
+    strip = strips.get(instrument, strips.get(camera_family(instrument)))
+    return None if strip is None else tuple(strip)
+
+
+def xmm_timing_regions(instrument, config):
+    """
+    The source and background column strips of a timing exposure.
+
+    **Only pn has default strips, and that is a decision rather than an omission.**
+    ``RAWX in [31:45]`` for the source and ``[3:5]`` for the background are the pn Timing
+    cookbook's numbers, measured on a read-out whose source column is fixed by the
+    boresight. MOS Timing has no equivalent number worth trusting: the source column
+    depends on where in the central CCD the target sits, and SAS's own driver
+    (``lib/perl5/run_epatplot.pl``) accordingly builds the MOS strip around a source
+    position it is given instead of around a constant. Rather than invent one, a MOS
+    timing exposure is skipped, loudly, until either a strip is put in the configuration
+    or this module learns to find the source column in the data.
+
+    Parameters
+    ----------
+    instrument : str
+        ``"pn"``, ``"mos1"`` or ``"mos2"``.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+
+    Returns
+    -------
+    tuple of str or None
+        ``(source, background)``, both ``evselect`` expressions, or ``None`` when this
+        camera has no strips configured. ``None`` is a skip, not a failure.
+
+    Examples
+    --------
+    >>> xmm_timing_regions("pn", xmm_config({}))
+    ('(RAWX in [31:45])', '(RAWX in [3:5])')
+    """
+    source = _configured_strip("timing_src_rawx", instrument, config)
+    background = _configured_strip("timing_bkg_rawx", instrument, config)
+    if source is None or background is None:
+        get_logger().warning(
+            f"No RAWX extraction strips are configured for {instrument} in timing mode, "
+            f"so its timing products are skipped. Only pn has defaults: the source "
+            f"column of a MOS timing read-out depends on where the target sits in the "
+            f"central CCD, and this pipeline will not guess it. Set both "
+            f"`timing_src_rawx` and `timing_bkg_rawx` for {instrument} in the "
+            f"configuration to extract it anyway."
+        )
+        return None
+    return rawx_region(*source), rawx_region(*background)
+
+
+def xmm_exposure_regions(exposure, config, sky=None):
+    """
+    Where one exposure's source and background events come from, whatever its mode.
+
+    Imaging gets a circle and an annulus on the sky; timing gets two strips of detector
+    columns. Everything downstream -- the pile-up check, the spectra -- asks this one
+    question and does not have to know which kind of answer it got.
+
+    Parameters
+    ----------
+    exposure : Exposure
+        Which camera and which mode.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    sky : tuple of float, optional
+        ``(x, y)`` sky pixel position, from :func:`xmm_source_sky_position`. Required for
+        an imaging exposure and ignored for a timing one, which has no sky image to
+        convert into.
+
+    Returns
+    -------
+    tuple of str or None
+        ``(source, background)``, or ``None`` for a timing exposure with no strips
+        configured -- see :func:`xmm_timing_regions`.
+
+    Raises
+    ------
+    ValueError
+        If an imaging exposure is given no sky position. That is a caller's mistake, not
+        a property of the data, so it is raised rather than skipped.
+    """
+    if exposure.mode == TIMING:
+        return xmm_timing_regions(exposure.instrument, config)
+    if sky is None:
+        raise ValueError(
+            f"{exposure.instrument}{exposure.expid} is an imaging exposure and needs a "
+            f"sky position to extract at"
+        )
+    return xmm_extraction_regions(sky[0], sky[1], config)
 
 
 #: The line ``ecoordconv`` prints the sky position on. Anchored at the start of the line so
