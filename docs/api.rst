@@ -48,6 +48,15 @@ Missions
    :undoc-members:
    :show-inheritance:
 
+.. automodule:: heasarc_retrieve_pipeline.xmm
+   :members:
+   :show-inheritance:
+
+.. automodule:: heasarc_retrieve_pipeline.sas
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Products
 --------
 

@@ -1663,6 +1663,180 @@ contain (GoodXenon observations always have two, ``GX1`` and ``GX2``, which must
 only the first is used here).
 
 
+XMM-Newton / EPIC
+-----------------
+
+The one mission here whose reduction software is **not** HEASOFT.
+:mod:`heasarc_retrieve_pipeline.xmm` drives ESA's Science Analysis System (SAS) through
+:mod:`heasarc_retrieve_pipeline.sas`, which runs one task at a time with
+``subprocess.run`` and an argument list. SAS has no pip or conda distribution: it is an
+*environment* requirement, initialised by sourcing ``setsas.sh``, and every SAS-marked
+test skips without it. ``sas.run`` takes a mandatory ``produces``, because a SAS task's
+zero return code is not evidence that it wrote anything -- ``epatplot`` returns 0 while
+writing a PDF where PostScript was asked for, and ``barycen`` edits its input in place.
+
+Two routes, one back end
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``config["products"]`` chooses:
+
+* ``"pps"`` (the default) reads the archive's own reduction. An observation is 200 MB to
+  1.2 GB and the EPIC reduction wants about a fortieth of it, so ``xmm_download_filter``
+  fetches only the event lists, background time series, source list and calibration index
+  -- plus 3.8 MB of ODF housekeeping, which barycentring needs.
+* ``"odf"`` reprocesses from raw telemetry with ``epproc`` and ``emproc``. Slower by an
+  order of magnitude, and the reason to want it is calibration: a PPS event list carries
+  whatever the SOC had when it was made.
+
+``xmm_pps_front_end`` and ``xmm_odf_front_end`` each return ``(exposures, env, summary)``
+and everything after them is shared. The two differ in more than speed:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * -
+     - PPS
+     - ODF
+   * - exposure discovery
+     - parse product file names
+     - read ``INSTRUME`` / ``EXPIDSTR`` / ``DATAMODE``
+   * - flare light curve
+     - ``FBKTSR``, from the SOC
+     - built with ``evselect``
+   * - flare threshold
+     - the file's ``FLCUTTHR``
+     - ``odf_flare_rate_limit``
+   * - ``DATE-OBS`` for ``cifbuild``
+     - an event list
+     - the ODF housekeeping
+
+The ODF route reads header keywords rather than parsing names because those names are
+SAS's own and have changed between releases, while ``INSTRUME``, ``EXPIDSTR`` and
+``DATAMODE`` are written by the same code on either route's files. The PPS route does
+parse names, because there they are a published archive convention.
+
+What an exposure is
+~~~~~~~~~~~~~~~~~~~
+
+``Exposure`` is keyed on ``(instrument, expid, mode)``, and the mode is not decoration.
+MOS ``FastUncompressed`` reads its central CCD in timing and its outer six in imaging, and
+PPS writes both under one exposure identifier. Keyed on camera and exposure alone, one of
+the two would be dropped in silence.
+
+The calibration index is built, not downloaded
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``xmm_build_calibration_index`` runs ``cifbuild withobservationdate=yes
+observationdate=<DATE-OBS>``, once per observation, rather than using the downloaded
+``CALIND``. The local CCF mirror is ESA's *Valid CCF Set* -- what is needed to process any
+ODF **at the current date** -- so an archival ``CALIND`` naming superseded constituents
+cannot be satisfied from it. Building the index costs 26 s and removes the failure mode
+instead of catching it. One consequence to state plainly: PPS event lists were generated
+with an older calibration, so responses built against a newer index are marginally
+inconsistent with those events' ``PI`` values. That is the ordinary situation for anyone
+reanalysing archival data with current SAS.
+
+Flare screening
+~~~~~~~~~~~~~~~
+
+Soft protons funnelled by the mirrors raise the background by orders of magnitude for
+minutes at a time. ``xmm_flare_gti`` thresholds the background light curve and inverts the
+result into good time intervals -- pure arithmetic, no SAS, fully testable offline.
+
+**The SAS cookbook's 0.4 and 0.35 counts/s do not apply to a PPS ``FBKTSR``.** Those
+numbers are for a curve you build yourself with ``evselect`` above 10 keV, which is what
+the ODF route does and what ``odf_flare_rate_limit`` keeps them for. An ``FBKTSR`` is made
+by ``epiclccorr`` and is on quite another scale: measured across the archive its median
+rate ranges from 0.9 to 45 counts/s, and the same camera in the same observation can differ
+twentyfold between exposures. PPS has already chosen a threshold per exposure and written
+it into the file as ``FLCUTTHR``, and that is what the PPS route uses.
+
+A timing exposure is screened with the imaging curve of the same exposure where there is
+one: a flare illuminates the whole detector, so a rise seen in the outer CCDs is happening
+during the timing read-out too. The curve's provenance is recorded so the choice is visible.
+
+Extraction regions, and whether they fit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Imaging mode extracts a circle on the sky, its centre converted from the requested RA/Dec
+by ``ecoordconv`` -- the only SAS task here whose output is parsed, because it writes no
+file. Timing mode has no sky image and extracts a strip of ``RAWX`` detector columns
+instead. **MOS timing has no default strip**: pn's ``[31:45]`` is trustworthy because a pn
+timing read-out puts the source at a column fixed by the boresight, and MOS has no
+equivalent constant, so a MOS timing exposure is cleaned, warned about and skipped rather
+than extracted at an invented column. Setting ``timing_src_rawx`` for that camera extracts
+it.
+
+``xmm_check_extraction_window`` measures whether the background annulus fits on the
+illuminated part of the chip. It *measures* rather than looking up a table of window sizes:
+the question is not "how big is a ``PrimePartialW3`` window" but "does the annulus for this
+source at this position fall off the chip". Two details are load-bearing and were both
+found on real data:
+
+* It reads the **cleaned** events, not the archive's unscreened list. The raw list carries
+  flagged events out to the chip edges: on ``0870940101``'s pn it reads 96.1 arcsec against
+  the cleaned 87.6, on either side of the 90 the default annulus needs.
+* The edge is a **percentile**, not a minimum and maximum. Taking the extreme events put a
+  300x300-pixel MOS window at 8.8 x 11.4 arcmin against its true 5.5, because a handful of
+  stray events set the answer. Clipping 0.1% from each end fixes it, and ``BACKSCAL``
+  confirms the robust figure independently.
+
+A clipped annulus is not silently wrong -- ``BACKSCAL`` follows the *exposed* area, so the
+scaling stays right and the cost is counts -- but it is worth a warning, which is what this
+produces.
+
+Pile-up is measured and never corrected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``epatplot`` writes the observed-to-model singles and doubles pattern fractions onto the
+event list as ``SNGL_OTM`` and ``DBLE_OTM``, with errors, and those keywords are read
+rather than its screen output. Correcting pile-up means excluding the core of the point
+spread function, which changes which photons the science is done with; that is a decision
+for whoever reads the plot.
+
+Spectra
+~~~~~~~
+
+``especget`` produces source and background spectra, ARF and RMF in one call, with
+``withfilestem=no`` so that all four outputs are named outright rather than by a convention
+that has to be trusted. It is run with ``cwd`` set to the products directory and handed
+bare file names, because it writes the names it is *given* into ``BACKFILE``, ``RESPFILE``
+and ``ANCRFILE``, and a FITS header card holds 80 characters -- absolute paths were being
+truncated. The source position is passed to ``arfgen`` explicitly; left alone it would take
+the centre of the extraction region, which is meaningless for a strip of columns.
+
+The three cameras' spectra are **not** co-added. pn, MOS1 and MOS2 are different detectors
+with different responses, so ``addspec``'s case B does not apply; they are meant to be
+fitted jointly. SAS's ``epicspeccombine`` is the right tool if one file is ever wanted.
+
+Barycentring
+~~~~~~~~~~~~
+
+SAS ``barycen``, over an ODF ingested with ``odfingest``. HEASOFT ``barycorr`` is **not**
+usable: its own documentation limits it to RXTE, Swift, Chandra, NuSTAR and NICER, and on
+XMM data it fails with "Invalid Observatory/Spacecraft position vector" before reading an
+event.
+
+Two traps, both paid for:
+
+* The ODF constituents must be staged as plain ``.FIT`` and ``.ASC``. SAS reads ``.FTZ``
+  when a file is *named* to it, but ``odfingest`` does not *discover* one while scanning a
+  directory: a ``.FTZ``-staged ODF ingests as though the housekeeping were absent and
+  writes a truncated summary that ``barycen`` then rejects.
+* ``barycen`` edits in place, so the correction is applied to a copy and the spacecraft
+  times survive. The evidence that it worked is the rewritten ``TIMESYS``, which is
+  checked -- ``produces=IN_PLACE`` can only confirm that the copy we made ourselves is
+  still there.
+
+Verified on ``0870940101`` against an independent astropy calculation from the same orbit
+file: the correction sweeps 1.79 s across the exposure and agrees to 3.3 ms, constant to
+0.3 ms over 27 ks. The three cameras, three independent event lists, agree with each other
+to 0.1 ms.
+
+An observation whose ODF is missing reduces completely but is not barycentred; the step
+records ``barycentered: false`` with a reason rather than failing the run.
+
 Orchestration with Prefect
 --------------------------
 
