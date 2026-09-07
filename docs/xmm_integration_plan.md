@@ -1,10 +1,11 @@
 # Adding XMM-Newton (EPIC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-07 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `bc12c41`). **Commits 1–4 of the sequence below have landed**
-> (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, 2026-09-07); the rest is still the agreed
-> design, not a report on work done. It is written to be picked up cold, by a
-> person or a session with no memory of the conversation that produced it. Every number in
+> `various_fixes` (HEAD `bc12c41`). **Commits 1–5 of the sequence below have landed**
+> (`5c4ec2c`, `683fba1`, `e9bc841`, `c46a044`, `b1c7df4`, `a122c21`, `2cc6037`,
+> 2026-09-07); the rest is still the agreed design, not a report on work done. It is
+> written to be picked up cold, by a person or a session with no memory of the
+> conversation that produced it. Every number in
 > it was measured against the live HEASARC archive on that date; the snippets under
 > *Reproducing the archive facts* re-derive them, so none of it has to be taken on trust.
 >
@@ -56,7 +57,7 @@ grouping — with the same diagnostics records and HTML page every other mission
 | Flare GTI | Threshold the PPS `FBKTSR` light curve when present; `evselect` on the ODF route. |
 | Source list | Use PPS `OBSMLI` as a cross-check on the given position, never to override it. |
 | Background | Annulus around the given position, radii configurable, user can override. |
-| SAS access | `import pysas` as the availability probe; tasks run via `subprocess.run` with an argv list. |
+| SAS access | Tasks run via `subprocess.run` with an argv list. (The probe was `import pysas`; it is now `SAS_DIR` plus `evselect` on `PATH` — see *What changed while implementing step 5*.) |
 | Refactor | `heasoft.py` untouched. `sas.py` standalone, duplicating ~80 lines of output checking. |
 
 ### Measurements this plan rests on
@@ -67,7 +68,7 @@ Taken from the live archive and S3 listing for `0123700101`:
 |---|---|
 | Whole observation | 1.24 GB — PPS 977 MB, ODF 229 MB, `om_mosaic` 22 MB, `4XMM` 13 MB |
 | **PPS files a reduction needs** | **~290 MB** — 4 EPIC event lists (280 MB), `FBKTSR`, `CALIND`, `ATTTSR`, `ORBTSR`, `OBSMLI`, `REGION`, `SUMMAR` |
-| **ODF housekeeping** | **3.8 MB** — `ATS.FIT`, `ROS.ASC`, `RAS.ASC`, `SUM.ASC`, `TCS.FIT`, `TCX.FIT` |
+| **ODF housekeeping** | **3.8 MB here, 5.3 MB on `0153950401`** — `SCX00000` + `ATS.FIT`, `ROS.ASC`, `RAS.ASC`, `SUM.ASC`, `TCS.FIT`, `TCX.FIT`, all but `SUM.ASC` gzipped |
 | PPS event lists present | `PNS003PIEVLI`, `M1S001MIEVLI`, `M1U002MIEVLI`, `M2S002MIEVLI` |
 
 So the PPS route downloads ~294 MB against the ODF route's 229 MB — a wash — and skips
@@ -193,10 +194,17 @@ Two traps in that regex, both found by listing real observations rather than by 
   `0153950401` carries `EPX000OBSMLI` *and* `OMX000OBSMLI`, each in `.FTZ` and a companion
   (`.HTM` for EPIC, `.ASC` for OM). Anchor on `EPX000OBSMLI` or the filter quietly pulls
   the OM list and the cross-check reads the wrong table.
-* **Measured cost of the finished filter**, so nobody has to guess: `0153950401` 39.8 MB of
-  206; Crab `0611180201` 70.0 MB of 205; SAX J1808 `0804330201` **78.1 MB of 393**. The
-  filter is what makes a 35 ks observation an ordinary download — *short* and *small* are
-  different axes, and the filter decouples them.
+* **Measured cost of the finished filter**, re-measured against the regex that shipped in
+  `a122c21`: `0153950401` **39.8 MB of 205.8** (19 files of 461); Crab `0611180201` 69.8 MB
+  of 204.5; SAX J1808 `0804330201` **77.3 MB of 393.0**; Mkn 421 `0123700101` 290.2 MB of
+  1241.2, which is large only because its pn event list alone is 212 MB. The filter is what
+  makes a 35 ks observation an ordinary download — *short* and *small* are different axes,
+  and the filter decouples them.
+* **The six ODF housekeeping files are not named the way this document first said.** They
+  are `<revolution>_<OBSID>_SCX00000<CODE>.<EXT>`, and most of them are gzipped:
+  `SCX00000ATS.FIT.gz`, `RAS.ASC.gz`, `ROS.ASC.gz`, `SUM.ASC` (not gzipped), `TCS.FIT.gz`,
+  `TCX.FIT.gz`. They come to 5.3 MB on `0153950401`, of which `RAS.ASC.gz` is 4.9 —
+  the earlier figure of 3.1 MB was for a different observation.
 
 Since the filter now depends on the run's config and not only on the mission, the value in
 `MISSION_CONFIG` is a callable `download_filter(config) -> dict`, not a literal dict.
@@ -441,7 +449,10 @@ One commit each, tests first in every case.
    **Done, `e9bc841`.**
 4. ~~`xmm.py` — config, path builders, PPS name parser keyed on
    `(instrument, expid, mode)`, `NO_SCIENCE_DATA`.~~ **Done, `c46a044`.**
-5. PPS download filter and front end, with the route probed rather than trusted.
+5. ~~PPS download filter and front end, with the route probed rather than trusted.~~
+   **Done, in three commits.** `b1c7df4` drops the `pysas` import from the SAS probe;
+   `a122c21` is `xmm_download_filter`; `2cc6037` is `core.list_archive_directory`, the
+   `resolve_config` hook and `xmm_resolve_config`.
 6. Flare GTI from the PPS light curve (pure Python).
 7. `evselect` cleaning and `ecoordconv` position, with the OBSMLI cross-check.
 8. Timing mode — `RAWX` regions, timing screening, `epatplot` pile-up diagnostic.
@@ -485,6 +496,45 @@ MOS2 exposure is **`M2S005`**, not `M2S002`. Everything else checked out, includ
 no `FBKTSR` for the pn timing exposure of `0153950401`** — the flare light curves present
 are `M1S004`, `M2S005` and `R1S001` (RGS, not ours). Step 6 therefore cannot assume every
 exposure has one; `Exposure.flare_lightcurve` is `None` there.
+
+## What changed while implementing step 5
+
+Step 5 became three commits, and one of them was not in the plan at all.
+
+* **`has_sas` no longer requires that `import pysas` succeed** (`b1c7df4`). The plan had
+  pysas as the probe for "is a SAS installation present". Matteo's machine is the first
+  real evidence that it is the wrong probe: a complete SAS 22.1.0 with every task on
+  `PATH`, and `import pysas` failing because `beautifultable` — a table formatter this
+  package never touches — was missing from `henv313`. The pipeline called that "no SAS".
+  Since `sas.run` reaches the tasks through `subprocess.run`, pysas is not on the path
+  between this package and a reduction and has no say in whether one can happen. The probe
+  is now `SAS_DIR` plus `evselect` on `PATH`, and the guard in `tests/test_sas.py` was
+  widened from "only `sas.py` imports pysas" to "no module does" — and rewritten to read
+  the syntax tree, since `sas.py`'s prose now discusses the import it does not make.
+* **`pps_flag` is not read at all.** The plan wanted it read to *predict* the route and
+  logged, then confirmed against the listing. `download_and_process_observation` never
+  sees the catalogue row, and threading it down three layers to produce one log line is
+  not worth it when the listing is authoritative and costs one request.
+* **The probe is a second `MISSION_CONFIG` hook, `resolve_config(config, url) -> config`**,
+  read by `core.mission_resolve_config` and called just before the download. Keeping it
+  separate from `download_filter` leaves that one pure and offline-testable, and it is
+  honest about the two being different questions: one decides the configuration, the other
+  decides what to fetch. It refuses a hook that returns something that is not a dictionary.
+* **`core.list_archive_directory(url)`** is the shallow listing the probe needs — one
+  directory, no recursion, all three transports, answering in one spelling. It returns
+  `None` for "could not look" and `[]` for "nothing here", and every caller keeps the
+  difference: downgrading the route on a network timeout would fetch a quarter of a
+  gigabyte of telemetry for an observation whose PPS products are sitting in the archive.
+* **The demotion only ever runs one way**, `"pps"` → `"odf"`. A run that asked for the ODF
+  route keeps it and the archive is not listed at all, which is also how "the user asks"
+  is honoured without having to track whether a config key was set explicitly.
+* **The route is not stored anywhere else.** The reduction reads it off the disk — if
+  `<OBSID>/PPS` holds EPIC event lists, that is the PPS route — so there is no second copy
+  of the answer to keep in step with the first.
+
+Two further archive facts, verified live on both transports: `0973390101` really does hold
+only `ODF/` on the HTTPS mirror as well as in S3, and `0153950401` holds `4XMM/`, `ODF/`,
+`PPS/` and `om_mosaic/`.
 
 ## Verification
 
