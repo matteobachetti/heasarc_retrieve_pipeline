@@ -7,6 +7,7 @@ touches the network.
 
 import os
 import re
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -749,6 +750,219 @@ class TestThePerMissionDownloadFilter:
 
         with pytest.raises(ValueError, match="re_includes"):
             core.mission_download_filter(mission, {})
+
+
+# The top level of an XMM observation directory at HEASARC, as Apache writes it. This one
+# is Her X-1 0153950401, which has both a PPS directory and an ODF one.
+XMM_TOP_LEVEL_HTML = """\
+<html><head><title>Index of /FTP/xmm/data/rev0/0153950401</title></head><body>
+<h1>Index of /FTP/xmm/data/rev0/0153950401</h1>
+<table><tr><th><a href="?C=N;O=D">Name</a></th><th><a href="?C=M;O=A">Last modified</a></th></tr>
+<tr><td><a href="/FTP/xmm/data/rev0/">Parent Directory</a></td><td>&nbsp;</td></tr>
+<tr><td><a href="4XMM/">4XMM/</a></td><td>2024-11-08 03:12</td></tr>
+<tr><td><a href="ODF/">ODF/</a></td><td>2024-11-08 03:12</td></tr>
+<tr><td><a href="PPS/">PPS/</a></td><td>2024-11-08 03:14</td></tr>
+<tr><td><a href="om_mosaic/">om_mosaic/</a></td><td>2024-11-08 03:12</td></tr>
+</table></body></html>
+"""
+
+XMM_URL = "https://heasarc.gsfc.nasa.gov/FTP/xmm/data/rev0/0153950401/"
+
+
+class TestListingOneArchiveDirectory:
+    """
+    One request, one directory, no recursion.
+
+    ``get_remote_directory_listing`` walks a whole tree, which is what a download wants
+    and far more than a question about the tree's shape needs. Deciding whether an
+    observation has been reduced at the archive is such a question, and it is asked
+    before the download that would answer it expensively.
+
+    A directory that cannot be listed is ``None`` and not an empty list. The difference
+    matters to every caller: "there is nothing here" is a fact about the archive, and "I
+    could not look" is a fact about the network, and only the first is worth acting on.
+    """
+
+    def a_page(self, monkeypatch, html):
+        monkeypatch.setattr(core, "_fetch_directory_index", lambda url: html)
+
+    def test_the_subdirectories_come_back_named(self, monkeypatch):
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert core.list_archive_directory(XMM_URL) == ["4XMM/", "ODF/", "PPS/", "om_mosaic/"]
+
+    def test_a_directory_keeps_its_slash(self, monkeypatch):
+        """Which is how a caller tells a subdirectory from a file, here as everywhere
+        else in this module."""
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert all(entry.endswith("/") for entry in core.list_archive_directory(XMM_URL))
+
+    def test_nothing_below_the_top_level_is_listed(self, monkeypatch):
+        """The whole point: 0153950401 holds 461 files, and this asks about four names."""
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert not [e for e in core.list_archive_directory(XMM_URL) if "/" in e.rstrip("/")]
+
+    def test_a_url_without_a_trailing_slash_works_too(self, monkeypatch):
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert core.list_archive_directory(XMM_URL.rstrip("/")) == [
+            "4XMM/",
+            "ODF/",
+            "PPS/",
+            "om_mosaic/",
+        ]
+
+    def test_a_directory_that_cannot_be_reached_is_none(self, monkeypatch):
+        self.a_page(monkeypatch, None)
+
+        assert core.list_archive_directory(XMM_URL) is None
+
+    def test_an_http_error_is_not_an_empty_directory(self, monkeypatch):
+        def fetch(url):
+            raise HTTPError(url, 404, "Not Found", {}, None)
+
+        monkeypatch.setattr(core, "_fetch_directory_index", fetch)
+
+        assert core.list_archive_directory(XMM_URL) is None
+
+    def test_s3_lists_the_same_names(self, monkeypatch):
+        """The bucket has no directories, so subdirectories are common prefixes and the
+        delimiter is what stops the listing from returning every key in the tree."""
+        asked = {}
+
+        def list_objects_v2(**kwargs):
+            asked.update(kwargs)
+            return {
+                "CommonPrefixes": [
+                    {"Prefix": "xmm/data/rev0/0153950401/ODF/"},
+                    {"Prefix": "xmm/data/rev0/0153950401/PPS/"},
+                ],
+                "Contents": [{"Key": "xmm/data/rev0/0153950401/README.txt"}],
+            }
+
+        monkeypatch.setattr(
+            core, "_s3_client", lambda: SimpleNamespace(list_objects_v2=list_objects_v2)
+        )
+
+        entries = core.list_archive_directory("s3://nasa-heasarc/xmm/data/rev0/0153950401/")
+
+        assert entries == ["ODF/", "PPS/", "README.txt"]
+        assert asked["Delimiter"] == "/"
+        assert asked["Prefix"] == "xmm/data/rev0/0153950401/"
+
+    def test_a_bucket_that_cannot_be_read_is_none(self, monkeypatch):
+        def broken():
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(core, "_s3_client", broken)
+
+        assert core.list_archive_directory("s3://nasa-heasarc/xmm/x/") is None
+
+    def test_a_local_directory_is_listed_from_disk(self, tmp_path):
+        """The SciServer transport, where the archive is a mounted filesystem."""
+        (tmp_path / "PPS").mkdir()
+        (tmp_path / "ODF").mkdir()
+        (tmp_path / "MANIFEST.1").write_text("x")
+
+        assert core.list_archive_directory(str(tmp_path)) == ["MANIFEST.1", "ODF/", "PPS/"]
+
+    def test_a_local_directory_that_is_not_there_is_none(self, tmp_path):
+        assert core.list_archive_directory(str(tmp_path / "nowhere")) is None
+
+
+class TestThePerMissionConfigResolution:
+    """
+    Some missions cannot know their configuration until they have looked at the archive.
+
+    XMM is the one: ``xmmmaster`` says whether an observation was reduced at the archive,
+    and it is wrong often enough to matter -- 0973390101 is flagged as reduced and has no
+    PPS directory mirrored at HEASARC at all. A run that trusted the flag would download
+    five megabytes of housekeeping and then report an observation with no data in it.
+
+    Missions that declare nothing are handed their configuration back unchanged, which is
+    what every mission did before this existed.
+    """
+
+    def a_mission_like_nustar(self, monkeypatch, **extra):
+        monkeypatch.setitem(
+            core.MISSION_CONFIG, "fictional", dict(MISSION_CONFIG["nustar"], **extra)
+        )
+        return "fictional"
+
+    def test_a_mission_that_declares_nothing_keeps_its_config(self):
+        config = {"products": "pps"}
+
+        assert core.mission_resolve_config("nustar", config, "https://x/") == config
+
+    def test_a_mission_that_declares_one_gets_to_change_its_config(self, monkeypatch):
+        mission = self.a_mission_like_nustar(
+            monkeypatch, resolve_config=lambda config, url: dict(config, products="odf")
+        )
+
+        assert core.mission_resolve_config(mission, {"products": "pps"}, "https://x/") == {
+            "products": "odf"
+        }
+
+    def test_the_url_is_what_it_is_given_to_look_at(self, monkeypatch):
+        seen = []
+        mission = self.a_mission_like_nustar(
+            monkeypatch, resolve_config=lambda config, url: seen.append(url) or config
+        )
+
+        core.mission_resolve_config(mission, {}, "s3://nasa-heasarc/xmm/x/")
+
+        assert seen == ["s3://nasa-heasarc/xmm/x/"]
+
+    def test_something_that_is_not_a_configuration_is_refused(self, monkeypatch):
+        """A hook that forgets to return would otherwise fail three steps later, inside
+        the mission's own reduction, under a name that has nothing to do with it."""
+        mission = self.a_mission_like_nustar(monkeypatch, resolve_config=lambda config, url: None)
+
+        with pytest.raises(TypeError, match="fictional"):
+            core.mission_resolve_config(mission, {}, "https://x/")
+
+
+class TestTheResolvedConfigReachesTheRun:
+    """The wiring: what the hook decides is what the download filters on, and what the
+    mission's own reduction is handed."""
+
+    def a_run_that_records_what_it_saw(self, monkeypatch):
+        seen = {}
+
+        def recursive_download(url, outdir, **kwargs):
+            seen["download"] = kwargs
+            return []
+
+        monkeypatch.setattr(core, "recursive_download", recursive_download)
+        return seen
+
+    def test_the_filter_sees_the_resolved_config(self, tmp_path, monkeypatch):
+        seen = self.a_run_that_records_what_it_saw(monkeypatch)
+        monkeypatch.setitem(
+            core.MISSION_CONFIG,
+            "fictional",
+            dict(
+                MISSION_CONFIG["nustar"],
+                resolve_config=lambda config, url: dict(config, products="odf"),
+                download_filter=lambda config: {"re_include": config["products"]},
+            ),
+        )
+
+        core.download_and_process_observation.fn(
+            "0153950401",
+            "https://example.invalid/0153950401",
+            83.0,
+            22.0,
+            str(tmp_path),
+            "fictional",
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            test=True,
+        )
+
+        assert seen["download"]["re_include"] == "odf"
 
 
 class TestTheDownloadFilterReachesTheDownload:

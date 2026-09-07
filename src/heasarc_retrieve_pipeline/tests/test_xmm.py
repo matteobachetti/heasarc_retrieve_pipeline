@@ -545,6 +545,119 @@ class TestWhatIsWorthDownloading:
             xmm.xmm_download_filter({"products": "PPS "})
 
 
+class TestChoosingTheRoute:
+    """
+    Which reduction an observation gets, decided by looking rather than by asking.
+
+    ``xmmmaster`` carries a ``pps_flag`` saying whether the Pipeline Processing System
+    reduced an observation, and 22779 of 25087 rows say ``Y``. It is a hint and not a
+    guarantee: ``0973390101`` says ``Y`` and HEASARC mirrors no PPS directory for it at
+    all -- 103 files, every one of them under ``ODF/``. Trusting the flag there means
+    downloading the housekeeping, finding no event lists, and reporting a real
+    observation as empty.
+
+    The listing is one request and it is authoritative, so the flag is not read at all.
+    """
+
+    def test_an_observation_with_a_pps_directory_takes_the_pps_route(self):
+        assert xmm.xmm_route_from_listing(["4XMM/", "ODF/", "PPS/", "om_mosaic/"]) == "pps"
+
+    def test_an_observation_with_only_an_odf_takes_the_odf_route(self):
+        assert xmm.xmm_route_from_listing(["ODF/"]) == "odf"
+
+    def test_a_directory_holding_neither_says_so(self):
+        """Rather than guessing. An observation directory with no PPS and no ODF is not
+        something this module has ever seen, and inventing a route for it would turn an
+        unknown into a download."""
+        assert xmm.xmm_route_from_listing(["4XMM/", "om_mosaic/"]) is None
+
+    def test_an_empty_directory_says_so_too(self):
+        assert xmm.xmm_route_from_listing([]) is None
+
+    def test_a_listing_without_slashes_reads_the_same(self):
+        """Not every transport marks its directories, and the answer must not depend on
+        which one asked."""
+        assert xmm.xmm_route_from_listing(["ODF", "PPS"]) == "pps"
+
+    def an_archive_holding(self, monkeypatch, entries):
+        from heasarc_retrieve_pipeline import core
+
+        monkeypatch.setattr(core, "list_archive_directory", lambda url: entries)
+
+    def test_the_route_is_taken_from_the_archive(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, ["ODF/", "PPS/"])
+
+        assert xmm.xmm_resolve_config({}, "https://x/0153950401/")["products"] == "pps"
+
+    def test_an_observation_with_no_pps_is_moved_to_the_odf_route(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, ["ODF/"])
+
+        assert xmm.xmm_resolve_config({}, "https://x/0973390101/")["products"] == "odf"
+
+    def test_a_user_who_asked_for_the_odf_route_keeps_it(self, monkeypatch):
+        """The demotion only ever runs one way. Reprocessing from the telemetry is a
+        legitimate thing to ask for even when the archive's own reduction is right
+        there -- an old SAS version, or a doubt about the products."""
+        self.an_archive_holding(monkeypatch, ["ODF/", "PPS/"])
+
+        resolved = xmm.xmm_resolve_config({"products": "odf"}, "https://x/0153950401/")
+
+        assert resolved["products"] == "odf"
+
+    def test_the_archive_is_not_even_asked_in_that_case(self, monkeypatch):
+        from heasarc_retrieve_pipeline import core
+
+        asked = []
+        monkeypatch.setattr(core, "list_archive_directory", lambda url: asked.append(url))
+
+        xmm.xmm_resolve_config({"products": "odf"}, "https://x/0153950401/")
+
+        assert asked == []
+
+    def test_an_archive_that_cannot_be_listed_leaves_the_route_alone(self, monkeypatch):
+        """``None`` means "I could not look", not "there is nothing there". Downgrading
+        on a timeout would fetch a quarter of a gigabyte of telemetry for an observation
+        whose PPS products are sitting in the archive."""
+        self.an_archive_holding(monkeypatch, None)
+
+        assert xmm.xmm_resolve_config({}, "https://x/0153950401/")["products"] == "pps"
+
+    def test_a_directory_holding_neither_leaves_the_route_alone(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, ["4XMM/"])
+
+        assert xmm.xmm_resolve_config({}, "https://x/0153950401/")["products"] == "pps"
+
+    def test_the_resolved_config_is_a_complete_one(self, monkeypatch):
+        """It is what the reduction runs with, so the partial config
+        ``core.download_and_process_observation`` builds has to come out whole."""
+        self.an_archive_holding(monkeypatch, ["ODF/", "PPS/"])
+
+        resolved = xmm.xmm_resolve_config({"out_data_path": "/data"}, "https://x/0153950401/")
+
+        assert resolved["src_radius_arcsec"] == 30.0
+        assert resolved["flare_rate_limit"] == {"pn": 0.4, "mos": 0.35}
+
+    def test_the_caller_dictionary_is_not_modified(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, ["ODF/"])
+        config = {"products": "pps"}
+
+        xmm.xmm_resolve_config(config, "https://x/0973390101/")
+
+        assert config == {"products": "pps"}
+
+    def test_the_filter_follows_the_route_that_was_chosen(self, monkeypatch):
+        """The two halves together: an observation with no PPS directory ends up asking
+        for the whole ODF, not for PPS products that are not there."""
+        self.an_archive_holding(monkeypatch, ["ODF/"])
+
+        resolved = xmm.xmm_resolve_config({}, "https://x/0973390101/")
+        kept = what_a_filter_keeps(
+            xmm.xmm_download_filter(resolved), NO_PPS_ARCHIVE, obsid="0973390101"
+        )
+
+        assert kept == NO_PPS_ARCHIVE
+
+
 class TestTheConfiguration:
     """
     The mission defaults have to survive a caller who only names the paths, which is

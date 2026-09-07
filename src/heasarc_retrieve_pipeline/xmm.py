@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .utils import absolute_config
+from .utils import absolute_config, get_logger
 
 #: Configuration a run starts from. ``products`` chooses the route: ``"pps"`` reads the
 #: archive's own reduction, ``"odf"`` reprocesses from the raw telemetry. See
@@ -223,6 +223,110 @@ def xmm_download_filter(config):
     if products == "odf":
         return {"re_include": ODF_DOWNLOAD_RE}
     raise ValueError(f"XMM has a 'pps' route and an 'odf' route, not {products!r}.")
+
+
+#: The archive's own reduction of an observation lives in this subdirectory, and the raw
+#: telemetry in that one. Compared case-insensitively and without the trailing slash, so
+#: that the answer does not depend on which transport did the listing.
+PPS_DIRECTORY = "PPS"
+ODF_DIRECTORY = "ODF"
+
+
+def xmm_route_from_listing(entries):
+    """
+    Which route an observation directory can support, read off its top level.
+
+    Parameters
+    ----------
+    entries : iterable of str
+        Names directly under the observation directory, as
+        :func:`~heasarc_retrieve_pipeline.core.list_archive_directory` returns them.
+
+    Returns
+    -------
+    str or None
+        ``"pps"``, ``"odf"``, or ``None`` when the directory holds neither. ``None`` is
+        not a third route: it means this function has been shown something it does not
+        recognise, and the caller should leave the route where it was rather than turn an
+        unknown into a quarter of a gigabyte of download.
+
+    Examples
+    --------
+    >>> xmm_route_from_listing(["4XMM/", "ODF/", "PPS/", "om_mosaic/"])
+    'pps'
+    >>> xmm_route_from_listing(["ODF/"])
+    'odf'
+    """
+    names = {entry.strip("/").upper() for entry in entries}
+    if PPS_DIRECTORY in names:
+        return "pps"
+    if ODF_DIRECTORY in names:
+        return "odf"
+    return None
+
+
+def xmm_resolve_config(config, url):
+    """
+    The configuration this observation will be reduced with, after looking at the archive.
+
+    Called through ``core.mission_resolve_config``, before the download.
+
+    ``xmmmaster``'s ``pps_flag`` is a hint and not a guarantee. ``0973390101`` is flagged
+    ``Y`` and HEASARC mirrors no PPS directory for it: 103 files, every one under
+    ``ODF/``. So the flag is not read at all, and the route is settled by one listing of
+    the observation directory -- which costs a single request, against a download of tens
+    of megabytes that would otherwise arrive with nothing to reduce in it.
+
+    The change only ever goes one way, from ``"pps"`` to ``"odf"``. Asking to reprocess
+    from the telemetry is legitimate even when the archive's own products are there -- an
+    old ``sas_version``, or a doubt about the products -- so a run that asked for the ODF
+    route keeps it, and the archive is not listed at all.
+
+    Parameters
+    ----------
+    config : dict or None
+        What the caller asked for; merged over the defaults by :func:`xmm_config`.
+    url : str
+        Where this observation will be downloaded from.
+
+    Returns
+    -------
+    dict
+        A complete configuration. The caller's dictionary is not modified.
+    """
+    # Imported here and not at the top of the module: ``core`` imports every mission, so a
+    # mission that imported ``core`` in return could not be loaded at all.
+    from .core import list_archive_directory
+
+    config = xmm_config(config)
+    logger = get_logger()
+
+    if config["products"] != "pps":
+        logger.info(f"Reducing from the ODF as asked; not looking at what {url} holds")
+        return config
+
+    # The two ways of learning nothing are kept apart, because they are different facts:
+    # one is about this machine's network and the other about the archive.
+    entries = list_archive_directory(url)
+    if entries is None:
+        logger.warning(f"Could not list {url}; going on with the {config['products']} route")
+        return config
+
+    available = xmm_route_from_listing(entries)
+    if available is None:
+        logger.warning(
+            f"{url} holds neither a {PPS_DIRECTORY} nor an {ODF_DIRECTORY} directory; "
+            f"going on with the {config['products']} route"
+        )
+        return config
+
+    if available != config["products"]:
+        logger.info(
+            f"{url} holds no {PPS_DIRECTORY} directory, so this observation is reduced "
+            f"from its ODF rather than from the archive's own products"
+        )
+        config["products"] = available
+    return config
 
 
 #: A PPS file name, field by field. Anchored at both ends on purpose: the summary pages
