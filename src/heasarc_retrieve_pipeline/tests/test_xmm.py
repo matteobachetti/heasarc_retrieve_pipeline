@@ -1564,6 +1564,9 @@ class StubSas:
             if not os.path.exists(str(output)):
                 if str(output).endswith(".evt"):
                     an_event_file(str(output))
+                elif str(output).endswith(".lc"):
+                    # The ODF route's evselect rateset, which the flare screening reads.
+                    a_flare_lightcurve(str(output), [1.0, 1.0, 90.0, 1.0])
                 else:
                     open(str(output), "w").write("stub\n")
         if name == "epatplot":
@@ -2446,11 +2449,40 @@ class TestReducingAnObservation:
         # image, so converting into one would be meaningless rather than merely wasteful.
         assert len(stub.task("ecoordconv")) == 2
 
-    def test_the_odf_route_says_it_is_not_built_yet_rather_than_half_running(
-        self, tmp_path, stub_sas
+    def test_the_odf_route_reprocesses_before_it_looks_for_exposures(
+        self, tmp_path, stub_sas, monkeypatch
     ):
-        with pytest.raises(NotImplementedError, match="ODF"):
-            self.reduce(tmp_path, stub_sas, config=dict(products="odf"))
+        an_odf(tmp_path)
+        base = a_reducible_observation(tmp_path)
+        stub = stub_sas()
+        events = xmm.xmm_odf_events_path("0153950401", base)
+
+        def run(name, **kwargs):
+            result = stub(name, **kwargs)
+            if name == "epproc":
+                os.makedirs(events, exist_ok=True)
+                an_odf_event_list(os.path.join(events, "pnEvts.ds"))
+            return result
+
+        monkeypatch.setattr(sas, "run", run)
+        xmm.process_xmm_obsid.fn(
+            "0153950401", config=dict(base, products="odf"), ra=self.RA, dec=self.DEC
+        )
+
+        ran = [name for name, _ in stub.calls]
+        assert ran.index("cifbuild") < ran.index("odfingest") < ran.index("epproc")
+        assert "emproc" in ran
+        # The ODF has no FBKTSR, so the curve the flare screening reads is built here.
+        assert any(params.get("withrateset") == "yes" for params in stub.task("evselect"))
+
+    def test_an_odf_route_run_with_no_odf_downloaded_says_so(self, tmp_path, stub_sas):
+        base = a_reducible_observation(tmp_path)
+        stub_sas()
+
+        with pytest.raises(FileNotFoundError, match="no ODF was downloaded"):
+            xmm.process_xmm_obsid.fn(
+                "0153950401", config=dict(base, products="odf"), ra=self.RA, dec=self.DEC
+            )
 
     def test_the_diagnostics_the_report_reads_are_written(self, tmp_path, stub_sas):
         self.reduce(tmp_path, stub_sas)
@@ -2622,15 +2654,29 @@ def an_odf(tmp_path, obsid="0153950401", compressed=True):
     ``compressed`` writes the ``.FIT.gz``/``.ASC.gz`` HEASARC actually serves; ``False``
     writes them already plain, the other case the staging has to handle.
     """
+    from astropy.io import fits
+
     odf = tmp_path / obsid / "ODF"
     odf.mkdir(parents=True, exist_ok=True)
-    for name in (f"3906_{obsid}_SCX00000ATS.FIT", f"3906_{obsid}_SCX00000ROS.ASC"):
-        body = f"contents of {name}\n".encode()
+
+    # The attitude file is real FITS and carries DATE-OBS, which is where the ODF route
+    # gets the date for cifbuild -- it has no event list yet to take it from.
+    attitude = tmp_path / f"{obsid}_ATS.FIT"
+    hdu = fits.PrimaryHDU()
+    hdu.header["DATE-OBS"] = "2002-03-27T21:11:14"
+    hdu.writeto(attitude, overwrite=True)
+
+    bodies = {
+        f"3906_{obsid}_SCX00000ATS.FIT": attitude.read_bytes(),
+        f"3906_{obsid}_SCX00000ROS.ASC": f"contents of 3906_{obsid}_SCX00000ROS.ASC\n".encode(),
+    }
+    for name, body in bodies.items():
         if compressed:
             with gzip.open(odf / (name + ".gz"), "wb") as out:
                 out.write(body)
         else:
             (odf / name).write_bytes(body)
+    attitude.unlink()
     return odf
 
 
@@ -2660,8 +2706,17 @@ class TestStagingTheOdf:
 
         staged = xmm.xmm_stage_odf("0153950401", self.config(tmp_path))
 
-        body = open(os.path.join(staged, self.PLAIN[0])).read()
-        assert body == f"contents of {self.PLAIN[0]}\n"
+        body = open(os.path.join(staged, self.PLAIN[1])).read()
+        assert body == f"contents of {self.PLAIN[1]}\n"
+
+    def test_a_decompressed_fits_constituent_is_still_readable(self, tmp_path):
+        # The ODF route reads DATE-OBS out of one of these, so "it decompressed" is not
+        # enough -- it has to still be FITS afterwards.
+        an_odf(tmp_path)
+
+        staged = xmm.xmm_stage_odf("0153950401", self.config(tmp_path))
+
+        assert xmm.xmm_observation_date(os.path.join(staged, self.PLAIN[0])) == "2002-03-27"
 
     def test_files_that_arrive_uncompressed_are_copied_unchanged(self, tmp_path):
         an_odf(tmp_path, compressed=False)
@@ -3006,13 +3061,26 @@ class TestRunningTheOdfPipeline:
         assert "epproc failed" in caplog.text
         assert len(xmm.xmm_exposures_from_odf("0153950401", config)) == 1
 
-    def test_two_tasks_that_returned_zero_and_wrote_nothing_is_a_failure(self, tmp_path, stub_sas):
-        # Both tasks "succeed" and leave no event list. A return code is not evidence.
+    def test_both_tasks_failing_is_a_failure(self, tmp_path, stub_sas, monkeypatch):
         config = self.config(tmp_path)
         stub_sas()
 
-        with pytest.raises(RuntimeError, match="produced an event list"):
+        def run(name, **kwargs):
+            raise RuntimeError(f"{name} returned 1")
+
+        monkeypatch.setattr(sas, "run", run)
+        with pytest.raises(RuntimeError, match="both epproc and emproc failed"):
             xmm.xmm_run_odf_pipeline("0153950401", config)
+
+    def test_two_clean_runs_that_produced_nothing_is_not_a_failure(self, tmp_path, stub_sas):
+        # An observation with no EPIC science in it. The PPS route calls that
+        # NO_SCIENCE_DATA rather than an error, and the two routes have to agree.
+        config = self.config(tmp_path)
+        stub_sas()
+
+        xmm.xmm_run_odf_pipeline("0153950401", config)
+
+        assert xmm.xmm_exposures_from_odf("0153950401", config) == []
 
 
 class TestTheOdfFlareCurve:

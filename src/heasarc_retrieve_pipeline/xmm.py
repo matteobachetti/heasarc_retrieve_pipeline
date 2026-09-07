@@ -2767,7 +2767,10 @@ def xmm_run_odf_pipeline(obsid, config, env=None, log_to=None):
     Raises
     ------
     RuntimeError
-        If neither task produced an event list.
+        If **both** tasks failed. Two tasks that ran cleanly and produced nothing is a
+        different thing -- an observation with no EPIC science in it -- and is left to the
+        caller to report as ``NO_SCIENCE_DATA``, so that the two routes agree on what an
+        empty observation is.
     """
     from . import sas
 
@@ -2775,6 +2778,7 @@ def xmm_run_odf_pipeline(obsid, config, env=None, log_to=None):
     events = xmm_odf_events_path(obsid, config)
     os.makedirs(events, exist_ok=True)
 
+    failed = []
     for task in ODF_PIPELINE_TASKS:
         logger.info(f"{obsid}: running {task}; this is the slow part of the ODF route")
         try:
@@ -2784,12 +2788,13 @@ def xmm_run_odf_pipeline(obsid, config, env=None, log_to=None):
             sas.run(task, produces=[], log_to=log_to(task) if log_to else None, env=env, cwd=events)
         except Exception as error:  # noqa: BLE001 -- one camera failing is not fatal
             logger.warning(f"{obsid}: {task} failed ({error}); continuing without it")
+            failed.append(task)
 
     produced = glob.glob(os.path.join(events, ODF_EVENT_LIST_GLOB))
-    if not produced:
+    if not produced and len(failed) == len(ODF_PIPELINE_TASKS):
         raise RuntimeError(
-            f"{obsid}: neither {' nor '.join(ODF_PIPELINE_TASKS)} produced an event list "
-            f"in {events}."
+            f"{obsid}: both {' and '.join(ODF_PIPELINE_TASKS)} failed, so there is no "
+            f"event list in {events} to reduce."
         )
     logger.info(f"{obsid}: the ODF pipeline produced {len(produced)} event lists")
     return events
@@ -3218,6 +3223,141 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
     return output
 
 
+def xmm_pps_front_end(obsid, config):
+    """
+    Everything the PPS route does before the per-exposure loop.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+
+    Returns
+    -------
+    tuple
+        ``(exposures, env, summary)`` -- the exposures to reduce, the SAS environment
+        carrying this observation's calibration, and the ODF summary file barycentring
+        needs, which may be ``None``.
+    """
+    from . import sas
+
+    exposures = xmm_with_submodes(xmm_exposures_from_pps(obsid, config))
+    if not exposures:
+        return [], None, None
+
+    # Once per observation, and first: everything below reaches calibration through the
+    # environment this produces. See xmm_build_calibration_index for why the index is
+    # built rather than taken from the downloaded CALIND.
+    index = xmm_build_calibration_index(
+        obsid, config, exposures[0].event_list, log_to=tool_log_file("cifbuild", obsid, config)
+    )
+    env = sas.sas_environment(ccf=index, ccfpath=config["sas_ccfpath"])
+
+    # Once per observation, like the calibration index: every exposure shares the ODF.
+    summary = xmm_odf_summary(
+        obsid, config, env=env, log_to=tool_log_file("odfingest", obsid, config)
+    )
+    return exposures, env, summary
+
+
+def xmm_odf_front_end(obsid, config):
+    """
+    Everything the ODF route does before the per-exposure loop.
+
+    The order is forced and is not the PPS route's. The calibration index has to exist
+    before ``odfingest`` and ``epproc`` run, but there is no event list yet to take
+    ``DATE-OBS`` from -- so the date comes from the ODF housekeeping instead. On
+    ``0870940101`` that reads 2021-04-06 against the science exposure's 2021-04-07,
+    because the housekeeping starts before the cameras do. A day is immaterial to a CCF
+    validity period, and the earlier of the two is the conservative choice.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+
+    Returns
+    -------
+    tuple
+        ``(exposures, env, summary)``, as :func:`xmm_pps_front_end`.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the observation has no ODF, which on this route is not recoverable.
+    """
+    from . import sas
+
+    staged = xmm_stage_odf(obsid, config)
+    if staged is None:
+        raise FileNotFoundError(
+            f"{obsid}: products='odf' was asked for and no ODF was downloaded to "
+            f"{xmm_odf_path(obsid, config)}."
+        )
+
+    index = xmm_build_calibration_index(
+        obsid,
+        config,
+        _odf_date_source(staged),
+        log_to=tool_log_file("cifbuild", obsid, config),
+    )
+    env = sas.sas_environment(ccf=index, ccfpath=config["sas_ccfpath"])
+
+    summary = xmm_odf_summary(
+        obsid, config, env=env, log_to=tool_log_file("odfingest", obsid, config)
+    )
+    if summary is None:
+        raise RuntimeError(f"{obsid}: odfingest wrote no summary, so the ODF cannot be run.")
+
+    # From here on the tasks read the raw telemetry, which they reach through SAS_ODF.
+    env = sas.sas_environment(ccf=index, odf=summary, ccfpath=config["sas_ccfpath"])
+    xmm_run_odf_pipeline(
+        obsid, config, env=env, log_to=lambda task: tool_log_file(task, obsid, config)
+    )
+
+    exposures = xmm_exposures_from_odf(obsid, config)
+    if not exposures:
+        return [], env, summary
+
+    exposures = xmm_with_odf_flare_curves(
+        obsid,
+        exposures,
+        config,
+        env=env,
+        log_to=lambda stem: tool_log_file(f"evselect_flare_{stem}", obsid, config),
+    )
+    return exposures, env, summary
+
+
+def _odf_date_source(staged):
+    """
+    A staged ODF file to read ``DATE-OBS`` from.
+
+    Parameters
+    ----------
+    staged : str
+        Staging directory from :func:`xmm_stage_odf`.
+
+    Returns
+    -------
+    str
+        The first FITS constituent, sorted, so the choice is reproducible.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the staged ODF holds no FITS file at all.
+    """
+    candidates = sorted(glob.glob(os.path.join(staged, "*.FIT")))
+    if not candidates:
+        raise FileNotFoundError(f"No FITS constituent in the staged ODF at {staged}.")
+    return candidates[0]
+
+
 @flow(flow_run_name="xmm_{obsid}")
 def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     """
@@ -3257,35 +3397,12 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         :data:`heasarc_retrieve_pipeline.utils.NO_SCIENCE_DATA` when the observation holds
         no EPIC event lists of any mode, and ``None`` otherwise.
     """
-    from . import sas
-
     config = xmm_config(absolute_config(config, DEFAULT_CONFIG))
     logger = get_logger()
     logger.info(f"Processing XMM-Newton observation {obsid}")
 
-    if config["products"] != "pps":
-        raise NotImplementedError(
-            "Reprocessing from the ODF is not built yet: only the PPS route runs today. "
-            "Set config['products'] = 'pps', or leave it unset."
-        )
-
-    exposures = xmm_exposures_from_pps(obsid, config)
-    if not exposures:
-        # Not a failure, and not counted as one. An XMM observation can be real, public
-        # and downloaded and still hold nothing for this pipeline -- four of the twenty
-        # pointings at M82 have no EPIC exposure at all. The data stay on disk.
-        logger.warning(f"{obsid} holds no EPIC event lists of any mode. Nothing to reduce.")
-        return NO_SCIENCE_DATA
-
-    exposures = xmm_with_submodes(exposures)
-    logger.info(
-        f"{obsid}: "
-        + ", ".join(
-            f"{e.instrument} {e.expid} {e.mode} ({e.submode or 'submode unknown'})"
-            for e in exposures
-        )
-    )
-
+    # The output directories come first now: both front ends write into them, and the ODF
+    # one stages and reprocesses before it knows what the observation holds.
     for directory in (
         xmm_pipeline_output_path(obsid, config),
         xmm_product_output_path(obsid, config),
@@ -3294,21 +3411,27 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
 
     diagnostics = diagnostics_path(obsid, config)
 
-    # Once per observation, and first: everything below reaches calibration through the
-    # environment this produces. See xmm_build_calibration_index for why the index is
-    # built rather than taken from the downloaded CALIND.
-    index = xmm_build_calibration_index(
-        obsid, config, exposures[0].event_list, log_to=tool_log_file("cifbuild", obsid, config)
-    )
-    env = sas.sas_environment(ccf=index, ccfpath=config["sas_ccfpath"])
+    front_end = xmm_odf_front_end if config["products"] == "odf" else xmm_pps_front_end
+    logger.info(f"{obsid}: taking the {config['products']} route")
+    exposures, env, summary = front_end(obsid, config)
 
-    # Once per observation, like the calibration index: every exposure shares the ODF.
-    summary = xmm_odf_summary(
-        obsid, config, env=env, log_to=tool_log_file("odfingest", obsid, config)
+    if not exposures:
+        # Not a failure, and not counted as one. An XMM observation can be real, public
+        # and downloaded and still hold nothing for this pipeline -- four of the twenty
+        # pointings at M82 have no EPIC exposure at all. The data stay on disk.
+        logger.warning(f"{obsid} holds no EPIC event lists of any mode. Nothing to reduce.")
+        return NO_SCIENCE_DATA
+
+    logger.info(
+        f"{obsid}: "
+        + ", ".join(
+            f"{e.instrument} {e.expid} {e.mode} ({e.submode or 'submode unknown'})"
+            for e in exposures
+        )
     )
 
     with record_step(diagnostics, obsid, "source_position") as rec:
-        rec.value(ra=ra, dec=dec, calibration_index=index)
+        rec.value(ra=ra, dec=dec, calibration_index=env["SAS_CCF"])
         xmm_check_source_position(obsid, config, ra, dec, rec=rec)
 
     for exposure in exposures:
