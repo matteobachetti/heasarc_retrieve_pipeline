@@ -897,6 +897,42 @@ timing product for MOS1, the flare light curve and its threshold drawn, the OBSM
 cross-check reporting ~1.4″, and a grouped spectrum that loads in XSPEC with its ARF, RMF
 and background attached.
 
+### Two acceptance targets Matteo set, 2026-09-07
+
+Her X-1 proves a great deal, but it does **not** prove the most common EPIC configuration
+of all. `0153950401`'s pn exposure is FastTiming, so **no pn imaging exposure has ever
+been through this pipeline.** `SCREENING_EXPRESSIONS[("pn", IMAGING)]`, a sky circle and
+annulus on a pn event list, and `especget` with a pn imaging response are all written and
+unit-tested, and none of them has met real data.
+
+1. **A pn imaging run — Full Frame or Small Window — before this work is called done.**
+   Its own end-to-end run on its own observation, with the checks Her X-1 got, not folded
+   into another step. Small Window matters separately from Full Frame because its window
+   is about 4.4′ × 4.4′: the default 30″ source radius and `bkg_outer_factor=3.0` ask for
+   an annulus reaching 90″, which fits, but a caller who widens the source radius will
+   quietly ask for background from off the edge of the window. Nothing in the code reads
+   `SUBMODE` today — `Exposure.submode` is declared and never populated — so nothing can
+   warn about it. Frame times differ too, and only the submode tells them apart: Full
+   Frame 73.4 ms, Extended Full Frame 199.1 ms, Large Window 47.7 ms, Small Window 5.7 ms.
+
+2. **The final acceptance is a reanalysis of every XMM observation of M82 X-2.** That is a
+   batch, not a single reduction, so it exercises the front end, the report and the
+   parallel run at once. Three things to settle before promising it:
+
+   * **M82 X-1 lies about 5″ from X-2**, and XMM's point spread function is roughly 6″
+     full width at half maximum and 15″ half-energy width. A 30″ circle holds both, plus
+     the diffuse emission of the starburst. This pipeline will extract a *blend*;
+     separating X-2 is done through its pulsation, not through a smaller circle. That is a
+     limit of the instrument, not a defect in the extraction code, and it belongs in the
+     report and in `docs/known_issues.rst` rather than being rediscovered afterwards.
+   * **The science is the 1.37 s pulsation**, which puts commit 11, barycentring, on the
+     critical path for this target rather than making it a nicety.
+   * **These are pn imaging observations**, the same untested path as target 1. Doing
+     target 1 first is what keeps the batch from being the first real run of that code.
+     The submodes actually used across the M82 pointings have not been checked yet; that
+     listing is a cheap first move, and it decides whether Small Window is on the path or
+     only Full Frame.
+
 ## Prerequisites for whoever picks this up
 
 **To do steps 1–9 and 11–12** (everything except the real reduction) you need nothing
@@ -1063,3 +1099,7 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
   — yes, with the provenance recorded; see above.
 * ~~How the flare GTI reaches `evselect`.~~ **Settled** — a file we write, filtered with
   `gti(file,TIME)`; verified on real data, see *What changed while implementing step 7*.
+* **Whether `Exposure.submode` should be populated and acted on.** It is declared and
+  never filled. Reading `SUBMODE` from the event list header is one keyword, and it is
+  what would let a Small Window exposure warn that a widened background annulus falls off
+  the edge of the window. Raised by the pn imaging acceptance target above.
