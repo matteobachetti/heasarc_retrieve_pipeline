@@ -1413,6 +1413,50 @@ returns a speech-analysis package, `github.com/XMMGOF/pysas` has no `setup.py` o
 `heasoft`, `heasoft-tests`, `xspec`, `xspec-compilers`. `pysas.sastask.MyTask.run()` is
 readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362–456.
 
+## One exposure's failure loses the whole observation — a question for Matteo
+
+Found during the M82 batch, 2026-09-08, and **not acted on**: this is a behaviour change
+outside the agreed thirteen commits.
+
+`especget` was killed by SIGSEGV on `0560590201`'s mos2 exposure, so
+`process_xmm_obsid` raised and the observation was recorded as `failed`. By then it had
+already written complete spectra for the other two cameras:
+
+```
+pnS001_imaging.{arf,rmf}  pnS001_imaging_{src,bkg,grp}.pi     complete
+mos1S002_imaging.{arf,rmf}  mos1S002_imaging_{src,bkg,grp}.pi complete
+mos2S003_imaging_{src,bkg}.pi                                 crashed before arf/rmf
+```
+
+Two cameras' worth of usable spectra were thrown away because a third crashed. The
+per-exposure loop in `process_xmm_obsid` is flat: any exception in any step of any
+exposure ends the observation.
+
+This is the **opposite** of the choice made one step earlier, in step 10, where `epproc`
+failing does not stop `emproc` and only both failing is an error. The two ought to agree.
+
+The case for isolating each exposure: a MOS-only or pn-only reduction is worth having, the
+pipeline already has a vocabulary for partial results, and the diagnostics record which
+exposure failed and why. The case against: a quietly missing camera is easy not to notice,
+and a real calibration fault would then be downgraded from a failure into a gap in a
+report. **Matteo's call**, not one to absorb.
+
+### Why it crashed, which is a separate matter and not a code fault
+
+The machine, not the observation. At the moment of the crash swap was 9.5 GiB used of
+10.2 GiB, on a volume 97% full so swap could not grow, with two `rmfgen` processes
+overlapping — the batch ran `n_workers=2`. Re-running the identical `especget` on the same
+inputs, alone, succeeds in 107 s and returns 0.
+
+One hypothesis was checked and **falsified** rather than assumed: `setsas.sh` asks for
+`ulimit -s 65532` and fails, because macOS's hard limit here is 65520 KiB — twelve KiB
+short — leaving SAS on the default 8176 KiB stack. That looked like a textbook cause of a
+segfault in a task allocating a large matrix. It is not the cause: the standalone run that
+succeeded ran on that same 8 MiB stack. The note in `gom82.sh` calling the failed `ulimit`
+harmless is correct, though it was written as a guess and is now measured.
+
+Batch casualties from this are re-run serially rather than treated as results.
+
 ## Open items, to settle on the first run with SAS
 
 * Barycentring — which of the three candidates in step 8 works.
