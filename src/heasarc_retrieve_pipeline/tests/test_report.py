@@ -769,7 +769,9 @@ class TestJoiningTheOtherTwoRecords:
 
         page = os.path.join(base, "diagnostics.html")
         assert os.path.exists(page)
-        assert "Solar-flare filtering" in soup(page).get_text()
+        # Not "solar": XMM screens the same step for soft protons, and the heading has
+        # to be true of both. Which kind of flare is on the figure's own axes.
+        assert "Flare filtering" in soup(page).get_text()
 
 
 class TestTheRunIndex:

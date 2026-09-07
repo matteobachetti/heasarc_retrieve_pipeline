@@ -1438,6 +1438,11 @@ def xmm_check_extraction_window(exposure, config, x, y, rec=None):
     return fit
 
 
+#: Energy range the report draws a spectrum over, in keV. The screening band of
+#: :data:`SCREENING_EXPRESSIONS` -- ``PI in [200:12000]`` -- since outside it there are no
+#: counts to draw and a log axis would give the empty channels most of the picture.
+SPECTRUM_PLOT_BAND_KEV = (0.2, 12.0)
+
 #: Extension of a PPS ``OBSMLI`` holding the detections.
 SOURCE_LIST_EXTENSION = "SRCLIST"
 
@@ -2474,6 +2479,7 @@ def xmm_calculate_spectra(
 
     source_region, background_region = regions
     paths = xmm_spectrum_paths(obsid, exposure, config)
+    stem = _exposure_stem(exposure)
     products = os.path.dirname(paths.source)
     os.makedirs(products, exist_ok=True)
 
@@ -2528,7 +2534,12 @@ def xmm_calculate_spectra(
     for which, path in (("src", paths.source), ("bkg", paths.background)):
         curve = read_xmm_spectrum(path, paths.rmf)
         if curve is not None:
-            rec.array(**{f"{which}_{key}": value for key, value in curve.items()})
+            # `spec_<stem>_<src|bkg>_<...>` is report.spectrum_figure's convention, and
+            # following it is what makes the spectra draw. NuSTAR writes one record
+            # holding several extractions, so the stem is how it tells them apart; XMM
+            # writes one record per exposure and repeats the stem, which costs nothing
+            # and keeps one reader for both.
+            rec.array(**{f"spec_{stem}_{which}_{key}": value for key, value in curve.items()})
 
     rec.value(
         source_spectrum=os.path.basename(paths.source),
@@ -2540,6 +2551,9 @@ def xmm_calculate_spectra(
         background_region=background_region,
         min_counts=config["spectrum_min_counts"],
         oversample=config["spectrum_oversample"],
+        # What the page should draw. Without it the figure falls back on NuSTAR's
+        # 3-79 keV, which would throw away all but the hard tail of an XMM spectrum.
+        energy_band=list(SPECTRUM_PLOT_BAND_KEV),
     )
     return paths
 

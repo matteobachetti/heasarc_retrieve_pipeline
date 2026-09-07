@@ -1763,9 +1763,36 @@ class TestExtractingTheSpectra:
                 "0153950401", exposure, config, events, ra=254.4, dec=35.3, rec=rec
             )
 
-        assert rec.arrays["src_energy"].tolist() == [1.5, 2.5]
-        assert rec.arrays["src_rate"].tolist() == [0.01, 0.02]
-        assert rec.arrays["bkg_rate"].tolist() == [0.001, 0.002]
+        # `spec_<stem>_...` is report.spectrum_figure's convention. Recorded flat, the
+        # arrays were written, read back and silently not drawn: the page came out with
+        # the whole Spectra section missing and nothing anywhere said why.
+        stem = xmm._exposure_stem(exposure)
+        assert rec.arrays[f"spec_{stem}_src_energy"].tolist() == [1.5, 2.5]
+        assert rec.arrays[f"spec_{stem}_src_rate"].tolist() == [0.01, 0.02]
+        assert rec.arrays[f"spec_{stem}_bkg_rate"].tolist() == [0.001, 0.002]
+
+    def test_the_recorded_band_is_the_one_the_page_will_draw(self, tmp_path, stub_sas):
+        from heasarc_retrieve_pipeline import report
+
+        stub_sas()
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
+        exposure = an_exposure(None, instrument="pn", mode=xmm.TIMING)
+        paths = xmm.xmm_spectrum_paths("0153950401", exposure, config)
+        os.makedirs(os.path.dirname(paths.source), exist_ok=True)
+        a_spectrum(paths.source, [10, 20])
+        a_spectrum(paths.background, [1, 2])
+        a_response(paths.rmf, [1.0, 2.0, 3.0])
+        events = str(tmp_path / "cleaned.evt")
+        an_event_file(events)
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "calculate_spectra") as rec:
+            xmm.xmm_calculate_spectra(
+                "0153950401", exposure, config, events, ra=254.4, dec=35.3, rec=rec
+            )
+
+        assert rec.values["energy_band"] == list(xmm.SPECTRUM_PLOT_BAND_KEV)
+        figure = report.spectrum_figure(dict(values=rec.values), rec.arrays)
+        assert figure is not None and len(figure.data) == 2
 
     def test_an_unreadable_spectrum_records_no_curve_and_does_not_raise(self, tmp_path, stub_sas):
         # The stub writes files that are not spectra, so this is the "especget produced
@@ -2431,3 +2458,112 @@ class TestTheWindowEdgeIsRobustToStrayEvents:
         assert widened == pytest.approx(15.0, abs=1.0), (
             "two bad events out of 146 moved the window edge"
         )
+
+
+class TestTheSpectraReachThePage:
+    """
+    What ``xmm_calculate_spectra`` records has to be what ``report.spectrum_figure`` reads.
+
+    Two separate things went wrong here on the first real run and neither failed anything:
+    the arrays were recorded flat, under names the figure does not look for, and the
+    figure's energy band is NuSTAR's 3-79 keV, which keeps only the hard tail of an XMM
+    spectrum. The page came out with the section missing altogether.
+    """
+
+    def test_the_arrays_are_named_the_way_the_figure_looks_them_up(self):
+        from heasarc_retrieve_pipeline import report
+
+        exposure = an_exposure(None, instrument="mos2", mode=xmm.IMAGING)
+        stem = xmm._exposure_stem(exposure)
+        recorded = {f"spec_{stem}_src_energy", f"spec_{stem}_bkg_energy"}
+
+        found = {
+            key[len("spec_") : -len("_src_energy")]
+            for key in recorded
+            if key.startswith("spec_") and key.endswith("_src_energy")
+        }
+
+        assert found == {stem}
+        assert report.NUSTAR_SPECTRUM_BAND_KEV == (3.0, 79.0)
+
+    def test_the_band_is_the_screening_band_and_not_nustars(self):
+        from heasarc_retrieve_pipeline import report
+
+        low, high = xmm.SPECTRUM_PLOT_BAND_KEV
+
+        assert (low, high) == (0.2, 12.0)
+        assert xmm.SPECTRUM_PLOT_BAND_KEV != report.NUSTAR_SPECTRUM_BAND_KEV
+        # The band the events were screened to, so nothing drawn is outside the data.
+        assert "PI in [200:12000]" in xmm.SCREENING_EXPRESSIONS[("pn", xmm.IMAGING)]
+
+    def test_a_record_naming_a_band_is_drawn_over_that_band(self):
+        from heasarc_retrieve_pipeline import report
+
+        energy = np.array([0.5, 1.0, 5.0, 50.0])
+        arrays = {
+            "spec_pnS003_imaging_src_energy": energy,
+            "spec_pnS003_imaging_src_rate": np.array([1.0, 2.0, 3.0, 4.0]),
+        }
+        record = dict(values=dict(energy_band=list(xmm.SPECTRUM_PLOT_BAND_KEV)))
+
+        figure = report.spectrum_figure(record, arrays)
+
+        (trace,) = figure.data
+        assert list(trace.x) == [0.5, 1.0, 5.0], "the 50 keV point is outside XMM's band"
+
+    def test_a_record_naming_no_band_still_gets_nustars(self):
+        from heasarc_retrieve_pipeline import report
+
+        energy = np.array([0.5, 1.0, 5.0, 50.0])
+        arrays = {
+            "spec_A_src_energy": energy,
+            "spec_A_src_rate": np.array([1.0, 2.0, 3.0, 4.0]),
+        }
+
+        figure = report.spectrum_figure(dict(values={}), arrays)
+
+        (trace,) = figure.data
+        assert list(trace.x) == [5.0, 50.0], "NuSTAR's records must keep drawing as before"
+
+
+class TestTheFlareCurveIsDrawn:
+    """
+    XMM records one background curve, not NuSTAR's two bands before and after.
+
+    ``report.flare_figure`` drew NuSTAR's three empty panels for it on the first real run:
+    it returned a figure rather than ``None``, so nothing looked wrong, and the page showed
+    axis titles reading "3-10 keV (solar stray light)" over no data at all.
+    """
+
+    ARRAYS = dict(
+        lc_time=np.linspace(0.0, 1000.0, 50),
+        lc_rate=np.full(50, 2.0),
+        lc_rate_err=np.full(50, 0.2),
+        removed=np.array([[400.0, 500.0]]),
+    )
+    VALUES = dict(threshold=3.4, exposure_before=1000.0, exposure_after=900.0)
+
+    def test_one_curve_gives_one_panel_with_data_in_it(self):
+        from heasarc_retrieve_pipeline import report
+
+        figure = report.flare_figure(dict(values=self.VALUES), dict(self.ARRAYS))
+
+        assert figure is not None
+        assert len(figure.data) == 1, "NuSTAR's three panels are not XMM's picture"
+        assert list(figure.data[0].y) == [2.0] * 50
+
+    def test_the_threshold_and_the_removed_interval_are_both_shown(self):
+        from heasarc_retrieve_pipeline import report
+
+        figure = report.flare_figure(dict(values=self.VALUES), dict(self.ARRAYS))
+        shapes = figure.layout.shapes
+
+        assert any(getattr(shape, "y0", None) == 3.4 for shape in shapes), "no threshold line"
+        assert any(getattr(shape, "x0", None) == 400.0 for shape in shapes), "nothing shaded"
+
+    def test_an_empty_curve_draws_nothing_rather_than_empty_axes(self):
+        from heasarc_retrieve_pipeline import report
+
+        empty = dict(lc_time=np.array([]), lc_rate=np.array([]))
+
+        assert report.flare_figure(dict(values={}), empty) is None

@@ -67,6 +67,10 @@ OBSERVATION_SUBDIRECTORIES = (
 )
 
 
+#: Energy range ``spectrum_figure`` draws when a record does not name its own, in keV.
+#: NuSTAR's, because NuSTAR's records were written before the key existed.
+NUSTAR_SPECTRUM_BAND_KEV = (3.0, 79.0)
+
 STATUS_COLOURS = {
     "done": "#2a9d8f",
     "skipped": "#e9c46a",
@@ -86,7 +90,7 @@ STEP_TITLES = {
     "source_position": "Source position",
     "pileup_check": "Pile-up check",
     "join_source_data": "Source join",
-    "flare_filtering": "Solar-flare filtering",
+    "flare_filtering": "Flare filtering",
     "calculate_spectra": "Spectral extraction",
     "combine_modules": "Module combination",
 }
@@ -416,9 +420,10 @@ def spectrum_figure(record, arrays):
 
     Notes
     -----
-    Counts are placed in energy with ``E = 0.04 * PI + 1.6``, not by folding the response.
-    That is right for a diagnostic and wrong for a fit; see
-    :func:`heasarc_retrieve_pipeline.nustar.read_spectrum`.
+    For NuSTAR, counts are placed in energy with ``E = 0.04 * PI + 1.6``, not by folding
+    the response. That is right for a diagnostic and wrong for a fit; see
+    :func:`heasarc_retrieve_pipeline.nustar.read_spectrum`. XMM takes its energies from the
+    ``EBOUNDS`` of the response instead, which needs no such constant.
     """
     go, _ = _plotly()
 
@@ -435,6 +440,12 @@ def spectrum_figure(record, arrays):
     if not stems:
         return None
 
+    # The band exists because a log axis would otherwise give the channels outside the
+    # instrument's effective area most of the plot. Which band that is belongs to the
+    # mission, so the record says: NuSTAR's 3-79 keV is the default because NuSTAR's
+    # records predate the key, and XMM writes its own 0.2-12.
+    low, high = (record.get("values") or {}).get("energy_band") or NUSTAR_SPECTRUM_BAND_KEV
+
     fig = go.Figure()
     for stem in stems:
         for which, name, dash in (("src", "source", None), ("bkg", "background", "dot")):
@@ -442,9 +453,7 @@ def spectrum_figure(record, arrays):
             rate = arrays.get(f"spec_{stem}_{which}_rate")
             if energy is None or rate is None:
                 continue
-            # Below 3 keV and above 79 keV NuSTAR has no effective area, and a log axis
-            # would give the empty channels the whole left half of the plot.
-            inside = (np.asarray(energy) >= 3.0) & (np.asarray(energy) <= 79.0)
+            inside = (np.asarray(energy) >= low) & (np.asarray(energy) <= high)
             fig.add_trace(
                 go.Scatter(
                     x=np.asarray(energy)[inside],
@@ -613,6 +622,12 @@ def flare_figure(record, arrays):
     if not arrays or not any(key.startswith("lc_") for key in arrays):
         return None
 
+    # XMM records one background curve rather than NuSTAR's before-and-after in two
+    # energy bands, so it gets one panel. Drawn here rather than in a second function
+    # because the step, the record and the shading are the same; only the picture differs.
+    if "lc_time" in arrays:
+        return _single_band_flare_figure(record, arrays)
+
     bands = [("3_10", "3–10 keV (solar stray light)"), ("10_79", "10–79 keV (control)")]
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.26, 0.37, 0.37]
@@ -680,6 +695,83 @@ def flare_figure(record, arrays):
     fig.update_xaxes(title_text="mission elapsed time (s)", row=3, col=1)
     fig.update_layout(legend=dict(orientation="h", y=1.06, x=0, font=dict(size=10)))
     return _blank(fig, height=780)
+
+
+def _single_band_flare_figure(record, arrays):
+    """
+    One background light curve, its threshold, and the intervals the threshold removed.
+
+    The shape a mission gives when it screens on a single curve someone else made -- XMM
+    thresholds the PPS ``FBKTSR``, which is one series with no band structure and no
+    before-and-after, because the "after" is the good time intervals rather than a second
+    light curve.
+
+    Parameters
+    ----------
+    record : dict
+        A ``flare_filtering`` record.
+    arrays : dict of numpy.ndarray
+        Its array payload, holding ``lc_time``, ``lc_rate`` and optionally
+        ``lc_rate_err`` and ``removed``.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if the curve is empty.
+    """
+    go, _ = _plotly()
+
+    time = np.asarray(arrays.get("lc_time", []), float)
+    rate = np.asarray(arrays.get("lc_rate", []), float)
+    if time.size == 0 or rate.size == 0:
+        return None
+
+    values = record.get("values") or {}
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=time,
+            y=rate,
+            error_y=dict(array=arrays.get("lc_rate_err"), thickness=0.7, width=0),
+            mode="markers",
+            name="background rate",
+            marker=dict(size=4, color="#264653"),
+        )
+    )
+
+    # The shading first and the threshold second, because update_layout(shapes=...)
+    # *replaces* the shape list rather than adding to it -- the other order drew the line
+    # and then silently threw it away.
+    removed = np.atleast_2d(np.asarray(arrays.get("removed", np.zeros((0, 2))), float))
+    fig.update_layout(
+        shapes=_row_spans(
+            fig,
+            removed.reshape(-1, 2),
+            fillcolor="#e76f51",
+            opacity=0.16,
+            line=dict(width=0),
+            layer="below",
+        )
+    )
+
+    threshold = values.get("threshold")
+    if threshold is not None:
+        fig.add_hline(
+            y=float(threshold),
+            line=dict(color="#e76f51", width=1, dash="dash"),
+            annotation_text=f"threshold {float(threshold):.3g}",
+            annotation_position="top left",
+            annotation_font_size=10,
+        )
+
+    kept, total = values.get("exposure_after"), values.get("exposure_before")
+    title = "background rate (s<sup>-1</sup>)"
+    if kept is not None and total:
+        title += f"<br>kept {float(kept):.0f} s of {float(total):.0f} s"
+    fig.update_yaxes(title_text=title, title_font_size=10)
+    fig.update_xaxes(title_text="mission elapsed time (s)")
+    fig.update_layout(legend=dict(orientation="h", y=1.08, x=0, font=dict(size=10)))
+    return _blank(fig, height=420)
 
 
 def _centres(edges, n):
@@ -932,7 +1024,10 @@ def observation_body(summary, directory):
         ("Source separation", "separate_sources", separation_figure),
         ("Extraction regions", "source_region", radial_profile_figure),
         ("Joining", "join_source_data", gti_figure),
-        ("Solar-flare filtering", "flare_filtering", flare_figure),
+        # Not "solar": NuSTAR's flares are solar stray light and XMM's are soft protons,
+        # and the figure's own axes say which. The step title is generic for the same
+        # reason.
+        ("Flare filtering", "flare_filtering", flare_figure),
         ("Spectra", "calculate_spectra", spectrum_figure),
         # The same figure: a combined product is a spectrum like any other, and drawing it
         # on its own axes is what lets a reader see it sitting at the sum of the two
