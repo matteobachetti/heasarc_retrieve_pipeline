@@ -134,6 +134,15 @@ FLARE_LIGHTCURVE_PRODUCT = "FBKTSR"
 #: PPS products, and therefore the right value for ``SAS_CCF`` on the PPS route.
 CALIBRATION_INDEX_PRODUCT = "CALIND"
 
+#: What the time system keyword reads once ``barycen`` has done its work. Checking it is
+#: the only real evidence the correction happened: the task edits its input in place, so
+#: ``produces=IN_PLACE(...)`` can only confirm that the copy we made ourselves still
+#: exists. This is ``epatplot``'s lesson again -- the task's answer is a header keyword.
+BARYCENTRED_TIMESYS = "TDB"
+
+#: And what the reference position becomes.
+BARYCENTRED_TIMEREF = "SOLARSYSTEM"
+
 #: Suffix of the summary file ``odfingest`` writes and ``barycen`` reads through
 #: ``SAS_ODF``. The one the archive ships is ``SUM.ASC``, which is a different file in a
 #: different format: ``barycen`` rejects it by name.
@@ -2657,6 +2666,29 @@ def read_xmm_spectrum(spectrum, rmf):
     )
 
 
+def _time_system(event_list):
+    """
+    ``(TIMESYS, TIMEREF)`` of the first extension that names them.
+
+    Parameters
+    ----------
+    event_list : str
+        Event file to read.
+
+    Returns
+    -------
+    tuple
+        The two keyword values, either of which may be ``None``.
+    """
+    from astropy.io import fits
+
+    with fits.open(event_list) as hdul:
+        for hdu in hdul:
+            if "TIMESYS" in hdu.header:
+                return hdu.header.get("TIMESYS"), hdu.header.get("TIMEREF")
+    return None, None
+
+
 def xmm_staged_odf_path(obsid, config):
     """
     Directory the ODF is staged into for ``odfingest``.
@@ -2833,7 +2865,20 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
         withtable="yes",
     )
 
-    rec.value(barycentered=True, barycentered_file=os.path.basename(output), summary=summary)
+    timesys, timeref = _time_system(output)
+    if timesys != BARYCENTRED_TIMESYS:
+        raise ValueError(
+            f"barycen returned success but left {os.path.basename(output)} on "
+            f"{timesys or 'no'} time rather than {BARYCENTRED_TIMESYS}."
+        )
+
+    rec.value(
+        barycentered=True,
+        barycentered_file=os.path.basename(output),
+        summary=summary,
+        timesys=timesys,
+        timeref=timeref,
+    )
     return output
 
 

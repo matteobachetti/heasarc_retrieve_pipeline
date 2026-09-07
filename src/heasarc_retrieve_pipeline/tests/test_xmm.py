@@ -1546,11 +1546,15 @@ class StubSas:
     #: position the flow was told about rather than off the edge of the events.
     SKY = (26000.0, 26000.0)
 
-    def __init__(self, keywords=None, sky=None):
+    def __init__(self, keywords=None, sky=None, barycen_timesys="TDB"):
         self.calls = []
         self.environments = []
         self.keywords = keywords
         self.sky = sky or self.SKY
+        #: What the stubbed ``barycen`` leaves in ``TIMESYS``. ``None`` stands for a task
+        #: that returns success having converted nothing, which is the case the caller's
+        #: header check exists for.
+        self.barycen_timesys = barycen_timesys
 
     def __call__(self, name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params):
         self.calls.append((name, dict(params, cwd=cwd)))
@@ -1566,6 +1570,14 @@ class StubSas:
             assert params["modifyinset"] == "yes", "the ratios would not be written"
         if name == "epatplot" and self.keywords is not None:
             an_event_file(params["set"], **self.keywords)
+        if name == "barycen":
+            # The real task edits its input in place and its answer is the rewritten time
+            # system, so the stub has to leave that behind or the check cannot be tested.
+            path = params["table"].split(":")[0]
+            if self.barycen_timesys is None:
+                an_event_file(path)
+            else:
+                an_event_file(path, TIMESYS=self.barycen_timesys, TIMEREF="SOLARSYSTEM")
         if name == "odfingest":
             # The real task writes a summary whose name it chooses from the ODF it read,
             # which is why the caller globs for the suffix instead of assuming a name.
@@ -1586,10 +1598,10 @@ class StubSas:
 
 @pytest.fixture
 def stub_sas(monkeypatch):
-    def install(keywords=None, sky=None):
+    def install(keywords=None, sky=None, barycen_timesys="TDB"):
         from heasarc_retrieve_pipeline import sas
 
-        stub = StubSas(keywords, sky=sky)
+        stub = StubSas(keywords, sky=sky, barycen_timesys=barycen_timesys)
         monkeypatch.setattr(sas, "run", stub)
         return stub
 
@@ -2778,6 +2790,25 @@ class TestBarycentringAnExposure:
         assert stub.calls == []
         assert rec.values["barycentered"] is False
         assert "no ODF summary" in rec.values["reason"]
+
+    def test_a_task_that_converted_nothing_is_not_taken_at_its_word(self, tmp_path, stub_sas):
+        # barycen edits in place, so produces=IN_PLACE can only confirm that the copy we
+        # made ourselves is still there. The time system is the real evidence.
+        events, summary = self.setup_files(tmp_path)
+        stub_sas(barycen_timesys=None)
+
+        with pytest.raises(ValueError, match="rather than TDB"):
+            xmm.xmm_barycenter("0153950401", {}, events, summary)
+
+    def test_the_time_system_is_recorded(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, summary, rec=rec)
+
+        assert rec.values["timesys"] == "TDB"
+        assert rec.values["timeref"] == "SOLARSYSTEM"
 
     def test_a_successful_correction_is_recorded(self, tmp_path, stub_sas):
         events, summary = self.setup_files(tmp_path)
