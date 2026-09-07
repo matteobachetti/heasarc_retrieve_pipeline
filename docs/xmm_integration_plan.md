@@ -835,6 +835,44 @@ Net count rate (cts/s) for Spectrum:1  2.730e+00 +/- 2.382e-02 (95.0 % total)
 
 594 groups from 2400 channels at `mincounts=25`, `oversample=3`; 1374 from 4096 on pn.
 
+## Building the calibration index
+
+**Matteo's ruling, 2026-09-07.** The CCF mirror on this machine — 550 files, 2.8 GB — is
+ESA's **Valid CCF Set**, not a partial copy of anything. ESA assembles it daily and states
+that it holds every constituent needed to process any XMM-Newton ODF *at the current date*.
+The complete history (~1550 files, ~4.3 GB) exists only for reproducing the calibration
+knowledge of a past moment, and many of its files have been superseded by better
+calibration since. **New analyses want the current set.**
+
+That reframes what the Her X-1 failure was. `0153950401`'s `CALIND` names
+`XMM_BORESIGHT_0029.CCF`, which the mirror does not hold. That is not a missing file: it is
+the SOC's record of what it used in November 2024, and issue 0036 supersedes it. Fetching
+0029 would be *asking for worse calibration*.
+
+**Proposed, not yet agreed — needs Matteo's yes before implementing.** `SAS_CCF` should
+point at an index this pipeline builds, rather than at the downloaded `CALIND`:
+
+```bash
+cifbuild withobservationdate=yes observationdate=<DATE-OBS> fullpath=yes
+```
+
+* `DATE-OBS` comes from the event list header, so this needs no ODF and no download. It
+  selects the constituents *valid for the observation's epoch*, at their current issue —
+  which is exactly the distinction ESA draws above.
+* Measured at **26 s** on Her X-1, against 524 s for one pn `arfgen`. Negligible per
+  observation, and it happens once, not once per exposure.
+* It removes the failure mode entirely rather than catching it, so there is no fallback
+  branch to test, and no observation old enough to break.
+* Keep downloading `CALIND` anyway — it is about 90 kB and it records what ESA used, which
+  is worth having on the report page next to the index we built.
+
+One consequence to state plainly rather than discover: PPS event lists were *generated*
+with the November 2024 calibration, and responses built against a newer CIF are then
+marginally inconsistent with the `PI` values in those events. This is the ordinary
+situation for anyone reanalysing archival data with current SAS, and the alternative is the
+superseded calibration Matteo has just ruled out. Both index files should be named in the
+report so the choice is visible.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):
@@ -919,12 +957,23 @@ unit-tested, and none of them has met real data.
    batch, not a single reduction, so it exercises the front end, the report and the
    parallel run at once. Three things to settle before promising it:
 
-   * **M82 X-1 lies about 5″ from X-2**, and XMM's point spread function is roughly 6″
-     full width at half maximum and 15″ half-energy width. A 30″ circle holds both, plus
-     the diffuse emission of the starburst. This pipeline will extract a *blend*;
-     separating X-2 is done through its pulsation, not through a smaller circle. That is a
-     limit of the instrument, not a defect in the extraction code, and it belongs in the
-     report and in `docs/known_issues.rst` rather than being rediscovered afterwards.
+   * **M82 X-1 lies about 5″ from X-2**, against a point spread function roughly 6″ full
+     width at half maximum and 15″ half-energy width, so a 30″ circle holds both plus the
+     starburst's diffuse emission. **Matteo knows, and accepts it** -- it is worse in
+     NuSTAR, and his main interest is timing, where the blend is unavoidable and the
+     pulsation is what identifies X-2. Spectra are blended too. So this is a caveat to
+     *state* in the report and in `docs/known_issues.rst`, not a problem for the
+     extraction code to solve, and **the extraction is not to be redesigned around it**.
+   * **A separate exercise he plans for later, not part of these thirteen commits**:
+     recovering at least a flux *ratio* between X-1 and X-2 from the partially blended
+     image, MOS especially, where the finer pixels give the better chance. Worth knowing
+     before that starts: the PPS `OBSMLI` source list, which this pipeline already
+     downloads for the position cross-check, is the output of `emldetect` -- SAS's
+     maximum-likelihood fit of the point spread function, which fits neighbouring sources
+     together and is the standard tool for exactly this. Whether it in fact splits the pair
+     at 5″ on any given M82 pointing has **not** been checked; doing so costs one listing
+     of a file already on the download path, and would say whether the ratio is a new
+     analysis or a column read.
    * **The science is the 1.37 s pulsation**, which puts commit 11, barycentring, on the
      critical path for this target rather than making it a nicety.
    * **These are pn imaging observations**, the same untested path as target 1. Doing
@@ -1077,10 +1126,17 @@ readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362�
   step 8*. The mirror never did reach `XMM_BORESIGHT_0029.CCF`, because ESA's current
   issue is 0036 and an archival `CALIND` names the issue of its day; `cifbuild
   withobservationdate=yes` is what closed it.
-* **Whether a missing `CALIND` constituent should trigger `cifbuild` automatically.** New,
-  and the direct consequence of the item above: an archival observation's own index can
-  name calibration issues a current mirror does not hold. The fallback is verified to
-  work; whether the pipeline should reach for it unasked is Matteo's call.
+* ~~**Whether a missing `CALIND` constituent should trigger `cifbuild` automatically.**~~
+  **Settled by Matteo, 2026-09-07, and settled the other way round from how it was asked.**
+  The ~548-file, 2.9 GB set on this machine is ESA's *Valid CCF Set*, which ESA assembles
+  daily and describes as everything needed to process any XMM-Newton ODF at the current
+  date. The ~1550-file, 4.3 GB full history exists only to reproduce the calibration
+  knowledge of a given past moment, and many of its constituents have been superseded.
+  Matteo does not want past calibration in a new analysis. So an archival `CALIND` naming
+  `XMM_BORESIGHT_0029.CCF` is not a gap to fill by fetching issue 0029 -- it is a record of
+  what the SOC used in November 2024, and the current issue supersedes it. The consequence
+  is that `cifbuild` stops being a fallback and becomes the normal path; see *Building the
+  calibration index* below.
 * ~~Whether `arfgen`/`rmfgen` need `SAS_ODF`, or the PPS `CALIND` alone suffices.~~
   **Settled** — neither was given `SAS_ODF` and both produced a valid ARF and RMF on Her
   X-1, in imaging and in timing. `useodfatt=yes` exists for the rare case where the
