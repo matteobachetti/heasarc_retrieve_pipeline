@@ -43,7 +43,13 @@ extensions = [
 # This pattern also affects html_static_path and html_extra_path.
 # completion_model_plan.md is a planning document, not user documentation: it is in no
 # toctree, and a -W build treats that as an error.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "completion_model_plan.md"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "completion_model_plan.md",
+    "xmm_integration_plan.md",
+]
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
