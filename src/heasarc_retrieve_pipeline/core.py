@@ -38,6 +38,12 @@ from .nustar import (
 from . import heasoft
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
 from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
+from .xmm import (
+    process_xmm_obsid,
+    xmm_download_filter,
+    xmm_resolve_config,
+    DEFAULT_CONFIG as XMM_DEFAULT_CONFIG,
+)
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
@@ -1004,6 +1010,27 @@ MISSION_CONFIG = {
         "obsid_processing": process_rxte_obsid,
         "default_config": RXTE_DEFAULT_CONFIG,
         "name_column": "target_name",
+    },
+    "xmm": {
+        "table": "xmmmaster",
+        # xmmmaster's exposure column is `duration`, and it has no `cycle` at all --
+        # which is why `cycle` had to come out of the hardcoded OBSID query.
+        "expo_column": "duration",
+        # Assume the catalogue may be wrong, as for NICER: four of the twenty pointings
+        # at M82 report no EPIC exposure, and whether that means "nothing to reduce" is
+        # answered by the PPS directory, not by the row.
+        "zero_exposure_may_be_wrong": True,
+        # pps_flag and sas_version are carried so a run can say which route it expects
+        # before downloading anything. The route is still decided by probing the archive
+        # directory -- 0973390101 has pps_flag = "Y" and no PPS directory at all.
+        "additional": (
+            "pn_time, mos1_time, mos2_time, pn_mode, mos1_mode, mos2_mode, pps_flag, sas_version"
+        ),
+        "obsid_processing": process_xmm_obsid,
+        "default_config": XMM_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": xmm_download_filter,
+        "resolve_config": xmm_resolve_config,
     },
 }
 

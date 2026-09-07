@@ -127,7 +127,8 @@ _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 #: :mod:`heasarc_retrieve_pipeline.core` for where the three schemas come from.
 CANONICAL_COLUMNS = {
     "source_name": ("source_name", "name", "target_name"),
-    "exposure": ("exposure", "exposure_a"),
+    # xmmmaster spells it `duration`.
+    "exposure": ("exposure", "exposure_a", "duration"),
     "time": ("time",),
     "ra": ("ra",),
     "dec": ("dec",),

@@ -15,12 +15,14 @@ import copy
 import os
 import re
 import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from heasarc_retrieve_pipeline import xmm
 from heasarc_retrieve_pipeline.diagnostics import record_step
+from heasarc_retrieve_pipeline.utils import NO_SCIENCE_DATA
 
 
 # Her X-1, the end-to-end test target. Every PPS file of it that this step cares about,
@@ -1537,12 +1539,20 @@ class StubSas:
     output -- is where its answer is documented to appear.
     """
 
-    def __init__(self, keywords=None):
+    #: Where the stubbed ``ecoordconv`` says the source is. The centre of the box
+    #: ``a_windowed_event_file`` fills, so a flow test measures a window around the
+    #: position the flow was told about rather than off the edge of the events.
+    SKY = (26000.0, 26000.0)
+
+    def __init__(self, keywords=None, sky=None):
         self.calls = []
+        self.environments = []
         self.keywords = keywords
+        self.sky = sky or self.SKY
 
     def __call__(self, name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params):
         self.calls.append((name, dict(params, cwd=cwd)))
+        self.environments.append(dict(env or {}))
         for output in produces if isinstance(produces, (list, tuple)) else [produces]:
             os.makedirs(os.path.dirname(str(output)), exist_ok=True)
             if not os.path.exists(str(output)):
@@ -1554,6 +1564,12 @@ class StubSas:
             assert params["modifyinset"] == "yes", "the ratios would not be written"
         if name == "epatplot" and self.keywords is not None:
             an_event_file(params["set"], **self.keywords)
+        if name == "ecoordconv":
+            # The real task writes no file: its answer *is* its standard output, in the
+            # two-line shape its documentation pins. Both lines carry the same numbers,
+            # which is the trap the parser's start-of-line anchor exists for.
+            x, y = self.sky
+            return SimpleNamespace(stdout=f" X: Y: {x} {y}\n IM_X: IM_Y: {x} {y}\n", returncode=0)
         return None
 
     def task(self, name):
@@ -1562,10 +1578,10 @@ class StubSas:
 
 @pytest.fixture
 def stub_sas(monkeypatch):
-    def install(keywords=None):
+    def install(keywords=None, sky=None):
         from heasarc_retrieve_pipeline import sas
 
-        stub = StubSas(keywords)
+        stub = StubSas(keywords, sky=sky)
         monkeypatch.setattr(sas, "run", stub)
         return stub
 
@@ -2283,3 +2299,89 @@ class TestWhatTheWindowCheckRecords:
 
     def test_a_timing_exposure_has_no_window_to_check(self, tmp_path):
         assert self.check(tmp_path, self.TIGHT, mode=xmm.TIMING) is None
+
+
+def a_reducible_observation(tmp_path, obsid="0153950401", event_lists=None, submode=None):
+    """
+    A downloaded PPS tree whose event lists and light curves are real enough to open.
+
+    ``a_downloaded_observation`` writes text files, which is all a name parser needs.
+    The flow opens them -- for ``DATE-OBS``, for ``SUBMODE``, for the flare curve -- so
+    this writes FITS.
+    """
+    if event_lists is None:
+        event_lists = ["PNS003TIEVLI", "M1S004MIEVLI", "M2S005MIEVLI"]
+    pps = tmp_path / obsid / "PPS"
+    pps.mkdir(parents=True)
+    for stem in event_lists:
+        a_windowed_event_file(
+            pps / f"P{obsid}{stem}0000.FTZ",
+            {1: (25000, 27000, 25000, 27000)},
+            **{"DATE-OBS": "2002-03-27T21:11:14", "SUBMODE": submode or "PrimeFullWindow"},
+        )
+        a_flare_lightcurve(pps / f"P{obsid}{stem[:6]}FBKTSR0000.FTZ", [1.0, 1.0, 90.0, 1.0])
+    a_source_list(pps / f"P{obsid}EPX000OBSMLI0000.FTZ", [(254.4576, 35.3427, 9.9e-11)])
+    return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+
+class TestReducingAnObservation:
+    """
+    ``process_xmm_obsid``: the order the steps run in, and what each one is handed.
+
+    Every SAS task is stubbed, so what is under test is the orchestration -- which is
+    exactly the part no unit test of an individual step can reach.
+    """
+
+    RA, DEC = 254.4575, 35.3423
+
+    def reduce(self, tmp_path, stub_sas, config=None, **kwargs):
+        base = a_reducible_observation(tmp_path, **kwargs)
+        stub = stub_sas()
+        result = xmm.process_xmm_obsid.fn(
+            "0153950401", config=dict(base, **(config or {})), ra=self.RA, dec=self.DEC
+        )
+        return stub, result
+
+    def test_an_observation_with_no_epic_data_is_not_a_failure(self, tmp_path, stub_sas):
+        stub, result = self.reduce(tmp_path, stub_sas, event_lists=[])
+
+        assert result == NO_SCIENCE_DATA
+        assert stub.calls == [], "nothing should have been run on an empty observation"
+
+    def test_the_calibration_index_is_built_before_any_other_task(self, tmp_path, stub_sas):
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        assert stub.calls[0][0] == "cifbuild"
+        assert len(stub.task("cifbuild")) == 1, "the index is per observation, not per exposure"
+
+    def test_every_task_after_it_is_pointed_at_the_index_we_built(self, tmp_path, stub_sas):
+        stub, _ = self.reduce(tmp_path, stub_sas)
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path)))
+        index = xmm.xmm_calibration_index_path("0153950401", config)
+
+        assert {env.get("SAS_CCF") for env in stub.environments[1:]} == {index}
+
+    def test_every_exposure_is_screened(self, tmp_path, stub_sas):
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        assert len(stub.task("evselect")) >= 3
+
+    def test_the_position_is_converted_once_per_imaging_exposure_only(self, tmp_path, stub_sas):
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        # PNS003 is timing; M1S004 and M2S005 are imaging. A timing read-out has no sky
+        # image, so converting into one would be meaningless rather than merely wasteful.
+        assert len(stub.task("ecoordconv")) == 2
+
+    def test_the_odf_route_says_it_is_not_built_yet_rather_than_half_running(
+        self, tmp_path, stub_sas
+    ):
+        with pytest.raises(NotImplementedError, match="ODF"):
+            self.reduce(tmp_path, stub_sas, config=dict(products="odf"))
+
+    def test_the_diagnostics_the_report_reads_are_written(self, tmp_path, stub_sas):
+        self.reduce(tmp_path, stub_sas)
+        written = {path.name for path in (tmp_path / "0153950401" / "diagnostics").glob("*.json")}
+
+        assert any(name.startswith("flare_filtering") for name in written)
+        assert any(name.startswith("source_position") for name in written)

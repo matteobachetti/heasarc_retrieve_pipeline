@@ -54,6 +54,8 @@ PLOTLY_BUNDLE = "plotly.min.js"
 #: reduction, and a partly reduced observation may have only one of them. Temporary
 #: working directories such as ``1988_tmp_nuproducts`` have none, which is the point.
 OBSERVATION_SUBDIRECTORIES = (
+    "ODF",
+    "PPS",
     "auxil",
     "event_cl",
     "event_pipe",
@@ -76,6 +78,8 @@ STATUS_COLOURS = {
 STEP_TITLES = {
     "observation": "The observation as a whole",
     "l2_pipeline": "Level 2 pipeline",
+    "odf_ingest": "ODF ingestion",
+    "barycenter": "Barycentric correction",
     "recover_spacecraft_science": "Spacecraft science recovery",
     "separate_sources": "Source separation",
     "source_region": "Extraction region",

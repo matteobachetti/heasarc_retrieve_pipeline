@@ -49,13 +49,17 @@ from typing import Optional
 
 import numpy as np
 
-from .diagnostics import no_record
+from prefect import flow
+
+from .diagnostics import diagnostics_path, no_record, record_step
 from .utils import (
+    NO_SCIENCE_DATA,
     absolute_config,
     get_logger,
     good_intervals,
     intervals_above_threshold,
     intervals_removed,
+    tool_log_file,
 )
 
 #: Configuration a run starts from. ``products`` chooses the route: ``"pps"`` reads the
@@ -2574,3 +2578,151 @@ def read_xmm_spectrum(spectrum, rmf):
         rate=counts / exposure / width,
         rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
     )
+
+
+@flow(flow_run_name="xmm_{obsid}")
+def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
+    """
+    Reduce one XMM-Newton observation end to end.
+
+    Builds the calibration index, then per EPIC camera, exposure and mode: the flare good
+    time intervals, a screened event list, the extraction regions, a pile-up measurement
+    and a grouped spectrum with its background, ARF and RMF.
+
+    ``config=None`` rather than ``{}``, so that the fallback to :data:`DEFAULT_CONFIG`
+    actually fires. NICER and RXTE take ``{}`` and therefore never fall back, which is
+    known issue 27; this is the same mistake not repeated.
+
+    One thing here is deliberately *not* NuSTAR's shape: ``ra`` and ``dec`` are used as
+    given and never overridden. NuSTAR measures a position off its own image and reduces
+    at whatever it finds, which is better than the catalogue pointing when the detection
+    is right and reduces the wrong source when it is not. XMM's astrometry does not need
+    that, so the position asked for is the position extracted, and the PPS source list is
+    only ever consulted to *report* how far the nearest detection lies.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict, optional
+        Pipeline configuration; :data:`DEFAULT_CONFIG` where it says nothing.
+    ra, dec : float or str, optional
+        Source position in degrees. Required for anything beyond screening: the regions,
+        the responses and the position cross-check are all built from it.
+    flags : dict, optional
+        Accepted for the signature every mission's entry point shares. Nothing reads it
+        yet; per-task overrides belong in ``config``.
+
+    Returns
+    -------
+    str or None
+        :data:`heasarc_retrieve_pipeline.utils.NO_SCIENCE_DATA` when the observation holds
+        no EPIC event lists of any mode, and ``None`` otherwise.
+    """
+    from . import sas
+
+    config = xmm_config(absolute_config(config, DEFAULT_CONFIG))
+    logger = get_logger()
+    logger.info(f"Processing XMM-Newton observation {obsid}")
+
+    if config["products"] != "pps":
+        raise NotImplementedError(
+            "Reprocessing from the ODF is not built yet: only the PPS route runs today. "
+            "Set config['products'] = 'pps', or leave it unset."
+        )
+
+    exposures = xmm_exposures_from_pps(obsid, config)
+    if not exposures:
+        # Not a failure, and not counted as one. An XMM observation can be real, public
+        # and downloaded and still hold nothing for this pipeline -- four of the twenty
+        # pointings at M82 have no EPIC exposure at all. The data stay on disk.
+        logger.warning(f"{obsid} holds no EPIC event lists of any mode. Nothing to reduce.")
+        return NO_SCIENCE_DATA
+
+    exposures = xmm_with_submodes(exposures)
+    logger.info(
+        f"{obsid}: "
+        + ", ".join(
+            f"{e.instrument} {e.expid} {e.mode} ({e.submode or 'submode unknown'})"
+            for e in exposures
+        )
+    )
+
+    for directory in (
+        xmm_pipeline_output_path(obsid, config),
+        xmm_product_output_path(obsid, config),
+    ):
+        os.makedirs(directory, exist_ok=True)
+
+    diagnostics = diagnostics_path(obsid, config)
+
+    # Once per observation, and first: everything below reaches calibration through the
+    # environment this produces. See xmm_build_calibration_index for why the index is
+    # built rather than taken from the downloaded CALIND.
+    index = xmm_build_calibration_index(
+        obsid, config, exposures[0].event_list, log_to=tool_log_file("cifbuild", obsid, config)
+    )
+    env = sas.sas_environment(ccf=index, ccfpath=config["sas_ccfpath"])
+
+    with record_step(diagnostics, obsid, "source_position") as rec:
+        rec.value(ra=ra, dec=dec, calibration_index=index)
+        xmm_check_source_position(obsid, config, ra, dec, rec=rec)
+
+    for exposure in exposures:
+        stem = _exposure_stem(exposure)
+        logger.info(f"{obsid}: reducing {stem}")
+
+        with record_step(diagnostics, obsid, "flare_filtering", key=stem) as rec:
+            gti = xmm_flare_gti(exposure, config, rec=rec)
+
+        events = xmm_clean_event_list(
+            obsid,
+            exposure,
+            config,
+            gti=gti,
+            env=env,
+            log_to=tool_log_file(f"evselect_{stem}", obsid, config),
+        )
+
+        # A timing read-out has no sky image to convert into, so the conversion is not
+        # merely wasteful there -- it has no answer. Its regions are RAWX strips instead.
+        sky = None
+        if exposure.mode == IMAGING:
+            sky = xmm_source_sky_position(
+                events,
+                ra,
+                dec,
+                env=env,
+                log_to=tool_log_file(f"ecoordconv_{stem}", obsid, config),
+            )
+            with record_step(diagnostics, obsid, "source_region", key=stem) as rec:
+                xmm_check_extraction_window(exposure, config, *sky, rec=rec)
+
+        with record_step(diagnostics, obsid, "pileup_check", key=stem) as rec:
+            xmm_pileup_check(
+                obsid,
+                exposure,
+                config,
+                events,
+                sky=sky,
+                rec=rec,
+                env=env,
+                log_to=tool_log_file(f"epatplot_{stem}", obsid, config),
+            )
+
+        with record_step(diagnostics, obsid, "calculate_spectra", key=stem) as rec:
+            xmm_calculate_spectra(
+                obsid,
+                exposure,
+                config,
+                events,
+                ra,
+                dec,
+                sky=sky,
+                rec=rec,
+                env=env,
+                log_to=tool_log_file(f"especget_{stem}", obsid, config),
+            )
+
+    logger.info(f"Finished processing XMM-Newton observation {obsid}")
+    return None
