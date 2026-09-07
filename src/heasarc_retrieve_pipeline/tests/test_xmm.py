@@ -1507,6 +1507,201 @@ class TestWhatThePositionCheckRecords:
         assert rec.status == "skipped"
 
 
+def an_event_file(path, hdu="EVENTS", **keywords):
+    """A file with the shape ``epatplot`` leaves behind: events, and its numbers on them."""
+    from astropy.io import fits
+
+    events = fits.BinTableHDU.from_columns(
+        [fits.Column(name="TIME", format="D", array=np.array([1.0, 2.0]))], name="EVENTS"
+    )
+    primary = fits.PrimaryHDU()
+    destination = primary if hdu == "PRIMARY" else events
+    for key, value in keywords.items():
+        destination.header[key] = value
+    fits.HDUList([primary, events]).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+PILED_UP = dict(SNGL_OTM=0.82, ESGL_OTM=0.02, DBLE_OTM=1.31, EDBL_OTM=0.03)
+NOT_PILED_UP = dict(SNGL_OTM=0.99, ESGL_OTM=0.02, DBLE_OTM=1.02, EDBL_OTM=0.03)
+
+
+class StubSas:
+    """
+    A SAS that writes what each task claims to produce, and remembers how it was called.
+
+    In the mould of ``test_segments.py``'s ``StubNuproducts``. The files have to be
+    written because :func:`heasarc_retrieve_pipeline.sas.run` checks a task's outputs, and
+    ``epatplot`` has to write its keywords onto its input because that -- not its standard
+    output -- is where its answer is documented to appear.
+    """
+
+    def __init__(self, keywords=None):
+        self.calls = []
+        self.keywords = keywords
+
+    def __call__(self, name, *, produces, log_to=None, capture=False, env=None, **params):
+        self.calls.append((name, params))
+        for output in produces if isinstance(produces, (list, tuple)) else [produces]:
+            os.makedirs(os.path.dirname(str(output)), exist_ok=True)
+            if not os.path.exists(str(output)):
+                if str(output).endswith(".evt"):
+                    an_event_file(str(output))
+                else:
+                    open(str(output), "w").write("stub\n")
+        if name == "epatplot" and self.keywords is not None:
+            an_event_file(params["set"], **self.keywords)
+        return None
+
+    def task(self, name):
+        return [params for called, params in self.calls if called == name]
+
+
+@pytest.fixture
+def stub_sas(monkeypatch):
+    def install(keywords=None):
+        from heasarc_retrieve_pipeline import sas
+
+        stub = StubSas(keywords)
+        monkeypatch.setattr(sas, "run", stub)
+        return stub
+
+    return install
+
+
+class TestReadingThePileupNumbers:
+    """
+    Where ``epatplot``'s answer is, which is not its standard output.
+
+    The task documents that it appends the observed-to-model singles and doubles pattern
+    fractions to the *input* event set, as ``SNGL_OTM`` and ``DBLE_OTM`` with one-sigma
+    errors ``ESGL_OTM`` and ``EDBL_OTM``. Reading keywords beats scraping a screen.
+    """
+
+    def test_the_numbers_come_off_the_event_extension(self, tmp_path):
+        ratios = xmm.read_pileup_ratios(an_event_file(tmp_path / "src.evt", **PILED_UP))
+
+        assert ratios.singles == 0.82
+        assert ratios.singles_error == 0.02
+        assert ratios.doubles == 1.31
+        assert ratios.doubles_error == 0.03
+
+    def test_they_are_found_wherever_in_the_file_they_are_written(self, tmp_path):
+        path = an_event_file(tmp_path / "src.evt", hdu="PRIMARY", **PILED_UP)
+
+        assert xmm.read_pileup_ratios(path).singles == 0.82
+
+    def test_a_file_without_them_yields_nothing_rather_than_a_zero(self, tmp_path):
+        assert xmm.read_pileup_ratios(an_event_file(tmp_path / "src.evt")) is None
+
+    def test_pileup_is_a_low_singles_ratio_and_a_high_doubles_one(self, tmp_path):
+        piled = xmm.read_pileup_ratios(an_event_file(tmp_path / "a.evt", **PILED_UP))
+        clean = xmm.read_pileup_ratios(an_event_file(tmp_path / "b.evt", **NOT_PILED_UP))
+
+        assert piled.is_piled_up(sigma=3.0)
+        assert not clean.is_piled_up(sigma=3.0)
+
+    def test_a_ratio_within_its_errors_of_one_is_not_pileup(self, tmp_path):
+        # 0.95 +/- 0.02 is three sigma from 1.0, and 0.95 +/- 0.05 is one. The same
+        # number means different things with different statistics, so the error bars
+        # decide and not the ratio alone.
+        noisy = xmm.read_pileup_ratios(
+            an_event_file(
+                tmp_path / "c.evt", SNGL_OTM=0.95, ESGL_OTM=0.05, DBLE_OTM=1.0, EDBL_OTM=0.05
+            )
+        )
+
+        assert not noisy.is_piled_up(sigma=3.0)
+
+
+class TestThePileupCheck:
+    """
+    Running ``epatplot`` on the events a spectrum would be built from.
+
+    Pile-up is a property of the source region, not of the field, so the region is cut out
+    first. The check never changes anything: it reports two numbers and, when they say the
+    spectrum is piled up, says so loudly enough to be seen on the page.
+    """
+
+    def a_check(self, tmp_path, stub_sas, keywords=NOT_PILED_UP, exposure=None, **extra):
+        stub = stub_sas(keywords)
+        config = xmm.xmm_config(dict(out_data_path=str(tmp_path), **extra))
+        exposure = exposure or an_exposure(None, instrument="pn", mode=xmm.TIMING)
+        events = str(tmp_path / "cleaned.evt")
+        an_event_file(events)
+        with record_step(str(tmp_path / "diag"), "0153950401", "pileup_check") as rec:
+            ratios = xmm.xmm_pileup_check(
+                "0153950401", exposure, config, events, sky=(26000.0, 25000.0), rec=rec
+            )
+        return ratios, rec, stub
+
+    def test_the_source_region_is_cut_out_before_the_patterns_are_counted(self, tmp_path, stub_sas):
+        _, _, stub = self.a_check(tmp_path, stub_sas)
+
+        (selection,) = stub.task("evselect")
+        assert selection["expression"] == "(RAWX in [31:45])"
+        assert selection["table"] == str(tmp_path / "cleaned.evt")
+
+    def test_epatplot_reads_the_source_events_and_not_the_whole_field(self, tmp_path, stub_sas):
+        _, _, stub = self.a_check(tmp_path, stub_sas)
+
+        (plot,) = stub.task("epatplot")
+        assert plot["set"].endswith("pnS004_timing_src.evt")
+
+    def test_an_imaging_exposure_is_checked_at_its_sky_position(self, tmp_path, stub_sas):
+        exposure = an_exposure(None, instrument="mos2", mode=xmm.IMAGING)
+
+        _, _, stub = self.a_check(tmp_path, stub_sas, exposure=exposure)
+
+        (selection,) = stub.task("evselect")
+        assert "circle(26000.0000,25000.0000" in selection["expression"]
+
+    def test_the_two_numbers_are_recorded_for_the_page(self, tmp_path, stub_sas):
+        ratios, rec, _ = self.a_check(tmp_path, stub_sas, keywords=PILED_UP)
+
+        assert ratios.singles == 0.82
+        assert rec.values["singles"] == 0.82
+        assert rec.values["doubles"] == 1.31
+        assert rec.values["piled_up"] is True
+
+    def test_a_clean_spectrum_is_recorded_as_one(self, tmp_path, stub_sas):
+        _, rec, _ = self.a_check(tmp_path, stub_sas)
+
+        assert rec.values["piled_up"] is False
+
+    def test_pileup_warns_and_does_not_raise(self, tmp_path, stub_sas, caplog):
+        with caplog.at_level("WARNING"):
+            self.a_check(tmp_path, stub_sas, keywords=PILED_UP)
+
+        assert "piled up" in caplog.text.lower()
+
+    def test_a_camera_with_no_timing_strip_is_a_skip_and_not_a_failure(self, tmp_path, stub_sas):
+        exposure = an_exposure(None, instrument="mos1", mode=xmm.TIMING)
+
+        ratios, rec, stub = self.a_check(tmp_path, stub_sas, exposure=exposure)
+
+        assert ratios is None
+        assert rec.status == "skipped"
+        assert stub.calls == []
+
+    def test_a_task_that_wrote_no_numbers_is_a_skip_too(self, tmp_path, stub_sas):
+        ratios, rec, _ = self.a_check(tmp_path, stub_sas, keywords=None)
+
+        assert ratios is None
+        assert rec.status == "skipped"
+
+    def test_the_plot_lands_beside_the_events_it_describes(self, tmp_path, stub_sas):
+        self.a_check(tmp_path, stub_sas)
+
+        plot = xmm.xmm_pileup_plot_path(
+            "0153950401",
+            an_exposure(None, instrument="pn", mode=xmm.TIMING),
+            xmm.xmm_config(dict(out_data_path=str(tmp_path))),
+        )
+        assert os.path.exists(plot)
+        assert os.path.basename(plot) == "pnS004_timing_pat.ps"
+
+
 class TestWhereTheCleanedFilesGo:
     """
     One exposure can hold two modes, so the names have to carry the mode.

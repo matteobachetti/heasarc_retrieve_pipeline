@@ -89,6 +89,9 @@ DEFAULT_CONFIG = dict(
     # see :func:`xmm_timing_regions`.
     timing_src_rawx=dict(pn=(31, 45)),
     timing_bkg_rawx=dict(pn=(3, 5)),
+    # How far from one an ``epatplot`` pattern ratio has to be, in its own error bars,
+    # before the spectrum is called piled up -- see :class:`PileupRatios`.
+    pileup_warn_sigma=3.0,
 )
 
 #: The EPIC cameras, by the two-character instrument code PPS names them with. The codes
@@ -1674,3 +1677,229 @@ def xmm_clean_event_list(obsid, exposure, config, gti=None, env=None, log_to=Non
         expression=xmm_screening_expression(exposure.instrument, exposure.mode, gti_file=gti_file),
     )
     return output
+
+
+def xmm_source_event_list_path(obsid, exposure, config):
+    """
+    Where the events inside one exposure's source region go.
+
+    The pile-up check needs them, because pile-up is a property of the region a spectrum
+    is built from and not of the field around it.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_src.evt``.
+    """
+    return os.path.join(
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_src.evt"
+    )
+
+
+def xmm_pileup_plot_path(obsid, exposure, config):
+    """
+    Where one exposure's ``epatplot`` diagram goes, beside the events it describes.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_pat.ps``.
+    """
+    return os.path.join(
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_pat.ps"
+    )
+
+
+#: The keywords ``epatplot`` appends to the event set it was given: the observed-to-model
+#: singles and doubles pattern fractions and their one-sigma errors. Documented output,
+#: not reverse-engineered -- the task's own page says the two numbers "are printed both to
+#: the console and on the plot and are appended to the input event set as attributes
+#: SNGL_OTM and DBLE_OTM". Keywords are read here in preference to the console for the
+#: same reason ``ecoordconv``'s output is parsed only because it writes no file at all.
+PILEUP_KEYWORDS = ("SNGL_OTM", "ESGL_OTM", "DBLE_OTM", "EDBL_OTM")
+
+
+@dataclass(frozen=True)
+class PileupRatios:
+    """
+    What ``epatplot`` measured about one source region.
+
+    Attributes
+    ----------
+    singles, doubles : float
+        Observed-to-model pattern fractions over 0.5-2.0 keV. Both are 1.0 when there is
+        no pile-up. When there is, two photons landing in one frame are read as one event
+        of a larger pattern, so singles go missing and doubles are made: the singles ratio
+        falls below one and the doubles ratio rises above it.
+    singles_error, doubles_error : float
+        One-sigma errors, as the task reports them.
+    """
+
+    singles: float
+    singles_error: float
+    doubles: float
+    doubles_error: float
+
+    def is_piled_up(self, sigma=3.0):
+        """
+        Whether either ratio is far enough from one to mean something.
+
+        The error bars decide, not the ratio: 0.95 +/- 0.02 is a detection of pile-up and
+        0.95 +/- 0.05 is a short exposure.
+
+        Examples
+        --------
+        >>> PileupRatios(0.82, 0.02, 1.31, 0.03).is_piled_up()
+        True
+        >>> PileupRatios(0.95, 0.05, 1.00, 0.05).is_piled_up()
+        False
+        """
+        return bool(
+            self.singles + sigma * self.singles_error < 1.0
+            or self.doubles - sigma * self.doubles_error > 1.0
+        )
+
+
+def read_pileup_ratios(path):
+    """
+    The pile-up numbers ``epatplot`` wrote onto an event set.
+
+    Every header is searched rather than one named, because "attribute of the event set"
+    is SAS's own wording and which block carries it is not part of what the task
+    documents.
+
+    Parameters
+    ----------
+    path : str
+        The event set ``epatplot`` was run on.
+
+    Returns
+    -------
+    PileupRatios or None
+        ``None`` when the keywords are absent -- an ``epatplot`` that plotted but could
+        not fit, which is a step to skip and not a zero to record.
+    """
+    from astropy.io import fits
+
+    with fits.open(path) as hdul:
+        for hdu in hdul:
+            if all(keyword in hdu.header for keyword in PILEUP_KEYWORDS):
+                return PileupRatios(*(float(hdu.header[key]) for key in PILEUP_KEYWORDS))
+    return None
+
+
+def xmm_pileup_check(obsid, exposure, config, events, sky=None, rec=None, env=None, log_to=None):
+    """
+    Measure the pile-up of one exposure's source region with ``epatplot``.
+
+    **A diagnostic and nothing else.** Pile-up is corrected by throwing the middle of the
+    point spread function away -- an annulus instead of a circle -- and that changes which
+    photons the science is done with. Deciding it automatically would silently hand back a
+    different spectrum than the one that was asked for, so this measures, records and
+    warns, and the decision stays with the person reading the page.
+
+    The source region is cut out first, for both modes: a circle on the sky for an imaging
+    exposure, a strip of detector columns for a timing one.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    events : str
+        The cleaned event list, from :func:`xmm_clean_event_list`.
+    sky : tuple of float, optional
+        ``(x, y)`` sky position, from :func:`xmm_source_sky_position`. Needed by imaging
+        exposures only.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where the numbers go. ``None`` records nothing.
+    env : dict, optional
+        Environment for the tasks, from
+        :func:`heasarc_retrieve_pipeline.sas.sas_environment`.
+    log_to : str, optional
+        File the tasks' output goes to.
+
+    Returns
+    -------
+    PileupRatios or None
+        ``None`` when the check could not be made -- a camera with no timing strip
+        configured, or an ``epatplot`` that wrote no numbers.
+    """
+    from . import sas
+
+    logger = get_logger()
+    if rec is None:
+        rec = no_record()
+
+    regions = xmm_exposure_regions(exposure, config, sky=sky)
+    if regions is None:
+        reason = (
+            f"{exposure.instrument}{exposure.expid} has no extraction region in "
+            f"{exposure.mode} mode, so its pile-up cannot be measured"
+        )
+        logger.warning(reason)
+        rec.skip(reason)
+        return None
+
+    source_events = xmm_source_event_list_path(obsid, exposure, config)
+    os.makedirs(os.path.dirname(source_events), exist_ok=True)
+    sas.run(
+        "evselect",
+        produces=source_events,
+        log_to=log_to,
+        env=env,
+        table=events,
+        withfilteredset="yes",
+        filteredset=source_events,
+        keepfilteroutput="yes",
+        expression=regions[0],
+    )
+
+    plot = xmm_pileup_plot_path(obsid, exposure, config)
+    sas.run(
+        "epatplot",
+        produces=plot,
+        log_to=log_to,
+        env=env,
+        set=source_events,
+        device="/VCPS",
+        outdir=os.path.dirname(plot),
+        useplotfile="yes",
+        plotfile=os.path.basename(plot),
+    )
+
+    ratios = read_pileup_ratios(source_events)
+    if ratios is None:
+        reason = f"epatplot wrote no pattern ratios onto {os.path.basename(source_events)}"
+        logger.warning(reason)
+        rec.skip(reason)
+        return None
+
+    piled_up = ratios.is_piled_up(sigma=config["pileup_warn_sigma"])
+    rec.value(
+        singles=ratios.singles,
+        singles_error=ratios.singles_error,
+        doubles=ratios.doubles,
+        doubles_error=ratios.doubles_error,
+        piled_up=piled_up,
+        region=regions[0],
+        plot=os.path.basename(plot),
+    )
+
+    numbers = (
+        f"singles {ratios.singles:.3f} +/- {ratios.singles_error:.3f}, "
+        f"doubles {ratios.doubles:.3f} +/- {ratios.doubles_error:.3f}"
+    )
+    if piled_up:
+        logger.warning(
+            f"{exposure.instrument}{exposure.expid} looks piled up: {numbers}, where "
+            f"both should be 1. Its spectrum will be biased. Extracting it anyway -- "
+            f"excluding the core of the point spread function is a decision for whoever "
+            f"reads {os.path.basename(plot)}, not for the pipeline."
+        )
+    else:
+        logger.info(f"{exposure.instrument}{exposure.expid} shows no pile-up: {numbers}")
+    return ratios

@@ -80,6 +80,7 @@ STEP_TITLES = {
     "separate_sources": "Source separation",
     "source_region": "Extraction region",
     "source_position": "Source position",
+    "pileup_check": "Pile-up check",
     "join_source_data": "Source join",
     "flare_filtering": "Solar-flare filtering",
     "calculate_spectra": "Spectral extraction",
