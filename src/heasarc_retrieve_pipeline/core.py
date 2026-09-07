@@ -925,6 +925,60 @@ MISSION_CONFIG = {
 }
 
 
+#: The arguments a ``"download_filter"`` is allowed to return. They are the two
+#: :func:`recursive_download` already takes.
+DOWNLOAD_FILTER_ARGUMENTS = frozenset({"re_include", "re_exclude"})
+
+
+def mission_download_filter(mission: str, config: dict) -> dict:
+    """
+    What of an observation directory this mission wants downloaded.
+
+    A mission may declare a ``"download_filter"`` in :data:`MISSION_CONFIG`: a callable
+    taking the run's config and returning ``re_include`` and/or ``re_exclude`` for
+    :func:`recursive_download`. It is a callable and not a literal because the filter can
+    depend on the run -- XMM downloads different files on its PPS route than on its ODF
+    route, and the route is a config key.
+
+    Most missions declare nothing and download the whole directory, which is what every
+    mission did before this existed.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of :data:`MISSION_CONFIG`.
+    config : dict
+        The run's configuration, as the mission's reduction will see it.
+
+    Returns
+    -------
+    dict
+        Keyword arguments for :func:`recursive_download`; empty if this mission filters
+        nothing.
+
+    Raises
+    ------
+    ValueError
+        If the filter names anything but ``re_include`` and ``re_exclude``. A misspelt
+        key would otherwise be dropped in silence, and the symptom -- a whole gigabyte
+        arriving where forty megabytes were meant to -- looks like a slow network rather
+        than like a bug.
+    """
+    build_filter = MISSION_CONFIG[mission].get("download_filter")
+    if build_filter is None:
+        return {}
+
+    arguments = build_filter(config)
+    unknown = set(arguments) - DOWNLOAD_FILTER_ARGUMENTS
+    if unknown:
+        raise ValueError(
+            f"The download filter of {mission} names {', '.join(sorted(unknown))}, which "
+            f"recursive_download does not take. It takes "
+            f"{', '.join(sorted(DOWNLOAD_FILTER_ARGUMENTS))}."
+        )
+    return arguments
+
+
 @task(task_run_name="read_config_{config_file}")
 def read_config(config_file: str):
     """
@@ -1520,7 +1574,13 @@ def download_and_process_observation(
                 rec.skip("files already downloaded and decrypted in a prior run")
                 return None
 
-            recursive_download(url, outdir, test_str=".", test=test)
+            recursive_download(
+                url,
+                outdir,
+                test_str=".",
+                test=test,
+                **mission_download_filter(mission, config),
+            )
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None

@@ -703,3 +703,100 @@ class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
         tables = {config["table"] for config in MISSION_CONFIG.values()}
 
         assert tables <= set(CATALOGUE_COLUMNS)
+
+
+class TestThePerMissionDownloadFilter:
+    """
+    Some missions want only part of an observation directory.
+
+    ``recursive_download`` has taken ``re_include`` and ``re_exclude`` all along and
+    nothing ever passed them. A mission declares a ``"download_filter"`` callable in
+    ``MISSION_CONFIG``, the run's config chooses which filter it returns, and missions
+    that declare nothing download whole directories exactly as before.
+    """
+
+    def a_mission_like_nustar(self, monkeypatch, **extra):
+        """Register a fictional mission, so the real ones are not disturbed."""
+        monkeypatch.setitem(
+            core.MISSION_CONFIG, "fictional", dict(MISSION_CONFIG["nustar"], **extra)
+        )
+        return "fictional"
+
+    def test_a_mission_that_declares_no_filter_downloads_the_whole_directory(self):
+        assert core.mission_download_filter("nustar", {}) == {}
+
+    def test_a_mission_that_declares_one_gets_it(self, monkeypatch):
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_include": r"\.evt"}
+        )
+
+        assert core.mission_download_filter(mission, {}) == {"re_include": r"\.evt"}
+
+    def test_the_run_config_is_what_chooses_the_filter(self, monkeypatch):
+        """XMM's filter differs between the PPS and the ODF route, which is a config key."""
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_include": config["products"]}
+        )
+
+        assert core.mission_download_filter(mission, {"products": "pps"}) == {"re_include": "pps"}
+        assert core.mission_download_filter(mission, {"products": "odf"}) == {"re_include": "odf"}
+
+    def test_a_filter_may_name_only_the_arguments_the_download_takes(self, monkeypatch):
+        """A misspelt key would silently download the whole gigabyte instead of 40 MB."""
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_includes": r"\.evt"}
+        )
+
+        with pytest.raises(ValueError, match="re_includes"):
+            core.mission_download_filter(mission, {})
+
+
+class TestTheDownloadFilterReachesTheDownload:
+    """The wiring, from ``MISSION_CONFIG`` down to the call that fetches the files."""
+
+    def a_download_that_records_its_arguments(self, monkeypatch):
+        seen = {}
+
+        def recursive_download(url, outdir, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(core, "recursive_download", recursive_download)
+        return seen
+
+    def download(self, tmp_path, mission):
+        core.download_and_process_observation.fn(
+            "80002092008",
+            "https://example.invalid/80002092008",
+            83.0,
+            22.0,
+            str(tmp_path),
+            mission,
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            test=True,
+        )
+
+    def test_a_mission_without_a_filter_passes_none(self, tmp_path, monkeypatch):
+        seen = self.a_download_that_records_its_arguments(monkeypatch)
+
+        self.download(tmp_path, "nustar")
+
+        assert "re_include" not in seen
+        assert "re_exclude" not in seen
+
+    def test_a_mission_with_a_filter_passes_it(self, tmp_path, monkeypatch):
+        seen = self.a_download_that_records_its_arguments(monkeypatch)
+        monkeypatch.setitem(
+            core.MISSION_CONFIG,
+            "fictional",
+            dict(
+                MISSION_CONFIG["nustar"],
+                download_filter=lambda config: {"re_include": r"EVLI", "re_exclude": r"\.PNG$"},
+            ),
+        )
+
+        self.download(tmp_path, "fictional")
+
+        assert seen["re_include"] == r"EVLI"
+        assert seen["re_exclude"] == r"\.PNG$"

@@ -130,23 +130,47 @@ in the download half of the code:
      - ``numaster``
      - ``exposure_a``
      - ``name``
-     - ``solar_activity``
+     - ``cycle``, ``solar_activity``
    * - ``nicer``
      - ``nicermastr``
      - ``exposure``
      - ``name``
-     - --
+     - ``cycle``
    * - ``rxte``
      - ``xtemaster``
      - ``exposure``
      - ``target_name``
      - ``cycle``, ``prnb``
 
-Each entry also carries ``obsid_processing``, the flow that reduces one observation.
+Each entry also carries ``obsid_processing``, the flow that reduces one observation, and
+may carry an optional ``download_filter``.
 
 The differences are real archive quirks, not arbitrary: NuSTAR's master catalogue reports
 per-telescope exposures (``exposure_a`` is FPMA), and RXTE's catalogue uses ``target_name``
-rather than ``name`` and needs ``cycle`` and ``prnb`` selected alongside it.
+rather than ``name`` and needs ``prnb`` selected alongside it.
+
+``cycle`` is in the extra columns of all three, and not in the query text, because it is
+not universal: ``numaster``, ``nicermastr`` and ``xtemaster`` have it and ``xmmmaster``
+does not. Only the columns *every* master catalogue has may be written into a query
+literally; anything else belongs to the mission that has it. ``test_core.py`` holds a
+recorded copy of each catalogue's schema and asserts that no mission asks for a column its
+catalogue lacks, so a mission added later cannot rediscover this by failing against the
+live archive.
+
+Downloading only part of an observation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``recursive_download`` has always taken ``re_include`` and ``re_exclude``, and for a long
+time nothing passed them: every mission downloaded whole observation directories. A
+mission that wants less declares a ``download_filter`` in ``MISSION_CONFIG``, and
+``mission_download_filter`` (``core.py``) calls it and forwards the result.
+
+It is a callable taking the run's config, rather than a literal pair of patterns, because
+the answer can depend on the run and not only on the mission: XMM downloads different files
+on its PPS route than on its ODF route, and which route is taken is a config key. A filter
+that returns anything but ``re_include`` and ``re_exclude`` raises, because a misspelt key
+would be dropped in silence and the symptom -- a whole gigabyte arriving where forty
+megabytes were meant to -- reads as a slow network rather than as a bug.
 
 Entries used to carry a ``path_func`` as well, building an archive path from the OBSID.
 Nothing needs it: the URL of an observation's directory comes from the datalink service,
@@ -193,8 +217,7 @@ Notes on the astronomy encoded here:
   filtering the caller does on the table.
 
 The single-OBSID query (``retrieve_info_for_obsid``, ``core.py:343``) is the same shape
-with ``WHERE cat.obsid = '<obsid>'``, and additionally selects ``cycle`` for every mission
-(all three master catalogues have it).
+with ``WHERE cat.obsid IN (...)``, and selects no ``public_date``.
 
 Locating the files
 ~~~~~~~~~~~~~~~~~~
