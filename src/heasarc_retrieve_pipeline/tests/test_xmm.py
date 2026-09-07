@@ -1135,7 +1135,7 @@ class TestTheScreeningExpression:
     """
 
     def test_pn_gets_the_pn_macro_and_the_single_pixel_patterns(self):
-        expression = xmm.xmm_screening_expression("pn")
+        expression = xmm.xmm_screening_expression("pn", xmm.IMAGING)
 
         assert "#XMMEA_EP" in expression
         assert "PATTERN<=4" in expression
@@ -1143,27 +1143,55 @@ class TestTheScreeningExpression:
     def test_pn_alone_rejects_the_flagged_events(self):
         # FLAG==0 is deliberately not applied to MOS: on MOS it also throws away events
         # near the chip edges that the standard threads keep.
-        assert "FLAG==0" in xmm.xmm_screening_expression("pn")
-        assert "FLAG==0" not in xmm.xmm_screening_expression("mos1")
+        assert "FLAG==0" in xmm.xmm_screening_expression("pn", xmm.IMAGING)
+        assert "FLAG==0" not in xmm.xmm_screening_expression("mos1", xmm.IMAGING)
 
     def test_both_mos_cameras_get_the_mos_macro_and_the_wider_patterns(self):
         for instrument in ("mos1", "mos2"):
-            expression = xmm.xmm_screening_expression(instrument)
+            expression = xmm.xmm_screening_expression(instrument, xmm.IMAGING)
 
             assert "#XMMEA_EM" in expression
             assert "PATTERN<=12" in expression
 
     def test_every_camera_keeps_the_same_energy_band(self):
         for instrument in ("pn", "mos1", "mos2"):
-            assert "(PI in [200:12000])" in xmm.xmm_screening_expression(instrument)
+            for mode in (xmm.IMAGING, xmm.TIMING):
+                assert "(PI in [200:12000])" in xmm.xmm_screening_expression(instrument, mode)
+
+    def test_pn_is_screened_the_same_way_in_both_modes(self):
+        # There is no timing-specific screening macro in SAS 22.1.0 -- #XMMEA_EP,
+        # #XMMEA_EM and #XMMEA_SM are the only EPIC ones -- and xmmextractor, SAS's own
+        # automatic reduction, documents applying PATTERN<=4, FLAG==0 and #XMMEA_EP to pn
+        # whatever mode it is in.
+        assert xmm.xmm_screening_expression("pn", xmm.TIMING) == xmm.xmm_screening_expression(
+            "pn", xmm.IMAGING
+        )
+
+    def test_mos_in_timing_keeps_only_the_single_pixel_events(self):
+        # The one real difference between the modes, and it is xmmextractor's:
+        # PATTERN<=12 in imaging, PATTERN==0 in timing.
+        expression = xmm.xmm_screening_expression("mos1", xmm.TIMING)
+
+        assert "PATTERN==0" in expression
+        assert "PATTERN<=12" not in expression
+        assert "#XMMEA_EM" in expression
+
+    def test_a_mode_nobody_has_heard_of_is_an_error(self):
+        with pytest.raises(KeyError):
+            xmm.xmm_screening_expression("pn", "burst")
 
     def test_a_good_time_interval_file_is_added_as_a_filter(self):
-        expression = xmm.xmm_screening_expression("pn", gti_file="flare.gti")
+        expression = xmm.xmm_screening_expression("pn", xmm.IMAGING, gti_file="flare.gti")
+
+        assert expression.endswith("&& gti(flare.gti,TIME)")
+
+    def test_a_timing_exposure_is_filtered_on_time_the_same_way(self):
+        expression = xmm.xmm_screening_expression("pn", xmm.TIMING, gti_file="flare.gti")
 
         assert expression.endswith("&& gti(flare.gti,TIME)")
 
     def test_without_a_file_nothing_about_time_is_said(self):
-        assert "gti(" not in xmm.xmm_screening_expression("pn")
+        assert "gti(" not in xmm.xmm_screening_expression("pn", xmm.IMAGING)
 
 
 class TestWritingAGoodTimeIntervalFile:

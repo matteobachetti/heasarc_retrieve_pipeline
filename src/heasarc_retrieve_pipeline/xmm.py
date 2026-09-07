@@ -1024,7 +1024,7 @@ SOURCE_LIST_FLUX_COLUMN = "EP_TOT_FLUX"
 #: than written out: a bare ``0.05`` in an expression says nothing about what it is.
 SKY_PIXEL_ARCSEC = 0.05
 
-#: Standard EPIC event screening, by camera family.
+#: Standard EPIC event screening, by camera family and mode.
 #:
 #: ``#XMMEA_EP`` and ``#XMMEA_EM`` are macros SAS expands from the calibration -- they
 #: stand for a list of event attributes that changes with the calibration, which is
@@ -1034,16 +1034,26 @@ SKY_PIXEL_ARCSEC = 0.05
 #: ``FLAG==0`` is applied to pn and not to MOS on purpose. It is the strictest possible
 #: cut, and on MOS it also throws away good events near the chip edges; the standard SAS
 #: threads apply it to pn alone.
+#:
+#: **The mode changes one number, not the macro.** There is no timing-specific screening
+#: macro to change to: ``#XMMEA_EP``, ``#XMMEA_EM`` and ``#XMMEA_SM`` are the only EPIC
+#: ones in SAS 22.1.0. What does differ is MOS's pattern cut, and the authority for that
+#: is SAS's own automatic reduction: ``xmmextractor`` documents applying ``PATTERN<=4``,
+#: ``FLAG==0`` and ``#XMMEA_EP`` to pn, and ``PATTERN<=12`` (imaging) or ``PATTERN==0``
+#: (timing) with ``#XMMEA_EM`` to MOS. A MOS timing read-out has one dimension collapsed,
+#: so a multi-pixel pattern there is not the split charge cloud it is in an image.
 SCREENING_EXPRESSIONS = {
-    "pn": "#XMMEA_EP && (PATTERN<=4) && (PI in [200:12000]) && FLAG==0",
-    "mos": "#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000])",
+    ("pn", IMAGING): "#XMMEA_EP && (PATTERN<=4) && (PI in [200:12000]) && FLAG==0",
+    ("pn", TIMING): "#XMMEA_EP && (PATTERN<=4) && (PI in [200:12000]) && FLAG==0",
+    ("mos", IMAGING): "#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000])",
+    ("mos", TIMING): "#XMMEA_EM && (PATTERN==0) && (PI in [200:12000])",
 }
 
 #: Extension name of the good time interval files this module writes.
 GTI_EXTENSION = "STDGTI"
 
 
-def xmm_screening_expression(instrument, gti_file=None):
+def xmm_screening_expression(instrument, mode, gti_file=None):
     """
     The ``evselect`` expression that cleans one camera's events.
 
@@ -1051,6 +1061,10 @@ def xmm_screening_expression(instrument, gti_file=None):
     ----------
     instrument : str
         ``"pn"``, ``"mos1"`` or ``"mos2"``.
+    mode : str
+        :data:`IMAGING` or :data:`TIMING`. Required rather than defaulted, because a
+        timing exposure screened as an image is wrong in a way nothing downstream would
+        notice -- see :data:`SCREENING_EXPRESSIONS`.
     gti_file : str, optional
         Good time intervals to apply as well, as written by :func:`write_gti_file`.
         ``None`` screens on event attributes alone, which is what an exposure with no
@@ -1060,14 +1074,21 @@ def xmm_screening_expression(instrument, gti_file=None):
     -------
     str
 
+    Raises
+    ------
+    KeyError
+        For a camera or a mode this module does not know.
+
     Examples
     --------
-    >>> xmm_screening_expression("mos1")
+    >>> xmm_screening_expression("mos1", IMAGING)
     '#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000])'
-    >>> xmm_screening_expression("mos1", gti_file="flare.gti")
+    >>> xmm_screening_expression("mos1", TIMING)
+    '#XMMEA_EM && (PATTERN==0) && (PI in [200:12000])'
+    >>> xmm_screening_expression("mos1", IMAGING, gti_file="flare.gti")
     '#XMMEA_EM && (PATTERN<=12) && (PI in [200:12000]) && gti(flare.gti,TIME)'
     """
-    expression = SCREENING_EXPRESSIONS[camera_family(instrument)]
+    expression = SCREENING_EXPRESSIONS[(camera_family(instrument), mode)]
     if gti_file is None:
         return expression
     return f"{expression} && gti({gti_file},TIME)"
@@ -1532,6 +1553,6 @@ def xmm_clean_event_list(obsid, exposure, config, gti=None, env=None, log_to=Non
         withfilteredset="yes",
         filteredset=output,
         keepfilteroutput="yes",
-        expression=xmm_screening_expression(exposure.instrument, gti_file=gti_file),
+        expression=xmm_screening_expression(exposure.instrument, exposure.mode, gti_file=gti_file),
     )
     return output
