@@ -148,6 +148,11 @@ BARYCENTRED_TIMEREF = "SOLARSYSTEM"
 #: header anyway -- see :func:`xmm_exposures_from_odf`.
 ODF_EVENT_LIST_GLOB = "*Evts.ds"
 
+#: The two tasks that turn raw telemetry into event lists, and the camera family each
+#: covers. They are run separately and a failure of one does not stop the other: an
+#: observation with no pn is ordinary, and MOS data is worth reducing without it.
+ODF_PIPELINE_TASKS = {"epproc": "pn", "emproc": "mos"}
+
 #: SAS's own instrument names, to the camera names this module reasons in. Written by the
 #: same code path in a PPS product and in an ``epproc`` one, which is what makes reading
 #: them safer than parsing either route's file names.
@@ -2705,6 +2710,67 @@ def _time_system(event_list):
             if "TIMESYS" in hdu.header:
                 return hdu.header.get("TIMESYS"), hdu.header.get("TIMEREF")
     return None, None
+
+
+def xmm_run_odf_pipeline(obsid, config, env=None, log_to=None):
+    """
+    Turn one observation's raw telemetry into event lists with ``epproc`` and ``emproc``.
+
+    The ODF route's expensive step, and the reason that route exists: these tasks apply
+    the current calibration to the raw frames, where a PPS event list carries whatever
+    calibration the SOC had when it was made.
+
+    Both tasks are run, and **a failure of one does not stop the other**. An observation
+    with no pn exposure is ordinary, and a MOS-only reduction is worth having; the
+    observation fails only if neither task left an event list behind, which is checked
+    rather than inferred from return codes.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    env : dict, optional
+        SAS environment, with ``SAS_CCF`` and ``SAS_ODF`` already pointing at this
+        observation's calibration index and summary file.
+    log_to : callable, optional
+        Called with a task name, returning the file to send that task's output to.
+
+    Returns
+    -------
+    str
+        The directory the event lists are in.
+
+    Raises
+    ------
+    RuntimeError
+        If neither task produced an event list.
+    """
+    from . import sas
+
+    logger = get_logger()
+    events = xmm_odf_events_path(obsid, config)
+    os.makedirs(events, exist_ok=True)
+
+    for task in ODF_PIPELINE_TASKS:
+        logger.info(f"{obsid}: running {task}; this is the slow part of the ODF route")
+        try:
+            # The tasks take no arguments: they read SAS_ODF and SAS_CCF from the
+            # environment and write into the working directory. `produces=[]` because
+            # their output names are theirs to choose -- what they left is checked below.
+            sas.run(task, produces=[], log_to=log_to(task) if log_to else None, env=env, cwd=events)
+        except Exception as error:  # noqa: BLE001 -- one camera failing is not fatal
+            logger.warning(f"{obsid}: {task} failed ({error}); continuing without it")
+
+    produced = glob.glob(os.path.join(events, ODF_EVENT_LIST_GLOB))
+    if not produced:
+        raise RuntimeError(
+            f"{obsid}: neither {' nor '.join(ODF_PIPELINE_TASKS)} produced an event list "
+            f"in {events}."
+        )
+    logger.info(f"{obsid}: the ODF pipeline produced {len(produced)} event lists")
+    return events
 
 
 def _event_list_identity(event_list):

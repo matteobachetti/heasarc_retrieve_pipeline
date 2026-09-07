@@ -2934,3 +2934,82 @@ class TestWhatTheOdfPipelineProduced:
 
         assert len(exposures) == 1
         assert "brokenEvts.ds" in caplog.text
+
+
+class TestRunningTheOdfPipeline:
+    """
+    ``xmm_run_odf_pipeline``: both tasks run, and neither is trusted for having returned.
+    """
+
+    def config(self, tmp_path):
+        return dict(input_data_path=str(tmp_path), out_data_path=str(tmp_path))
+
+    def produce(self, directory, names=("pnEvts.ds",)):
+        def write(name, **kwargs):
+            for output in names:
+                an_odf_event_list(os.path.join(directory, output))
+
+        return write
+
+    def test_both_tasks_are_run(self, tmp_path, stub_sas, monkeypatch):
+        config = self.config(tmp_path)
+        directory = xmm.xmm_odf_events_path("0153950401", config)
+        stub = stub_sas()
+        os.makedirs(directory, exist_ok=True)
+        write = self.produce(directory)
+
+        def run(name, **kwargs):
+            result = stub(name, **kwargs)
+            write(name)
+            return result
+
+        monkeypatch.setattr(sas, "run", run)
+        xmm.xmm_run_odf_pipeline("0153950401", config)
+
+        assert [name for name, _ in stub.calls] == ["epproc", "emproc"]
+
+    def test_the_tasks_run_where_their_output_goes(self, tmp_path, stub_sas, monkeypatch):
+        config = self.config(tmp_path)
+        directory = xmm.xmm_odf_events_path("0153950401", config)
+        stub = stub_sas()
+        os.makedirs(directory, exist_ok=True)
+
+        def run(name, **kwargs):
+            result = stub(name, **kwargs)
+            an_odf_event_list(os.path.join(directory, "aEvts.ds"))
+            return result
+
+        monkeypatch.setattr(sas, "run", run)
+        xmm.xmm_run_odf_pipeline("0153950401", config)
+
+        assert all(params["cwd"] == directory for params in stub.task("epproc"))
+
+    def test_one_camera_failing_does_not_stop_the_other(
+        self, tmp_path, stub_sas, monkeypatch, caplog
+    ):
+        config = self.config(tmp_path)
+        directory = xmm.xmm_odf_events_path("0153950401", config)
+        stub = stub_sas()
+        os.makedirs(directory, exist_ok=True)
+
+        def run(name, **kwargs):
+            if name == "epproc":
+                raise RuntimeError("epproc returned 1")
+            result = stub(name, **kwargs)
+            an_odf_event_list(os.path.join(directory, "mosEvts.ds"), instrument="EMOS1")
+            return result
+
+        monkeypatch.setattr(sas, "run", run)
+        with caplog.at_level("WARNING"):
+            xmm.xmm_run_odf_pipeline("0153950401", config)
+
+        assert "epproc failed" in caplog.text
+        assert len(xmm.xmm_exposures_from_odf("0153950401", config)) == 1
+
+    def test_two_tasks_that_returned_zero_and_wrote_nothing_is_a_failure(self, tmp_path, stub_sas):
+        # Both tasks "succeed" and leave no event list. A return code is not evidence.
+        config = self.config(tmp_path)
+        stub_sas()
+
+        with pytest.raises(RuntimeError, match="produced an event list"):
+            xmm.xmm_run_odf_pipeline("0153950401", config)
