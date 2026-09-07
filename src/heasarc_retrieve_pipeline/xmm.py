@@ -1369,7 +1369,7 @@ def xmm_window_reach_arcsec(event_list, x, y):
     return float(max(reach, 0.0)) * SKY_PIXEL_ARCSEC
 
 
-def xmm_check_extraction_window(exposure, config, x, y, rec=None):
+def xmm_check_extraction_window(exposure, config, events, x, y, rec=None):
     """
     Warn when the background annulus asks for more detector than the exposure has.
 
@@ -1393,6 +1393,14 @@ def xmm_check_extraction_window(exposure, config, x, y, rec=None):
         Which camera, exposure and mode, and where its events are.
     config : dict
         A complete configuration, from :func:`xmm_config`.
+    events : str
+        The **cleaned** event list, from :func:`xmm_clean_event_list` -- not the exposure's
+        own ``event_list``, which is the archive's unscreened one. Measuring the raw list
+        answers a different question and answers it wrongly: it carries flagged events out
+        to the chip edges, which on ``0870940101``'s pn put the reach at 96.1 arcsec
+        against the cleaned 87.6, on either side of the 90 the annulus asks for. The
+        extraction runs on the cleaned events, so the window they cover is the window that
+        matters.
     x, y : float
         Sky position of the source, from :func:`xmm_source_sky_position`.
     rec : Recorder, optional
@@ -1407,7 +1415,7 @@ def xmm_check_extraction_window(exposure, config, x, y, rec=None):
     if exposure.mode != IMAGING:
         return None
 
-    reach = xmm_window_reach_arcsec(exposure.event_list, x, y)
+    reach = xmm_window_reach_arcsec(events, x, y)
     if reach is None:
         return None
 
@@ -2748,7 +2756,7 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
                 log_to=tool_log_file(f"ecoordconv_{stem}", obsid, config),
             )
             with record_step(diagnostics, obsid, "source_region", key=stem) as rec:
-                xmm_check_extraction_window(exposure, config, *sky, rec=rec)
+                xmm_check_extraction_window(exposure, config, events, *sky, rec=rec)
 
         with record_step(diagnostics, obsid, "pileup_check", key=stem) as rec:
             xmm_pileup_check(

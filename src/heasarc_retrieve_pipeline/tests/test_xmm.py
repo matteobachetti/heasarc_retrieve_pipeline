@@ -2288,10 +2288,13 @@ class TestWhatTheWindowCheckRecords:
 
     def check(self, tmp_path, ccds, radius=30.0, mode=xmm.IMAGING, submode="PrimePartialW3"):
         path = a_windowed_event_file(tmp_path / "events.ds", ccds, SUBMODE=submode)
-        exposure = an_exposure(None, mode=mode, event_list=path)
+        exposure = an_exposure(None, mode=mode, event_list="never-opened.FTZ")
         exposure = copy.replace(exposure, submode=submode)
         config = xmm.xmm_config(dict(self.CONFIG, src_radius_arcsec=radius))
-        return xmm.xmm_check_extraction_window(exposure, config, 26000, 26000)
+        # The cleaned events, not the exposure's own raw list -- and `never-opened.FTZ`
+        # does not exist, so a regression that went back to the raw list would fail here
+        # rather than quietly measure the wrong file.
+        return xmm.xmm_check_extraction_window(exposure, config, path, 26000, 26000)
 
     ROOMY = {1: (20000, 32000, 20000, 32000)}
     TIGHT = {1: (25700, 26300, 25700, 26300)}
