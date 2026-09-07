@@ -1548,6 +1548,22 @@ reading the outputs, and they are described in more detail in :ref:`technical_de
 * **XMM MOS Timing exposures get no spectrum.** Only pn has a ``RAWX`` extraction strip
   worth trusting by default, so a MOS timing exposure is cleaned, warned about and left
   there. Setting ``timing_src_rawx`` and ``timing_bkg_rawx`` for that camera extracts it.
+* **XMM extractions of M82 X-2 are blended with M82 X-1**, and this is accepted rather
+  than worked around. The two lie about 5 arcseconds apart, against an EPIC point spread
+  function roughly 6 arcseconds full width at half maximum and a default 30 arcsecond
+  extraction radius, so every circular region on X-2 contains both. Separating them needs
+  Chandra. The science these observations are reduced for is X-2's **1.37 s pulsation**,
+  which a period search still finds in the blend at a reduced pulsed fraction because X-1
+  contributes no power at that period. What must not be done is to quote the flux, count
+  rate or spectral shape of such an extraction as X-2's: they are X-1 + X-2 together, and
+  X-1 is the brighter of the pair at most epochs.
+* **XMM barycentring needs the observation's ODF housekeeping.** SAS ``barycen`` finds the
+  spacecraft orbit through ``SAS_ODF``, so the PPS route downloads about 3.8 MB of
+  housekeeping and runs ``odfingest`` on it purely to obtain a ``SUM.SAS``. An observation
+  whose ODF is missing reduces completely but is not barycentred: the step records
+  ``barycentered: false`` with a reason instead of failing the run. HEASOFT ``barycorr``
+  is not an alternative -- its own documentation limits it to RXTE, Swift, Chandra, NuSTAR
+  and NICER, and on XMM data it fails before reading an event.
 * **XMM pile-up is measured and never corrected.** ``epatplot`` writes the
   observed-to-model pattern ratios onto the page; excluding the core of the point spread
   function to remove pile-up changes which photons the science is done with, and is left
