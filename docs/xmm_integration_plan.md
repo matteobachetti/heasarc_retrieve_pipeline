@@ -697,7 +697,8 @@ That `evselect` accepted the file at all is the point that mattered: the OGIP ta
 
 Note that `evselect` needed no calibration access for this — `#XMMEA_EM` expanded from the
 event file itself — so the cleaning half of this step runs on an incomplete CCF. The
-`ecoordconv` half remains unverified on real data until the mirror finishes.
+`ecoordconv` half remained unverified on real data until the mirror finished; it has since
+run on every exposure of the M82 batch and of the ODF-route run, against a complete index.
 
 ## What changed while implementing step 8
 
@@ -1059,12 +1060,6 @@ only part a period search can see, is 0.3 ms in 27 ks.
 
 ## What changed while implementing step 10
 
-> **Not yet verified against a real SAS run.** Everything below is written and tested
-> offline, 21 tests over the four new pieces, and `epproc` has not been run once. Step 10
-> is the only part of this integration in that state; steps 1–9 and 11–12 were each checked
-> on real data before being called done. Treat the ODF route as untested until an
-> observation has been through it.
-
 **The ODF route reads header keywords where the PPS route parses names.** PPS product
 names are a published archive convention and parsing them is safe. `epproc` and `emproc`
 name their outputs themselves and have changed those names between SAS releases, so
@@ -1110,13 +1105,65 @@ shared, which is what the plan's "two front ends, one back end" was for. The cal
 index is read back out of `env["SAS_CCF"]` for the diagnostics record rather than passed
 alongside it, so the recorded index cannot drift from the one the tasks actually used.
 
-### What step 10 still needs
+### Verified against a real SAS run
 
-One ODF-route run on a real observation, checking that: `epproc` and `emproc` produce event
-lists this code recognises; `DATE-OBS` from the housekeeping satisfies `cifbuild`; the
-`evselect` curve is on the scale `odf_flare_rate_limit` expects; and the back end reduces
-those event lists as it does PPS ones. `0870940101` is the natural candidate, its ODF being
-already characterised.
+`0973390101`, 2026-09-08, end to end at one worker in 26 minutes: `1 of 1 observations
+reduced, 0 held no science data, 0 failed`.
+
+It was chosen over `0870940101`, which the plan nominated, because with it **the route is
+not forced**. HEASARC mirrors only this observation's ODF, so `xmm_resolve_config` chose
+the ODF route unaided — "holds no PPS directory, so this observation is reduced from its
+ODF rather than from the archive's own products" — which makes the run a test of the
+dispatch as well as of the route. It also exercises both tasks and both modes: a pn
+**timing** exposure and two MOS **imaging** ones, all `U002`.
+
+The four things this section previously listed as unverified:
+
+- **`epproc` and `emproc` produce event lists this code recognises.** `epproc`, 2.7 min,
+  wrote `4720_0973390101_EPN_U002_TimingEvts.ds` (102 MB); `emproc`, 5.0 min, wrote the two
+  `..._EMOS[12]_U002_ImagingEvts.ds` (20 MB each). Header discovery read `EMOS1_U002_
+  Imaging` back as mos1/`U002`/imaging without parsing a character of the name.
+- **`DATE-OBS` from the ODF housekeeping satisfies `cifbuild`**: `observationdate=
+  2025-09-16`, index built, and no later task complained about it.
+- **The `evselect` curve is on the scale `odf_flare_rate_limit` expects.** Both MOS curves
+  — `#XMMEA_EM && (PI>10000) && (PATTERN==0)`, 100 s bins — cut 31.7% of the exposure at
+  the cookbook's 0.35 counts/s: 28.4 ks down to 19.4 ks, 14 good intervals. The two cameras
+  agree to four digits (0.31712 against 0.31710), which is the cross-check step 6 uses on
+  the PPS route — they watch the same sky, so they must see the same flares. A limit on the
+  wrong scale shows up as nothing cut or everything cut, and neither happened.
+- **The back end reduces those event lists as it does PPS ones.** `ecoordconv`, the window
+  check (`PrimeFullWindow`, 302″ and 307″ of reach against the 90″ needed), `epatplot`,
+  `barycen` — all three exposures to TDB — and `especget`: 15 products, five per exposure.
+  The pn timing exposure came back flagged for pile-up on the doubles arm alone, doubles
+  1.045 ± 0.004 with singles undepressed at 1.004 ± 0.002, which is the same unusual
+  signature as the seven pn exposures of the M82 batch and is recorded under the open item
+  those raised.
+
+Two findings, neither of them a change to the code:
+
+**The pn timing exposure was left unscreened for flares, and that is the designed
+behaviour.** One curve is built per *imaging* exposure and shared with the timing exposure
+of the same camera and exposure identifier; `0973390101`'s pn is timing-only, so it has no
+imaging twin to borrow from and its screening is recorded `skipped`, "pn U002 has no
+background light curve". The temptation is to build the curve from the timing event list
+itself — the expression is already there, `ODF_FLARE_EXPRESSIONS["pn"]` — but a timing
+window is a strip a few dozen columns wide centred on the source, so a rate above 10 keV
+taken off it is the *source's* hard flux and not the background. Cutting on that would
+throw away the brightest part of the observation and call it a flare. Leaving the exposure
+unscreened and saying so in the diagnostics is the honest choice, and it is what the PPS
+route already does when there is no `FBKTSR`.
+
+**The `*Evts.ds` glob is safe only because the tasks clean up after themselves.** Both
+tasks also write per-CCD intermediates — `..._EPN_U002_04_Evts.ds`,
+`..._EMOS1_U002_01_Evts.ds` and eleven more are named in the logs — which match the glob
+and carry the *same* `INSTRUME`, `EXPIDSTR` and `DATAMODE` as the merged list they go into.
+SAS 22.1.0 deletes them once it has merged them, leaving the three merged lists and the
+`Badpixels.ds` files the glob does not match, so the run discovered exactly three
+exposures. But `xmm_exposures_from_odf` does not deduplicate on identity, so a release that
+kept those files, or a run interrupted between merge and cleanup, would have the back end
+reduce sixteen "exposures" onto three output stems. Written down rather than fixed: the fix
+is small, but the question inside it — which file wins — is worth answering when it bites
+rather than guessing at now.
 
 ## What changed while implementing step 13
 
@@ -1593,7 +1640,10 @@ Batch casualties from this are re-run serially rather than treated as results.
 
 ## Open items, to settle on the first run with SAS
 
-* Barycentring — which of the three candidates in step 8 works.
+* ~~Barycentring — which of the three candidates in step 8 works.~~ **Settled** — SAS
+  `barycen`, over an `odfingest`-produced `SUM.SAS`; HEASOFT `barycorr` has no XMM
+  clock. 48 of 48 exposures in the M82 batch and 3 of 3 in the ODF-route run reached
+  `TIMESYS = TDB`; see *What changed while implementing step 11*.
 * ~~`especget`'s output file names, pinned as a constant.~~ **Settled** — dictated with
   `withfilestem=no` rather than pinned, so there is nothing left to pin.
 * ~~**`ecoordconv` against a real observation.**~~ **Settled** — run on Her X-1's MOS1 and
@@ -1616,7 +1666,11 @@ Batch casualties from this are re-run serially rather than treated as results.
   **Settled** — neither was given `SAS_ODF` and both produced a valid ARF and RMF on Her
   X-1, in imaging and in timing. `useodfatt=yes` exists for the rare case where the
   attitude in the spectrum header is not enough; it was not needed here.
-* The `.FIT.gz` → `.FTZ` staging rule on the ODF route.
+* ~~The `.FIT.gz` → `.FTZ` staging rule on the ODF route.~~ **Settled the other way
+  round** — staging decompresses to plain `.FIT` and `.ASC` instead. `odfingest` finds
+  `.FTZ` housekeeping and then rejects it; see *What changed while implementing step 11*,
+  and the ODF-route run of `0973390101` ingested a 104-file staging directory built this
+  way.
 * ~~Default flare-rate thresholds.~~ **Settled** — PPS's own `FLCUTTHR`, see above.
 * The pn Timing `RAWX` defaults — `[31:45]` source, `[3:5]` background are the cookbook's
   numbers, and the right background strip depends on how far the source wings spread. They
