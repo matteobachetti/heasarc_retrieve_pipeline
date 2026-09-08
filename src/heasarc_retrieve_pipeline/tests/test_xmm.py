@@ -12,6 +12,7 @@ on 2026-09-07, and the two observations behind them are the ones
 """
 
 import copy
+import json
 import glob
 import gzip
 import os
@@ -2488,6 +2489,62 @@ class TestReducingAnObservation:
             xmm.process_xmm_obsid.fn(
                 "0153950401", config=dict(base, products="odf"), ra=self.RA, dec=self.DEC
             )
+
+    def _failing_on(self, monkeypatch, stub, task, marker):
+        """Make one SAS task fail for the one exposure whose stem contains ``marker``."""
+
+        def run(name, **kwargs):
+            if name == task and marker in " ".join(str(v) for v in kwargs.values()):
+                raise RuntimeError(f"{name} failed with return code -11")
+            return stub(name, **kwargs)
+
+        monkeypatch.setattr(sas, "run", run)
+
+    def test_one_exposure_failing_does_not_lose_the_others(self, tmp_path, stub_sas, monkeypatch):
+        """
+        Keep going and report the failure -- Matteo's ruling, 2026-09-08.
+
+        Measured on 0560590201, where an ``especget`` killed by the operating system threw
+        away complete pn and mos1 spectra that were already on disk. One camera SAS could
+        not finish must not take the other two with it.
+        """
+        base = a_reducible_observation(tmp_path)
+        stub = stub_sas()
+        self._failing_on(monkeypatch, stub, "especget", "mos2")
+
+        xmm.process_xmm_obsid.fn("0153950401", config=base, ra=self.RA, dec=self.DEC)
+
+        extracted = [params["srcspecset"] for params in stub.task("especget")]
+        assert any("pn" in name for name in extracted), extracted
+        assert any("mos1" in name for name in extracted), extracted
+
+    def test_the_failed_exposure_is_recorded_rather_than_passed_over(
+        self, tmp_path, stub_sas, monkeypatch
+    ):
+        """Carrying on is only acceptable if the loss is written down where it shows."""
+        base = a_reducible_observation(tmp_path)
+        stub = stub_sas()
+        self._failing_on(monkeypatch, stub, "especget", "mos2")
+
+        xmm.process_xmm_obsid.fn("0153950401", config=base, ra=self.RA, dec=self.DEC)
+
+        written = {}
+        for path in (tmp_path / "0153950401" / "diagnostics").glob("calculate_spectra__*.json"):
+            written[path.name] = json.loads(path.read_text())
+        failed = [name for name, rec in written.items() if rec["status"] == "failed"]
+        assert len(failed) == 1 and "mos2" in failed[0], written.keys()
+        assert "-11" in written[failed[0]]["error"]
+
+    def test_every_exposure_failing_is_still_a_failed_observation(
+        self, tmp_path, stub_sas, monkeypatch
+    ):
+        """Carrying on past *everything* would report an empty reduction as a success."""
+        base = a_reducible_observation(tmp_path)
+        stub = stub_sas()
+        self._failing_on(monkeypatch, stub, "especget", "0153950401")
+
+        with pytest.raises(RuntimeError, match="no exposure of 0153950401 could be reduced"):
+            xmm.process_xmm_obsid.fn("0153950401", config=base, ra=self.RA, dec=self.DEC)
 
     def test_the_diagnostics_the_report_reads_are_written(self, tmp_path, stub_sas):
         self.reduce(tmp_path, stub_sas)

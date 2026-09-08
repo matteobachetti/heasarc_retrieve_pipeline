@@ -655,6 +655,35 @@ class TestPagesThatCouldGoWrong:
         assert "source separation produced nothing for FPMA" in text
         assert "Traceback" in text
 
+    def test_an_observation_that_lost_one_exposure_is_partial_not_done(self, tmp_path):
+        """
+        Keeping going has to be visible, or it is just quiet data loss.
+
+        XMM reduces each exposure independently and carries on past one that fails, so an
+        observation can finish having produced two cameras out of three. Calling that
+        "done" hides the loss; calling it "failed" hides the two that worked.
+        """
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="mos2"):
+                raise RuntimeError("especget failed with return code -11")
+        with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="pn"):
+            pass
+        with record_step(observation(tmp_path), OBSID, "observation"):
+            pass
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "partial"
+
+    def test_an_observation_that_failed_outright_is_still_failed(self, tmp_path):
+        """The guard: partial must not swallow a real failure of the whole observation."""
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="mos2"):
+                raise RuntimeError("especget failed with return code -11")
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "observation"):
+                raise RuntimeError("no exposure could be reduced")
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "failed"
+
     def test_an_observation_with_no_science_data_is_not_called_done(self, tmp_path):
         """
         An observation the pipeline skipped must not be tallied as a reduction.

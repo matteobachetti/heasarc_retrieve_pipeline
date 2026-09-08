@@ -74,6 +74,7 @@ NUSTAR_SPECTRUM_BAND_KEV = (3.0, 79.0)
 STATUS_COLOURS = {
     "done": "#2a9d8f",
     "skipped": "#e9c46a",
+    "partial": "#e8a33d",
     "failed": "#e76f51",
     "running": "#8ecae6",
 }
@@ -899,9 +900,10 @@ def outcome_of(records):
     """
     One word for how an observation went.
 
-    ``failed`` if any step failed, ``running`` if any step never finished -- which is what
-    a killed run leaves behind -- ``skipped`` if the observation as a whole was skipped,
-    ``done`` if anything finished, and ``no records`` if the observation never started.
+    ``running`` if any step never finished -- which is what a killed run leaves behind --
+    ``failed`` if a step failed and the observation did too, ``partial`` if a step failed
+    but the observation still finished, ``skipped`` if the observation as a whole was
+    skipped, ``done`` if anything finished, and ``no records`` if it never started.
 
     Only the *observation-level* record makes an outcome ``skipped``. A single skipped
     step is ordinary -- a download reused from an earlier run is recorded that way -- and
@@ -920,12 +922,19 @@ def outcome_of(records):
     statuses = {record.get("status") for record in records}
     if not statuses:
         return "no records"
-    for status in ("failed", "running"):
-        if status in statuses:
-            return status
-    for record in records:
-        if record.get("step") == "observation" and record.get("status") == "skipped":
-            return "skipped"
+    whole = next((r for r in records if r.get("step") == "observation"), None)
+    if "running" in statuses:
+        return "running"
+    if "failed" in statuses:
+        # A step failed. Whether the observation did is a different question: XMM reduces
+        # each exposure independently and carries on past one that fails, so an
+        # observation can finish having produced two cameras out of three. Calling that
+        # "done" hides the loss and calling it "failed" hides the two that worked.
+        if whole is not None and whole.get("status") == "done":
+            return "partial"
+        return "failed"
+    if whole is not None and whole.get("status") == "skipped":
+        return "skipped"
     return "done"
 
 

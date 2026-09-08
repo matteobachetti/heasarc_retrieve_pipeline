@@ -3445,72 +3445,100 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
         rec.value(ra=ra, dec=dec, calibration_index=env["SAS_CCF"])
         xmm_check_source_position(obsid, config, ra, dec, rec=rec)
 
+    failed = {}
     for exposure in exposures:
-        stem = _exposure_stem(exposure)
-        logger.info(f"{obsid}: reducing {stem}")
+        try:
+            stem = _exposure_stem(exposure)
+            logger.info(f"{obsid}: reducing {stem}")
 
-        with record_step(diagnostics, obsid, "flare_filtering", key=stem) as rec:
-            gti = xmm_flare_gti(exposure, config, rec=rec)
+            with record_step(diagnostics, obsid, "flare_filtering", key=stem) as rec:
+                gti = xmm_flare_gti(exposure, config, rec=rec)
 
-        events = xmm_clean_event_list(
-            obsid,
-            exposure,
-            config,
-            gti=gti,
-            env=env,
-            log_to=tool_log_file(f"evselect_{stem}", obsid, config),
+            events = xmm_clean_event_list(
+                obsid,
+                exposure,
+                config,
+                gti=gti,
+                env=env,
+                log_to=tool_log_file(f"evselect_{stem}", obsid, config),
+            )
+
+            # A timing read-out has no sky image to convert into, so the conversion is not
+            # merely wasteful there -- it has no answer. Its regions are RAWX strips instead.
+            sky = None
+            if exposure.mode == IMAGING:
+                sky = xmm_source_sky_position(
+                    events,
+                    ra,
+                    dec,
+                    env=env,
+                    log_to=tool_log_file(f"ecoordconv_{stem}", obsid, config),
+                )
+                with record_step(diagnostics, obsid, "source_region", key=stem) as rec:
+                    xmm_check_extraction_window(exposure, config, events, *sky, rec=rec)
+
+            with record_step(diagnostics, obsid, "pileup_check", key=stem) as rec:
+                xmm_pileup_check(
+                    obsid,
+                    exposure,
+                    config,
+                    events,
+                    sky=sky,
+                    rec=rec,
+                    env=env,
+                    log_to=tool_log_file(f"epatplot_{stem}", obsid, config),
+                )
+
+            with record_step(diagnostics, obsid, "barycenter", key=stem) as rec:
+                xmm_barycenter(
+                    obsid,
+                    config,
+                    events,
+                    summary,
+                    env=env,
+                    rec=rec,
+                    log_to=tool_log_file(f"barycen_{stem}", obsid, config),
+                )
+
+            with record_step(diagnostics, obsid, "calculate_spectra", key=stem) as rec:
+                xmm_calculate_spectra(
+                    obsid,
+                    exposure,
+                    config,
+                    events,
+                    ra,
+                    dec,
+                    sky=sky,
+                    rec=rec,
+                    env=env,
+                    log_to=tool_log_file(f"especget_{stem}", obsid, config),
+                )
+        except Exception as error:
+            # Keep going and report, rather than discarding the cameras that worked. One
+            # exposure SAS could not finish is a loss to write down, not a reason to throw
+            # away the rest -- measured on 0560590201, where an especget killed by the
+            # operating system took complete pn and mos1 spectra down with it. The step
+            # that failed has already recorded what went wrong under this exposure's own
+            # key; all that is decided here is whether to carry on.
+            failed[_exposure_stem(exposure)] = error
+            logger.error(
+                f"{obsid}: {_exposure_stem(exposure)} could not be reduced and is left "
+                f"out of this observation's products: {type(error).__name__}: {error}"
+            )
+
+    if failed and len(failed) == len(exposures):
+        # Carrying on past every exposure would report an observation that produced
+        # nothing as a success, which is the one thing this must not do.
+        last = list(failed.values())[-1]
+        raise RuntimeError(
+            f"no exposure of {obsid} could be reduced; the last failure was "
+            f"{type(last).__name__}: {last}"
+        ) from last
+    if failed:
+        logger.warning(
+            f"{obsid}: reduced {len(exposures) - len(failed)} of {len(exposures)} "
+            f"exposures. {', '.join(sorted(failed))} failed; the diagnostics say why."
         )
-
-        # A timing read-out has no sky image to convert into, so the conversion is not
-        # merely wasteful there -- it has no answer. Its regions are RAWX strips instead.
-        sky = None
-        if exposure.mode == IMAGING:
-            sky = xmm_source_sky_position(
-                events,
-                ra,
-                dec,
-                env=env,
-                log_to=tool_log_file(f"ecoordconv_{stem}", obsid, config),
-            )
-            with record_step(diagnostics, obsid, "source_region", key=stem) as rec:
-                xmm_check_extraction_window(exposure, config, events, *sky, rec=rec)
-
-        with record_step(diagnostics, obsid, "pileup_check", key=stem) as rec:
-            xmm_pileup_check(
-                obsid,
-                exposure,
-                config,
-                events,
-                sky=sky,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file(f"epatplot_{stem}", obsid, config),
-            )
-
-        with record_step(diagnostics, obsid, "barycenter", key=stem) as rec:
-            xmm_barycenter(
-                obsid,
-                config,
-                events,
-                summary,
-                env=env,
-                rec=rec,
-                log_to=tool_log_file(f"barycen_{stem}", obsid, config),
-            )
-
-        with record_step(diagnostics, obsid, "calculate_spectra", key=stem) as rec:
-            xmm_calculate_spectra(
-                obsid,
-                exposure,
-                config,
-                events,
-                ra,
-                dec,
-                sky=sky,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file(f"especget_{stem}", obsid, config),
-            )
 
     logger.info(f"Finished processing XMM-Newton observation {obsid}")
     return None
