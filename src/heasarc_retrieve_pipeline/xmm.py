@@ -3123,6 +3123,17 @@ def xmm_odf_summary(obsid, config, env=None, log_to=None):
     if staged is None:
         return None
 
+    # A summary left by an earlier run has to go before this one is written. ``odfingest``
+    # runs with ``writepath=yes``, so the summary records the absolute path of the staging
+    # directory it was made in; the staging directory lives under the output tree and
+    # survives between runs, but the short working directory named inside it does not.
+    # ``odfingest`` reads that path back out and stops with ``NoOdfFound`` -- measured on
+    # 0560590201, whose second run was still looking for a working directory from the
+    # first. Leaving it would also risk returning the wrong file, since the summary below
+    # is picked by sort order.
+    for previous in glob.glob(os.path.join(staged, f"*{ODF_SUMMARY_SUFFIX}")):
+        os.remove(previous)
+
     ingest_env = dict(env or os.environ)
     ingest_env["SAS_ODF"] = staged
     sas.run(

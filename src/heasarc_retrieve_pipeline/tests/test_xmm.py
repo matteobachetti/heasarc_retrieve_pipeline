@@ -2775,6 +2775,35 @@ class TestIngestingTheOdf:
         assert xmm.xmm_odf_summary("0153950401", self.config(tmp_path)) is None
         assert stub.calls == []
 
+    def test_a_summary_left_by_an_earlier_run_is_cleared_first(self, tmp_path, stub_sas):
+        """
+        Re-running an observation must ingest its ODF again, not trip over last time.
+
+        ``odfingest`` runs with ``writepath=yes``, so the summary it writes records the
+        absolute path of the staging directory. The staging directory lives under the
+        output tree and survives between runs, while the short working directory whose
+        path is written into the summary does not -- so on the second run ``odfingest``
+        reads a path that no longer exists and stops with ``NoOdfFound``. Measured on
+        ``0560590201`` on 2026-09-08, where the batch's summary still named
+        ``/tmp/hrpppyjld41``.
+
+        The stale name here sorts before the fresh one on purpose: picking the summary
+        by ``sorted(...)[0]`` would otherwise return the wrong file quietly.
+        """
+        an_odf(tmp_path)
+        stub_sas()
+        config = self.config(tmp_path)
+        staged = xmm.xmm_staged_odf_path("0153950401", config)
+        os.makedirs(staged, exist_ok=True)
+        stale = os.path.join(staged, "0001_0153950401_SCX00000SUM.SAS")
+        with open(stale, "w") as f:
+            f.write("names a working directory that no longer exists\n")
+
+        summary = xmm.xmm_odf_summary("0153950401", config)
+
+        assert os.path.basename(summary) == "3906_0153950401_SCX00000SUM.SAS"
+        assert not os.path.exists(stale), "the stale summary must be gone before ingesting"
+
 
 class TestBarycentringAnExposure:
     """
