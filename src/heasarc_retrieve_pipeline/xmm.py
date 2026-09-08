@@ -2078,13 +2078,57 @@ def xmm_check_source_position(obsid, config, ra, dec, rec=None):
 
 def _exposure_stem(exposure):
     """
-    The name every output of one exposure is built on, ``"mos1S004_imaging"``.
+    How one exposure is referred to *inside* an observation, ``"mos1S004_imaging"``.
+
+    This names log files and diagnostics records, which already sit under the
+    observation's own directory and are already keyed by its identifier -- adding the
+    identifier here again would lengthen every key without distinguishing anything. Files
+    on disk are named by :func:`_exposure_file_stem` instead, since those get copied out
+    of the tree that gives them their context.
 
     The mode belongs in the name and is not decoration: MOS ``FastUncompressed`` writes an
     imaging and a timing event list under one exposure identifier, so a stem without the
     mode would have the second overwrite the first.
     """
     return f"{exposure.instrument}{exposure.expid}_{exposure.mode}"
+
+
+def _exposure_file_stem(obsid, exposure):
+    """
+    The name every file of one exposure is built on, ``"xmm0153950401_mos1_S004_imaging"``.
+
+    Every product of a reduction says which observation it came from, the way NuSTAR's
+    ``nu80002092006A01_cl.evt`` does: an event list mailed to a collaborator or dropped in
+    a working directory beside another observation's is still identifiable on its own.
+    The camera and the exposure identifier are separated here, unlike in
+    :func:`_exposure_stem`, because ``xmm0153950401_pnS003_imaging`` reads as one long run
+    of characters while ``xmm0153950401_pn_S003_imaging`` has the four things it names
+    visibly apart.
+
+    Length is deliberate rather than incidental. ``especget`` writes these names into the
+    spectrum's ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, and a FITS header card holds
+    80 characters; the longest of them, ``xmm0153950401_mos1_S004_imaging_bkg.pi``, is 38.
+    A convention that grew much beyond this would hit the limit that truncated names in an
+    ``addspec`` merge.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+
+    Returns
+    -------
+    str
+
+    Examples
+    --------
+    >>> exposure = Exposure("pn", "S003", IMAGING, "/nowhere.FTZ")
+    >>> _exposure_file_stem("0153950401", exposure)
+    'xmm0153950401_pn_S003_imaging'
+    """
+    return f"xmm{obsid}_{exposure.instrument}_{exposure.expid}_{exposure.mode}"
 
 
 def xmm_cleaned_event_list_path(obsid, exposure, config):
@@ -2103,10 +2147,10 @@ def xmm_cleaned_event_list_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_cl.evt``.
+        ``<out_data_path>/<OBSID>/event_cl/xmm<OBSID>_<camera>_<expid>_<mode>_cl.evt``.
     """
     return os.path.join(
-        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_cl.evt"
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_file_stem(obsid, exposure)}_cl.evt"
     )
 
 
@@ -2129,10 +2173,10 @@ def xmm_flare_gti_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_flare.gti``.
+        ``<out_data_path>/<OBSID>/event_cl/xmm<OBSID>_<camera>_<expid>_<mode>_flare.gti``.
     """
     return os.path.join(
-        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_flare.gti"
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_file_stem(obsid, exposure)}_flare.gti"
     )
 
 
@@ -2199,10 +2243,10 @@ def xmm_source_event_list_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_src.evt``.
+        ``<out_data_path>/<OBSID>/event_cl/xmm<OBSID>_<camera>_<expid>_<mode>_src.evt``.
     """
     return os.path.join(
-        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_src.evt"
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_file_stem(obsid, exposure)}_src.evt"
     )
 
 
@@ -2225,13 +2269,13 @@ def xmm_pileup_plot_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<out_data_path>/<OBSID>/event_cl/<camera><expid>_<mode>_pat.pdf`` -- see
+        ``<out_data_path>/<OBSID>/event_cl/xmm<OBSID>_<camera>_<expid>_<mode>_pat.pdf`` -- see
         :data:`PILEUP_PLOT_EXTENSION` for why the extension is not the ``.ps`` the task's
         own parameters suggest.
     """
     return os.path.join(
         xmm_pipeline_output_path(obsid, config),
-        f"{_exposure_stem(exposure)}_pat.{PILEUP_PLOT_EXTENSION}",
+        f"{_exposure_file_stem(obsid, exposure)}_pat.{PILEUP_PLOT_EXTENSION}",
     )
 
 
@@ -2483,7 +2527,7 @@ def xmm_spectrum_paths(obsid, exposure, config):
         Paths under ``<out_data_path>/<OBSID>/products``.
     """
     products = xmm_product_output_path(obsid, config)
-    stem = os.path.join(products, _exposure_stem(exposure))
+    stem = os.path.join(products, _exposure_file_stem(obsid, exposure))
     return SpectrumProducts(
         source=f"{stem}_src.pi",
         background=f"{stem}_bkg.pi",
@@ -2824,10 +2868,10 @@ def xmm_odf_flare_lightcurve_path(obsid, exposure, config):
     Returns
     -------
     str
-        ``<event_cl>/<stem>_flare.lc``.
+        ``<event_cl>/xmm<OBSID>_<camera>_<expid>_<mode>_flare.lc``.
     """
     return os.path.join(
-        xmm_pipeline_output_path(obsid, config), f"{_exposure_stem(exposure)}_flare.lc"
+        xmm_pipeline_output_path(obsid, config), f"{_exposure_file_stem(obsid, exposure)}_flare.lc"
     )
 
 

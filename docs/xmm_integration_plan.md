@@ -1205,6 +1205,38 @@ requirement rather than a dependency. The science caveats went into
 `docs/known_issues.rst` as caveats rather than numbered bugs — including the M82 X-1 blend,
 which is a property of the sky and not of this code.
 
+## The output names, 2026-09-08
+
+**Matteo's request.** Every file the reduction writes now carries the observation:
+`xmm0153950401_pn_S003_imaging_src.evt` where it used to be `pnS003_imaging_src.evt`.
+The reason is that these files do not stay where they were written -- beside another
+observation's, or attached to a message, the old name identified nothing. NuSTAR has
+always named its files this way (`nu80002092006A01_cl.evt`), so this is the house
+convention rather than a new one.
+
+Two things did *not* change, deliberately:
+
+* **Log files and diagnostics keys keep the short `pnS003_imaging`.** They are read inside
+  `<OBSID>/logs/` and `<OBSID>/.steps/`, are already keyed by the observation, and
+  repeating it would lengthen every key while distinguishing nothing. The two stems are
+  `_exposure_file_stem(obsid, exposure)` and `_exposure_stem(exposure)`, and their
+  docstrings say which is for what.
+* **The recorded spectrum arrays keep `spec_pnS003_imaging_src_rate`.** That is
+  `report.spectrum_figure`'s convention, shared with NuSTAR, and the records are
+  per-observation already.
+
+The camera and the exposure identifier are separated -- `..._pn_S003_...`, not
+`..._pnS003_...` -- because the run-together form reads as one long string once the
+observation identifier is in front of it.
+
+**Length was checked, not assumed.** The longest name,
+`xmm0153950401_mos1_S004_imaging_bkg.pi`, is 38 characters against the 80 a FITS card
+holds; `especget` writes these into `BACKFILE`, `RESPFILE` and `ANCRFILE`, which is the
+limit that truncated names in an `addspec` merge. `TestHowTheFilesAreNamed` guards it.
+
+Sections above quote file names from runs made before this change; those are transcripts
+of what actually happened and are left as they are.
+
 ## Verification
 
 Offline suite (`-o addopts=` because `--doctest-rst` needs pytest-doctestplus):

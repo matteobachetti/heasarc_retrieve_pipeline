@@ -1636,11 +1636,11 @@ class TestWhereTheSpectraGo:
     def test_the_five_products_are_named_for_the_exposure(self):
         paths = self.paths()
 
-        assert os.path.basename(paths.source) == "pnS004_timing_src.pi"
-        assert os.path.basename(paths.background) == "pnS004_timing_bkg.pi"
-        assert os.path.basename(paths.arf) == "pnS004_timing.arf"
-        assert os.path.basename(paths.rmf) == "pnS004_timing.rmf"
-        assert os.path.basename(paths.grouped) == "pnS004_timing_grp.pi"
+        assert os.path.basename(paths.source) == "xmm0153950401_pn_S004_timing_src.pi"
+        assert os.path.basename(paths.background) == "xmm0153950401_pn_S004_timing_bkg.pi"
+        assert os.path.basename(paths.arf) == "xmm0153950401_pn_S004_timing.arf"
+        assert os.path.basename(paths.rmf) == "xmm0153950401_pn_S004_timing.rmf"
+        assert os.path.basename(paths.grouped) == "xmm0153950401_pn_S004_timing_grp.pi"
 
     def test_they_go_in_the_products_directory_and_not_beside_the_events(self):
         products = xmm.xmm_product_output_path("0153950401", xmm.xmm_config(self.CONFIG))
@@ -2006,7 +2006,7 @@ class TestThePileupCheck:
         _, _, stub = self.a_check(tmp_path, stub_sas)
 
         (plot,) = stub.task("epatplot")
-        assert plot["set"].endswith("pnS004_timing_src.evt")
+        assert plot["set"].endswith("xmm0153950401_pn_S004_timing_src.evt")
 
     def test_an_imaging_exposure_is_checked_at_its_sky_position(self, tmp_path, stub_sas):
         exposure = an_exposure(None, instrument="mos2", mode=xmm.IMAGING)
@@ -2061,7 +2061,44 @@ class TestThePileupCheck:
         assert os.path.exists(plot)
         # ``.pdf`` and not the ``.ps`` epatplot's own device parameter suggests: SAS
         # 22.1.0 draws the plot from Python and writes PDF whatever it is asked for.
-        assert os.path.basename(plot) == "pnS004_timing_pat.pdf"
+        assert os.path.basename(plot) == "xmm0153950401_pn_S004_timing_pat.pdf"
+
+
+class TestHowTheFilesAreNamed:
+    """
+    Every file names its observation; every key inside the observation does not.
+
+    A reduced event list rarely stays where it was written. Once it is beside another
+    observation's, or attached to a message, ``pnS003_imaging_src.evt`` says nothing about
+    where it came from -- so the observation identifier goes in the name, as it does in
+    NuSTAR's ``nu80002092006A01_cl.evt``. Log files and diagnostics keys are the opposite
+    case: they are read inside the observation's own directory, and repeating the
+    identifier there would only make them longer.
+    """
+
+    EXPOSURE = xmm.Exposure("mos1", "S004", xmm.IMAGING, "/nowhere.FTZ")
+
+    def test_a_file_name_carries_the_observation_the_camera_the_exposure_and_the_mode(self):
+        assert (
+            xmm._exposure_file_stem("0153950401", self.EXPOSURE)
+            == "xmm0153950401_mos1_S004_imaging"
+        )
+
+    def test_a_key_inside_the_observation_stays_short(self):
+        assert xmm._exposure_stem(self.EXPOSURE) == "mos1S004_imaging"
+
+    def test_the_longest_product_name_fits_in_a_fits_header_card(self):
+        """
+        ``especget`` writes these names into ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``,
+        and a card holds 80 characters -- the limit that truncated names in an ``addspec``
+        merge. Guarded here so a future lengthening of the convention fails loudly.
+        """
+        paths = xmm.xmm_spectrum_paths(
+            "0153950401", self.EXPOSURE, xmm.xmm_config(dict(out_data_path="/data"))
+        )
+
+        longest = max(os.path.basename(name) for name in vars(paths).values())
+        assert len(longest) <= 80, longest
 
 
 class TestWhereTheCleanedFilesGo:
@@ -2075,7 +2112,7 @@ class TestWhereTheCleanedFilesGo:
 
         path = xmm.xmm_cleaned_event_list_path("0153950401", exposure, config)
 
-        assert os.path.basename(path) == "mos1S004_imaging_cl.evt"
+        assert os.path.basename(path) == "xmm0153950401_mos1_S004_imaging_cl.evt"
 
     def test_the_two_modes_of_one_exposure_do_not_collide(self, tmp_path):
         config = xmm.xmm_config(dict(out_data_path=str(tmp_path)))
@@ -2092,7 +2129,7 @@ class TestWhereTheCleanedFilesGo:
 
         path = xmm.xmm_flare_gti_path("0153950401", exposure, config)
 
-        assert os.path.basename(path) == "pnS004_imaging_flare.gti"
+        assert os.path.basename(path) == "xmm0153950401_pn_S004_imaging_flare.gti"
         assert os.path.dirname(path) == xmm.xmm_pipeline_output_path("0153950401", config)
 
 
@@ -2912,7 +2949,7 @@ class TestBarycentringAnExposure:
     """
 
     def setup_files(self, tmp_path):
-        events = tmp_path / "pnS003_imaging_cl.evt"
+        events = tmp_path / "xmm0153950401_pn_S003_imaging_cl.evt"
         an_event_file(str(events))
         return str(events), str(tmp_path / "sum.SAS")
 
@@ -2928,7 +2965,7 @@ class TestBarycentringAnExposure:
         (params,) = stub.task("barycen")
         assert params["table"] == f"{output}:EVENTS"
         assert output != events, "barycen edits in place, so it must be given a copy"
-        assert output.endswith("pnS003_imaging_cl_bary.evt")
+        assert output.endswith("xmm0153950401_pn_S003_imaging_cl_bary.evt")
 
     def test_the_copy_is_in_place_before_the_task_runs(self, tmp_path, stub_sas, monkeypatch):
         events, summary = self.setup_files(tmp_path)
@@ -3000,7 +3037,7 @@ class TestBarycentringAnExposure:
             xmm.xmm_barycenter("0153950401", {}, events, summary, rec=rec)
 
         assert rec.values["barycentered"] is True
-        assert rec.values["barycentered_file"] == "pnS003_imaging_cl_bary.evt"
+        assert rec.values["barycentered_file"] == "xmm0153950401_pn_S003_imaging_cl_bary.evt"
 
     def test_the_position_asked_for_is_the_one_corrected_to(self, tmp_path, stub_sas):
         events, summary = self.setup_files(tmp_path)
@@ -3065,7 +3102,7 @@ class TestCuttingTheBarycentredSourceEvents:
     def setup_files(self, tmp_path, obsid="0153950401"):
         config = xmm.xmm_config({"out_data_path": str(tmp_path)})
         corrected = os.path.join(
-            xmm.xmm_pipeline_output_path(obsid, config), "pnS003_timing_cl_bary.evt"
+            xmm.xmm_pipeline_output_path(obsid, config), "xmm0153950401_pn_S003_timing_cl_bary.evt"
         )
         os.makedirs(os.path.dirname(corrected), exist_ok=True)
         an_event_file(corrected)
@@ -3082,7 +3119,7 @@ class TestCuttingTheBarycentredSourceEvents:
         (params,) = stub.task("evselect")
         assert params["table"] == corrected
         assert params["filteredset"] == output
-        assert output.endswith("pnS003_timing_src_bary.evt")
+        assert output.endswith("xmm0153950401_pn_S003_timing_src_bary.evt")
         assert params["expression"] == "(RAWX in [31:45])"
 
     def test_it_is_recorded_beside_the_correction(self, tmp_path, stub_sas):
@@ -3094,7 +3131,7 @@ class TestCuttingTheBarycentredSourceEvents:
                 "0153950401", self.an_exposure(), config, corrected, rec=rec
             )
 
-        assert rec.values["barycentered_source_file"] == "pnS003_timing_src_bary.evt"
+        assert rec.values["barycentered_source_file"] == "xmm0153950401_pn_S003_timing_src_bary.evt"
         assert rec.values["source_region"] == "(RAWX in [31:45])"
 
     def test_without_a_corrected_list_nothing_runs(self, tmp_path, stub_sas):

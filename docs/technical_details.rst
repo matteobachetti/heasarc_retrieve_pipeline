@@ -1795,6 +1795,35 @@ rather than its screen output. Correcting pile-up means excluding the core of th
 spread function, which changes which photons the science is done with; that is a decision
 for whoever reads the plot.
 
+What the reduction writes
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every file an exposure produces is built on one stem,
+``xmm<OBSID>_<camera>_<expid>_<mode>``, so that a file carried out of the tree still says
+where it came from -- the same reasoning behind NuSTAR's ``nu<OBSID><FPM><mode>_cl.evt``.
+The mode is part of the identity and not decoration: a MOS ``FastUncompressed`` exposure
+writes an imaging *and* a timing event list under one exposure identifier, and without the
+mode the second would overwrite the first::
+
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl.evt        screened events
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.gti     the flare cut applied to them
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.lc      background curve, ODF route only
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src.evt       the source region alone
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_pat.pdf       the pile-up diagram
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl_bary.evt   barycentred
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src_bary.evt  barycentred, source region
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_src.pi        source spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_bkg.pi        background spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging.arf  .rmf     responses
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_grp.pi        grouped, the one you fit
+
+Log files and diagnostics records use a *shorter* key, ``pnS003_imaging``, because both are
+read inside the observation's own directory and are already keyed by its identifier.
+
+The longest of these names is 38 characters, which matters: ``especget`` writes them into
+``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, where a FITS card holds 80. A test guards the
+margin.
+
 Spectra
 ~~~~~~~
 
