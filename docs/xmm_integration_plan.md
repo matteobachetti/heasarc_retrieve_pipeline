@@ -1432,31 +1432,34 @@ quoting these numbers.
 | | count |
 |---|---|
 | observations in the cone search | 20 |
-| reduced | 15 |
+| reduced | 16 |
 | `NO_SCIENCE_DATA` (no EPIC exposure) | 4 |
-| failed | 1 — `0560590201`, see below |
-| exposures reduced | 45 — pn, mos1, mos2 on each |
-| grouped spectra written | 45 |
-| barycentred to `TDB`/`SOLARSYSTEM` | 45 of 45 |
-| good time kept | 1144 ks of 1550 ks, 73.8% |
+| failed | none, after the re-run below |
+| exposures reduced | 48 — pn, mos1, mos2 on each |
+| grouped spectra written | 48 |
+| barycentred to `TDB`/`SOLARSYSTEM` | 48 of 48 |
+| good time kept | 1198 ks of 1676 ks, 71.5% |
 
 The four `NO_SCIENCE_DATA` observations — `0112290401`, `0870940501`, `0891060501`,
 `0891060601` — are **exactly** the four the archive query predicted carry no EPIC data.
 That is the first live confirmation of that path on real observations, and it agrees with
 an independent prediction rather than merely not crashing.
 
-### Barycentring, 45 for 45
+### Barycentring, 48 for 48
 
 Every exposure came back `TIMESYS=TDB`, `TIMEREF=SOLARSYSTEM`. Step 11 was built and
-verified against a single observation; it holds across fifteen, three cameras each. Since
+verified against a single observation; it holds across sixteen, three cameras each. Since
 the science here is the 1.37 s pulsation, this was the part of the batch that had to work.
 
 ### The window check found something systematic
 
 The background annulus needs 90 arcsec of exposed detector. Across the batch:
 
-* **MOS: 30 of 30 fit**, with 350–430 arcsec of reach. Never close to a problem.
-* **pn: 10 of 15 clipped**, reach 53.0 to 100.1 arcsec.
+* **MOS: 32 of 32 fit**, with 172–430 arcsec of reach. Never close to a problem.
+* **pn: 11 of 16 clipped**, reach 53.0 to 117.4 arcsec.
+
+The five pn exposures that pass do so by very little — 90.9, 91.2, 94.1, 100.1 and 117.4
+arcsec against the 90 required. Only one of sixteen has real margin.
 
 M82 falls near a pn chip edge in most of these pointings. This is not silently wrong —
 `BACKSCAL` records the *exposed* area, so a clipped annulus costs background counts
@@ -1470,7 +1473,7 @@ arcsec and passes, against 87.6 arcsec and clipped when measured correctly.
 
 ### Pile-up: pn only, and only marginally
 
-Flagged on 7 of 15 pn exposures and **0 of 30 MOS**. The instrument split is right —
+Flagged on 7 of 16 pn exposures and **0 of 32 MOS**. The instrument split is right —
 pn has the highest throughput, so it piles up first.
 
 The numbers deserve a caveat rather than a headline. The criterion is
@@ -1485,7 +1488,7 @@ seven exposures should be treated as piled up is a judgement for Matteo**, and t
 
 ### Flare screening agrees across cameras
 
-Median 13.9% of exposure removed, which is ordinary for XMM. Two observations are
+Median 19.9% of exposure removed, which is ordinary for XMM. Two observations are
 genuinely flare-dominated: `0560590201` loses 56.5 / 55.7 / 59.0% on mos1 / mos2 / pn, and
 `0560590301` loses 54.1 / 45.1 / 65.8%.
 
@@ -1530,9 +1533,13 @@ Confirmed both ways: the new unit test fails before the fix and passes after, an
 the stale summary by hand let the real observation run through `odfingest` and on to its
 spectra.
 
-**This does not affect the batch results above.** Every observation there was reduced into
-an empty staging directory on its first run. What it broke was *re-running* one, which is
-an ordinary thing to want and was not covered by any test until now.
+With the fix in place the observation reduced cleanly on the next attempt — "1 of 1
+observations reduced, 0 failed", all three cameras with `arf`, `rmf`, source, background
+and grouped spectra — so the batch above is complete at sixteen of sixteen.
+
+**The bug did not affect the batch results.** Every observation there was reduced into an
+empty staging directory on its first run. What it broke was *re-running* one, which is an
+ordinary thing to want and was not covered by any test until now.
 
 Three hypotheses were checked and discarded before this one, which is worth recording so
 they are not chased again: the SAS stack `ulimit` (falsified — the same `especget`
