@@ -143,6 +143,14 @@ BARYCENTRED_TIMESYS = "TDB"
 #: And what the reference position becomes.
 BARYCENTRED_TIMEREF = "SOLARSYSTEM"
 
+#: Which JPL planetary ephemeris ``barycen`` is told to use.
+#:
+#: Set explicitly because the task's own default is ``DE200``, released in 1981, while SAS
+#: ships ``JPLEPH.430`` beside ``JPLEPH.200`` in ``lib/barycendata`` and this pipeline
+#: already barycentres NuSTAR with DE430 (:mod:`heasarc_retrieve_pipeline.barycenter`).
+#: Two missions on two ephemerides cannot be timed against each other, so both use DE430.
+BARYCENTRE_EPHEMERIS = "DE430"
+
 #: What ``epproc`` and ``emproc`` leave behind. Their file names are not parsed: SAS has
 #: changed them between releases, and every event list carries the same identity in its
 #: header anyway -- see :func:`xmm_exposures_from_odf`.
@@ -3156,7 +3164,22 @@ def xmm_odf_summary(obsid, config, env=None, log_to=None):
     return summaries[0]
 
 
-def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=None):
+def _source_coordinates(ra, dec):
+    """
+    ``(ra, dec)`` as numbers, or ``None`` when no position was given.
+
+    ``process_xmm_obsid`` defaults both to the string ``"NONE"``, which is a position
+    nothing can be corrected to. Everything the pipeline itself calls passes real numbers.
+    """
+    try:
+        return float(ra), float(dec)
+    except (TypeError, ValueError):
+        return None
+
+
+def xmm_barycenter(
+    obsid, config, events, summary, ra="NONE", dec="NONE", env=None, log_to=None, rec=None
+):
     """
     Write a barycentred copy of one cleaned event list.
 
@@ -3174,6 +3197,15 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
     before reading a single event, and no renaming of columns or rescaling of units gets
     past that. See docs/xmm_integration_plan.md.
 
+    **The correction is made to the position asked for, not to the one in the header.**
+    The size of the correction depends on the direction to the source, so the position is
+    part of the answer rather than a detail of it: told nothing, ``barycen`` falls back to
+    the observation's own target, which is the telescope's pointing and can sit an
+    arcminute or more from the source -- and in timing mode there is no image to correct
+    it against afterwards. A run that searched by source name has a position good to well
+    under an arcsecond and should use it. Where the caller genuinely has none, the header
+    is left to speak and the record says so.
+
     Parameters
     ----------
     obsid : str
@@ -3184,6 +3216,10 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
         Cleaned event list to barycentre.
     summary : str
         ODF summary file from :func:`xmm_odf_summary`, for ``SAS_ODF``.
+    ra, dec : float or str, optional
+        Source position in degrees, as given to :func:`process_xmm_obsid`. Anything that
+        is not a pair of numbers -- the default ``"NONE"`` -- leaves ``barycen`` to read
+        the position out of the event header.
     env : dict, optional
         SAS environment; ``SAS_ODF`` is overridden on a copy of it.
     log_to : str, optional
@@ -3208,6 +3244,18 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
 
     bary_env = dict(env or os.environ)
     bary_env["SAS_ODF"] = summary
+
+    position = _source_coordinates(ra, dec)
+    at_position = {"withsrccoordinates": "no"}
+    if position is None:
+        get_logger().warning(
+            f"{obsid}: no source position was given, so {os.path.basename(output)} is "
+            f"barycentred to the target in its own header -- the pointing, which is not "
+            f"the source. Any timing done with it is only as accurate as that."
+        )
+    else:
+        at_position = dict(withsrccoordinates="yes", srcra=position[0], srcdec=position[1])
+
     sas.run(
         "barycen",
         produces=sas.IN_PLACE(output),
@@ -3215,6 +3263,8 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
         env=bary_env,
         table=f"{output}:EVENTS",
         withtable="yes",
+        ephemeris=BARYCENTRE_EPHEMERIS,
+        **at_position,
     )
 
     timesys, timeref = _time_system(output)
@@ -3230,6 +3280,96 @@ def xmm_barycenter(obsid, config, events, summary, env=None, log_to=None, rec=No
         summary=summary,
         timesys=timesys,
         timeref=timeref,
+        ephemeris=BARYCENTRE_EPHEMERIS,
+        srcra=None if position is None else position[0],
+        srcdec=None if position is None else position[1],
+    )
+    return output
+
+
+def xmm_barycentered_source_events(
+    obsid, exposure, config, barycentered, sky=None, rec=None, env=None, log_to=None
+):
+    """
+    Cut one exposure's source region out of its barycentred event list.
+
+    This is the file a timing analysis actually reads: the events of the source, on
+    barycentric time. The two files it sits between are neither of those things -- the
+    barycentred list from :func:`xmm_barycenter` is the whole field, and the source list
+    from :func:`xmm_pileup_check` is the region but still on spacecraft time, and carries
+    ``epatplot``'s pattern keywords besides.
+
+    Cutting the region out of the corrected list, rather than correcting the source list a
+    second time, is deliberate: ``barycen`` is run once per exposure, and the two files
+    cannot then disagree about the position they were corrected to.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    exposure : Exposure
+        Which camera, exposure and mode.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+    barycentered : str or None
+        The corrected event list, from :func:`xmm_barycenter`. ``None`` -- an observation
+        with no ODF, so nothing was corrected -- means there is nothing to cut from.
+    sky : tuple of float, optional
+        ``(x, y)`` sky position, from :func:`xmm_source_sky_position`. Imaging only.
+    rec : :class:`heasarc_retrieve_pipeline.diagnostics.StepRecord`, optional
+        Where the names go. Shares the ``barycenter`` step's record, so that one
+        diagnostics record holds the correction, the position it was made to and the file
+        cut from it, rather than splitting them across two steps.
+    env : dict, optional
+        Environment for the task.
+    log_to : str, optional
+        File the task's output goes to.
+
+    Returns
+    -------
+    str or None
+        Path of the barycentred source event list, or ``None`` when there was no corrected
+        list to cut from or no region to cut.
+    """
+    from . import sas
+
+    rec = rec or no_record()
+    logger = get_logger()
+
+    if barycentered is None:
+        rec.value(barycentered_source_file=None)
+        return None
+
+    regions = xmm_exposure_regions(exposure, config, sky=sky)
+    if regions is None:
+        reason = (
+            f"{exposure.instrument}{exposure.expid} has no extraction region in "
+            f"{exposure.mode} mode, so its barycentred source events cannot be cut"
+        )
+        logger.warning(reason)
+        rec.value(barycentered_source_file=None, source_reason=reason)
+        return None
+
+    output = barycentered_file_name(xmm_source_event_list_path(obsid, exposure, config))
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    sas.run(
+        "evselect",
+        produces=output,
+        log_to=log_to,
+        env=env,
+        table=barycentered,
+        withfilteredset="yes",
+        filteredset=output,
+        keepfilteroutput="yes",
+        expression=regions[0],
+    )
+
+    rec.value(
+        barycentered_source_file=os.path.basename(output),
+        source_region=regions[0],
+    )
+    logger.info(
+        f"{_exposure_stem(exposure)}: barycentred source events in {os.path.basename(output)}"
     )
     return output
 
@@ -3490,14 +3630,26 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
                 )
 
             with record_step(diagnostics, obsid, "barycenter", key=stem) as rec:
-                xmm_barycenter(
+                corrected = xmm_barycenter(
                     obsid,
                     config,
                     events,
                     summary,
+                    ra,
+                    dec,
                     env=env,
                     rec=rec,
                     log_to=tool_log_file(f"barycen_{stem}", obsid, config),
+                )
+                xmm_barycentered_source_events(
+                    obsid,
+                    exposure,
+                    config,
+                    corrected,
+                    sky=sky,
+                    rec=rec,
+                    env=env,
+                    log_to=tool_log_file(f"evselect_src_bary_{stem}", obsid, config),
                 )
 
             with record_step(diagnostics, obsid, "calculate_spectra", key=stem) as rec:

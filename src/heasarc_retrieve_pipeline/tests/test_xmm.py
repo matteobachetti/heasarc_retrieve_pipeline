@@ -2409,6 +2409,42 @@ class TestReducingAnObservation:
         assert len(corrected) == 3, "one barycentred copy per exposure"
         assert all(t.endswith("_cl_bary.evt:EVENTS") for t in corrected), corrected
 
+    def test_the_correction_is_made_to_the_position_asked_for(self, tmp_path, stub_sas):
+        # The position the flow was given, not the one in the event header. For a target
+        # known to well under an arcsecond that is the whole accuracy of the timing.
+        an_odf(tmp_path)
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        for params in stub.task("barycen"):
+            assert params["withsrccoordinates"] == "yes"
+            assert params["srcra"] == self.RA
+            assert params["srcdec"] == self.DEC
+
+    def test_the_source_events_are_cut_from_the_barycentred_list(self, tmp_path, stub_sas):
+        an_odf(tmp_path)
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        cut = [
+            p
+            for p in stub.task("evselect")
+            if str(p.get("filteredset", "")).endswith("_src_bary.evt")
+        ]
+        assert len(cut) == 3, "one barycentred source event list per exposure"
+        for params in cut:
+            assert params["table"].endswith("_cl_bary.evt"), (
+                "the source events must come from the corrected list, not the raw one"
+            )
+
+    def test_with_no_odf_there_are_no_barycentred_source_events(self, tmp_path, stub_sas):
+        # Nothing was corrected, so there is nothing to cut the source region out of.
+        stub, _ = self.reduce(tmp_path, stub_sas)
+
+        assert [
+            p
+            for p in stub.task("evselect")
+            if str(p.get("filteredset", "")).endswith("_src_bary.evt")
+        ] == []
+
     def test_the_odf_is_ingested_once_for_the_whole_observation(self, tmp_path, stub_sas):
         an_odf(tmp_path)
         stub, _ = self.reduce(tmp_path, stub_sas)
@@ -2965,6 +3001,127 @@ class TestBarycentringAnExposure:
 
         assert rec.values["barycentered"] is True
         assert rec.values["barycentered_file"] == "pnS003_imaging_cl_bary.evt"
+
+    def test_the_position_asked_for_is_the_one_corrected_to(self, tmp_path, stub_sas):
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, summary, 254.4575, 35.3423, rec=rec)
+
+        (params,) = stub.task("barycen")
+        assert params["withsrccoordinates"] == "yes"
+        assert params["srcra"] == 254.4575
+        assert params["srcdec"] == 35.3423
+        assert rec.values["srcra"] == 254.4575
+        assert rec.values["srcdec"] == 35.3423
+
+    def test_the_ephemeris_is_the_one_nustar_is_corrected_with(self, tmp_path, stub_sas):
+        # barycen's own default is DE200, from 1981. Two missions on two ephemerides
+        # cannot be timed against each other, so this is pinned rather than inherited.
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, summary, rec=rec)
+
+        (params,) = stub.task("barycen")
+        assert params["ephemeris"] == "DE430"
+        assert rec.values["ephemeris"] == "DE430"
+
+    def test_without_a_position_the_header_is_left_to_speak(self, tmp_path, stub_sas):
+        # barycen falls back to the observation's own target, which is right for a run
+        # that was never told which source it is about -- and worth recording as such.
+        events, summary = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        with self.recorder(tmp_path) as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, summary, rec=rec)
+
+        (params,) = stub.task("barycen")
+        assert params["withsrccoordinates"] == "no"
+        assert "srcra" not in params
+        assert rec.values["srcra"] is None
+
+
+class TestCuttingTheBarycentredSourceEvents:
+    """
+    ``xmm_barycentered_source_events``: the source region, taken out of the corrected list.
+
+    The pile-up check's ``_src.evt`` is on spacecraft time and carries ``epatplot``'s
+    keywords; this is the file a timing analysis reads, and it exists because cutting the
+    region out of the corrected list is cheaper and safer than correcting a second file.
+    """
+
+    def an_exposure(self):
+        return xmm.Exposure(
+            instrument="pn",
+            expid="S003",
+            mode=xmm.TIMING,
+            event_list="/nowhere.FTZ",
+            submode="FastTiming",
+        )
+
+    def setup_files(self, tmp_path, obsid="0153950401"):
+        config = xmm.xmm_config({"out_data_path": str(tmp_path)})
+        corrected = os.path.join(
+            xmm.xmm_pipeline_output_path(obsid, config), "pnS003_timing_cl_bary.evt"
+        )
+        os.makedirs(os.path.dirname(corrected), exist_ok=True)
+        an_event_file(corrected)
+        return config, corrected
+
+    def test_the_region_is_cut_out_of_the_corrected_list(self, tmp_path, stub_sas):
+        config, corrected = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        output = xmm.xmm_barycentered_source_events(
+            "0153950401", self.an_exposure(), config, corrected
+        )
+
+        (params,) = stub.task("evselect")
+        assert params["table"] == corrected
+        assert params["filteredset"] == output
+        assert output.endswith("pnS003_timing_src_bary.evt")
+        assert params["expression"] == "(RAWX in [31:45])"
+
+    def test_it_is_recorded_beside_the_correction(self, tmp_path, stub_sas):
+        config, corrected = self.setup_files(tmp_path)
+        stub_sas()
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "barycenter") as rec:
+            xmm.xmm_barycentered_source_events(
+                "0153950401", self.an_exposure(), config, corrected, rec=rec
+            )
+
+        assert rec.values["barycentered_source_file"] == "pnS003_timing_src_bary.evt"
+        assert rec.values["source_region"] == "(RAWX in [31:45])"
+
+    def test_without_a_corrected_list_nothing_runs(self, tmp_path, stub_sas):
+        config, _ = self.setup_files(tmp_path)
+        stub = stub_sas()
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "barycenter") as rec:
+            output = xmm.xmm_barycentered_source_events(
+                "0153950401", self.an_exposure(), config, None, rec=rec
+            )
+
+        assert output is None
+        assert stub.calls == []
+        assert rec.values["barycentered_source_file"] is None
+
+    def test_without_a_region_nothing_runs(self, tmp_path, stub_sas):
+        # A timing exposure on a camera with no strip configured has nowhere to cut.
+        config, corrected = self.setup_files(tmp_path)
+        config["timing_src_rawx"] = {}
+        stub = stub_sas()
+
+        output = xmm.xmm_barycentered_source_events(
+            "0153950401", self.an_exposure(), config, corrected
+        )
+
+        assert output is None
+        assert stub.calls == []
 
 
 def an_odf_event_list(

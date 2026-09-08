@@ -1016,6 +1016,32 @@ times are silently no longer spacecraft times is a trap for everything downstrea
 Spectra continue to be extracted from the uncorrected list; the barycentred file is an
 additional product for timing.
 
+**The correction is made to the position asked for.** `barycen`'s `withsrccoordinates`
+defaults to `no`, in which case it reads the direction to the source out of the event
+header — the observation's *pointing*, which can sit an arcminute or more from the target.
+The size of the correction depends on that direction, so the position is part of the
+answer and not a detail of it. `xmm_barycenter` therefore takes the `ra`/`dec` the flow
+was given and passes them as `srcra`/`srcdec`. This matters most in timing mode, where
+there is no image to check the position against afterwards, and it is free where it
+matters least: a run that searched by source name already knows the position to well under
+an arcsecond. Where a caller has no position at all — the bare default `ra="NONE"` — the
+header is left to speak, a warning says so, and the step records `srcra: null`.
+
+**The ephemeris is DE430, set explicitly.** `barycen`'s own default is `DE200`, released in
+1981, while SAS ships `JPLEPH.430` beside `JPLEPH.200` in `lib/barycendata`. NuSTAR and
+NICER are already barycentred with DE430 (`barycenter.py`), and two missions on two
+ephemerides cannot be timed against each other. `BARYCENTRE_EPHEMERIS` pins it. Note that
+the independent check tabulated below was made against a `DE200` run.
+
+**The source events are cut out of the corrected list, not corrected separately.** The
+file a timing analysis reads is the source region on barycentric time, and neither of the
+two files around it is that: the barycentred list is the whole field, and the pile-up
+check's `_src.evt` is the region but still on spacecraft time. `xmm_barycentered_source_events`
+runs one more `evselect` with the same region expression, `<stem>_cl_bary.evt` →
+`<stem>_src_bary.evt`. Cutting rather than running `barycen` a second time keeps one
+correction per exposure, so the two files cannot disagree about the position they were
+corrected to.
+
 **An observation with no ODF still reduces.** Barycentring is the one thing that cannot be
 done without it, and it is not worth failing an otherwise complete reduction over: the
 step records `barycentered: false` with a reason and the run continues.
