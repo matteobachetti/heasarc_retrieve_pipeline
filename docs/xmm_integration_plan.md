@@ -1498,25 +1498,47 @@ It also settles step 6 retrospectively. The SAS cookbook's fixed 0.4 counts/s, a
 an exposure whose own `FLCUTTHR` is 212.8, would have thrown away essentially the whole
 observation.
 
-### One casualty, still outstanding
+### One casualty, and the bug it uncovered
 
 `0560590201` failed in the batch on an `especget` killed by SIGSEGV — the memory-starved
 machine, not the data; see the section below. Re-running it did **not** reproduce that
-crash. It instead fails earlier and repeatably, at `odfingest`, with return code 1.
+crash. It failed earlier and repeatably, at `odfingest` with return code 1, and chasing
+that turned up a real defect in step 11.
 
-What is established so far, by measurement rather than inference:
+**`xmm_odf_summary` was not idempotent.** `odfingest` runs with `writepath=yes`, so the
+`SUM.SAS` it writes records the absolute path of the staging directory it was made in.
+The staging directory lives under the *output* tree and survives between runs; the short
+working directory whose path is written inside it does not. On the second run `odfingest`
+read that path back out and stopped:
 
-* Run by hand on that observation's staged ODF, `cifbuild` and `odfingest` both return 0.
-  `odfingest` warns `NoScienceFiles` and falls back to the housekeeping, exactly as
-  intended. **So the ODF is fine and the task can succeed on it.**
-* The batch itself ran `odfingest` on this observation successfully at 01:21:55 and went
-  on to barycentre all three cameras.
-* `n_workers` is not the cause: the re-run fails identically at 1 and at 2.
+```
+odfingest odfdir=/tmp/hrpydzm8ubt/d/0560590201/event_cl/odf  withodfdir=no ...
+odfingest:- Looking for ODF constituents in /tmp/hrpppyjld41/d/0560590201/event_cl/odf/
+** odfingest: error (NoOdfFound)
+```
 
-So the same observation succeeds through the batch entry point and by hand, and fails
-through `retrieve_and_process_data` called directly. That points at run setup rather than
-at the ODF or the task, and it is **not yet diagnosed**. Fifteen of sixteen is the honest
-count for this batch until it is.
+`/tmp/hrpppyjld41` is the *batch's* working directory, deleted hours earlier. Note
+`withodfdir=no`: the `odfdir` parameter is not what the task obeys.
+
+The bug has a second and quieter face. `xmm_odf_summary` picks its result with
+`sorted(glob(...))[0]`, so a stale summary sorting before the fresh one is returned in
+preference to it — the test added with the fix uses exactly that arrangement, and without
+the fix it returns the wrong file even when `odfingest` succeeds.
+
+Fixed in `05d7ebd` by removing any `*SUM.SAS` from the staging directory before ingesting.
+Confirmed both ways: the new unit test fails before the fix and passes after, and deleting
+the stale summary by hand let the real observation run through `odfingest` and on to its
+spectra.
+
+**This does not affect the batch results above.** Every observation there was reduced into
+an empty staging directory on its first run. What it broke was *re-running* one, which is
+an ordinary thing to want and was not covered by any test until now.
+
+Three hypotheses were checked and discarded before this one, which is worth recording so
+they are not chased again: the SAS stack `ulimit` (falsified — the same `especget`
+succeeds on the default 8 MiB stack), `n_workers` (the re-run fails identically at 1 and
+at 2), and the ODF itself (`cifbuild` and `odfingest` both return 0 on it by hand, with
+the pipeline's own observation date).
 
 ## One exposure's failure loses the whole observation — a question for Matteo
 
