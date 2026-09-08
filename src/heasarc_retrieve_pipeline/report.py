@@ -900,8 +900,14 @@ def outcome_of(records):
     One word for how an observation went.
 
     ``failed`` if any step failed, ``running`` if any step never finished -- which is what
-    a killed run leaves behind -- ``done`` if anything finished, and ``no records`` if the
-    observation never started.
+    a killed run leaves behind -- ``skipped`` if the observation as a whole was skipped,
+    ``done`` if anything finished, and ``no records`` if the observation never started.
+
+    Only the *observation-level* record makes an outcome ``skipped``. A single skipped
+    step is ordinary -- a download reused from an earlier run is recorded that way -- and
+    leaves the observation done. Without that distinction an observation holding no
+    science data was tallied as a reduction: four of the twenty XMM observations of
+    M82 X-2 are empty, and the run index called all twenty done.
 
     Parameters
     ----------
@@ -917,6 +923,9 @@ def outcome_of(records):
     for status in ("failed", "running"):
         if status in statuses:
             return status
+    for record in records:
+        if record.get("step") == "observation" and record.get("status") == "skipped":
+            return "skipped"
     return "done"
 
 

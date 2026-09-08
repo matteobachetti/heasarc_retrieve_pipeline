@@ -655,6 +655,30 @@ class TestPagesThatCouldGoWrong:
         assert "source separation produced nothing for FPMA" in text
         assert "Traceback" in text
 
+    def test_an_observation_with_no_science_data_is_not_called_done(self, tmp_path):
+        """
+        An observation the pipeline skipped must not be tallied as a reduction.
+
+        Four of the twenty XMM observations of M82 X-2 hold no EPIC exposure, and the run
+        index called all twenty "done" -- the report contradicting the run it describes.
+        The observation-level record is what decides: ``skipped`` on a single *step* is
+        ordinary (a download reused from an earlier run) and must still leave the
+        observation done.
+        """
+        with record_step(observation(tmp_path), OBSID, "observation") as rec:
+            rec.skip("the observation holds no science data")
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "skipped"
+
+    def test_one_skipped_step_still_leaves_the_observation_done(self, tmp_path):
+        """The opposite case, so the fix above cannot swallow an ordinary reused input."""
+        with record_step(observation(tmp_path), OBSID, "download") as rec:
+            rec.skip("files already downloaded in a prior run")
+        with record_step(observation(tmp_path), OBSID, "calculate_spectra"):
+            pass
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "done"
+
     def test_a_step_that_never_finished_names_itself(self, tmp_path):
         """A killed run leaves its last step as running. That is the point of writing it."""
         rec = record_step(observation(tmp_path), OBSID, "calculate_spectra")
