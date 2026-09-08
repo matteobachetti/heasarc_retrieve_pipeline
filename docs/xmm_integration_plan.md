@@ -1413,6 +1413,111 @@ returns a speech-analysis package, `github.com/XMMGOF/pysas` has no `setup.py` o
 `heasoft`, `heasoft-tests`, `xspec`, `xspec-compilers`. `pysas.sastask.MyTask.run()` is
 readable at `raw.githubusercontent.com/XMMGOF/pysas/main/sastask.py`, lines 362–456.
 
+## Acceptance target 2: every XMM observation of M82 X-2, as a batch
+
+Run 2026-09-08, `n_workers=2`, PPS route, one command:
+
+```python
+retrieve_heasarc_data_by_source_name(
+    "M82 X-2", outdir="out_m82", mission="xmm", radius_deg=0.2, n_workers=2
+)
+```
+
+Twenty observations in the cone search, all twenty accounted for, about two hours wall
+clock. **Every extraction below is a blend of M82 X-2 with M82 X-1**, which lies about
+5 arcsec away — known, accepted, and not something the extraction is designed around. It
+is stated in `docs/known_issues.rst` under science caveats and belongs in anything
+quoting these numbers.
+
+| | count |
+|---|---|
+| observations in the cone search | 20 |
+| reduced | 15 |
+| `NO_SCIENCE_DATA` (no EPIC exposure) | 4 |
+| failed | 1 — `0560590201`, see below |
+| exposures reduced | 45 — pn, mos1, mos2 on each |
+| grouped spectra written | 45 |
+| barycentred to `TDB`/`SOLARSYSTEM` | 45 of 45 |
+| good time kept | 1144 ks of 1550 ks, 73.8% |
+
+The four `NO_SCIENCE_DATA` observations — `0112290401`, `0870940501`, `0891060501`,
+`0891060601` — are **exactly** the four the archive query predicted carry no EPIC data.
+That is the first live confirmation of that path on real observations, and it agrees with
+an independent prediction rather than merely not crashing.
+
+### Barycentring, 45 for 45
+
+Every exposure came back `TIMESYS=TDB`, `TIMEREF=SOLARSYSTEM`. Step 11 was built and
+verified against a single observation; it holds across fifteen, three cameras each. Since
+the science here is the 1.37 s pulsation, this was the part of the batch that had to work.
+
+### The window check found something systematic
+
+The background annulus needs 90 arcsec of exposed detector. Across the batch:
+
+* **MOS: 30 of 30 fit**, with 350–430 arcsec of reach. Never close to a problem.
+* **pn: 10 of 15 clipped**, reach 53.0 to 100.1 arcsec.
+
+M82 falls near a pn chip edge in most of these pointings. This is not silently wrong —
+`BACKSCAL` records the *exposed* area, so a clipped annulus costs background counts
+rather than biasing the result — but it is a real and repeatable caveat on pn spectra of
+this target, and it is exactly what the check was added to catch. `0657802301` is the
+worst at 53 arcsec, well under half the area asked for.
+
+Worth remembering that this check only tells the truth because of the fix in `ed85047`:
+measured on the *raw* event list instead of the cleaned one, `0870940101` reads 96.1
+arcsec and passes, against 87.6 arcsec and clipped when measured correctly.
+
+### Pile-up: pn only, and only marginally
+
+Flagged on 7 of 15 pn exposures and **0 of 30 MOS**. The instrument split is right —
+pn has the highest throughput, so it piles up first.
+
+The numbers deserve a caveat rather than a headline. The criterion is
+`singles + 3 sigma < 1` **or** `doubles - 3 sigma > 1`, and all seven fired on the
+doubles arm alone: doubles 1.027–1.057, singles 0.9996–1.0148, that is
+**not depressed at all**. Genuine pile-up pushes singles down as it pushes doubles up.
+A doubles excess by itself, in a field with M82's diffuse emission inside the extraction
+region and X-1 blended with X-2, is as easily a distorted pattern distribution as it is
+pile-up. The check reports what it measured and the flag is doing its job; **whether these
+seven exposures should be treated as piled up is a judgement for Matteo**, and the
+`epatplot` PDFs are in each observation's products directory for that.
+
+### Flare screening agrees across cameras
+
+Median 13.9% of exposure removed, which is ordinary for XMM. Two observations are
+genuinely flare-dominated: `0560590201` loses 56.5 / 55.7 / 59.0% on mos1 / mos2 / pn, and
+`0560590301` loses 54.1 / 45.1 / 65.8%.
+
+The three cameras agreeing per observation is the check that matters, because each
+threshold is read independently from that file's own `FLCUTTHR`, and those thresholds span
+**2.9 to 212.8 counts/s** across the batch. Three independent thresholds converging on the
+same good-time fraction means they are seeing the same flares.
+
+It also settles step 6 retrospectively. The SAS cookbook's fixed 0.4 counts/s, applied to
+an exposure whose own `FLCUTTHR` is 212.8, would have thrown away essentially the whole
+observation.
+
+### One casualty, still outstanding
+
+`0560590201` failed in the batch on an `especget` killed by SIGSEGV — the memory-starved
+machine, not the data; see the section below. Re-running it did **not** reproduce that
+crash. It instead fails earlier and repeatably, at `odfingest`, with return code 1.
+
+What is established so far, by measurement rather than inference:
+
+* Run by hand on that observation's staged ODF, `cifbuild` and `odfingest` both return 0.
+  `odfingest` warns `NoScienceFiles` and falls back to the housekeeping, exactly as
+  intended. **So the ODF is fine and the task can succeed on it.**
+* The batch itself ran `odfingest` on this observation successfully at 01:21:55 and went
+  on to barycentre all three cameras.
+* `n_workers` is not the cause: the re-run fails identically at 1 and at 2.
+
+So the same observation succeeds through the batch entry point and by hand, and fails
+through `retrieve_and_process_data` called directly. That points at run setup rather than
+at the ODF or the task, and it is **not yet diagnosed**. Fifteen of sixteen is the honest
+count for this batch until it is.
+
 ## One exposure's failure loses the whole observation — a question for Matteo
 
 Found during the M82 batch, 2026-09-08, and **not acted on**: this is a behaviour change
