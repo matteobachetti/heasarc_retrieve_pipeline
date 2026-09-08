@@ -1547,33 +1547,33 @@ succeeds on the default 8 MiB stack), `n_workers` (the re-run fails identically 
 at 2), and the ODF itself (`cifbuild` and `odfingest` both return 0 on it by hand, with
 the pipeline's own observation date).
 
-## One exposure's failure loses the whole observation — a question for Matteo
+## Matteo's rulings, 2026-09-08
 
-Found during the M82 batch, 2026-09-08, and **not acted on**: this is a behaviour change
-outside the agreed thirteen commits.
+**One exposure's failure must not lose the whole observation.** "There should be a way to
+keep going and report failures." Implemented in `fe673e5`: `process_xmm_obsid` reduces each
+exposure in its own `try`, records the failure under that exposure's key, and carries on.
+Every exposure failing is still a failed observation — carrying on past all of them would
+report an observation that produced nothing as a success. This also brings the per-exposure
+loop into line with step 10, where `epproc` failing does not stop `emproc`.
 
-`especget` was killed by SIGSEGV on `0560590201`'s mos2 exposure, so
-`process_xmm_obsid` raised and the observation was recorded as `failed`. By then it had
-already written complete spectra for the other two cameras:
+Reporting it is half the ruling, so `outcome_of` gained **`partial`**: a step failed but the
+observation finished. "Done" would hide the loss and "failed" would hide the cameras that
+worked. It cannot swallow a real failure — the observation-level record decides.
+
+The case that prompted this: `especget` was killed by SIGSEGV on `0560590201`'s mos2, and
+the observation was discarded with complete pn and mos1 spectra already written —
 
 ```
-pnS001_imaging.{arf,rmf}  pnS001_imaging_{src,bkg,grp}.pi     complete
-mos1S002_imaging.{arf,rmf}  mos1S002_imaging_{src,bkg,grp}.pi complete
-mos2S003_imaging_{src,bkg}.pi                                 crashed before arf/rmf
+pnS001_imaging.{arf,rmf}    pnS001_imaging_{src,bkg,grp}.pi     complete
+mos1S002_imaging.{arf,rmf}  mos1S002_imaging_{src,bkg,grp}.pi   complete
+mos2S003_imaging_{src,bkg}.pi                                   crashed before arf/rmf
 ```
 
-Two cameras' worth of usable spectra were thrown away because a third crashed. The
-per-exposure loop in `process_xmm_obsid` is flat: any exception in any step of any
-exposure ends the observation.
+**Pile-up: no further treatment, reporting is sufficient.** The seven flagged pn exposures
+are reported and nothing is done about them. No `withxrlcorr`, no annular excision.
 
-This is the **opposite** of the choice made one step earlier, in step 10, where `epproc`
-failing does not stop `emproc` and only both failing is an error. The two ought to agree.
-
-The case for isolating each exposure: a MOS-only or pn-only reduction is worth having, the
-pipeline already has a vocabulary for partial results, and the diagnostics record which
-exposure failed and why. The case against: a quietly missing camera is easy not to notice,
-and a real calibration fault would then be downgraded from a failure into a gap in a
-report. **Matteo's call**, not one to absorb.
+**The extraction window is measured, not tabulated.** The deviation from the endorsed table
+of window sizes is approved — "ok doing the measurement".
 
 ### Why it crashed, which is a separate matter and not a code fault
 
