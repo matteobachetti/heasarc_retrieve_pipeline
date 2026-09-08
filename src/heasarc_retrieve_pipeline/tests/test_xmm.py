@@ -1560,15 +1560,20 @@ class StubSas:
         self.calls.append((name, dict(params, cwd=cwd)))
         self.environments.append(dict(env or {}))
         for output in produces if isinstance(produces, (list, tuple)) else [produces]:
-            os.makedirs(os.path.dirname(str(output)), exist_ok=True)
-            if not os.path.exists(str(output)):
-                if str(output).endswith(".evt"):
-                    an_event_file(str(output))
-                elif str(output).endswith(".lc"):
+            # IN_PLACE wraps the path it means, and its repr is "IN_PLACE('/some/path')".
+            # Calling str() on it made a directory of that name under the process working
+            # directory -- the test suite littering the repository -- and meant the
+            # in-place outputs were never really checked.
+            path = output.path if isinstance(output, sas.IN_PLACE) else str(output)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if not os.path.exists(path):
+                if path.endswith(".evt"):
+                    an_event_file(path)
+                elif path.endswith(".lc"):
                     # The ODF route's evselect rateset, which the flare screening reads.
-                    a_flare_lightcurve(str(output), [1.0, 1.0, 90.0, 1.0])
+                    a_flare_lightcurve(path, [1.0, 1.0, 90.0, 1.0])
                 else:
-                    open(str(output), "w").write("stub\n")
+                    open(path, "w").write("stub\n")
         if name == "epatplot":
             assert params["modifyinset"] == "yes", "the ratios would not be written"
         if name == "epatplot" and self.keywords is not None:
