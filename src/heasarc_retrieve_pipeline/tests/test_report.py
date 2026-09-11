@@ -15,6 +15,7 @@ Three layers, none of which needs a browser:
 
 import json
 import os
+import time
 
 import numpy as np
 import pytest
@@ -376,6 +377,55 @@ class TestWhatTheFiguresContain:
         shaded = [(shape.x0, shape.x1) for shape in fig.layout.shapes]
         assert shaded == [(400.0, 600.0)] * 3, "one band per panel"
 
+    @pytest.mark.parametrize("goes", [True, False])
+    def test_the_shading_is_exactly_what_add_vrect_would_have_drawn(self, tmp_path, goes):
+        """
+        The rectangles are assigned in one go rather than added one at a time, because
+        ``add_vrect`` is quadratic in the number of shapes already on the figure. This
+        pins the result to what plotly itself would have produced, panel for panel --
+        including its habit of leaving out panels that have no traces, which is why the
+        GOES row is switched off and on here.
+        """
+        import plotly.graph_objects as go
+
+        a_flare_filtering(tmp_path, goes=goes)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        arrays["removed"] = np.array([[100.0, 150.0], [400.0, 600.0], [800.0, 820.0]])
+
+        fig = report.flare_figure(record, arrays)
+
+        reference = go.Figure(fig)
+        reference.layout.shapes = ()
+        for start, stop in arrays["removed"]:
+            reference.add_vrect(
+                x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16, line_width=0, layer="below"
+            )
+        assert [shape.to_plotly_json() for shape in fig.layout.shapes] == [
+            shape.to_plotly_json() for shape in reference.layout.shapes
+        ]
+        assert len(fig.layout.shapes) == 3 * (3 if goes else 2)
+
+    def test_a_thousand_removed_intervals_still_draw_promptly(self, tmp_path):
+        """
+        Adding the rectangles one at a time cost more than the square of their number:
+        800 intervals took 71 minutes, and two M82 observations sat inside a page write
+        for half an hour each, holding a worker of the pool the whole time. Assigning
+        the list in one call is linear -- a thousand intervals in well under a second.
+
+        The bound is a couple of orders of magnitude above the measured time, so it is a
+        regression guard rather than a benchmark, and will not flap on a busy machine.
+        """
+        a_flare_filtering(tmp_path)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        arrays["removed"] = np.arange(2000.0).reshape(-1, 2)
+
+        began = time.perf_counter()
+        fig = report.flare_figure(record, arrays)
+        elapsed = time.perf_counter() - began
+
+        assert len(fig.layout.shapes) == 3000, "a thousand intervals across three panels"
+        assert elapsed < 10.0, f"a thousand intervals took {elapsed:.1f} s to draw"
+
     def test_the_flare_figure_leaves_the_goes_panel_out_when_there_is_none(self, tmp_path):
         a_flare_filtering(tmp_path, goes=False)
         record, arrays = self.records(tmp_path, "flare_filtering")
@@ -384,6 +434,24 @@ class TestWhatTheFiguresContain:
 
         assert not [trace for trace in fig.data if "GOES" in (trace.name or "")]
         assert len(fig.data) == 4, "both bands, before and after"
+
+    def test_the_flare_figure_survives_a_chi2_that_could_not_be_measured(self, tmp_path):
+        """
+        Fewer than two light-curve bins gives ``nan``, which reaches JSON as ``null``.
+
+        A pair with a hole in it is not a before-and-after comparison, so the axis says
+        nothing about it -- but the panels themselves are still worth drawing.
+        """
+        a_flare_filtering(tmp_path)
+        record, arrays = self.records(tmp_path, "flare_filtering")
+        record["values"]["chi2_dof_3_10"] = [None, None]
+        record["values"]["chi2_dof_10_79"] = [1.2, None]
+
+        fig = report.flare_figure(record, arrays)
+
+        labels = [fig.layout[f"yaxis{n}"].title.text for n in (2, 3)]
+        assert not [label for label in labels if "dof" in label]
+        assert len(fig.data) == 6, "GOES pair, both bands, before and after"
 
     def test_a_region_read_back_from_disk_has_no_profile_to_draw(self, tmp_path):
         """A rerun measures nothing, so there is nothing to plot. That is not a failure."""
@@ -587,6 +655,59 @@ class TestPagesThatCouldGoWrong:
         assert "source separation produced nothing for FPMA" in text
         assert "Traceback" in text
 
+    def test_an_observation_that_lost_one_exposure_is_partial_not_done(self, tmp_path):
+        """
+        Keeping going has to be visible, or it is just quiet data loss.
+
+        XMM reduces each exposure independently and carries on past one that fails, so an
+        observation can finish having produced two cameras out of three. Calling that
+        "done" hides the loss; calling it "failed" hides the two that worked.
+        """
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="mos2"):
+                raise RuntimeError("especget failed with return code -11")
+        with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="pn"):
+            pass
+        with record_step(observation(tmp_path), OBSID, "observation"):
+            pass
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "partial"
+
+    def test_an_observation_that_failed_outright_is_still_failed(self, tmp_path):
+        """The guard: partial must not swallow a real failure of the whole observation."""
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "calculate_spectra", key="mos2"):
+                raise RuntimeError("especget failed with return code -11")
+        with pytest.raises(RuntimeError):
+            with record_step(observation(tmp_path), OBSID, "observation"):
+                raise RuntimeError("no exposure could be reduced")
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "failed"
+
+    def test_an_observation_with_no_science_data_is_not_called_done(self, tmp_path):
+        """
+        An observation the pipeline skipped must not be tallied as a reduction.
+
+        Four of the twenty XMM observations of M82 X-2 hold no EPIC exposure, and the run
+        index called all twenty "done" -- the report contradicting the run it describes.
+        The observation-level record is what decides: ``skipped`` on a single *step* is
+        ordinary (a download reused from an earlier run) and must still leave the
+        observation done.
+        """
+        with record_step(observation(tmp_path), OBSID, "observation") as rec:
+            rec.skip("the observation holds no science data")
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "skipped"
+
+    def test_one_skipped_step_still_leaves_the_observation_done(self, tmp_path):
+        """The opposite case, so the fix above cannot swallow an ordinary reused input."""
+        with record_step(observation(tmp_path), OBSID, "download") as rec:
+            rec.skip("files already downloaded in a prior run")
+        with record_step(observation(tmp_path), OBSID, "calculate_spectra"):
+            pass
+
+        assert report.observation_summary(OBSID, str(tmp_path))["outcome"] == "done"
+
     def test_a_step_that_never_finished_names_itself(self, tmp_path):
         """A killed run leaves its last step as running. That is the point of writing it."""
         rec = record_step(observation(tmp_path), OBSID, "calculate_spectra")
@@ -701,7 +822,9 @@ class TestJoiningTheOtherTwoRecords:
 
         page = os.path.join(base, "diagnostics.html")
         assert os.path.exists(page)
-        assert "Solar-flare filtering" in soup(page).get_text()
+        # Not "solar": XMM screens the same step for soft protons, and the heading has
+        # to be true of both. Which kind of flare is on the figure's own axes.
+        assert "Flare filtering" in soup(page).get_text()
 
 
 class TestTheRunIndex:

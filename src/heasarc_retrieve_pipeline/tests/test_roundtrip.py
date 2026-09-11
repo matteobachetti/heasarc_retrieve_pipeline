@@ -308,14 +308,40 @@ class TestTheCommandLine:
         seen = {}
 
         def fake_check(obsid, config, mjds, workdir, **kwargs):
-            seen.update(obsid=obsid, workdir=workdir, mjds=mjds, kwargs=kwargs)
+            # Resolved here, not in the assertion: short_workspace removes the link on
+            # the way out, and realpath of a name that is gone is the name itself.
+            seen.update(
+                obsid=obsid,
+                workdir=workdir,
+                real=os.path.realpath(workdir),
+                mjds=mjds,
+                kwargs=kwargs,
+            )
             return {"config": config, "spectra": {}, "events": {}, "merged": None}
 
         monkeypatch.setattr(roundtrip, "check_roundtrip", fake_check)
         roundtrip.main([str(tmp_path / "out"), OBSID, "56000.5"])
 
-        assert seen["workdir"] == str(tmp_path / "roundtrip")
+        # The check is handed a short_workspace link rather than the directory itself --
+        # every HEASOFT call in the check happens inside it -- so what is asserted is
+        # where that link lands.
+        assert seen["real"] == os.path.realpath(tmp_path / "roundtrip")
         assert seen["mjds"] == [56000.5]
+
+    def test_the_check_is_handed_a_short_name_to_work_under(self, tmp_path, monkeypatch):
+        """HEASOFT truncates long file names, and pytest's own temporary directory is
+        already 90 characters deep on macOS. See utils.short_workspace."""
+        seen = {}
+
+        def fake_check(obsid, config, mjds, workdir, **kwargs):
+            seen.update(workdir=workdir)
+            return {"config": config, "spectra": {}, "events": {}, "merged": None}
+
+        monkeypatch.setattr(roundtrip, "check_roundtrip", fake_check)
+        deep = tmp_path / ("d" * 60) / "out"
+        roundtrip.main([str(deep), OBSID, "56000.5"])
+
+        assert len(seen["workdir"]) < len(str(deep.parent / "roundtrip"))
 
     def test_the_flags_reach_the_check(self, tmp_path, monkeypatch):
         seen = {}

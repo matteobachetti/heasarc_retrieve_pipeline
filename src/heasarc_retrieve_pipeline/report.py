@@ -41,7 +41,7 @@ from .diagnostics import (
     read_manifest,
     read_records,
 )
-from .utils import get_logger, read_skipped_inputs
+from .utils import get_logger, log_version, read_skipped_inputs
 
 
 PLOTLY_BUNDLE = "plotly.min.js"
@@ -54,6 +54,8 @@ PLOTLY_BUNDLE = "plotly.min.js"
 #: reduction, and a partly reduced observation may have only one of them. Temporary
 #: working directories such as ``1988_tmp_nuproducts`` have none, which is the point.
 OBSERVATION_SUBDIRECTORIES = (
+    "ODF",
+    "PPS",
     "auxil",
     "event_cl",
     "event_pipe",
@@ -65,9 +67,14 @@ OBSERVATION_SUBDIRECTORIES = (
 )
 
 
+#: Energy range ``spectrum_figure`` draws when a record does not name its own, in keV.
+#: NuSTAR's, because NuSTAR's records were written before the key existed.
+NUSTAR_SPECTRUM_BAND_KEV = (3.0, 79.0)
+
 STATUS_COLOURS = {
     "done": "#2a9d8f",
     "skipped": "#e9c46a",
+    "partial": "#e8a33d",
     "failed": "#e76f51",
     "running": "#8ecae6",
 }
@@ -76,12 +83,15 @@ STATUS_COLOURS = {
 STEP_TITLES = {
     "observation": "The observation as a whole",
     "l2_pipeline": "Level 2 pipeline",
+    "odf_ingest": "ODF ingestion",
+    "barycenter": "Barycentric correction",
     "recover_spacecraft_science": "Spacecraft science recovery",
     "separate_sources": "Source separation",
     "source_region": "Extraction region",
     "source_position": "Source position",
+    "pileup_check": "Pile-up check",
     "join_source_data": "Source join",
-    "flare_filtering": "Solar-flare filtering",
+    "flare_filtering": "Flare filtering",
     "calculate_spectra": "Spectral extraction",
     "combine_modules": "Module combination",
 }
@@ -411,9 +421,10 @@ def spectrum_figure(record, arrays):
 
     Notes
     -----
-    Counts are placed in energy with ``E = 0.04 * PI + 1.6``, not by folding the response.
-    That is right for a diagnostic and wrong for a fit; see
-    :func:`heasarc_retrieve_pipeline.nustar.read_spectrum`.
+    For NuSTAR, counts are placed in energy with ``E = 0.04 * PI + 1.6``, not by folding
+    the response. That is right for a diagnostic and wrong for a fit; see
+    :func:`heasarc_retrieve_pipeline.nustar.read_spectrum`. XMM takes its energies from the
+    ``EBOUNDS`` of the response instead, which needs no such constant.
     """
     go, _ = _plotly()
 
@@ -430,6 +441,12 @@ def spectrum_figure(record, arrays):
     if not stems:
         return None
 
+    # The band exists because a log axis would otherwise give the channels outside the
+    # instrument's effective area most of the plot. Which band that is belongs to the
+    # mission, so the record says: NuSTAR's 3-79 keV is the default because NuSTAR's
+    # records predate the key, and XMM writes its own 0.2-12.
+    low, high = (record.get("values") or {}).get("energy_band") or NUSTAR_SPECTRUM_BAND_KEV
+
     fig = go.Figure()
     for stem in stems:
         for which, name, dash in (("src", "source", None), ("bkg", "background", "dot")):
@@ -437,9 +454,7 @@ def spectrum_figure(record, arrays):
             rate = arrays.get(f"spec_{stem}_{which}_rate")
             if energy is None or rate is None:
                 continue
-            # Below 3 keV and above 79 keV NuSTAR has no effective area, and a log axis
-            # would give the empty channels the whole left half of the plot.
-            inside = (np.asarray(energy) >= 3.0) & (np.asarray(energy) <= 79.0)
+            inside = (np.asarray(energy) >= low) & (np.asarray(energy) <= high)
             fig.add_trace(
                 go.Scatter(
                     x=np.asarray(energy)[inside],
@@ -540,6 +555,47 @@ def gti_figure(record, arrays):
     return _blank(fig, height=max(200, 30 * len(rows) + 90))
 
 
+def _row_spans(fig, intervals, **style):
+    """
+    Rectangles spanning the full height of every populated row of a subplot figure.
+
+    ``Figure.add_vrect`` does this one rectangle at a time, and before each one it walks
+    the shapes already on the figure to decide which subplots are empty. The cost of a
+    whole list therefore grows faster than its square: on the three-row flare figure, 800
+    intervals took 71 minutes to draw, against a quarter of a second for the identical
+    shapes assigned in a single ``update_layout``. Two M82 observations were last seen
+    inside one of these, half an hour in, each holding a worker of the pool. So the rows
+    are worked out here and the caller assigns the lot at once.
+
+    Rows carrying no traces are skipped, which is what ``add_vrect`` does of its own
+    accord (``exclude_empty_subplots``), and an interval's rectangles come out in row
+    order -- both pinned by the tests against ``add_vrect`` itself.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        A subplot figure whose traces have already been added.
+    intervals : iterable of (float, float)
+        Start and stop along the x axis.
+    **style
+        Passed through to every shape: ``fillcolor``, ``opacity``, ``layer`` and so on.
+
+    Returns
+    -------
+    list of dict
+        Ready for ``fig.update_layout(shapes=...)``.
+    """
+    axes = dict.fromkeys((trace.xaxis or "x", trace.yaxis or "y") for trace in fig.data)
+    # "x" is row one, "x2" row two: order by the number so the result does not depend on
+    # the order the traces happened to be added in.
+    rows = sorted(axes, key=lambda ref: int(ref[0][1:] or 1))
+    return [
+        dict(type="rect", xref=xref, yref=f"{yref} domain", x0=start, x1=stop, y0=0, y1=1, **style)
+        for start, stop in intervals
+        for xref, yref in rows
+    ]
+
+
 def flare_figure(record, arrays):
     """
     The three panels of the solar-flare filtering, on one shared time axis.
@@ -566,6 +622,12 @@ def flare_figure(record, arrays):
 
     if not arrays or not any(key.startswith("lc_") for key in arrays):
         return None
+
+    # XMM records one background curve rather than NuSTAR's before-and-after in two
+    # energy bands, so it gets one panel. Drawn here rather than in a second function
+    # because the step, the record and the shading are the same; only the picture differs.
+    if "lc_time" in arrays:
+        return _single_band_flare_figure(record, arrays)
 
     bands = [("3_10", "3–10 keV (solar stray light)"), ("10_79", "10–79 keV (control)")]
     fig = make_subplots(
@@ -611,21 +673,106 @@ def flare_figure(record, arrays):
                 row=row,
                 col=1,
             )
-        chi2 = values.get(f"chi2_dof_{band}")
+        # A light curve with fewer than two bins has no chi2, which arrives here as
+        # None: half a before-and-after is not a comparison, so say nothing at all.
+        chi2 = values.get(f"chi2_dof_{band}") or []
         label = f"{title} rate (s<sup>-1</sup>)"
-        if chi2:
+        if len(chi2) == 2 and all(value is not None for value in chi2):
             label += f"<br>χ²/dof {chi2[0]:.2f} → {chi2[1]:.2f}"
         fig.update_yaxes(title_text=label, title_font_size=10, row=row, col=1)
 
     removed = np.atleast_2d(np.asarray(arrays.get("removed", np.zeros((0, 2))), float))
-    for start, stop in removed.reshape(-1, 2):
-        fig.add_vrect(
-            x0=start, x1=stop, fillcolor="#e76f51", opacity=0.16, line_width=0, layer="below"
+    fig.update_layout(
+        shapes=_row_spans(
+            fig,
+            removed.reshape(-1, 2),
+            fillcolor="#e76f51",
+            opacity=0.16,
+            line=dict(width=0),
+            layer="below",
         )
+    )
 
     fig.update_xaxes(title_text="mission elapsed time (s)", row=3, col=1)
     fig.update_layout(legend=dict(orientation="h", y=1.06, x=0, font=dict(size=10)))
     return _blank(fig, height=780)
+
+
+def _single_band_flare_figure(record, arrays):
+    """
+    One background light curve, its threshold, and the intervals the threshold removed.
+
+    The shape a mission gives when it screens on a single curve someone else made -- XMM
+    thresholds the PPS ``FBKTSR``, which is one series with no band structure and no
+    before-and-after, because the "after" is the good time intervals rather than a second
+    light curve.
+
+    Parameters
+    ----------
+    record : dict
+        A ``flare_filtering`` record.
+    arrays : dict of numpy.ndarray
+        Its array payload, holding ``lc_time``, ``lc_rate`` and optionally
+        ``lc_rate_err`` and ``removed``.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if the curve is empty.
+    """
+    go, _ = _plotly()
+
+    time = np.asarray(arrays.get("lc_time", []), float)
+    rate = np.asarray(arrays.get("lc_rate", []), float)
+    if time.size == 0 or rate.size == 0:
+        return None
+
+    values = record.get("values") or {}
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=time,
+            y=rate,
+            error_y=dict(array=arrays.get("lc_rate_err"), thickness=0.7, width=0),
+            mode="markers",
+            name="background rate",
+            marker=dict(size=4, color="#264653"),
+        )
+    )
+
+    # The shading first and the threshold second, because update_layout(shapes=...)
+    # *replaces* the shape list rather than adding to it -- the other order drew the line
+    # and then silently threw it away.
+    removed = np.atleast_2d(np.asarray(arrays.get("removed", np.zeros((0, 2))), float))
+    fig.update_layout(
+        shapes=_row_spans(
+            fig,
+            removed.reshape(-1, 2),
+            fillcolor="#e76f51",
+            opacity=0.16,
+            line=dict(width=0),
+            layer="below",
+        )
+    )
+
+    threshold = values.get("threshold")
+    if threshold is not None:
+        fig.add_hline(
+            y=float(threshold),
+            line=dict(color="#e76f51", width=1, dash="dash"),
+            annotation_text=f"threshold {float(threshold):.3g}",
+            annotation_position="top left",
+            annotation_font_size=10,
+        )
+
+    kept, total = values.get("exposure_after"), values.get("exposure_before")
+    title = "background rate (s<sup>-1</sup>)"
+    if kept is not None and total:
+        title += f"<br>kept {float(kept):.0f} s of {float(total):.0f} s"
+    fig.update_yaxes(title_text=title, title_font_size=10)
+    fig.update_xaxes(title_text="mission elapsed time (s)")
+    fig.update_layout(legend=dict(orientation="h", y=1.08, x=0, font=dict(size=10)))
+    return _blank(fig, height=420)
 
 
 def _centres(edges, n):
@@ -753,9 +900,16 @@ def outcome_of(records):
     """
     One word for how an observation went.
 
-    ``failed`` if any step failed, ``running`` if any step never finished -- which is what
-    a killed run leaves behind -- ``done`` if anything finished, and ``no records`` if the
-    observation never started.
+    ``running`` if any step never finished -- which is what a killed run leaves behind --
+    ``failed`` if a step failed and the observation did too, ``partial`` if a step failed
+    but the observation still finished, ``skipped`` if the observation as a whole was
+    skipped, ``done`` if anything finished, and ``no records`` if it never started.
+
+    Only the *observation-level* record makes an outcome ``skipped``. A single skipped
+    step is ordinary -- a download reused from an earlier run is recorded that way -- and
+    leaves the observation done. Without that distinction an observation holding no
+    science data was tallied as a reduction: four of the twenty XMM observations of
+    M82 X-2 are empty, and the run index called all twenty done.
 
     Parameters
     ----------
@@ -768,9 +922,19 @@ def outcome_of(records):
     statuses = {record.get("status") for record in records}
     if not statuses:
         return "no records"
-    for status in ("failed", "running"):
-        if status in statuses:
-            return status
+    whole = next((r for r in records if r.get("step") == "observation"), None)
+    if "running" in statuses:
+        return "running"
+    if "failed" in statuses:
+        # A step failed. Whether the observation did is a different question: XMM reduces
+        # each exposure independently and carries on past one that fails, so an
+        # observation can finish having produced two cameras out of three. Calling that
+        # "done" hides the loss and calling it "failed" hides the two that worked.
+        if whole is not None and whole.get("status") == "done":
+            return "partial"
+        return "failed"
+    if whole is not None and whole.get("status") == "skipped":
+        return "skipped"
     return "done"
 
 
@@ -878,7 +1042,10 @@ def observation_body(summary, directory):
         ("Source separation", "separate_sources", separation_figure),
         ("Extraction regions", "source_region", radial_profile_figure),
         ("Joining", "join_source_data", gti_figure),
-        ("Solar-flare filtering", "flare_filtering", flare_figure),
+        # Not "solar": NuSTAR's flares are solar stray light and XMM's are soft protons,
+        # and the figure's own axes say which. The step title is generic for the same
+        # reason.
+        ("Flare filtering", "flare_filtering", flare_figure),
         ("Spectra", "calculate_spectra", spectrum_figure),
         # The same figure: a combined product is a spectrum like any other, and drawing it
         # on its own axes is what lets a reader see it sitting at the sum of the two
@@ -1266,6 +1433,11 @@ def main(argv=None):
         print(__doc__.strip().splitlines()[0])
         print("usage: hrp-report <output directory>")
         return 2
+
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
     outdir = os.path.abspath(argv[0])
     obsids = observation_directories(outdir)

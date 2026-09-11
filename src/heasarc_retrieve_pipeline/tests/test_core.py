@@ -7,15 +7,18 @@ touches the network.
 
 import os
 import re
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
 
 from heasarc_retrieve_pipeline import core
 from heasarc_retrieve_pipeline.core import (
+    MISSION_CONFIG,
     download_node,
     get_remote_directory_listing,
     file_needs_download,
+    obsid_query,
     parse_directory_index,
     recursive_download_s3,
     s3_key_destination,
@@ -610,3 +613,404 @@ class TestThePageWriteIsTimed:
             caplog.text,
         )
         assert "Wrote the diagnostics page" not in caplog.text
+
+
+# Recorded from the live HEASARC TAP service on 2026-09-07 with
+#
+#     SELECT column_name FROM TAP_SCHEMA.columns WHERE table_name='<table>'
+#
+# (the service quotes ``"time"`` and ``"__row"``; the quotes are stripped here). The
+# point of keeping the whole schema rather than the interesting parts is that the
+# assertion below is then exact: every column a mission asks for is one the catalogue
+# really has. ``xmmmaster`` is recorded before XMM is a mission, so the guard is in
+# place on the day the mission is added.
+CATALOGUE_COLUMNS = {
+    "numaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec abstract bii caldb_version category_code
+        comments coordinated copi_fname copi_lname country cycle data_gap dec end_time
+        exposure_a exposure_b instrument_mode issue_flag lii name nupsdout obs_type
+        observation_mode obsid ontime_a ontime_b pi_fname pi_lname priority prnb
+        processing_date public_date ra roll_angle slew_mode software_version
+        solar_activity spacecraft_mode status subject_category time title
+        """.split()
+    ),
+    "nicermastr": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec abstract bii caldb_version category_code
+        coordinated cycle dec end_time exposure facility galactic_nh lii mpu0_exposure
+        mpu1_exposure mpu2_exposure mpu3_exposure mpu4_exposure mpu5_exposure
+        mpu6_exposure name num_fpm num_processed obs_type obsid orig_target_id pi_fname
+        pi_lname prnb processing_date processing_status processing_version public_date ra
+        remarks software_version subject_category target_class target_dec target_id
+        target_ra time time_awarded title
+        """.split()
+    ),
+    "xtemaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec archived_date bii cycle dec duration
+        exposure hexte_anglea hexte_angleb hexte_dwella hexte_dwellb hexte_energya
+        hexte_energyb hexte_modea hexte_modeb lii observed_date obsid pca_config1
+        pca_config2 pca_config3 pca_config4 pca_config5 pca_config6 pi_fname pi_lname
+        pi_no priority prnb processed_date ra scheduled_date status subject_category
+        tar_no target_name time time_awarded
+        """.split()
+    ),
+    "xmmmaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec bii class data_in_heasarc dec
+        distribution_date duration end_time estimated_exposure lii mos1_mode mos1_num
+        mos1_time mos2_mode mos2_num mos2_time name obsid odf_date om_mode om_num om_time
+        pi_fname pi_lname pi_title pn_mode pn_num pn_time pno pps_flag pps_version
+        process_date process_status public_date ra rgs1_mode rgs1_num rgs1_time
+        rgs2_mode rgs2_num rgs2_time sas_version scheduled_duration status
+        subject_category time xmm_revolution
+        """.split()
+    ),
+}
+
+
+class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
+    """
+    The rest of the ``obsid_query`` tests are in ``test_concurrency.py``; this one is
+    here because it is a schema guard that costs nothing, and that file is deselected
+    unless ``--run-slow`` is given.
+
+    ``cycle`` is the reason the guard exists. It used to be written into the query text
+    for every mission, and ``xmmmaster`` does not have it, so the XMM query failed before
+    it reached the archive.
+    """
+
+    def selected_columns(self, mission):
+        query = obsid_query("1", mission)
+        selected = query.split("SELECT", 1)[1].split("FROM", 1)[0]
+        return [column.strip() for column in selected.split(",") if column.strip()]
+
+    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    def test_every_column_a_mission_asks_for_exists_in_its_catalogue(self, mission):
+        table = MISSION_CONFIG[mission]["table"]
+
+        assert set(self.selected_columns(mission)) <= CATALOGUE_COLUMNS[table]
+
+    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    def test_a_mission_asks_for_no_column_twice(self, mission):
+        """``rxte`` named ``cycle`` in "additional" while the query text named it too."""
+        columns = self.selected_columns(mission)
+
+        assert len(columns) == len(set(columns))
+
+    def test_a_new_mission_has_to_record_its_catalogue_schema(self):
+        """Otherwise the guard above silently passes over it."""
+        tables = {config["table"] for config in MISSION_CONFIG.values()}
+
+        assert tables <= set(CATALOGUE_COLUMNS)
+
+
+class TestThePerMissionDownloadFilter:
+    """
+    Some missions want only part of an observation directory.
+
+    ``recursive_download`` has taken ``re_include`` and ``re_exclude`` all along and
+    nothing ever passed them. A mission declares a ``"download_filter"`` callable in
+    ``MISSION_CONFIG``, the run's config chooses which filter it returns, and missions
+    that declare nothing download whole directories exactly as before.
+    """
+
+    def a_mission_like_nustar(self, monkeypatch, **extra):
+        """Register a fictional mission, so the real ones are not disturbed."""
+        monkeypatch.setitem(
+            core.MISSION_CONFIG, "fictional", dict(MISSION_CONFIG["nustar"], **extra)
+        )
+        return "fictional"
+
+    def test_a_mission_that_declares_no_filter_downloads_the_whole_directory(self):
+        assert core.mission_download_filter("nustar", {}) == {}
+
+    def test_a_mission_that_declares_one_gets_it(self, monkeypatch):
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_include": r"\.evt"}
+        )
+
+        assert core.mission_download_filter(mission, {}) == {"re_include": r"\.evt"}
+
+    def test_the_run_config_is_what_chooses_the_filter(self, monkeypatch):
+        """XMM's filter differs between the PPS and the ODF route, which is a config key."""
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_include": config["products"]}
+        )
+
+        assert core.mission_download_filter(mission, {"products": "pps"}) == {"re_include": "pps"}
+        assert core.mission_download_filter(mission, {"products": "odf"}) == {"re_include": "odf"}
+
+    def test_a_filter_may_name_only_the_arguments_the_download_takes(self, monkeypatch):
+        """A misspelt key would silently download the whole gigabyte instead of 40 MB."""
+        mission = self.a_mission_like_nustar(
+            monkeypatch, download_filter=lambda config: {"re_includes": r"\.evt"}
+        )
+
+        with pytest.raises(ValueError, match="re_includes"):
+            core.mission_download_filter(mission, {})
+
+
+# The top level of an XMM observation directory at HEASARC, as Apache writes it. This one
+# is Her X-1 0153950401, which has both a PPS directory and an ODF one.
+XMM_TOP_LEVEL_HTML = """\
+<html><head><title>Index of /FTP/xmm/data/rev0/0153950401</title></head><body>
+<h1>Index of /FTP/xmm/data/rev0/0153950401</h1>
+<table><tr><th><a href="?C=N;O=D">Name</a></th><th><a href="?C=M;O=A">Last modified</a></th></tr>
+<tr><td><a href="/FTP/xmm/data/rev0/">Parent Directory</a></td><td>&nbsp;</td></tr>
+<tr><td><a href="4XMM/">4XMM/</a></td><td>2024-11-08 03:12</td></tr>
+<tr><td><a href="ODF/">ODF/</a></td><td>2024-11-08 03:12</td></tr>
+<tr><td><a href="PPS/">PPS/</a></td><td>2024-11-08 03:14</td></tr>
+<tr><td><a href="om_mosaic/">om_mosaic/</a></td><td>2024-11-08 03:12</td></tr>
+</table></body></html>
+"""
+
+XMM_URL = "https://heasarc.gsfc.nasa.gov/FTP/xmm/data/rev0/0153950401/"
+
+
+class TestListingOneArchiveDirectory:
+    """
+    One request, one directory, no recursion.
+
+    ``get_remote_directory_listing`` walks a whole tree, which is what a download wants
+    and far more than a question about the tree's shape needs. Deciding whether an
+    observation has been reduced at the archive is such a question, and it is asked
+    before the download that would answer it expensively.
+
+    A directory that cannot be listed is ``None`` and not an empty list. The difference
+    matters to every caller: "there is nothing here" is a fact about the archive, and "I
+    could not look" is a fact about the network, and only the first is worth acting on.
+    """
+
+    def a_page(self, monkeypatch, html):
+        monkeypatch.setattr(core, "_fetch_directory_index", lambda url: html)
+
+    def test_the_subdirectories_come_back_named(self, monkeypatch):
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert core.list_archive_directory(XMM_URL) == ["4XMM/", "ODF/", "PPS/", "om_mosaic/"]
+
+    def test_a_directory_keeps_its_slash(self, monkeypatch):
+        """Which is how a caller tells a subdirectory from a file, here as everywhere
+        else in this module."""
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert all(entry.endswith("/") for entry in core.list_archive_directory(XMM_URL))
+
+    def test_nothing_below_the_top_level_is_listed(self, monkeypatch):
+        """The whole point: 0153950401 holds 461 files, and this asks about four names."""
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert not [e for e in core.list_archive_directory(XMM_URL) if "/" in e.rstrip("/")]
+
+    def test_a_url_without_a_trailing_slash_works_too(self, monkeypatch):
+        self.a_page(monkeypatch, XMM_TOP_LEVEL_HTML)
+
+        assert core.list_archive_directory(XMM_URL.rstrip("/")) == [
+            "4XMM/",
+            "ODF/",
+            "PPS/",
+            "om_mosaic/",
+        ]
+
+    def test_a_directory_that_cannot_be_reached_is_none(self, monkeypatch):
+        self.a_page(monkeypatch, None)
+
+        assert core.list_archive_directory(XMM_URL) is None
+
+    def test_an_http_error_is_not_an_empty_directory(self, monkeypatch):
+        def fetch(url):
+            raise HTTPError(url, 404, "Not Found", {}, None)
+
+        monkeypatch.setattr(core, "_fetch_directory_index", fetch)
+
+        assert core.list_archive_directory(XMM_URL) is None
+
+    def test_s3_lists_the_same_names(self, monkeypatch):
+        """The bucket has no directories, so subdirectories are common prefixes and the
+        delimiter is what stops the listing from returning every key in the tree."""
+        asked = {}
+
+        def list_objects_v2(**kwargs):
+            asked.update(kwargs)
+            return {
+                "CommonPrefixes": [
+                    {"Prefix": "xmm/data/rev0/0153950401/ODF/"},
+                    {"Prefix": "xmm/data/rev0/0153950401/PPS/"},
+                ],
+                "Contents": [{"Key": "xmm/data/rev0/0153950401/README.txt"}],
+            }
+
+        monkeypatch.setattr(
+            core, "_s3_client", lambda: SimpleNamespace(list_objects_v2=list_objects_v2)
+        )
+
+        entries = core.list_archive_directory("s3://nasa-heasarc/xmm/data/rev0/0153950401/")
+
+        assert entries == ["ODF/", "PPS/", "README.txt"]
+        assert asked["Delimiter"] == "/"
+        assert asked["Prefix"] == "xmm/data/rev0/0153950401/"
+
+    def test_a_bucket_that_cannot_be_read_is_none(self, monkeypatch):
+        def broken():
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(core, "_s3_client", broken)
+
+        assert core.list_archive_directory("s3://nasa-heasarc/xmm/x/") is None
+
+    def test_a_local_directory_is_listed_from_disk(self, tmp_path):
+        """The SciServer transport, where the archive is a mounted filesystem."""
+        (tmp_path / "PPS").mkdir()
+        (tmp_path / "ODF").mkdir()
+        (tmp_path / "MANIFEST.1").write_text("x")
+
+        assert core.list_archive_directory(str(tmp_path)) == ["MANIFEST.1", "ODF/", "PPS/"]
+
+    def test_a_local_directory_that_is_not_there_is_none(self, tmp_path):
+        assert core.list_archive_directory(str(tmp_path / "nowhere")) is None
+
+
+class TestThePerMissionConfigResolution:
+    """
+    Some missions cannot know their configuration until they have looked at the archive.
+
+    XMM is the one: ``xmmmaster`` says whether an observation was reduced at the archive,
+    and it is wrong often enough to matter -- 0973390101 is flagged as reduced and has no
+    PPS directory mirrored at HEASARC at all. A run that trusted the flag would download
+    five megabytes of housekeeping and then report an observation with no data in it.
+
+    Missions that declare nothing are handed their configuration back unchanged, which is
+    what every mission did before this existed.
+    """
+
+    def a_mission_like_nustar(self, monkeypatch, **extra):
+        monkeypatch.setitem(
+            core.MISSION_CONFIG, "fictional", dict(MISSION_CONFIG["nustar"], **extra)
+        )
+        return "fictional"
+
+    def test_a_mission_that_declares_nothing_keeps_its_config(self):
+        config = {"products": "pps"}
+
+        assert core.mission_resolve_config("nustar", config, "https://x/") == config
+
+    def test_a_mission_that_declares_one_gets_to_change_its_config(self, monkeypatch):
+        mission = self.a_mission_like_nustar(
+            monkeypatch, resolve_config=lambda config, url: dict(config, products="odf")
+        )
+
+        assert core.mission_resolve_config(mission, {"products": "pps"}, "https://x/") == {
+            "products": "odf"
+        }
+
+    def test_the_url_is_what_it_is_given_to_look_at(self, monkeypatch):
+        seen = []
+        mission = self.a_mission_like_nustar(
+            monkeypatch, resolve_config=lambda config, url: seen.append(url) or config
+        )
+
+        core.mission_resolve_config(mission, {}, "s3://nasa-heasarc/xmm/x/")
+
+        assert seen == ["s3://nasa-heasarc/xmm/x/"]
+
+    def test_something_that_is_not_a_configuration_is_refused(self, monkeypatch):
+        """A hook that forgets to return would otherwise fail three steps later, inside
+        the mission's own reduction, under a name that has nothing to do with it."""
+        mission = self.a_mission_like_nustar(monkeypatch, resolve_config=lambda config, url: None)
+
+        with pytest.raises(TypeError, match="fictional"):
+            core.mission_resolve_config(mission, {}, "https://x/")
+
+
+class TestTheResolvedConfigReachesTheRun:
+    """The wiring: what the hook decides is what the download filters on, and what the
+    mission's own reduction is handed."""
+
+    def a_run_that_records_what_it_saw(self, monkeypatch):
+        seen = {}
+
+        def recursive_download(url, outdir, **kwargs):
+            seen["download"] = kwargs
+            return []
+
+        monkeypatch.setattr(core, "recursive_download", recursive_download)
+        return seen
+
+    def test_the_filter_sees_the_resolved_config(self, tmp_path, monkeypatch):
+        seen = self.a_run_that_records_what_it_saw(monkeypatch)
+        monkeypatch.setitem(
+            core.MISSION_CONFIG,
+            "fictional",
+            dict(
+                MISSION_CONFIG["nustar"],
+                resolve_config=lambda config, url: dict(config, products="odf"),
+                download_filter=lambda config: {"re_include": config["products"]},
+            ),
+        )
+
+        core.download_and_process_observation.fn(
+            "0153950401",
+            "https://example.invalid/0153950401",
+            83.0,
+            22.0,
+            str(tmp_path),
+            "fictional",
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            test=True,
+        )
+
+        assert seen["download"]["re_include"] == "odf"
+
+
+class TestTheDownloadFilterReachesTheDownload:
+    """The wiring, from ``MISSION_CONFIG`` down to the call that fetches the files."""
+
+    def a_download_that_records_its_arguments(self, monkeypatch):
+        seen = {}
+
+        def recursive_download(url, outdir, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(core, "recursive_download", recursive_download)
+        return seen
+
+    def download(self, tmp_path, mission):
+        core.download_and_process_observation.fn(
+            "80002092008",
+            "https://example.invalid/80002092008",
+            83.0,
+            22.0,
+            str(tmp_path),
+            mission,
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            test=True,
+        )
+
+    def test_a_mission_without_a_filter_passes_none(self, tmp_path, monkeypatch):
+        seen = self.a_download_that_records_its_arguments(monkeypatch)
+
+        self.download(tmp_path, "nustar")
+
+        assert "re_include" not in seen
+        assert "re_exclude" not in seen
+
+    def test_a_mission_with_a_filter_passes_it(self, tmp_path, monkeypatch):
+        seen = self.a_download_that_records_its_arguments(monkeypatch)
+        monkeypatch.setitem(
+            core.MISSION_CONFIG,
+            "fictional",
+            dict(
+                MISSION_CONFIG["nustar"],
+                download_filter=lambda config: {"re_include": r"EVLI", "re_exclude": r"\.PNG$"},
+            ),
+        )
+
+        self.download(tmp_path, "fictional")
+
+        assert seen["re_include"] == r"EVLI"
+        assert seen["re_exclude"] == r"\.PNG$"

@@ -130,23 +130,47 @@ in the download half of the code:
      - ``numaster``
      - ``exposure_a``
      - ``name``
-     - ``solar_activity``
+     - ``cycle``, ``solar_activity``
    * - ``nicer``
      - ``nicermastr``
      - ``exposure``
      - ``name``
-     - --
+     - ``cycle``
    * - ``rxte``
      - ``xtemaster``
      - ``exposure``
      - ``target_name``
      - ``cycle``, ``prnb``
 
-Each entry also carries ``obsid_processing``, the flow that reduces one observation.
+Each entry also carries ``obsid_processing``, the flow that reduces one observation, and
+may carry an optional ``download_filter``.
 
 The differences are real archive quirks, not arbitrary: NuSTAR's master catalogue reports
 per-telescope exposures (``exposure_a`` is FPMA), and RXTE's catalogue uses ``target_name``
-rather than ``name`` and needs ``cycle`` and ``prnb`` selected alongside it.
+rather than ``name`` and needs ``prnb`` selected alongside it.
+
+``cycle`` is in the extra columns of all three, and not in the query text, because it is
+not universal: ``numaster``, ``nicermastr`` and ``xtemaster`` have it and ``xmmmaster``
+does not. Only the columns *every* master catalogue has may be written into a query
+literally; anything else belongs to the mission that has it. ``test_core.py`` holds a
+recorded copy of each catalogue's schema and asserts that no mission asks for a column its
+catalogue lacks, so a mission added later cannot rediscover this by failing against the
+live archive.
+
+Downloading only part of an observation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``recursive_download`` has always taken ``re_include`` and ``re_exclude``, and for a long
+time nothing passed them: every mission downloaded whole observation directories. A
+mission that wants less declares a ``download_filter`` in ``MISSION_CONFIG``, and
+``mission_download_filter`` (``core.py``) calls it and forwards the result.
+
+It is a callable taking the run's config, rather than a literal pair of patterns, because
+the answer can depend on the run and not only on the mission: XMM downloads different files
+on its PPS route than on its ODF route, and which route is taken is a config key. A filter
+that returns anything but ``re_include`` and ``re_exclude`` raises, because a misspelt key
+would be dropped in silence and the symptom -- a whole gigabyte arriving where forty
+megabytes were meant to -- reads as a slow network rather than as a bug.
 
 Entries used to carry a ``path_func`` as well, building an archive path from the OBSID.
 Nothing needs it: the URL of an observation's directory comes from the datalink service,
@@ -193,8 +217,7 @@ Notes on the astronomy encoded here:
   filtering the caller does on the table.
 
 The single-OBSID query (``retrieve_info_for_obsid``, ``core.py:343``) is the same shape
-with ``WHERE cat.obsid = '<obsid>'``, and additionally selects ``cycle`` for every mission
-(all three master catalogues have it).
+with ``WHERE cat.obsid IN (...)``, and selects no ``public_date``.
 
 Locating the files
 ~~~~~~~~~~~~~~~~~~
@@ -1393,13 +1416,45 @@ operator and the run dies on ``fitsio 4.060 error message: could not open the na
 file``. A ``BACKFILE`` must therefore carry no directory at all, and being in the right
 directory is then the only way to say which file is meant.
 
-The staging is no wider than that constraint, which was established by experiment rather
-than assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and builds its
-``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
-absolute too. So each spectrum is copied -- the originals are never touched -- with
-``BACKFILE`` reduced to a bare name and ``RESPFILE``/``ANCRFILE`` made absolute, and only
-the background spectra are linked in beside it. The 68 MB ``.rmf`` files are neither
-copied nor linked.
+``RESPFILE`` and ``ANCRFILE`` survive a path, but only a short one. ``DO_ADDSPEC`` reads
+them into an 80-character buffer -- ``coadd.ADDSPEC_NAME_LIMIT`` -- and truncates anything
+longer without a word about having done so. Measured on
+``merged_80002092002_80002092004``: a 94-character absolute ``RESPFILE`` was handed to
+``cp`` as its first 80 characters, so the working copies of the responses were never made,
+and ``ftaddrmf`` then died on files that were not there:
+
+.. code-block:: text
+
+    cp: cannot stat '.../products/merged_80002092002_80002'
+    terminate called after throwing an instance of 'CCfits::FITS::CantOpen'
+    ** DO_ADDSPEC 1.2.1   ERROR:   Problem with FTADDRMF spawn
+     ... CSPAWN Error flag =            6
+
+Nothing in that names a length, and the path it complains about is one nobody ever wrote.
+
+That limit cannot be met by keeping paths tidy, because merging spends the dataset name
+twice, once as the directory and once as the file:
+
+.. code-block:: text
+
+    <root>/merged_80002092002_80002092004/products/merged_80002092002_80002092004_A01.rsp
+            └──────────── 30 ────────────┘          └──────────── 30 ────────────┘
+
+That is 79 characters before the output root contributes anything, leaving room for an
+output root of exactly one character. Giving the tree a short name under ``/tmp``, which
+is what ``short_workspace`` buys against the 128-character limit elsewhere, does not help
+here: the root in the failing run was already only ``/tmp/mergesplit``.
+
+So no pointer this package writes into a FITS header is ever a path. Each spectrum is
+copied -- the originals are never touched -- with all three keywords reduced to bare names
+and the files they name symbolically linked in beside them. A link costs nothing even for
+a 68 MB ``.rmf``, and ``addspec`` resolves it while making the working copy of the response
+it would have made anyway.
+
+That makes the staging directory one flat namespace, so a bare name has to mean one file.
+NuSTAR file names carry the OBSID and cannot collide; a collision would mean something
+upstream is already wrong, and ``coadd._link`` raises rather than let one spectrum be
+co-added against another observation's response.
 
 Changing the working directory is otherwise forbidden in this package, and
 ``test_prefect_wiring`` enforces that by walking the AST for ``os.chdir``. The one
@@ -1607,6 +1662,209 @@ carry no response, and represent only one of the event-mode files that an observ
 contain (GoodXenon observations always have two, ``GX1`` and ``GX2``, which must be merged;
 only the first is used here).
 
+
+XMM-Newton / EPIC
+-----------------
+
+The one mission here whose reduction software is **not** HEASOFT.
+:mod:`heasarc_retrieve_pipeline.xmm` drives ESA's Science Analysis System (SAS) through
+:mod:`heasarc_retrieve_pipeline.sas`, which runs one task at a time with
+``subprocess.run`` and an argument list. SAS has no pip or conda distribution: it is an
+*environment* requirement, initialised by sourcing ``setsas.sh``, and every SAS-marked
+test skips without it. ``sas.run`` takes a mandatory ``produces``, because a SAS task's
+zero return code is not evidence that it wrote anything -- ``epatplot`` returns 0 while
+writing a PDF where PostScript was asked for, and ``barycen`` edits its input in place.
+
+Two routes, one back end
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``config["products"]`` chooses:
+
+* ``"pps"`` (the default) reads the archive's own reduction. An observation is 200 MB to
+  1.2 GB and the EPIC reduction wants about a fortieth of it, so ``xmm_download_filter``
+  fetches only the event lists, background time series, source list and calibration index
+  -- plus 3.8 MB of ODF housekeeping, which barycentring needs.
+* ``"odf"`` reprocesses from raw telemetry with ``epproc`` and ``emproc``. Slower by an
+  order of magnitude, and the reason to want it is calibration: a PPS event list carries
+  whatever the SOC had when it was made.
+
+``xmm_pps_front_end`` and ``xmm_odf_front_end`` each return ``(exposures, env, summary)``
+and everything after them is shared. The two differ in more than speed:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * -
+     - PPS
+     - ODF
+   * - exposure discovery
+     - parse product file names
+     - read ``INSTRUME`` / ``EXPIDSTR`` / ``DATAMODE``
+   * - flare light curve
+     - ``FBKTSR``, from the SOC
+     - built with ``evselect``
+   * - flare threshold
+     - the file's ``FLCUTTHR``
+     - ``odf_flare_rate_limit``
+   * - ``DATE-OBS`` for ``cifbuild``
+     - an event list
+     - the ODF housekeeping
+
+The ODF route reads header keywords rather than parsing names because those names are
+SAS's own and have changed between releases, while ``INSTRUME``, ``EXPIDSTR`` and
+``DATAMODE`` are written by the same code on either route's files. The PPS route does
+parse names, because there they are a published archive convention.
+
+What an exposure is
+~~~~~~~~~~~~~~~~~~~
+
+``Exposure`` is keyed on ``(instrument, expid, mode)``, and the mode is not decoration.
+MOS ``FastUncompressed`` reads its central CCD in timing and its outer six in imaging, and
+PPS writes both under one exposure identifier. Keyed on camera and exposure alone, one of
+the two would be dropped in silence.
+
+The calibration index is built, not downloaded
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``xmm_build_calibration_index`` runs ``cifbuild withobservationdate=yes
+observationdate=<DATE-OBS>``, once per observation, rather than using the downloaded
+``CALIND``. The local CCF mirror is ESA's *Valid CCF Set* -- what is needed to process any
+ODF **at the current date** -- so an archival ``CALIND`` naming superseded constituents
+cannot be satisfied from it. Building the index costs 26 s and removes the failure mode
+instead of catching it. One consequence to state plainly: PPS event lists were generated
+with an older calibration, so responses built against a newer index are marginally
+inconsistent with those events' ``PI`` values. That is the ordinary situation for anyone
+reanalysing archival data with current SAS.
+
+Flare screening
+~~~~~~~~~~~~~~~
+
+Soft protons funnelled by the mirrors raise the background by orders of magnitude for
+minutes at a time. ``xmm_flare_gti`` thresholds the background light curve and inverts the
+result into good time intervals -- pure arithmetic, no SAS, fully testable offline.
+
+**The SAS cookbook's 0.4 and 0.35 counts/s do not apply to a PPS ``FBKTSR``.** Those
+numbers are for a curve you build yourself with ``evselect`` above 10 keV, which is what
+the ODF route does and what ``odf_flare_rate_limit`` keeps them for. An ``FBKTSR`` is made
+by ``epiclccorr`` and is on quite another scale: measured across the archive its median
+rate ranges from 0.9 to 45 counts/s, and the same camera in the same observation can differ
+twentyfold between exposures. PPS has already chosen a threshold per exposure and written
+it into the file as ``FLCUTTHR``, and that is what the PPS route uses.
+
+A timing exposure is screened with the imaging curve of the same exposure where there is
+one: a flare illuminates the whole detector, so a rise seen in the outer CCDs is happening
+during the timing read-out too. The curve's provenance is recorded so the choice is visible.
+
+Extraction regions, and whether they fit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Imaging mode extracts a circle on the sky, its centre converted from the requested RA/Dec
+by ``ecoordconv`` -- the only SAS task here whose output is parsed, because it writes no
+file. Timing mode has no sky image and extracts a strip of ``RAWX`` detector columns
+instead. **MOS timing has no default strip**: pn's ``[31:45]`` is trustworthy because a pn
+timing read-out puts the source at a column fixed by the boresight, and MOS has no
+equivalent constant, so a MOS timing exposure is cleaned, warned about and skipped rather
+than extracted at an invented column. Setting ``timing_src_rawx`` for that camera extracts
+it.
+
+``xmm_check_extraction_window`` measures whether the background annulus fits on the
+illuminated part of the chip. It *measures* rather than looking up a table of window sizes:
+the question is not "how big is a ``PrimePartialW3`` window" but "does the annulus for this
+source at this position fall off the chip". Two details are load-bearing and were both
+found on real data:
+
+* It reads the **cleaned** events, not the archive's unscreened list. The raw list carries
+  flagged events out to the chip edges: on ``0870940101``'s pn it reads 96.1 arcsec against
+  the cleaned 87.6, on either side of the 90 the default annulus needs.
+* The edge is a **percentile**, not a minimum and maximum. Taking the extreme events put a
+  300x300-pixel MOS window at 8.8 x 11.4 arcmin against its true 5.5, because a handful of
+  stray events set the answer. Clipping 0.1% from each end fixes it, and ``BACKSCAL``
+  confirms the robust figure independently.
+
+A clipped annulus is not silently wrong -- ``BACKSCAL`` follows the *exposed* area, so the
+scaling stays right and the cost is counts -- but it is worth a warning, which is what this
+produces.
+
+Pile-up is measured and never corrected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``epatplot`` writes the observed-to-model singles and doubles pattern fractions onto the
+event list as ``SNGL_OTM`` and ``DBLE_OTM``, with errors, and those keywords are read
+rather than its screen output. Correcting pile-up means excluding the core of the point
+spread function, which changes which photons the science is done with; that is a decision
+for whoever reads the plot.
+
+What the reduction writes
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every file an exposure produces is built on one stem,
+``xmm<OBSID>_<camera>_<expid>_<mode>``, so that a file carried out of the tree still says
+where it came from -- the same reasoning behind NuSTAR's ``nu<OBSID><FPM><mode>_cl.evt``.
+The mode is part of the identity and not decoration: a MOS ``FastUncompressed`` exposure
+writes an imaging *and* a timing event list under one exposure identifier, and without the
+mode the second would overwrite the first::
+
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl.evt        screened events
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.gti     the flare cut applied to them
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.lc      background curve, ODF route only
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src.evt       the source region alone
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_pat.pdf       the pile-up diagram
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl_bary.evt   barycentred
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src_bary.evt  barycentred, source region
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_src.pi        source spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_bkg.pi        background spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging.arf  .rmf     responses
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_grp.pi        grouped, the one you fit
+
+Log files and diagnostics records use a *shorter* key, ``pnS003_imaging``, because both are
+read inside the observation's own directory and are already keyed by its identifier.
+
+The longest of these names is 38 characters, which matters: ``especget`` writes them into
+``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, where a FITS card holds 80. A test guards the
+margin.
+
+Spectra
+~~~~~~~
+
+``especget`` produces source and background spectra, ARF and RMF in one call, with
+``withfilestem=no`` so that all four outputs are named outright rather than by a convention
+that has to be trusted. It is run with ``cwd`` set to the products directory and handed
+bare file names, because it writes the names it is *given* into ``BACKFILE``, ``RESPFILE``
+and ``ANCRFILE``, and a FITS header card holds 80 characters -- absolute paths were being
+truncated. The source position is passed to ``arfgen`` explicitly; left alone it would take
+the centre of the extraction region, which is meaningless for a strip of columns.
+
+The three cameras' spectra are **not** co-added. pn, MOS1 and MOS2 are different detectors
+with different responses, so ``addspec``'s case B does not apply; they are meant to be
+fitted jointly. SAS's ``epicspeccombine`` is the right tool if one file is ever wanted.
+
+Barycentring
+~~~~~~~~~~~~
+
+SAS ``barycen``, over an ODF ingested with ``odfingest``. HEASOFT ``barycorr`` is **not**
+usable: its own documentation limits it to RXTE, Swift, Chandra, NuSTAR and NICER, and on
+XMM data it fails with "Invalid Observatory/Spacecraft position vector" before reading an
+event.
+
+Two traps, both paid for:
+
+* The ODF constituents must be staged as plain ``.FIT`` and ``.ASC``. SAS reads ``.FTZ``
+  when a file is *named* to it, but ``odfingest`` does not *discover* one while scanning a
+  directory: a ``.FTZ``-staged ODF ingests as though the housekeeping were absent and
+  writes a truncated summary that ``barycen`` then rejects.
+* ``barycen`` edits in place, so the correction is applied to a copy and the spacecraft
+  times survive. The evidence that it worked is the rewritten ``TIMESYS``, which is
+  checked -- ``produces=IN_PLACE`` can only confirm that the copy we made ourselves is
+  still there.
+
+Verified on ``0870940101`` against an independent astropy calculation from the same orbit
+file: the correction sweeps 1.79 s across the exposure and agrees to 3.3 ms, constant to
+0.3 ms over 27 ks. The three cameras, three independent event lists, agree with each other
+to 0.1 ms.
+
+An observation whose ODF is missing reduces completely but is not barycentred; the step
+records ``barycentered: false`` with a reason rather than failing the run.
 
 Orchestration with Prefect
 --------------------------
@@ -1989,6 +2247,16 @@ step (``ftmerge``, ``ftmgtime``, ``ftsort``, ``fappend``) both succeeded, and th
 per-CHU event files came out with the same event counts and the same exposure, to the
 microsecond, as a reduction of the same observation through the real path.
 
+The three post-processing entry points take the same link. ``hrp-merge-obsids``,
+``hrp-split-obsid`` and ``hrp-check-roundtrip`` are run by hand against a finished tree,
+so they build their own configuration rather than inheriting the flow's, and until they
+were wrapped they ran against the real path however long it was. ``hrp-check-roundtrip``
+shortens the *copy* it works in rather than the tree it reads from -- every HEASOFT call
+in the check happens inside the copy, and the read side is the one measured good to 247
+characters. This is insurance against the 128-character limit only; it does nothing for
+``addspec``'s 80-character ``RESPFILE`` buffer, which is why the staging above makes bare
+names instead.
+
 The workspace also has to survive being where the temporary directory is long.
 ``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is 48 characters under
 ``/var/folders``; ``short_workspace`` therefore takes the shortest writable choice among
@@ -2153,6 +2421,17 @@ one-writer-one-file-name rule below is untouched.
 ``arrays_from_earlier_run`` says which of the two happened. Where it is true the page
 draws the figure and says, next to it, that this run did not run the step -- the timeline
 goes on reporting ``skipped``, because a page must never claim work that did not happen.
+
+That flag is about *provenance*, not about existence, and conflating the two cost a
+second bug. ``recover.py`` sets it by hand, through ``rec.from_earlier_outputs()``,
+because it measures now but measures an old run's output -- and ``as_dict()`` took the
+flag alone as reason enough to name a payload. A recovered step that records no arrays,
+which is the ordinary fate of a CHU-split event file with fewer than twenty usable
+events, then wrote down the name of an ``.npz`` that had never been created, and every
+later read of that record logged ``Ignoring unreadable array payload``. Forty lines of it
+per run. ``as_dict()`` now decides the two questions separately: the record names a
+payload only when one is really on disk, and only such a record can be marked as coming
+from an earlier run.
 
 Source separation needed one more change to fit this. It skips per *directory* and used
 to ``continue`` in silence, opening no record at all, so the step was missing from the
@@ -2319,7 +2598,7 @@ Building the pages
 
 Plotly, with a hand-written ``string.Template`` shell rather than jinja2, and imported
 inside the figure builders so that ``import heasarc_retrieve_pipeline`` still works
-without it. Four measurements shaped the rest:
+without it. Five measurements shaped the rest:
 
 * ``to_html(..., include_plotlyjs="directory")`` emits a **bare** ``src="plotly.min.js"``
   with no directory part, and ``to_html`` never copies the bundle -- only ``write_html``
@@ -2331,6 +2610,36 @@ without it. Four measurements shaped the rest:
   theme boilerplate saved per page.
 * dtype drives page size linearly, so arrays are cast before they reach plotly: a
   100x100 image is 110.7 kB as float64, 55.9 as float32 and 27.1 as uint16.
+* ``add_vrect`` is not usable in a loop. On a subplot figure it spans every row by
+  default, and before adding each shape it scans the shapes already present to find the
+  empty subplots. Drawing the removed intervals of ``flare_figure`` one call at a time
+  therefore cost more than the square of their number:
+
+  .. list-table::
+     :header-rows: 1
+
+     * - intervals
+       - one ``add_vrect`` each
+       - one ``update_layout``
+     * - 100
+       - 21.7 s
+       - 0.045 s
+     * - 200
+       - 110.4 s
+       - 0.074 s
+     * - 400
+       - 662.4 s
+       - 0.150 s
+     * - 800
+       - 4285.9 s
+       - 0.260 s
+
+  This was the batch hang: a solar-flare filtering that removed several hundred intervals
+  left ``write_page`` drawing for the best part of an hour, holding a worker of the
+  process pool, and with two workers gone that way a four-wide run looked stopped. The
+  shapes are now built by ``_row_spans`` and assigned in one call, which is linear -- 800
+  intervals in 0.3 s. ``_row_spans`` reproduces ``add_vrect`` exactly, empty-row
+  exclusion included, and the tests assert that against ``add_vrect`` itself.
 
 The figure data is inline in the page, deliberately. Moving it to sidecar files the page
 fetched would be smaller, but ``fetch()`` against ``file://`` is blocked, and these pages

@@ -1534,6 +1534,40 @@ reading the outputs, and they are described in more detail in :ref:`technical_de
 * **The default cone-search radius is 0.1 degrees**, i.e. 6 arcmin on the *pointing*
   position. NuSTAR's field of view is 12x12 arcmin, so serendipitous coverage of a target
   by an observation pointed elsewhere in the field will be missed at the default radius.
+* **XMM's EPIC spectra are not co-added across cameras, deliberately.** pn, MOS1 and MOS2
+  are different detectors with different responses, so ``addspec``'s case B does not apply
+  and ``coadd.apply_case_b_scaling`` would be wrong on them. An observation therefore
+  yields one spectrum per camera, per exposure and per mode, each with its own ARF and
+  RMF, and they are meant to be fitted jointly. SAS's ``epicspeccombine`` is the right tool
+  if a single file is ever wanted; it is not run here.
+* **XMM's EPIC background is an annulus around the source**, as NuSTAR's is, with the same
+  caveat and one of its own: on pn the annulus can cross chip gaps and it collects the
+  out-of-time events that the read-out smears along a column. In timing mode the
+  "background" is a strip of detector columns some way from the source, which on a bright
+  target still contains source photons from the wings of the point spread function.
+* **XMM MOS Timing exposures get no spectrum.** Only pn has a ``RAWX`` extraction strip
+  worth trusting by default, so a MOS timing exposure is cleaned, warned about and left
+  there. Setting ``timing_src_rawx`` and ``timing_bkg_rawx`` for that camera extracts it.
+* **XMM extractions of M82 X-2 are blended with M82 X-1**, and this is accepted rather
+  than worked around. The two lie about 5 arcseconds apart, against an EPIC point spread
+  function roughly 6 arcseconds full width at half maximum and a default 30 arcsecond
+  extraction radius, so every circular region on X-2 contains both. Separating them needs
+  Chandra. The science these observations are reduced for is X-2's **1.37 s pulsation**,
+  which a period search still finds in the blend at a reduced pulsed fraction because X-1
+  contributes no power at that period. What must not be done is to quote the flux, count
+  rate or spectral shape of such an extraction as X-2's: they are X-1 + X-2 together, and
+  X-1 is the brighter of the pair at most epochs.
+* **XMM barycentring needs the observation's ODF housekeeping.** SAS ``barycen`` finds the
+  spacecraft orbit through ``SAS_ODF``, so the PPS route downloads about 3.8 MB of
+  housekeeping and runs ``odfingest`` on it purely to obtain a ``SUM.SAS``. An observation
+  whose ODF is missing reduces completely but is not barycentred: the step records
+  ``barycentered: false`` with a reason instead of failing the run. HEASOFT ``barycorr``
+  is not an alternative -- its own documentation limits it to RXTE, Swift, Chandra, NuSTAR
+  and NICER, and on XMM data it fails before reading an event.
+* **XMM pile-up is measured and never corrected.** ``epatplot`` writes the
+  observed-to-model pattern ratios onto the page; excluding the core of the point spread
+  function to remove pile-up changes which photons the science is done with, and is left
+  to the reader.
 
 Testing and infrastructure
 --------------------------

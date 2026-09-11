@@ -38,6 +38,12 @@ from .nustar import (
 from . import heasoft
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
 from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
+from .xmm import (
+    process_xmm_obsid,
+    xmm_download_filter,
+    xmm_resolve_config,
+    DEFAULT_CONFIG as XMM_DEFAULT_CONFIG,
+)
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
@@ -437,6 +443,89 @@ def get_remote_directory_listing(url: str):
         request returned an HTTP error.
     """
     return walk_remote_directory(url)
+
+
+def _fetch_directory_index(url):
+    """
+    The raw index page of one remote directory, or ``None`` if it could not be read.
+
+    Kept apart from :func:`list_archive_directory` so that the parsing can be tested
+    without the network, and separate from :func:`walk_remote_directory`'s own fetch
+    because the two want different things from a failure: a walk that cannot read a
+    subdirectory has already found the tree it is descending, while a probe that cannot
+    read a directory has learnt nothing at all.
+    """
+    from urllib.request import Request, urlopen
+
+    return urlopen(Request(url.replace(" ", "%20"))).read()
+
+
+def list_archive_directory(url):
+    """
+    What one archive directory holds, without descending into it.
+
+    :func:`get_remote_directory_listing` walks a whole tree. That is what a download
+    wants, and much more than a question about the *shape* of the tree needs -- and such
+    a question is normally asked before the download that would answer it expensively.
+    XMM asks one: whether the archive holds its own reduction of an observation, or only
+    the raw telemetry.
+
+    All three transports are understood, and all three answer in the same spelling: names
+    relative to ``url``, with subdirectories keeping their trailing slash, sorted.
+
+    Parameters
+    ----------
+    url : str
+        An HTTPS URL, an ``s3://`` URL, or a local path.
+
+    Returns
+    -------
+    list of str or None
+        The entries, or ``None`` if the directory could not be listed at all.
+
+        The difference matters, and every caller should keep it: an empty list is a fact
+        about the archive -- there is nothing here -- while ``None`` is a fact about this
+        machine's network, and only the first is worth acting on. A probe that treated a
+        timeout as "no data" would quietly change what gets downloaded.
+    """
+    logger = get_logger()
+
+    if url.startswith("http"):
+        prefix = url if url.endswith("/") else url + "/"
+        try:
+            page = _fetch_directory_index(prefix)
+        except OSError as error:  # HTTPError and URLError are both OSError
+            logger.warning(f"Could not list {prefix}: {error}")
+            return None
+        if page is None:
+            return None
+        return sorted(entry[len(prefix) :] for entry in parse_directory_index(page, prefix))
+
+    if url.startswith("s3://"):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        prefix = parsed.path.lstrip("/")
+        prefix = prefix if prefix.endswith("/") else prefix + "/"
+        try:
+            # Delimiter is what makes this one directory rather than the whole tree: with
+            # it, everything below a subdirectory collapses into one common prefix.
+            response = _s3_client().list_objects_v2(
+                Bucket=parsed.netloc, Prefix=prefix, Delimiter="/"
+            )
+        except Exception as error:  # noqa: BLE001 -- botocore raises a family of its own
+            logger.warning(f"Could not list {url}: {error}")
+            return None
+        names = [common["Prefix"][len(prefix) :] for common in response.get("CommonPrefixes", [])]
+        names += [obj["Key"][len(prefix) :] for obj in response.get("Contents", [])]
+        return sorted(names)
+
+    if not os.path.isdir(url):
+        logger.warning(f"Could not list {url}: not a directory")
+        return None
+    return sorted(
+        name + "/" if os.path.isdir(os.path.join(url, name)) else name for name in os.listdir(url)
+    )
 
 
 @task(task_run_name="download_{node}", retries=3, retry_delay_seconds=10)
@@ -895,7 +984,7 @@ MISSION_CONFIG = {
         # numaster means it: zero exposure_a is an observation with no data, and there is
         # no point downloading it.
         "zero_exposure_may_be_wrong": False,
-        "additional": "solar_activity",
+        "additional": "cycle, solar_activity",
         "obsid_processing": process_nustar_obsid,
         "default_config": NUSTAR_DEFAULT_CONFIG,
         "name_column": "name",
@@ -907,7 +996,7 @@ MISSION_CONFIG = {
         # nicermastr does not: it sometimes reports zero because NICER's own pipeline
         # filtered the data wrongly, and the data are fine. Download them and look.
         "zero_exposure_may_be_wrong": True,
-        "additional": "",
+        "additional": "cycle",
         "obsid_processing": process_nicer_obsid,
         "default_config": NICER_DEFAULT_CONFIG,
         "name_column": "name",
@@ -922,7 +1011,135 @@ MISSION_CONFIG = {
         "default_config": RXTE_DEFAULT_CONFIG,
         "name_column": "target_name",
     },
+    "xmm": {
+        "table": "xmmmaster",
+        # xmmmaster's exposure column is `duration`, and it has no `cycle` at all --
+        # which is why `cycle` had to come out of the hardcoded OBSID query.
+        "expo_column": "duration",
+        # Assume the catalogue may be wrong, as for NICER: four of the twenty pointings
+        # at M82 report no EPIC exposure, and whether that means "nothing to reduce" is
+        # answered by the PPS directory, not by the row.
+        "zero_exposure_may_be_wrong": True,
+        # pps_flag and sas_version are carried so a run can say which route it expects
+        # before downloading anything. The route is still decided by probing the archive
+        # directory -- 0973390101 has pps_flag = "Y" and no PPS directory at all.
+        "additional": (
+            "pn_time, mos1_time, mos2_time, pn_mode, mos1_mode, mos2_mode, pps_flag, sas_version"
+        ),
+        "obsid_processing": process_xmm_obsid,
+        "default_config": XMM_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": xmm_download_filter,
+        "resolve_config": xmm_resolve_config,
+    },
 }
+
+
+#: The arguments a ``"download_filter"`` is allowed to return. They are the two
+#: :func:`recursive_download` already takes.
+DOWNLOAD_FILTER_ARGUMENTS = frozenset({"re_include", "re_exclude"})
+
+
+def mission_download_filter(mission: str, config: dict) -> dict:
+    """
+    What of an observation directory this mission wants downloaded.
+
+    A mission may declare a ``"download_filter"`` in :data:`MISSION_CONFIG`: a callable
+    taking the run's config and returning ``re_include`` and/or ``re_exclude`` for
+    :func:`recursive_download`. It is a callable and not a literal because the filter can
+    depend on the run -- XMM downloads different files on its PPS route than on its ODF
+    route, and the route is a config key.
+
+    Most missions declare nothing and download the whole directory, which is what every
+    mission did before this existed.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of :data:`MISSION_CONFIG`.
+    config : dict
+        The run's configuration, as the mission's reduction will see it.
+
+    Returns
+    -------
+    dict
+        Keyword arguments for :func:`recursive_download`; empty if this mission filters
+        nothing.
+
+    Raises
+    ------
+    ValueError
+        If the filter names anything but ``re_include`` and ``re_exclude``. A misspelt
+        key would otherwise be dropped in silence, and the symptom -- a whole gigabyte
+        arriving where forty megabytes were meant to -- looks like a slow network rather
+        than like a bug.
+    """
+    build_filter = MISSION_CONFIG[mission].get("download_filter")
+    if build_filter is None:
+        return {}
+
+    arguments = build_filter(config)
+    unknown = set(arguments) - DOWNLOAD_FILTER_ARGUMENTS
+    if unknown:
+        raise ValueError(
+            f"The download filter of {mission} names {', '.join(sorted(unknown))}, which "
+            f"recursive_download does not take. It takes "
+            f"{', '.join(sorted(DOWNLOAD_FILTER_ARGUMENTS))}."
+        )
+    return arguments
+
+
+def mission_resolve_config(mission: str, config: dict, url: str) -> dict:
+    """
+    The configuration this observation will actually be reduced with.
+
+    A mission may declare a ``"resolve_config"`` in :data:`MISSION_CONFIG`: a callable
+    taking the run's config and the observation's URL and returning the config to use. It
+    runs before the download, so that what it decides can change what is downloaded.
+
+    XMM is why it exists, and the reason is a fact about the archive rather than about the
+    code. ``xmmmaster``'s ``pps_flag`` says whether an observation was reduced by the
+    Pipeline Processing System, and it is wrong often enough to matter: ``0973390101`` is
+    flagged ``Y`` and has no PPS directory mirrored at HEASARC at all, only ``ODF/``. A
+    run that trusted the flag would download five megabytes of housekeeping, find no
+    event lists, and report a perfectly good observation as holding no science data. One
+    listing of the observation directory settles it.
+
+    Most missions declare nothing and are handed their configuration back unchanged.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of :data:`MISSION_CONFIG`.
+    config : dict
+        The run's configuration, before the archive has been looked at.
+    url : str
+        Where this observation will be downloaded from.
+
+    Returns
+    -------
+    dict
+        The configuration to reduce with. The same object, for a mission that declares
+        nothing.
+
+    Raises
+    ------
+    TypeError
+        If the hook returns something that is not a configuration. A hook that forgets to
+        return would otherwise fail several steps later, inside the mission's own
+        reduction, under a name that has nothing to do with the mistake.
+    """
+    resolve = MISSION_CONFIG[mission].get("resolve_config")
+    if resolve is None:
+        return config
+
+    resolved = resolve(config, url)
+    if not isinstance(resolved, dict):
+        raise TypeError(
+            f"The resolve_config of {mission} returned {type(resolved).__name__}, not a "
+            f"configuration dictionary."
+        )
+    return resolved
 
 
 @task(task_run_name="read_config_{config_file}")
@@ -1085,6 +1302,11 @@ def obsid_query(obsid, mission: str = "nustar"):
     an OBSID has been named explicitly, returning nothing at all is more confusing than
     returning the row and letting the reduction say what it found.
 
+    Only the columns every master catalogue has are written into the query text. Anything
+    else, ``cycle`` included, belongs in the mission's ``"additional"`` string: ``cycle``
+    is in ``numaster``, ``nicermastr`` and ``xtemaster`` but not in ``xmmmaster``, so a
+    query that always asked for it could not reach XMM at all.
+
     Raises
     ------
     ValueError
@@ -1105,7 +1327,7 @@ def obsid_query(obsid, mission: str = "nustar"):
         additional = f", {additional}"
     wanted = ", ".join(f"'{one}'" for one in obsids)
 
-    return f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
+    return f"""SELECT {name_column}, obsid, time, {expo_name}, ra, dec, __row {additional}
         FROM public.{table} as cat
         where
         cat.obsid IN ({wanted})
@@ -1130,8 +1352,8 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     Returns
     -------
     astropy.table.Table
-        One row per OBSID found, with the mission's name, ``cycle``, ``obsid``, ``time``,
-        exposure, ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
+        One row per OBSID found, with the mission's name, ``obsid``, ``time``, exposure,
+        ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
 
     Notes
     -----
@@ -1515,7 +1737,16 @@ def download_and_process_observation(
                 rec.skip("files already downloaded and decrypted in a prior run")
                 return None
 
-            recursive_download(url, outdir, test_str=".", test=test)
+            # Before the download, because what it decides is what gets downloaded.
+            config = mission_resolve_config(mission, config, url)
+
+            recursive_download(
+                url,
+                outdir,
+                test_str=".",
+                test=test,
+                **mission_download_filter(mission, config),
+            )
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None

@@ -90,7 +90,7 @@ from .nustar import (
     nu_base_output_path,
     nu_product_output_path,
 )
-from .utils import get_logger
+from .utils import get_logger, log_version, short_workspace
 
 __all__ = [
     "GROUPING_COMMAND",
@@ -507,17 +507,22 @@ def main(argv=None):
 
     import logging
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    log_version()
 
-    config = {"out_data_path": os.path.abspath(args.out_data_path)}
-    result = merge_obsids(
-        args.obsid,
-        config,
-        name=args.name,
-        mode01_only=args.mode01_only,
-        spectra=not args.no_spectra,
-        events=not args.no_events,
-    )
+    # The same short name for the tree that the reduction flow gives its workers: some
+    # HEASOFT builds truncate file names at 128 characters without saying so, and this is
+    # post-processing on a tree whose own name is already spent. The bytes never move.
+    # See heasarc_retrieve_pipeline.utils.short_workspace.
+    with short_workspace(os.path.abspath(args.out_data_path)) as workspace:
+        result = merge_obsids(
+            args.obsid,
+            {"out_data_path": workspace.data},
+            name=args.name,
+            mode01_only=args.mode01_only,
+            spectra=not args.no_spectra,
+            events=not args.no_events,
+        )
     print(
         f"{result['name']}: {len(result['spectra'])} co-added spectrum/spectra, "
         f"{len(result['event_files'])} merged event file(s)"

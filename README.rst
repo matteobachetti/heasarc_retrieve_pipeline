@@ -8,8 +8,14 @@ Pipeline to automatically retrieve data from HEASARC
 Query the HEASARC archive, download an observation, run the mission's reduction, and keep
 a record of what happened -- as a `Prefect <https://www.prefect.io>`_ flow, so that
 several observations can be reduced at once. NuSTAR is the mission that is worked out in
-full, from ``nupipeline`` through split segments, merged event files and coadded spectra;
-NICER and RXTE are further behind.
+full, from ``nupipeline`` through split segments, merged event files and coadded spectra.
+**XMM-Newton** is next most complete -- EPIC pn and MOS, imaging and timing, through ESA's
+SAS: flare screening, extraction regions, a pile-up measurement, spectra with responses,
+and barycentring. NICER and RXTE are further behind.
+
+XMM needs SAS, which has no pip or conda distribution: it is initialised by sourcing
+``setsas.sh`` and is a requirement on the *environment* rather than a dependency. Without
+it the rest of the package is unaffected and the SAS-marked tests skip.
 
 It is research software, written for a particular set of reductions and grown from there.
 Read ``docs/known_issues.rst`` before trusting a number that comes out of it: the science
@@ -32,6 +38,8 @@ Extra           What it adds
                 background in sky images (``image_utils``)
 ``regions``     ds9 region files for the ``nuproducts`` spectral path
 ``s3``          ``boto3``, for the anonymous S3 download transport
+``xmm``         ``boto3``, for XMM downloads. SAS itself is not installable this way --
+                see above
 ``report``      ``plotly``, for the HTML observation pages written by ``hrp-report``
 ``solar``       ``sunpy``, for filtering out solar flares
 ``snr``         ``nustar_gen``, for signal-to-noise-optimised extraction regions. Not on
