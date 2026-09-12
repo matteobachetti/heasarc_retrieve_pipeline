@@ -2529,3 +2529,256 @@ def chandra_clean_event_list(observation, config, gti, rec=None, env=None, log_t
     )
     get_logger().info(f"{observation.obsid}: cleaned events in {os.path.basename(outfile)}")
     return outfile
+
+
+#: ``axbary``'s reference frame, and with it the ephemeris.
+#:
+#: The parameter admits exactly two values -- ``FK5``, which is DE200, and ``ICRS``, which
+#: is **DE405**. There is no DE430, so Chandra is the one mission in this pipeline not on
+#: the ephemeris every other one uses, and that break was measured rather than accepted:
+#: over obsid ``6298``'s own span and position, geocentric so that only the ephemerides
+#: differ, DE430 minus DE405 is a **constant +0.377 microseconds**, varying by 0.0016 us
+#: across a two-hour observation. It cannot distort a pulse profile, a period or a
+#: periodogram *within* an observation at any Chandra time resolution; it survives only as
+#: an absolute phase offset against DE430 times from another mission, where against M82
+#: X-2's 1.37 s spin it is 2.7e-7 in phase.
+#:
+#: HEASOFT ``barycorr`` is not an alternative. It has no Chandra orbit reader at all --
+#: ``hdaxbary``'s only ones are ``xtescorbit``, ``nicerscorbit`` and ``swiftscorbit`` --
+#: and on a real Chandra event list with its own orbit file it dies with "no bracketing
+#: sample found", with the orbit file demonstrably not at fault. Measured 2026-09-12; see
+#: ``docs/chandra_integration_plan.md``.
+BARYCENTRE_REFFRAME = "ICRS"
+
+#: What ``TIMESYS`` must read after a successful correction.
+BARYCENTRED_TIMESYS = "TDB"
+
+#: What DE405 costs against the pipeline's DE430, in microseconds. Constant, measured.
+DE405_MINUS_DE430_US = 0.377
+
+
+def _barycentred_time_keywords(path):
+    """The three keywords that say whether, and how, a file was barycentred."""
+    with fits.open(path) as hdulist:
+        header = hdulist[1].header
+        return (
+            _keyword(header, "TIMESYS"),
+            _keyword(header, "TIMEREF"),
+            _keyword(header, "PLEPHEM"),
+        )
+
+
+def chandra_barycenter(
+    observation, config, events, ra="NONE", dec="NONE", rec=None, env=None, log_to=None
+):
+    """
+    Write a barycentred copy of the cleaned event list.
+
+    Converting arrival times from the spacecraft to the solar system barycentre is what
+    makes a coherent timing search possible at all, and Chandra makes the point more
+    sharply than any other mission here: it reaches 125 000 km from Earth, so the
+    correction to the geocentre drifts about 2.1 s across a 75 ks observation -- 1.6 cycles
+    of M82 X-2's spin -- and the spacecraft-to-geocentre term adds another 0.129 s on top
+    of that. Barycentring to the geocentre alone would smear a tenth of a cycle.
+
+    **The correction is made to the position asked for, never to the one in the header.**
+    This is Matteo's rule for XMM, and obsid ``5644`` is the strongest case for it in the
+    whole pipeline: its ``OBJECT`` is M82 X-1, the pulsation Liu 2024 published belongs to
+    M82 X-2, and the two sit 4.63 arcseconds apart. Told nothing, ``axbary`` would correct
+    to the header's target and the signal would not be there.
+
+    ``axbary`` writes a new file rather than editing in place, so the original stays on
+    spacecraft time -- which matters, because an event list whose times are silently no
+    longer spacecraft times is a trap for every later step.
+
+    **The aspect solution is deliberately not barycentred alongside it.** The CXC's thread
+    says to do that, and it is right for their workflow and wrong for this one: here the
+    spectra, the responses and the pile-up map are all built from the *uncorrected* cleaned
+    list, and nothing pairs the barycentred file with an aspect solution. Barycentring one
+    anyway would write a 17 MB copy per observation that no step reads. If a later step
+    ever does pair the two, this is the line to revisit.
+
+    Parameters
+    ----------
+    observation : Observation
+        ``orbit_ephemeris`` is what the correction is computed from. Without one there is
+        nothing to correct with, and that is recorded rather than raised.
+    config : dict
+    events : str
+        The cleaned event list, on spacecraft time.
+    ra, dec : float or str, optional
+        Source position in degrees. Anything that is not a pair of numbers -- the default
+        ``"NONE"`` -- leaves ``axbary`` to read the position out of the header, loudly.
+    rec : StepRecord, optional
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    str or None
+        The barycentred file, or ``None`` when there was no orbit ephemeris.
+
+    Raises
+    ------
+    ValueError
+        If ``axbary`` returns success and the output is not on barycentric time, which
+        would otherwise leave a file that looks corrected and is not.
+    """
+    from . import ciao
+    from .barycenter import barycentered_file_name
+
+    rec = rec or no_record()
+    logger = get_logger()
+
+    if observation.orbit_ephemeris is None:
+        reason = (
+            f"{observation.obsid} has no orbit ephemeris, so its times cannot be corrected "
+            "to the barycentre. axbary needs the spacecraft's own position, and Chandra is "
+            "far enough from Earth that assuming the geocentre would smear a pulse profile."
+        )
+        logger.warning(reason)
+        rec.value(barycentered=False, reason=reason)
+        return None
+
+    output = barycentered_file_name(events)
+
+    position = _source_coordinates(ra, dec)
+    at_position = {}
+    if position is None:
+        logger.warning(
+            f"{observation.obsid}: no source position was given, so "
+            f"{os.path.basename(output)} is barycentred to the target in its own header -- "
+            "the pointing, which is not the source. On obsid 5644 those two are 4.63 "
+            "arcseconds and one published pulsation apart."
+        )
+    else:
+        at_position = dict(ra=position[0], dec=position[1])
+
+    ciao.run(
+        "axbary",
+        produces=output,
+        env=env,
+        log_to=log_to,
+        infile=events,
+        orbitfile=observation.orbit_ephemeris,
+        outfile=output,
+        refframe=BARYCENTRE_REFFRAME,
+        clobber=True,
+        **at_position,
+    )
+
+    timesys, timeref, ephemeris = _barycentred_time_keywords(output)
+    if timesys != BARYCENTRED_TIMESYS:
+        raise ValueError(
+            f"axbary returned success but left {os.path.basename(output)} on "
+            f"{timesys or 'no'} time rather than {BARYCENTRED_TIMESYS}."
+        )
+
+    rec.value(
+        barycentered=True,
+        barycentered_file=os.path.basename(output),
+        orbit_ephemeris=os.path.basename(observation.orbit_ephemeris),
+        refframe=BARYCENTRE_REFFRAME,
+        timesys=timesys,
+        timeref=timeref,
+        ephemeris=ephemeris,
+        de405_minus_de430_us=DE405_MINUS_DE430_US,
+        srcra=None if position is None else position[0],
+        srcdec=None if position is None else position[1],
+        position_from="argument" if position is not None else "header",
+        reason=(
+            f"Corrected to the barycentre with axbary at refframe={BARYCENTRE_REFFRAME}, "
+            f"which is {ephemeris}. Every other mission in this pipeline uses DE430, and "
+            f"axbary offers no such option; the difference is a constant "
+            f"{DE405_MINUS_DE430_US} microseconds, so it cannot affect anything measured "
+            "within this observation."
+        ),
+    )
+    logger.info(
+        f"{observation.obsid}: barycentred to {os.path.basename(output)} "
+        f"with {ephemeris} at the position asked for"
+    )
+    return output
+
+
+def _source_coordinates(ra, dec):
+    """
+    ``(ra, dec)`` as numbers, or ``None`` when no position was given.
+
+    ``process_chandra_obsid`` defaults both to the string ``"NONE"``, the way every
+    mission's entry point does. Twin of ``xmm._source_coordinates``.
+
+    Examples
+    --------
+    >>> _source_coordinates("148.96267", 69.67931)
+    (148.96267, 69.67931)
+    >>> _source_coordinates("NONE", "NONE") is None
+    True
+    """
+    try:
+        return float(ra), float(dec)
+    except (TypeError, ValueError):
+        return None
+
+
+def chandra_barycentered_source_events(
+    observation, config, barycentered, regions, rec=None, env=None, log_to=None
+):
+    """
+    Cut the source region out of the barycentred event list.
+
+    This is the file a timing analysis actually reads, and neither of the two it sits
+    between is: the barycentred list is the whole field, and the cleaned list is still on
+    spacecraft time.
+
+    Cutting the region out of the corrected list, rather than correcting a source list a
+    second time, is the same choice XMM made: ``axbary`` runs once per observation, so the
+    two files cannot then disagree about the position they were corrected to.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+    barycentered : str or None
+        From :func:`chandra_barycenter`. ``None`` means there is nothing to cut from.
+    regions : ExtractionRegions
+    rec : StepRecord, optional
+        Shares the ``barycenter`` step's record, so one record holds the correction, the
+        position it was made to and the file cut from it.
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    str or None
+    """
+    from . import ciao
+    from .barycenter import barycentered_file_name
+
+    rec = rec or no_record()
+    if barycentered is None:
+        rec.value(barycentered_source_file=None)
+        return None
+
+    output = barycentered_file_name(
+        os.path.join(
+            chandra_pipeline_output_path(observation.obsid, config),
+            f"{observation.stem}_src.evt",
+        )
+    )
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    ciao.run(
+        "dmcopy",
+        produces=output,
+        env=env,
+        log_to=log_to,
+        infile=barycentered + regions.source,
+        outfile=output,
+        clobber=True,
+    )
+
+    rec.value(barycentered_source_file=os.path.basename(output), source_region=regions.source)
+    get_logger().info(
+        f"{observation.obsid}: barycentred source events in {os.path.basename(output)}"
+    )
+    return output

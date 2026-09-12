@@ -2012,3 +2012,170 @@ class TestWritingTheCleanedEventList:
         )
 
         assert os.path.basename(found) == "chandra05644_aciss_timed_cl.evt"
+
+
+def a_barycentred_file(path, timesys="TDB"):
+    """What ``axbary`` leaves behind: the same events, on barycentric time."""
+    hdu = fits.BinTableHDU.from_columns(
+        [fits.Column("time", "1D", array=np.arange(10.0))], name="EVENTS"
+    )
+    hdu.header["TIMESYS"] = timesys
+    hdu.header["TIMEREF"] = "SOLARSYSTEM"
+    hdu.header["PLEPHEM"] = "JPL-DE405"
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+@pytest.fixture
+def stub_axbary(monkeypatch):
+    """A CIAO whose ``axbary`` writes a barycentred file and whose ``dmcopy`` writes a cut."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "axbary":
+            a_barycentred_file(kwargs["outfile"])
+        if name == "dmcopy":
+            os.makedirs(os.path.dirname(kwargs["outfile"]), exist_ok=True)
+            a_barycentred_file(kwargs["outfile"])
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestBarycentringWithAxbary:
+    def _observation(self, tmp_path, orbit="primary/orbitf240581100N001_eph1.fits.gz"):
+        return chandra.Observation(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "chandra05644_aciss_timed_cl.evt"),
+            orbit_ephemeris=None if orbit is None else str(tmp_path / orbit),
+        )
+
+    def _config(self, tmp_path):
+        return dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+    def test_the_correction_is_made_to_the_position_asked_for(self, tmp_path, stub_axbary):
+        """
+        The sharpest case in the pipeline. Obsid ``5644``'s header target is M82 X-1 and
+        the published pulsation is M82 X-2's, 4.63 arcseconds away; ``axbary`` told nothing
+        would correct to the wrong one of the two.
+        """
+        chandra.chandra_barycenter(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            148.96267,
+            69.67931,
+        )
+
+        axbary = [call for call in stub_axbary if call[0] == "axbary"][0][1]
+        assert (axbary["ra"], axbary["dec"]) == (148.96267, 69.67931)
+
+    def test_without_a_position_the_header_is_left_to_speak(self, tmp_path, stub_axbary):
+        chandra.chandra_barycenter(
+            self._observation(tmp_path), self._config(tmp_path), str(tmp_path / "cl.evt")
+        )
+
+        axbary = [call for call in stub_axbary if call[0] == "axbary"][0][1]
+        assert "ra" not in axbary and "dec" not in axbary
+
+    def test_the_reference_frame_is_the_only_one_that_is_de405(self, tmp_path, stub_axbary):
+        chandra.chandra_barycenter(
+            self._observation(tmp_path), self._config(tmp_path), str(tmp_path / "cl.evt")
+        )
+
+        assert [c for c in stub_axbary if c[0] == "axbary"][0][1]["refframe"] == "ICRS"
+
+    def test_the_original_is_not_edited_in_place(self, tmp_path, stub_axbary):
+        found = chandra.chandra_barycenter(
+            self._observation(tmp_path), self._config(tmp_path), str(tmp_path / "cl.evt")
+        )
+
+        assert found == str(tmp_path / "cl_bary.evt")
+
+    def test_an_observation_with_no_orbit_ephemeris_records_why_and_does_not_raise(
+        self, tmp_path, stub_axbary
+    ):
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "5644", "barycenter") as rec:
+            found = chandra.chandra_barycenter(
+                self._observation(tmp_path, orbit=None),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                rec=rec,
+            )
+
+        assert found is None
+        written = json.loads(next(directory.glob("*barycenter*.json")).read_text())
+        assert written["values"]["barycentered"] is False
+        assert "orbit ephemeris" in written["values"]["reason"]
+
+    def test_a_file_that_did_not_come_back_on_barycentric_time_raises(self, tmp_path, monkeypatch):
+        """A zero return code from ``axbary`` is not evidence that anything was corrected,
+        and a file that looks corrected and is not would poison every period it produced."""
+
+        def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+            if name == "axbary":
+                a_barycentred_file(kwargs["outfile"], timesys="TT")
+            return SimpleNamespace(stdout="")
+
+        monkeypatch.setattr(ciao, "run", fake_run)
+
+        with pytest.raises(ValueError, match="TT time rather than TDB"):
+            chandra.chandra_barycenter(
+                self._observation(tmp_path), self._config(tmp_path), str(tmp_path / "cl.evt")
+            )
+
+    def test_the_ephemeris_and_what_it_costs_are_recorded(self, tmp_path, stub_axbary):
+        """The DE405 break is never invisible: it is in every observation's record, with
+        the 0.377 microseconds it costs against the pipeline's DE430."""
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "5644", "barycenter") as rec:
+            chandra.chandra_barycenter(
+                self._observation(tmp_path),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                148.96267,
+                69.67931,
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
+        assert values["ephemeris"] == "JPL-DE405"
+        assert values["refframe"] == "ICRS"
+        assert values["de405_minus_de430_us"] == 0.377
+        assert values["position_from"] == "argument"
+
+    def test_the_source_is_cut_out_of_the_corrected_list_and_not_corrected_twice(
+        self, tmp_path, stub_axbary
+    ):
+        config = self._config(tmp_path)
+        regions = chandra.ExtractionRegions(
+            source="[sky=circle(4100.3809,4131.8172,1.6874)]", background="[sky=annulus(1,2,3,4)]"
+        )
+
+        found = chandra.chandra_barycentered_source_events(
+            self._observation(tmp_path), config, str(tmp_path / "cl_bary.evt"), regions
+        )
+
+        dmcopy = [call for call in stub_axbary if call[0] == "dmcopy"][0][1]
+        assert dmcopy["infile"] == str(tmp_path / "cl_bary.evt") + regions.source
+        assert os.path.basename(found) == "chandra05644_aciss_timed_src_bary.evt"
+
+    def test_with_nothing_corrected_there_is_nothing_to_cut(self, tmp_path, stub_axbary):
+        regions = chandra.ExtractionRegions(source="[sky=circle(1,2,3)]", background="")
+
+        found = chandra.chandra_barycentered_source_events(
+            self._observation(tmp_path), self._config(tmp_path), None, regions
+        )
+
+        assert found is None
+        assert stub_axbary == []
