@@ -44,6 +44,12 @@ from .xmm import (
     xmm_resolve_config,
     DEFAULT_CONFIG as XMM_DEFAULT_CONFIG,
 )
+from .chandra import (
+    chandra_download_filter,
+    chandra_resolve_config,
+    process_chandra_obsid,
+    DEFAULT_CONFIG as CHANDRA_DEFAULT_CONFIG,
+)
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
@@ -1031,6 +1037,21 @@ MISSION_CONFIG = {
         "name_column": "name",
         "download_filter": xmm_download_filter,
         "resolve_config": xmm_resolve_config,
+    },
+    "chandra": {
+        "table": "chanmaster",
+        "expo_column": "exposure",
+        # Assume the catalogue may be wrong, as for NICER and XMM: whether an observation
+        # has anything to reduce is answered by its primary/ directory, not by the row.
+        "zero_exposure_may_be_wrong": True,
+        # detector, grating and data_mode are carried so that a run can say what it is
+        # about to reduce -- HRC or ACIS, grating or not -- before downloading anything.
+        "additional": "cycle, status, detector, grating, data_mode, type",
+        "obsid_processing": process_chandra_obsid,
+        "default_config": CHANDRA_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": chandra_download_filter,
+        "resolve_config": chandra_resolve_config,
     },
 }
 

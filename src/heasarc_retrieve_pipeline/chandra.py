@@ -43,8 +43,10 @@ one directory silently drops it for a whole instrument. And four different files
 barycentres anything.
 """
 
+import copy
 import glob
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from itertools import takewhile
@@ -53,14 +55,19 @@ from typing import Optional
 import numpy as np
 from astropy.io import fits
 
-from .diagnostics import no_record
+from prefect import flow
+
+from .diagnostics import diagnostics_path, no_record, record_step
 from .utils import (
+    NO_SCIENCE_DATA,
+    absolute_config,
     get_logger,
     good_intervals,
     intersect_intervals,
     intervals_above_threshold,
     merge_intervals,
     read_pha_spectrum,
+    tool_log_file,
 )
 
 #: The pipeline's defaults for a Chandra run.
@@ -191,6 +198,134 @@ def chandra_download_filter(config):
     if products == "repro":
         return {"re_exclude": REPRO_DOWNLOAD_EXCLUDE_RE}
     raise ValueError(f"Chandra has an 'archive' route and a 'repro' route, not {products!r}.")
+
+
+def chandra_config(config):
+    """
+    The configuration one Chandra reduction runs with: the caller's, over the defaults.
+
+    The twin of ``xmm.xmm_config``, for the same reason: ``utils.absolute_config`` only
+    falls back to the defaults when handed ``None``, and
+    ``core.download_and_process_observation`` hands every mission a dictionary holding the
+    two paths and nothing else. Merged once here, ``config["products"]`` cannot raise
+    ``KeyError`` halfway through a reduction.
+
+    Parameters
+    ----------
+    config : dict or None
+        What the caller asked for. ``None`` means "all defaults".
+
+    Returns
+    -------
+    dict
+        A new dictionary. Neither the caller's nor :data:`DEFAULT_CONFIG` is modified, and
+        the two path entries are absolute.
+
+    Examples
+    --------
+    >>> chandra_config({"products": "repro"})["psf_ecf"]
+    0.9
+    >>> chandra_config(None)["products"]
+    'archive'
+    """
+    merged = copy.deepcopy(DEFAULT_CONFIG)
+    merged.update(copy.deepcopy(config or {}))
+    return absolute_config(merged, DEFAULT_CONFIG)
+
+
+#: A level-2 event list, as it appears in a listing of an observation's ``primary/``.
+LEVEL2_EVENT_LIST_RE = r"_evt2\.fits(?:\.gz)?$"
+
+
+def chandra_route_from_listing(entries):
+    """
+    Which route an observation's ``primary/`` directory can support.
+
+    Parameters
+    ----------
+    entries : iterable of str
+        Names directly under ``<observation>/primary/``, as
+        :func:`~heasarc_retrieve_pipeline.core.list_archive_directory` returns them.
+
+    Returns
+    -------
+    str or None
+        ``"archive"`` when a level-2 event list is there, ``"repro"`` when the directory
+        was listed and holds none. ``None`` for an empty listing, which is not evidence of
+        anything: an observation with no ``primary/`` at all is not one this module
+        recognises, and turning it into a full level-1 download would be a guess.
+
+    Examples
+    --------
+    >>> chandra_route_from_listing(["acisf05644N004_evt2.fits.gz", "pcadf05644_asol1.fits.gz"])
+    'archive'
+    >>> chandra_route_from_listing(["pcadf05644_000N001_asol1.fits.gz"])
+    'repro'
+    >>> chandra_route_from_listing([]) is None
+    True
+    """
+    names = [str(entry).strip("/") for entry in entries]
+    if not names:
+        return None
+    if any(re.search(LEVEL2_EVENT_LIST_RE, name) for name in names):
+        return "archive"
+    return "repro"
+
+
+def chandra_resolve_config(config, url):
+    """
+    The configuration this observation will be reduced with, after looking at the archive.
+
+    Called through ``core.mission_resolve_config``, before the download, and shaped like
+    ``xmm.xmm_resolve_config``. The question asked is narrower than XMM's: every Chandra
+    observation directory has the same top level (``primary/``, ``secondary/``,
+    ``oif.fits``), so the answer is one level down, in whether ``primary/`` holds a
+    level-2 event list. One request, against a download that would otherwise arrive with
+    nothing the archive route can reduce.
+
+    The change only ever goes one way, from ``"archive"`` to ``"repro"``. A run that asked
+    for the reprocessing route keeps it and the archive is not listed at all.
+
+    Parameters
+    ----------
+    config : dict or None
+        What the caller asked for; merged over the defaults by :func:`chandra_config`.
+    url : str
+        Where this observation will be downloaded from.
+
+    Returns
+    -------
+    dict
+        A complete configuration. The caller's dictionary is not modified.
+    """
+    # Imported here and not at the top of the module: ``core`` imports every mission.
+    from .core import list_archive_directory
+
+    config = chandra_config(config)
+    logger = get_logger()
+
+    if config["products"] != "archive":
+        logger.info(f"Reprocessing with chandra_repro as asked; not looking at what {url} holds")
+        return config
+
+    primary = url.rstrip("/") + "/primary/"
+    entries = list_archive_directory(primary)
+    if entries is None:
+        logger.warning(f"Could not list {primary}; going on with the archive route")
+        return config
+
+    available = chandra_route_from_listing(entries)
+    if available is None:
+        logger.warning(f"{primary} is empty; going on with the archive route")
+        return config
+
+    if available != config["products"]:
+        logger.info(
+            f"{primary} holds no level-2 event list, so this observation is reprocessed "
+            f"with chandra_repro rather than read off the archive's own products"
+        )
+        config["products"] = available
+    return config
 
 
 def chandra_obsid(obsid):
@@ -3756,3 +3891,171 @@ def chandra_calculate_spectra(
     if caveat:
         get_logger().warning(f"{observation.obsid}: {caveat}")
     return paths
+
+
+#: Why an observation reduced without a position stops where it does.
+NO_POSITION_REASON = (
+    "no source position was given, and every step past the front end is built from one: "
+    "the extraction regions, the background curve the flares are cut on (the source is "
+    "cut out of it), the pile-up measurement, the spectrum, and the barycentring, which "
+    "is only as good as the position it is made at"
+)
+
+
+@flow(flow_run_name="chandra_{obsid}")
+def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
+    """
+    Reduce one Chandra observation end to end.
+
+    One detector in one mode, so unlike XMM there is no loop over exposures: the front end
+    reads the observation, and then regions, flare screening, a cleaned event list, a
+    pile-up measurement, barycentring and the spectrum follow once each.
+
+    The order is forced in one place and chosen in another. The regions come **first**,
+    before any screening, because the flare curve is measured on the source's chip with
+    the source cut out of it. Barycentring comes **before** the spectrum, because timing
+    is what this pipeline is judged on and ``specextract`` is by far the slowest task in
+    it; an observation whose spectrum fails should still have its barycentred events.
+
+    Like XMM, and unlike NuSTAR, ``ra`` and ``dec`` are used as given and never
+    overridden -- see :func:`chandra_source_position`.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict, optional
+        Pipeline configuration; :data:`DEFAULT_CONFIG` where it says nothing.
+        ``products`` picks the front end.
+    ra, dec : float or str, optional
+        Source position in degrees. Without one the front end still runs and records what
+        the observation is, and every later step is recorded as skipped with the reason.
+    flags : dict, optional
+        Accepted for the signature every mission's entry point shares. Nothing reads it.
+
+    Returns
+    -------
+    str or None
+        :data:`heasarc_retrieve_pipeline.utils.NO_SCIENCE_DATA` when the observation holds
+        no event list the chosen route can reduce, and ``None`` otherwise.
+    """
+    from . import ciao
+
+    config = chandra_config(config)
+    obsid = chandra_obsid(obsid)
+    logger = get_logger()
+    logger.info(f"Processing Chandra observation {obsid} on the {config['products']} route")
+
+    for directory in (
+        chandra_pipeline_output_path(obsid, config),
+        chandra_product_output_path(obsid, config),
+    ):
+        os.makedirs(directory, exist_ok=True)
+    diagnostics = diagnostics_path(obsid, config)
+
+    with record_step(diagnostics, obsid, "chandra_front_end") as rec:
+        if config["products"] == "repro":
+            observation = chandra_repro_front_end(
+                obsid, config, rec=rec, log_to=tool_log_file("chandra_repro", obsid, config)
+            )
+        else:
+            observation = chandra_archive_front_end(obsid, config, rec=rec)
+
+    if observation is None:
+        # Not a failure. A downloaded Chandra directory can hold nothing a route reduces.
+        logger.warning(f"{obsid} holds no event list to reduce. Nothing to do.")
+        return NO_SCIENCE_DATA
+
+    logger.info(
+        f"{obsid}: {observation.detector} {observation.mode}, grating {observation.grating}, "
+        f"time resolution {observation.time_resolution.seconds} s"
+    )
+
+    if _source_coordinates(ra, dec) is None:
+        with record_step(diagnostics, obsid, "source_region") as rec:
+            rec.skip(NO_POSITION_REASON)
+        logger.warning(f"{obsid}: {NO_POSITION_REASON}.")
+        return None
+
+    env = ciao.ciao_environment(obsid, config)
+
+    with record_step(diagnostics, obsid, "source_region") as rec:
+        rec.value(ra=ra, dec=dec)
+        position, regions = chandra_source_regions(
+            observation,
+            config,
+            ra,
+            dec,
+            rec=rec,
+            env=env,
+            log_to=tool_log_file("psfsize_srcs", obsid, config),
+        )
+
+    with record_step(diagnostics, obsid, "flare_filtering") as rec:
+        lightcurve = chandra_flare_lightcurve(
+            observation,
+            position,
+            regions,
+            config,
+            env=env,
+            log_to=tool_log_file("dmextract", obsid, config),
+        )
+        gti = chandra_flare_gti(observation, config, lightcurve, rec=rec)
+
+    with record_step(diagnostics, obsid, "clean_event_list") as rec:
+        cleaned = chandra_clean_event_list(
+            observation,
+            config,
+            gti,
+            rec=rec,
+            env=env,
+            log_to=tool_log_file("dmcopy", obsid, config),
+        )
+
+    with record_step(diagnostics, obsid, "pileup_check") as rec:
+        chandra_pileup(
+            observation,
+            config,
+            cleaned,
+            position,
+            regions,
+            rec=rec,
+            env=env,
+            log_to=tool_log_file("pileup_map", obsid, config),
+        )
+
+    with record_step(diagnostics, obsid, "barycenter") as rec:
+        barycentered = chandra_barycenter(
+            observation,
+            config,
+            cleaned,
+            ra=ra,
+            dec=dec,
+            rec=rec,
+            env=env,
+            log_to=tool_log_file("axbary", obsid, config),
+        )
+        if barycentered is not None:
+            chandra_barycentered_source_events(
+                observation,
+                config,
+                barycentered,
+                regions,
+                rec=rec,
+                env=env,
+                log_to=tool_log_file("dmcopy_src_bary", obsid, config),
+            )
+
+    with record_step(diagnostics, obsid, "calculate_spectra") as rec:
+        chandra_calculate_spectra(
+            observation,
+            config,
+            cleaned,
+            regions,
+            rec=rec,
+            env=env,
+            log_to=tool_log_file("specextract", obsid, config),
+        )
+
+    logger.info(f"Finished processing Chandra observation {obsid}")
+    return None

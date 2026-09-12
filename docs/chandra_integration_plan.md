@@ -27,15 +27,15 @@
 
 ## Where this stands
 
-**Last updated 2026-09-12, after step 11.** Branch `various_fixes`,
+**Last updated 2026-09-12, after step 12.** Branch `various_fixes`,
 everything unpushed.
 
 | | |
 |---|---|
-| Landed | Steps 1–11, twelve commits, `5377cfd` → the step 11 commit |
-| Left | Steps 12, 13 |
+| Landed | Steps 1–12, thirteen commits, `5377cfd` → the step 12 commit |
+| Left | Step 13, then an end-to-end batch run |
 | Code | `src/heasarc_retrieve_pipeline/chandra.py`, `src/heasarc_retrieve_pipeline/ciao.py` |
-| Tests | `tests/test_chandra.py` (261 + 20 doctests), `tests/test_ciao.py` (41), all offline |
+| Tests | `tests/test_chandra.py` (296 + 22 doctests), `tests/test_ciao.py` (41), all offline; 1616 in the whole suite |
 | CIAO | 4.18.0 + CALDB 4.12.4 in the `ciao` micromamba environment, driven by `subprocess` from `py313-x64` — the pipeline never enters CIAO's Python |
 
 **The acceptance test passes on both verification observations.** Run through the module end
@@ -793,7 +793,7 @@ uncorrected times.
 
 *Commit:* `Barycentre Chandra with axbary at the searched position, and record DE405`
 
-### ~~Step 11 — the reprocessing route~~ **Done, see the commit below.**
+### ~~Step 11 — the reprocessing route~~ **Done, `928b52f`.**
 
 `chandra_repro_front_end(obsid, config)`, behind `products="repro"`. `chandra_repro
 indir=<obsid dir> outdir=<pipeline dir> set_ardlib=no`, then read the `repro/` products
@@ -889,12 +889,62 @@ genuinely differ.
 
 *Commit:* `Add the chandra_repro route behind products="repro"`
 
-### Step 12 — wire it in
+### ~~Step 12 — wire it in~~ **Done, see the commit below.**
 
 `chandra_resolve_config` probes the archive directory and falls back to the reprocessing
 route when no level-2 product exists, the way `xmm_resolve_config` does. `process_chandra_obsid`
 returns `NO_SCIENCE_DATA` when there is no event list of any kind. Diagnostics records and
 the HTML report.
+
+**What landed:** `chandra_config` (the twin of `xmm_config`), `chandra_route_from_listing`
+and `chandra_resolve_config`, the `process_chandra_obsid` flow, and the `MISSION_CONFIG`
+entry deferred here from step 1 — `chanmaster`, `exposure`, `name`,
+`zero_exposure_may_be_wrong=True`, and `cycle, status, detector, grating, data_mode, type`.
+Registering it put Chandra under every all-mission guard in `test_core.py` at once, and
+they pass.
+
+**The route probe looks one level further down than XMM's.** Every Chandra observation
+directory has the same top level — `00README`, the V&V report, `oif.fits`, `primary/`,
+`secondary/`, listed live for `5644` — so XMM's question, *is there a `PPS/`?*, has no
+Chandra analogue there. The probe lists `primary/` and asks whether a `*_evt2` is in it.
+Still one request. As with XMM the change only goes from `archive` to `repro`, a listing
+that fails (`None`) or comes back empty changes nothing, and a run that asked for `repro`
+lists nothing at all.
+
+**Four decisions in the flow, each tested:**
+
+1. **The order.** Regions come *first*, before any screening, because the flare curve is
+   measured on the source's chip with the source cut out. Barycentring comes *before* the
+   spectrum, because timing is what this pipeline is judged on and `specextract` is both
+   the slowest task and the most fragile one: an observation whose spectrum fails still
+   leaves its barycentred events behind.
+2. **No position, no reduction past the front end — said, not crashed.** XMM, handed
+   `ra="NONE"`, fails inside its first position-dependent task. Here the front end still
+   runs and records what the observation *is* (detector, mode, time resolution), and a
+   `source_region` record says, as a skip, why nothing else ran. Every later step needs a
+   position, barycentring included, since it is only as good as the position it is made at.
+3. **A failing step fails the observation.** XMM carries on past a failed exposure
+   because the other cameras are still worth having. A Chandra observation is one
+   detector in one mode, so there is nothing to carry on *with*; the record of the step
+   that failed says why.
+4. **No orbit ephemeris** means no barycentred source events, and the spectrum still runs.
+
+**The report page needed no code.** `report.py` picks figures by step name and array key,
+and the Chandra steps already use XMM's conventions: `flare_filtering` with `lc_time`
+draws the single-band flare figure, and `calculate_spectra` with `spec_<stem>_*` draws the
+spectra. There is no *Extraction regions* figure, because that one plots a radial profile
+and Chandra's PSF-sized regions record none — the section is simply absent, which is what
+`observation_body` does for any figure it cannot build.
+
+**Run for real on `5644`**, archive route, CIAO 4.18.0, calling the flow directly: all
+seven steps `done`, the page's outcome `done` with the step timeline, the flare figure and
+the spectra drawn, and every file under the name *Output names* asks for. The flow's own
+`chandra05644_aciss_timed_src_bary.evt`, searched exactly as before, gives **Z²₁ = 59.32 at
+1.3453202 s, next-highest peak 14.60** — the hand-driven verification to the last digit.
+
+**Not exercised on real data:** the route probe on an observation that really lacks level 2.
+None is known; it is tested offline against `5644`'s live `primary/` listing with the event
+list removed.
 
 *Commit:* `Wire Chandra into the pipeline, with diagnostics and a report page`
 

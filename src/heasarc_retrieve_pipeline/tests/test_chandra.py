@@ -3219,3 +3219,353 @@ class TestReprocessingAnObservation:
         # The header's CALDBVER is the archive's even after a reprocessing; ASCDSVER moves.
         assert values["caldb_version_is_from_the_archive"] is True
         assert values["ascds_version"] == "CIAO 4.18.0"
+
+
+class TestTheConfiguration:
+    """
+    The defaults have to survive a caller who names only the paths, which is exactly what
+    ``core.download_and_process_observation`` does.
+    """
+
+    def test_a_partial_config_is_completed(self):
+        config = chandra.chandra_config({"out_data_path": "/data"})
+
+        assert config["products"] == "archive"
+        assert config["psf_ecf"] == 0.9
+
+    def test_what_the_caller_named_wins(self):
+        assert chandra.chandra_config({"products": "repro"})["products"] == "repro"
+
+    def test_none_means_every_default(self):
+        assert chandra.chandra_config(None)["flare_sigma"] == 3.0
+
+    def test_the_callers_dictionary_is_not_modified(self):
+        config = {"products": "repro"}
+
+        chandra.chandra_config(config)
+
+        assert config == {"products": "repro"}
+
+    def test_the_paths_come_out_absolute(self):
+        config = chandra.chandra_config({"out_data_path": "relative"})
+
+        assert os.path.isabs(config["out_data_path"])
+
+
+class TestChoosingTheRoute:
+    """
+    Whether the archive's own products can be read, decided by looking at ``primary/``.
+
+    Every Chandra observation directory has the same top level, so XMM's question -- is
+    there a ``PPS/``? -- has no Chandra analogue one level up. The answer is one level
+    down: a ``primary/`` with no ``*_evt2`` has nothing the archive route can reduce.
+    Listed live for ``5644`` on 2026-09-12; the names below are that listing.
+    """
+
+    PRIMARY_5644 = [
+        "acisf05644N004_cntr_img2.fits.gz",
+        "acisf05644N004_cntr_img2.jpg",
+        "acisf05644N004_evt2.fits.gz",
+        "acisf05644N004_full_img2.fits.gz",
+        "acisf05644N004_full_img2.jpg",
+        "acisf05644_000N004_bpix1.fits.gz",
+        "acisf05644_000N004_fov1.fits.gz",
+        "orbitf240581100N001_eph1.fits.gz",
+        "pcadf05644_000N001_asol1.fits.gz",
+    ]
+
+    def test_a_primary_directory_with_a_level_2_list_takes_the_archive_route(self):
+        assert chandra.chandra_route_from_listing(self.PRIMARY_5644) == "archive"
+
+    def test_one_without_takes_the_reprocessing_route(self):
+        without = [name for name in self.PRIMARY_5644 if "_evt2" not in name]
+
+        assert chandra.chandra_route_from_listing(without) == "repro"
+
+    def test_an_empty_listing_says_nothing(self):
+        """Not evidence of anything, and not a reason to fetch the whole of level 1."""
+        assert chandra.chandra_route_from_listing([]) is None
+
+    def test_an_uncompressed_event_list_counts(self):
+        assert chandra.chandra_route_from_listing(["hrcf06298N006_evt2.fits"]) == "archive"
+
+    def test_a_level_1_list_does_not_count(self):
+        assert chandra.chandra_route_from_listing(["acisf05644_000N004_evt1.fits.gz"]) == "repro"
+
+    def an_archive_holding(self, monkeypatch, entries):
+        from heasarc_retrieve_pipeline import core
+
+        asked = []
+
+        def listing(url):
+            asked.append(url)
+            return entries
+
+        monkeypatch.setattr(core, "list_archive_directory", listing)
+        return asked
+
+    def test_the_route_is_taken_from_the_archive(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, self.PRIMARY_5644)
+
+        assert chandra.chandra_resolve_config({}, "https://x/4/5644/")["products"] == "archive"
+
+    def test_it_lists_primary_and_not_the_top_level(self, monkeypatch):
+        asked = self.an_archive_holding(monkeypatch, self.PRIMARY_5644)
+
+        chandra.chandra_resolve_config({}, "https://x/4/5644")
+
+        assert asked == ["https://x/4/5644/primary/"]
+
+    def test_an_observation_with_no_level_2_is_moved_to_the_reprocessing_route(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, ["pcadf05644_000N001_asol1.fits.gz"])
+
+        assert chandra.chandra_resolve_config({}, "https://x/4/5644/")["products"] == "repro"
+
+    def test_a_user_who_asked_for_reprocessing_keeps_it_and_nothing_is_listed(self, monkeypatch):
+        asked = self.an_archive_holding(monkeypatch, self.PRIMARY_5644)
+
+        resolved = chandra.chandra_resolve_config({"products": "repro"}, "https://x/4/5644/")
+
+        assert resolved["products"] == "repro"
+        assert asked == []
+
+    def test_an_archive_that_cannot_be_listed_leaves_the_route_alone(self, monkeypatch):
+        """``None`` is "I could not look", not "there is nothing there"."""
+        self.an_archive_holding(monkeypatch, None)
+
+        assert chandra.chandra_resolve_config({}, "https://x/4/5644/")["products"] == "archive"
+
+    def test_an_empty_primary_leaves_the_route_alone(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, [])
+
+        assert chandra.chandra_resolve_config({}, "https://x/4/5644/")["products"] == "archive"
+
+    def test_the_resolved_config_is_a_complete_one(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, self.PRIMARY_5644)
+
+        resolved = chandra.chandra_resolve_config({"out_data_path": "/data"}, "https://x/4/5644/")
+
+        assert resolved["psf_ecf"] == 0.9
+
+    def test_the_callers_dictionary_is_not_modified(self, monkeypatch):
+        self.an_archive_holding(monkeypatch, [])
+        config = {"products": "archive"}
+
+        chandra.chandra_resolve_config(config, "https://x/4/5644/")
+
+        assert config == {"products": "archive"}
+
+    def test_the_filter_follows_the_route_that_was_chosen(self, monkeypatch):
+        """An observation with no level 2 ends up asking for level 1, not for nothing."""
+        self.an_archive_holding(monkeypatch, ["pcadf05644_000N001_asol1.fits.gz"])
+
+        resolved = chandra.chandra_resolve_config({}, "https://x/4/5644/")
+
+        assert chandra.chandra_download_filter(resolved) == {
+            "re_exclude": chandra.REPRO_DOWNLOAD_EXCLUDE_RE
+        }
+
+
+class TestTheMissionIsRegistered:
+    def test_chandra_is_a_mission(self):
+        from heasarc_retrieve_pipeline import core
+
+        entry = core.MISSION_CONFIG["chandra"]
+
+        assert entry["table"] == "chanmaster"
+        assert entry["obsid_processing"] is chandra.process_chandra_obsid
+        assert entry["default_config"] is chandra.DEFAULT_CONFIG
+
+    def test_the_route_is_resolved_and_the_filter_chosen_through_the_registry(self):
+        from heasarc_retrieve_pipeline import core
+
+        entry = core.MISSION_CONFIG["chandra"]
+
+        assert entry["download_filter"] is chandra.chandra_download_filter
+        assert entry["resolve_config"] is chandra.chandra_resolve_config
+
+    def test_its_catalogue_query_asks_for_the_columns_the_plan_names(self):
+        from heasarc_retrieve_pipeline.core import obsid_query
+
+        query = obsid_query("5644", "chandra")
+
+        assert "public.chanmaster" in query
+        for column in ("detector", "grating", "data_mode"):
+            assert column in query
+
+
+@pytest.fixture
+def stub_every_step(monkeypatch):
+    """
+    Every step ``process_chandra_obsid`` calls, replaced by one that writes down its call.
+
+    What is under test is the orchestration -- the order, and what each step is handed --
+    which no unit test of a single step can reach. Each step is already tested on its own
+    above, against files shaped like the real ones.
+    """
+    calls = []
+    # Only what the flow itself reads, for its log line: every step that would read more
+    # is stubbed.
+    observation = SimpleNamespace(
+        obsid="5644",
+        detector="aciss",
+        grating="NONE",
+        mode="timed",
+        time_resolution=SimpleNamespace(seconds=0.44104),
+    )
+    position = SimpleNamespace(x=4100.38, y=4131.82, chip_id=7)
+    regions = SimpleNamespace(source="[sky=circle(1,1,1)]", background="[sky=annulus(1,1,2,3)]")
+
+    def recording(name, returns):
+        def step(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return returns
+
+        return step
+
+    for name, returns in (
+        ("chandra_archive_front_end", observation),
+        ("chandra_repro_front_end", observation),
+        ("chandra_source_regions", (position, regions)),
+        ("chandra_flare_lightcurve", "curve.fits"),
+        ("chandra_flare_gti", np.array([[0.0, 1.0]])),
+        ("chandra_clean_event_list", "cl.evt"),
+        ("chandra_pileup", None),
+        ("chandra_barycenter", "cl_bary.evt"),
+        ("chandra_barycentered_source_events", "src_bary.evt"),
+        ("chandra_calculate_spectra", None),
+    ):
+        monkeypatch.setattr(chandra, name, recording(name, returns))
+    monkeypatch.setattr(ciao, "ciao_environment", lambda obsid, config: {"PFILES": obsid})
+    return calls
+
+
+class TestReducingAnObservation:
+    RA, DEC = 148.96267, 69.67931
+
+    def reduce(self, tmp_path, config=None, **kwargs):
+        base = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+        return chandra.process_chandra_obsid.fn(
+            "5644", config=dict(base, **(config or {})), **kwargs
+        )
+
+    def steps(self, calls):
+        return [name for name, _, _ in calls]
+
+    def test_the_steps_run_in_the_order_the_data_force(self, tmp_path, stub_every_step):
+        """
+        Regions before screening, because the flare curve is measured with the source cut
+        out; barycentring before the spectrum, because timing is what this is judged on
+        and ``specextract`` is the slow, fragile part.
+        """
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert self.steps(stub_every_step) == [
+            "chandra_archive_front_end",
+            "chandra_source_regions",
+            "chandra_flare_lightcurve",
+            "chandra_flare_gti",
+            "chandra_clean_event_list",
+            "chandra_pileup",
+            "chandra_barycenter",
+            "chandra_barycentered_source_events",
+            "chandra_calculate_spectra",
+        ]
+
+    def test_the_reprocessing_route_takes_the_other_front_end(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, config={"products": "repro"}, ra=self.RA, dec=self.DEC)
+
+        assert self.steps(stub_every_step)[0] == "chandra_repro_front_end"
+        assert "chandra_archive_front_end" not in self.steps(stub_every_step)
+
+    def test_the_barycentring_is_made_at_the_position_asked_for(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        ((_, args, kwargs),) = [c for c in stub_every_step if c[0] == "chandra_barycenter"]
+        assert (kwargs["ra"], kwargs["dec"]) == (self.RA, self.DEC)
+        assert args[2] == "cl.evt", "the cleaned list, not the raw one"
+
+    def test_the_source_events_are_cut_from_the_barycentred_list(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        ((_, args, _),) = [
+            c for c in stub_every_step if c[0] == "chandra_barycentered_source_events"
+        ]
+        assert args[2] == "cl_bary.evt"
+
+    def test_every_later_step_reads_the_cleaned_list(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        for name in ("chandra_pileup", "chandra_calculate_spectra"):
+            ((_, args, _),) = [c for c in stub_every_step if c[0] == name]
+            assert args[2] == "cl.evt", name
+
+    def test_the_cleaned_list_is_screened_with_the_flare_gti(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        ((_, args, _),) = [c for c in stub_every_step if c[0] == "chandra_clean_event_list"]
+        np.testing.assert_array_equal(args[2], [[0.0, 1.0]])
+
+    def test_every_ciao_step_shares_one_private_environment(self, tmp_path, stub_every_step):
+        """One ``PFILES`` per observation, and the same one for all of its tasks."""
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        environments = {id(kwargs["env"]) for name, _, kwargs in stub_every_step if "env" in kwargs}
+        assert len(environments) == 1
+
+    def test_no_ephemeris_means_no_source_events_and_the_rest_still_runs(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        monkeypatch.setattr(chandra, "chandra_barycenter", lambda *a, **k: None)
+
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert "chandra_barycentered_source_events" not in self.steps(stub_every_step)
+        assert "chandra_calculate_spectra" in self.steps(stub_every_step)
+
+    def test_an_observation_with_nothing_to_reduce_is_not_a_failure(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        monkeypatch.setattr(chandra, "chandra_archive_front_end", lambda *a, **k: None)
+
+        result = self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert result == chandra.NO_SCIENCE_DATA
+        assert stub_every_step == [], "nothing should run on an empty observation"
+
+    def test_without_a_position_it_reads_the_observation_and_stops_saying_why(
+        self, tmp_path, stub_every_step
+    ):
+        result = self.reduce(tmp_path)
+
+        assert result is None
+        assert self.steps(stub_every_step) == ["chandra_archive_front_end"]
+        directory = pathlib.Path(tmp_path) / "5644"
+        record = next(directory.rglob("*source_region*.json")).read_text()
+        assert "skipped" in record
+        assert "no source position" in record
+
+    def test_a_reduction_returns_none(self, tmp_path, stub_every_step):
+        assert self.reduce(tmp_path, ra=self.RA, dec=self.DEC) is None
+
+    def test_the_output_directories_exist_before_any_step_runs(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert (tmp_path / "5644" / "event_cl").is_dir()
+        assert (tmp_path / "5644" / "products").is_dir()
+
+    def test_a_failing_step_fails_the_observation_and_records_why(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        """One observation, one outcome: there are no other cameras to carry on with."""
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("dmextract fell over")
+
+        monkeypatch.setattr(chandra, "chandra_flare_lightcurve", broken)
+
+        with pytest.raises(RuntimeError, match="dmextract fell over"):
+            self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        record = next((tmp_path / "5644").rglob("*flare_filtering*.json")).read_text()
+        assert "failed" in record
