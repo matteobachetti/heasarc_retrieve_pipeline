@@ -95,6 +95,7 @@ DEFAULT_CONFIG = {
     "flare_max_removed_fraction": 0.3,
     "hrc_veto_ratio_threshold": 0.99,
     "pileup_percentile": 90.0,
+    "pileup_image_pixels": 1024,
     "cc_source_halfwidth_pix": 3,
     "cc_background_pix": (10, 30),
 }
@@ -2782,3 +2783,352 @@ def chandra_barycentered_source_events(
         f"{observation.obsid}: barycentred source events in {os.path.basename(output)}"
     )
     return output
+
+
+#: The CXC's conversion from counts per ACIS frame to pile-up fraction, from
+#: `ahelp pileup_map <https://cxc.harvard.edu/ciao/ahelp/pileup_map.html>`_, with the
+#: origin added because an empty pixel is not piled. The three tabulated points lie
+#: exactly on ``fraction = counts_per_frame / 2``, so the interpolation is a straight
+#: line; the table is kept in the source anyway, because the *tool's* table is the
+#: authority and a future CIAO may revise it.
+PILEUP_TABLE = ((0.0, 0.0), (0.02, 0.01), (0.10, 0.05), (0.20, 0.10))
+
+
+def pileup_fraction(counts_per_frame):
+    """
+    The pile-up fraction the CXC's table implies for a counts-per-frame value.
+
+    Returns ``None`` above the last tabulated point rather than extrapolating. That is not
+    caution for its own sake: a severely piled source *craters*, as the tool's own help
+    says -- two photons in one frame are telemetered as one event of twice the energy, or
+    rejected outright -- so past some rate the counts per frame stop rising and start
+    falling. A straight line drawn through the crater would report less pile-up for a
+    worse source, which is the one answer that would actively mislead.
+
+    Parameters
+    ----------
+    counts_per_frame : float
+
+    Returns
+    -------
+    float or None
+
+    Examples
+    --------
+    >>> pileup_fraction(0.02)
+    0.01
+    >>> round(pileup_fraction(0.06), 4)
+    0.03
+    >>> pileup_fraction(0.5) is None
+    True
+    """
+    counts = float(counts_per_frame)
+    if counts > PILEUP_TABLE[-1][0]:
+        return None
+    rates = [point[0] for point in PILEUP_TABLE]
+    fractions = [point[1] for point in PILEUP_TABLE]
+    return float(np.interp(counts, rates, fractions))
+
+
+def sky_to_image_pixel(header, x, y):
+    """
+    Where a sky position falls in a CIAO image's own array.
+
+    A binned CIAO image is a crop of the sky plane, and its array indices are not sky
+    coordinates: the corner is wherever the binning started. The transform is in the
+    header as ``image = LTM * sky + LTV``, which is CIAO's own convention and the only
+    thing that makes a position drawn on the sky mean anything in the array.
+
+    Parameters
+    ----------
+    header : astropy.io.fits.Header
+    x, y : float
+        Sky pixel coordinates.
+
+    Returns
+    -------
+    tuple of float
+        Zero-based ``(column, row)`` into the array.
+    """
+    ltm1 = float(header.get("LTM1_1", 1.0))
+    ltm2 = float(header.get("LTM2_2", 1.0))
+    ltv1 = float(header.get("LTV1", 0.0))
+    ltv2 = float(header.get("LTV2", 0.0))
+    return (ltm1 * float(x) + ltv1 - 0.5, ltm2 * float(y) + ltv2 - 0.5)
+
+
+@dataclass(frozen=True)
+class PileUpCounts:
+    """
+    What the pile-up map says inside the source region.
+
+    Attributes
+    ----------
+    peak_counts_per_frame : float
+        The worst pixel.
+    percentile_counts_per_frame : float
+        The configured percentile of the pixels, which is the number to quote: the peak is
+        one pixel and therefore noisy, and the mean is dragged down by the region's empty
+        edge.
+    percentile : float
+    pixels : int
+        How many map pixels the circle covered.
+    """
+
+    peak_counts_per_frame: float
+    percentile_counts_per_frame: float
+    percentile: float
+    pixels: int
+
+
+def read_pileup_map(path, x, y, radius_arcsec, percentile):
+    """
+    Read the counts per frame inside the source circle.
+
+    The circle is applied here rather than by the Data Model on purpose. Filtering an
+    *image* with ``[sky=circle(...)]`` crops to the bounding box and zeroes what falls
+    outside it, so the zeroes would join the sample and drag the percentile down. Selecting
+    the pixels through the header's own transform keeps the sample to the circle.
+
+    Parameters
+    ----------
+    path : str
+        The ``pileup_map`` output.
+    x, y : float
+        The source, in sky pixels.
+    radius_arcsec : float
+    percentile : float
+
+    Returns
+    -------
+    PileUpCounts or None
+        ``None`` when the circle falls off the image, which means the map was made of the
+        wrong chip and no number should be reported.
+    """
+    with fits.open(path) as opened:
+        hdu = next(one for one in opened if one.data is not None and one.data.ndim == 2)
+        data = np.asarray(hdu.data, dtype=float)
+        header = hdu.header
+
+    column, row = sky_to_image_pixel(header, x, y)
+    radius_pixels = arcsec_to_sky_pixels(radius_arcsec) * abs(float(header.get("LTM1_1", 1.0)))
+    rows, columns = np.indices(data.shape)
+    inside = (columns - column) ** 2 + (rows - row) ** 2 <= radius_pixels**2
+    if not inside.any():
+        return None
+
+    values = data[inside]
+    return PileUpCounts(
+        peak_counts_per_frame=float(values.max()),
+        percentile_counts_per_frame=float(np.percentile(values, percentile)),
+        percentile=float(percentile),
+        pixels=int(values.size),
+    )
+
+
+def chandra_pileup_applies(observation):
+    """
+    Whether pile-up can be measured for this observation at all.
+
+    Parameters
+    ----------
+    observation : Observation
+
+    Returns
+    -------
+    tuple
+        ``(applies, reason)``. ``reason`` is empty when it applies and plain English when
+        it does not, because "no pile-up measurement" on a report page is a question and
+        the answer should be on the same line.
+    """
+    if not observation.detector.startswith("acis"):
+        return False, (
+            "HRC counts photons one at a time rather than in frames, so there is no frame "
+            "for two photons to land in and nothing for pileup_map to measure."
+        )
+    if observation.is_continuous_clocking:
+        return False, (
+            "Continuous Clocking clocks the chip out without ever integrating a frame, so "
+            "counts per frame is not a quantity this observation has."
+        )
+    return True, ""
+
+
+@dataclass(frozen=True)
+class PileUp:
+    """
+    What this observation's pile-up is, and what was done about it: nothing.
+
+    Attributes
+    ----------
+    counts : PileUpCounts or None
+    fraction, peak_fraction : float or None
+        What the CXC's table makes of the percentile and the peak. ``None`` means the
+        counts per frame are off the top of the table -- see :func:`pileup_fraction`.
+    frame_time : float or None
+        The frame the counts are per, in seconds. Worth reporting next to the fraction:
+        the CXC's "counts per second" column assumes 3.2 s, and a subarray observation
+        like obsid ``5644`` at 0.44 s tolerates seven times the count rate for the same
+        pile-up.
+    applies : bool
+    reason : str
+    """
+
+    counts: Optional[PileUpCounts] = None
+    fraction: Optional[float] = None
+    peak_fraction: Optional[float] = None
+    frame_time: Optional[float] = None
+    applies: bool = True
+    reason: str = ""
+
+
+def chandra_pileup_image_path(observation, config):
+    """Where the single-pixel counts image of the source chip goes."""
+    return os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{observation.stem}_chipimg.fits"
+    )
+
+
+def chandra_pileup_map_path(observation, config):
+    """Where the counts-per-frame map goes."""
+    return os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{observation.stem}_pileup.fits"
+    )
+
+
+def _pileup_image_filter(observation, position, config):
+    """
+    The Data Model filter that makes ``pileup_map``'s input.
+
+    Three things, each from the tool's own help. **One chip**, because a dropped frame on
+    another CCD corrupts the whole image and dropped frames are commonest exactly where
+    pile-up is. **Binned by one**, because the algorithm is defined per detector pixel and
+    does not work otherwise. **No energy filter**, because pile-up is two photons
+    telemetered as one event at their summed energy -- cut on energy and the evidence goes
+    with it. Grade and status filtering the level-2 list already carries, and that is what
+    the help asks for.
+
+    The image is a square of ``pileup_image_pixels`` around the source rather than the whole
+    chip. The help recommends about 2048 on a side; the crater a severely piled source
+    makes is tens of pixels across, so a window this size holds the crater and its halo
+    with room to spare, and it keeps the image the same size whatever the observation.
+    """
+    half = int(config["pileup_image_pixels"]) // 2
+    x0, x1 = int(round(position.x)) - half, int(round(position.x)) + half
+    y0, y1 = int(round(position.y)) - half, int(round(position.y)) + half
+    return f"[ccd_id={position.chip_id}][bin x={x0}:{x1}:1,y={y0}:{y1}:1]"
+
+
+def chandra_pileup(
+    observation, config, cleaned, position, regions, rec=None, env=None, log_to=None
+):
+    """
+    Measure ACIS pile-up, and report it without correcting it.
+
+    For the bright X-ray binaries this pipeline is aimed at, pile-up is not a corner case
+    to flag but the normal condition of an ACIS imaging observation -- a source at
+    0.07 counts per second is already 10% piled at a 3.2 s frame. There is no correction
+    here and there is not going to be one: ``jdpileup``, annulus surgery and readout-streak
+    extraction are all analysis decisions with a scientist's judgement in them, and this
+    pipeline's job is to say what the number is so that the decision can be made.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        ``pileup_percentile`` and ``pileup_image_pixels``.
+    cleaned : str or None
+        The screened event list. ``None`` means there is nothing to measure.
+    position : SourcePosition
+        Which chip to make the image of, and where in it to read the answer.
+    regions : ExtractionRegions
+        For the source radius; the circle is applied to the map, not to the events.
+    rec : StepRecord, optional
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    PileUp
+        Always a ``PileUp``, never ``None``: "not measured, and here is why" is a result
+        the report page needs as much as a number.
+    """
+    from . import ciao
+
+    rec = rec or no_record()
+    applies, why = chandra_pileup_applies(observation)
+    if not applies or cleaned is None:
+        reason = why or "There is no cleaned event list to measure pile-up on."
+        rec.value(pileup_measured=False, pileup_reason=reason)
+        get_logger().info(f"{observation.obsid}: no pile-up measurement -- {reason}")
+        return PileUp(applies=applies, reason=reason)
+
+    image = chandra_pileup_image_path(observation, config)
+    os.makedirs(os.path.dirname(image), exist_ok=True)
+    ciao.run(
+        "dmcopy",
+        produces=image,
+        env=env,
+        log_to=log_to,
+        infile=cleaned + _pileup_image_filter(observation, position, config),
+        outfile=image,
+        clobber=True,
+    )
+
+    mapped = chandra_pileup_map_path(observation, config)
+    ciao.run(
+        "pileup_map",
+        produces=mapped,
+        env=env,
+        log_to=log_to,
+        infile=image,
+        outfile=mapped,
+        clobber=True,
+    )
+
+    percentile = float(config["pileup_percentile"])
+    counts = read_pileup_map(mapped, position.x, position.y, regions.radius_arcsec, percentile)
+    if counts is None:
+        reason = (
+            "The source circle fell outside the pile-up map, which means the map was made "
+            "of the wrong chip. No number is reported rather than a wrong one."
+        )
+        rec.value(pileup_measured=False, pileup_reason=reason)
+        return PileUp(applies=True, reason=reason)
+
+    fraction = pileup_fraction(counts.percentile_counts_per_frame)
+    peak_fraction = pileup_fraction(counts.peak_counts_per_frame)
+    frame_time = observation.time_resolution.seconds
+    said = (
+        f"more than {PILEUP_TABLE[-1][1]:.0%}, off the top of the CXC's table"
+        if fraction is None
+        else f"about {fraction:.1%}"
+    )
+    reason = (
+        f"The {percentile:.0f}th percentile of the counts per frame inside the source "
+        f"circle is {counts.percentile_counts_per_frame:.3f}, over {counts.pixels} map "
+        f"pixels, and the worst pixel is {counts.peak_counts_per_frame:.3f}. By the CXC's "
+        f"table that is {said} pile-up at a {frame_time:.5f} second frame. It is measured "
+        f"and reported, never corrected."
+    )
+    rec.value(
+        pileup_measured=True,
+        pileup_reason=reason,
+        pileup_percentile=percentile,
+        pileup_counts_per_frame=counts.percentile_counts_per_frame,
+        pileup_peak_counts_per_frame=counts.peak_counts_per_frame,
+        pileup_fraction=fraction,
+        pileup_peak_fraction=peak_fraction,
+        pileup_pixels=counts.pixels,
+        pileup_map_file=os.path.basename(mapped),
+        frame_time_s=frame_time,
+    )
+    get_logger().info(f"{observation.obsid}: {reason}")
+    return PileUp(
+        counts=counts,
+        fraction=fraction,
+        peak_fraction=peak_fraction,
+        frame_time=frame_time,
+        applies=True,
+        reason=reason,
+    )

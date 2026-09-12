@@ -2179,3 +2179,322 @@ class TestBarycentringWithAxbary:
 
         assert found is None
         assert stub_axbary == []
+
+
+def a_pileup_map(path, values, x0=4000, y0=4500):
+    """
+    A counts-per-frame image the way ``pileup_map`` writes one.
+
+    CIAO images carry the sky-to-image transform in ``LTM``/``LTV``, and everything that
+    reads one back has to go through it: the array is a crop of the sky plane and its
+    corner is not the sky origin. ``values`` is indexed ``[row, column]``, i.e. ``[y, x]``.
+    """
+    data = np.asarray(values, dtype=np.float32)
+    header = fits.Header()
+    header["LTM1_1"] = 1.0
+    header["LTM2_2"] = 1.0
+    header["LTV1"] = 0.5 - x0
+    header["LTV2"] = 0.5 - y0
+    header["MTYPE1"] = "sky"
+    header["MFORM1"] = "x,y"
+    fits.PrimaryHDU(data=data, header=header).writeto(path, overwrite=True)
+    return path
+
+
+class TestTheCxcPileUpTable:
+    def test_the_three_tabulated_points_come_back_as_tabulated(self):
+        assert chandra.pileup_fraction(0.02) == pytest.approx(0.01)
+        assert chandra.pileup_fraction(0.10) == pytest.approx(0.05)
+        assert chandra.pileup_fraction(0.20) == pytest.approx(0.10)
+
+    def test_between_the_points_it_interpolates(self):
+        assert chandra.pileup_fraction(0.06) == pytest.approx(0.03)
+        assert chandra.pileup_fraction(0.01) == pytest.approx(0.005)
+
+    def test_an_empty_pixel_is_not_piled(self):
+        assert chandra.pileup_fraction(0.0) == 0.0
+
+    def test_above_the_table_it_refuses_to_extrapolate(self):
+        """
+        The relation saturates -- a severely piled source craters, and the counts per
+        frame stop growing with the true rate. Extrapolating the straight line past the
+        last tabulated point would read that crater as *less* pile-up. ``None`` means
+        "worse than the table goes", which is the only honest answer.
+        """
+        assert chandra.pileup_fraction(0.25) is None
+        assert chandra.pileup_fraction(3.0) is None
+
+
+class TestWhereAPixelOfTheMapIs:
+    def test_a_sky_position_is_found_through_the_images_own_transform(self, tmp_path):
+        path = a_pileup_map(str(tmp_path / "map.fits"), np.zeros((4, 4)), x0=4000, y0=4500)
+        header = fits.getheader(path)
+
+        assert chandra.sky_to_image_pixel(header, 4000.0, 4500.0) == pytest.approx((0.0, 0.0))
+        assert chandra.sky_to_image_pixel(header, 4002.0, 4501.0) == pytest.approx((2.0, 1.0))
+
+    def test_a_binned_image_scales_as_well_as_shifts(self, tmp_path):
+        path = str(tmp_path / "map.fits")
+        a_pileup_map(path, np.zeros((4, 4)))
+        with fits.open(path, mode="update") as opened:
+            opened[0].header["LTM1_1"] = 0.5
+            opened[0].header["LTM2_2"] = 0.5
+            opened[0].header["LTV1"] = 0.5 - 4000 * 0.5
+            opened[0].header["LTV2"] = 0.5 - 4500 * 0.5
+        header = fits.getheader(path)
+
+        assert chandra.sky_to_image_pixel(header, 4004.0, 4500.0) == pytest.approx((2.0, 0.0))
+
+
+class TestReadingThePileUpMap:
+    def _a_map(self, tmp_path):
+        values = np.zeros((9, 9))
+        values[4, 4] = 0.30
+        values[4, 5] = 0.10
+        values[5, 4] = 0.06
+        values[3, 4] = 0.02
+        values[0, 0] = 9.99
+        return a_pileup_map(str(tmp_path / "pileup.fits"), values, x0=4000, y0=4500)
+
+    def test_only_the_pixels_inside_the_circle_are_read(self, tmp_path):
+        """The bright corner pixel is 5.7 pixels away and must not be seen: a pile-up
+        measurement is of the source, and any other source on the chip is not it."""
+        radius = chandra.sky_pixels_to_arcsec(1.0)
+        found = chandra.read_pileup_map(self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0)
+
+        assert found.peak_counts_per_frame == pytest.approx(0.30)
+        assert found.pixels == 5
+
+    def test_the_percentile_is_taken_over_those_pixels(self, tmp_path):
+        radius = chandra.sky_pixels_to_arcsec(1.0)
+        found = chandra.read_pileup_map(self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0)
+
+        assert found.percentile_counts_per_frame == pytest.approx(
+            np.percentile([0.30, 0.10, 0.06, 0.02, 0.0], 90.0)
+        )
+
+    def test_a_radius_that_lands_on_nothing_is_not_a_measurement(self, tmp_path):
+        radius = chandra.sky_pixels_to_arcsec(1.0)
+        found = chandra.read_pileup_map(self._a_map(tmp_path), 9000.0, 9000.0, radius, 90.0)
+
+        assert found is None
+
+
+class TestWhetherPileUpCanBeMeasuredAtAll:
+    def _observation(self, tmp_path, **kwargs):
+        fields = dict(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+        )
+        fields.update(kwargs)
+        return chandra.Observation(**fields)
+
+    def test_acis_timed_exposure_is_the_case_it_was_written_for(self, tmp_path):
+        applies, why = chandra.chandra_pileup_applies(self._observation(tmp_path))
+
+        assert applies is True
+        assert why == ""
+
+    def test_hrc_has_no_frames_to_pile_into(self, tmp_path):
+        observation = self._observation(
+            tmp_path,
+            detector="hrci",
+            mode="imaging",
+            chips=(),
+            time_resolution=chandra.TimeResolution(1.5625e-05, "hrc_imaging", ""),
+        )
+
+        applies, why = chandra.chandra_pileup_applies(observation)
+
+        assert applies is False
+        assert "frame" in why
+
+    def test_continuous_clocking_does_not_have_frames_in_the_same_sense(self, tmp_path):
+        observation = self._observation(
+            tmp_path,
+            mode="cc",
+            time_resolution=chandra.TimeResolution(0.00285, "acis_continuous_clocking", ""),
+        )
+
+        applies, why = chandra.chandra_pileup_applies(observation)
+
+        assert applies is False
+        assert "Continuous Clocking" in why
+
+
+@pytest.fixture
+def stub_pileup_tasks(monkeypatch):
+    """A ``dmcopy`` that writes a counts image and a ``pileup_map`` that writes a map."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "dmcopy":
+            a_pileup_map(kwargs["outfile"], np.zeros((9, 9)), x0=4096, y0=4096)
+        if name == "pileup_map":
+            values = np.zeros((9, 9))
+            values[4, 4] = 0.30
+            values[4, 5] = values[5, 4] = values[3, 4] = 0.10
+            a_pileup_map(kwargs["outfile"], values, x0=4096, y0=4096)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestMeasuringPileUp:
+    def _observation(self, tmp_path, **kwargs):
+        fields = dict(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+        )
+        fields.update(kwargs)
+        return chandra.Observation(**fields)
+
+    def _config(self, tmp_path):
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["outdir"] = str(tmp_path / "out")
+        return config
+
+    def _position(self):
+        return chandra.SourcePosition(
+            x=4100.0, y=4100.0, chip_id=7, chipx=226.3, chipy=497.0, theta_arcmin=0.29
+        )
+
+    def _regions(self):
+        return chandra.ExtractionRegions(
+            source="[sky=circle(4100,4100,4)]",
+            background="[sky=annulus(4100,4100,8,16)]",
+            radius_arcsec=chandra.sky_pixels_to_arcsec(1.0),
+        )
+
+    def test_the_map_is_made_of_the_source_chip_at_single_pixel_binning(
+        self, tmp_path, stub_pileup_tasks
+    ):
+        """
+        The tool's own help asks for both: binned by one, or the algorithm does not work,
+        and one chip at a time, or dropped frames on another chip corrupt the answer.
+        """
+        chandra.chandra_pileup(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._position(),
+            self._regions(),
+        )
+
+        dmcopy = [call for call in stub_pileup_tasks if call[0] == "dmcopy"][0][1]
+        assert "[ccd_id=7]" in dmcopy["infile"]
+        assert re.search(r"\[bin x=\d+:\d+:1,y=\d+:\d+:1\]", dmcopy["infile"])
+
+    def test_no_energy_filter_is_applied(self, tmp_path, stub_pileup_tasks):
+        """Pile-up pushes two photons' energies into one event, so an energy cut throws
+        away exactly the events that are the evidence for it."""
+        chandra.chandra_pileup(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._position(),
+            self._regions(),
+        )
+
+        dmcopy = [call for call in stub_pileup_tasks if call[0] == "dmcopy"][0][1]
+        assert "energy" not in dmcopy["infile"].split("cl.evt")[1]
+
+    def test_the_map_is_made_from_the_image_and_measured_where_the_source_is(
+        self, tmp_path, stub_pileup_tasks
+    ):
+        found = chandra.chandra_pileup(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._position(),
+            self._regions(),
+        )
+
+        image = [call for call in stub_pileup_tasks if call[0] == "dmcopy"][0][1]["outfile"]
+        mapped = [call for call in stub_pileup_tasks if call[0] == "pileup_map"][0][1]
+        assert mapped["infile"] == image
+        assert found.counts.peak_counts_per_frame == pytest.approx(0.30)
+        assert found.counts.pixels == 5
+
+    def test_the_fraction_is_the_cxc_tables_and_nothing_is_corrected(
+        self, tmp_path, stub_pileup_tasks
+    ):
+        found = chandra.chandra_pileup(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._position(),
+            self._regions(),
+        )
+
+        assert found.peak_fraction is None
+        assert found.fraction == pytest.approx(chandra.pileup_fraction(found.counts.percentile))
+
+    def test_what_it_records(self, tmp_path, stub_pileup_tasks):
+        directory = tmp_path / "diag"
+        with record_step(str(directory), "5644", "pileup") as rec:
+            chandra.chandra_pileup(
+                self._observation(tmp_path),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._position(),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*pileup*.json")).read_text())["values"]
+        assert values["pileup_measured"] is True
+        assert values["pileup_percentile"] == 90.0
+        assert values["frame_time_s"] == pytest.approx(0.44104)
+        assert "pileup_map_file" in values
+
+    def test_hrc_is_skipped_and_says_why(self, tmp_path, stub_pileup_tasks):
+        observation = self._observation(
+            tmp_path,
+            detector="hrci",
+            mode="imaging",
+            chips=(),
+            time_resolution=chandra.TimeResolution(1.5625e-05, "hrc_imaging", ""),
+        )
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "pileup") as rec:
+            found = chandra.chandra_pileup(
+                observation,
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._position(),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*pileup*.json")).read_text())["values"]
+        assert found.applies is False
+        assert found.counts is None
+        assert values["pileup_measured"] is False
+        assert "frame" in values["pileup_reason"]
+        assert stub_pileup_tasks == []
+
+    def test_with_no_cleaned_list_there_is_nothing_to_measure(self, tmp_path, stub_pileup_tasks):
+        found = chandra.chandra_pileup(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            None,
+            self._position(),
+            self._regions(),
+        )
+
+        assert found.counts is None
+        assert stub_pileup_tasks == []
