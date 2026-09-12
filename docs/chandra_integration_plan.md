@@ -1,12 +1,15 @@
 # Adding Chandra (ACIS + HRC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-12 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `1153f58`). **Nothing has been implemented yet**: this is the
-> agreed design, not a report on work done. It is written to be picked up cold, by a
-> person or a session with no memory of the conversation that produced it. Every number in
-> it was measured against the live HEASARC archive, the live CXC conda channel, or real
-> Chandra data files on 2026-09-12; the snippets under *Reproducing the archive facts*
-> re-derive them, so none of it has to be taken on trust.
+> `various_fixes` (HEAD `1153f58`). **Steps 1 and 2 have landed**; steps 3 onwards are
+> still the agreed design rather than a report on work done. It is written to be picked up
+> cold, by a person or a session with no memory of the conversation that produced it.
+> Every number in it was measured against the live HEASARC archive, the live CXC conda
+> channel, or real Chandra data files on 2026-09-12; the snippets under *Reproducing the
+> archive facts* re-derive them, so none of it has to be taken on trust.
+>
+> **Steps 6 onwards need CIAO, which is not installed on Matteo's machine.** Steps 3, 4
+> and 5 do not, and are the work available before that is sorted.
 >
 > Decisions marked **decided** were made by Matteo and should not be relitigated without
 > him. Items under *Open items* are genuinely unresolved and need a machine with CIAO.
@@ -172,6 +175,45 @@ Three things to take from that table.
   4.9.4; the current CALDB is 4.12.4. With archive level-2 as the default route, **this
   becomes a diagnostic to report**, not a route decision: the reduction says how stale its
   calibration is and lets the user ask for `chandra_repro` if they care.
+
+### Which ACIS configuration an observation is
+
+**Measured 2026-09-12, while step 2 was being written. The plan did not have this, and
+assumed `DETNAM` would answer it.** It does not.
+
+`DETNAM` is a chip list, and its digits are chip identifiers: **0–3 are the ACIS-I array**
+(I0–I3) and **4–9 are the ACIS-S array** (S0–S5). The aimpoint is I3 — chip 3 — for ACIS-I
+and S3 — chip 7 — for ACIS-S. An observation routinely reads out chips from both arrays:
+`ACIS-012367` is the whole ACIS-I array with S2 and S3 alongside it, and `ACIS-235678` is
+an ACIS-S observation that happens to include I2 and I3.
+
+So both aimpoint chips are frequently on at once, and no rule written on the chip set can
+say which one the telescope was focused on. Over **150 randomly chosen archived ACIS
+observations, 75 of each configuration as `chanmaster.detector` labels them, 50 had both
+chip 3 and chip 7 reading out** — a third of the sample — and those 50 span both
+configurations.
+
+What does answer it is `SIM_Z`, where the Science Instrument Module was parked:
+
+| Catalogue | `SIM_Z` range (75 each) | Median (= nominal aimpoint) |
+|---|---|---|
+| `ACIS-I` | −238.274 … −214.099 | **−233.587** |
+| `ACIS-S` | −195.973 … −182.134 | **−190.143** |
+
+The two do not overlap: **18.126 mm** separate the most positive ACIS-I from the most
+negative ACIS-S. `chandra.ACIS_SIM_Z_THRESHOLD = -205.0` sits in that gap with about 9 mm
+of margin either way. An observation that does not offset the SIM sits exactly at its
+nominal aimpoint, which is why the medians and the nominals coincide.
+
+HRC needs none of this: its `DETNAM` *is* the configuration, `HRC-I` or `HRC-S`.
+
+**Two smaller header facts, also measured while writing step 2.** Continuous Clocking
+reads `READMODE = 'CONTINUOUS'`, `DATAMODE = 'CC33_FAINT'`, **`TIMEDEL = 0.00285`** (2.85
+ms) and carries no `EXPTIME` at all — a third instance of the lesson that the nominal 3.2 s
+describes almost nothing. And the archive's local download directory is the OBSID
+*unpadded* (`byobsid/8/6298/` → `<input>/6298`), while its file names are padded
+(`hrcf06298`), so directories and stems use different spellings of the same number. Both
+are pinned by tests.
 
 ---
 
@@ -371,7 +413,19 @@ The test is the same one `test_sas.py` uses: `ciao_environment` never mutates
 Ordered so that everything testable without CIAO comes first. Steps 1–4 need no CIAO
 installed at all, which means real progress is possible before the environment is sorted.
 
-### Step 1 — `MISSION_CONFIG` entry and the download filter
+### ~~Step 1 — `MISSION_CONFIG` entry and the download filter~~ **Done, `5377cfd`.**
+
+**One deviation, agreed with Matteo 2026-09-12.** The `MISSION_CONFIG` entry did *not*
+land here: registering a mission requires an `obsid_processing` callable, and
+`process_chandra_obsid` does not exist until step 12, so this step would have had to ship
+a function that raises. XMM did not do that either — its filter landed in `a122c21` and
+its `MISSION_CONFIG` entry nine commits later in `cda3cf0` — so **Chandra follows the same
+order and the entry moves to step 12.** What did land here is the filter, both regexes,
+and `chanmaster`'s 24 real columns recorded in `test_core.py`'s `CATALOGUE_COLUMNS`, so
+the all-mission guards cover Chandra the moment step 12 registers it.
+
+The repro route was measured while the filter was written and the plan did not have the
+numbers: it keeps **79%, 77% and 78%** of the three directories.
 
 Add `"chandra"` to `MISSION_CONFIG`, with `table="chanmaster"`, `expo_column="exposure"`,
 `name_column="name"`, `zero_exposure_may_be_wrong=True`, and
@@ -404,7 +458,11 @@ the ACIS and the HRC listing — that is the trap, and a test is how it stays fi
 
 *Commit:* `Add Chandra to MISSION_CONFIG, with a measured download filter`
 
-### Step 2 — `chandra.py`: config, paths, detector and mode parsing
+### ~~Step 2 — `chandra.py`: config, paths, detector and mode parsing~~ **Done, `e3814b1`.**
+
+The plan underestimated this step in one place: it assumed the detector label could be
+read off `DETNAM`. It cannot — see *Which ACIS configuration an observation is*, below,
+which is a measurement made while writing this step and added to the plan afterwards.
 
 `DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./", products="archive",
 caldb=None, psf_ecf=0.9, psf_energy_kev=1.0, src_radius_arcsec=None,
