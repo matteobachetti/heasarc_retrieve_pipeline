@@ -1616,3 +1616,399 @@ class TestTheSubarrayInTheHeader:
         config = an_archive_observation(tmp_path)
 
         assert chandra.chandra_archive_front_end("6298", config).active_rows is None
+
+
+class TestWhereTheFlareCurveIsMeasured:
+    """
+    Not the background annulus. That ring is a few arcseconds across and holds far too few
+    counts to see a flare in; the curve wants as much of the detector as can be had while
+    keeping the source out of it.
+    """
+
+    def _an_observation(self, detector="aciss", basis="acis_frame_time", mode="timed"):
+        return chandra.Observation(
+            obsid="5644",
+            detector=detector,
+            grating="NONE",
+            mode=mode,
+            time_resolution=chandra.TimeResolution(0.44104, basis, ""),
+            chips=(7,),
+            event_list="evt2.fits",
+        )
+
+    def _regions(self, **overrides):
+        values = dict(
+            source="[sky=circle(4100.3809,4131.8172,1.6874)]",
+            background="[sky=annulus(4100.3809,4131.8172,2.5311,5.0622)]",
+            radius_arcsec=0.83,
+        )
+        values.update(overrides)
+        return chandra.ExtractionRegions(**values)
+
+    def _position(self):
+        return chandra.SourcePosition(4100.38, 4131.82, 7, 226.3, 496.95, 0.29)
+
+    def test_acis_takes_the_source_chip_with_the_source_cut_out(self):
+        found = chandra.chandra_flare_curve_filter(
+            self._an_observation(), self._position(), self._regions(), dict(chandra.DEFAULT_CONFIG)
+        )
+
+        assert "[ccd_id=7]" in found
+        assert "field()-circle(4100.3809,4131.8172,1.6874)" in found
+
+    def test_the_source_is_cut_out_with_region_algebra_and_not_with_exclude(self):
+        """
+        ``exclude`` is the obvious spelling and the Data Model refuses it: an ``[exclude
+        ...]`` alongside any other filter fails with "cannot mix EXCLUDE and FILTER", so
+        the chip filter and the cut-out cannot both be written that way. ``field()-shape``
+        says the same thing inside one filter, and composes.
+        """
+        found = chandra.chandra_flare_curve_filter(
+            self._an_observation(), self._position(), self._regions(), dict(chandra.DEFAULT_CONFIG)
+        )
+
+        assert "exclude" not in found
+
+    def test_acis_is_banded_in_energy(self):
+        config = dict(chandra.DEFAULT_CONFIG, flare_energy_ev=(500, 7000))
+
+        found = chandra.chandra_flare_curve_filter(
+            self._an_observation(), self._position(), self._regions(), config
+        )
+
+        assert "[energy=500:7000]" in found
+
+    def test_hrc_is_not_banded_and_is_not_cut_to_one_segment(self):
+        """HRC has no usable energy resolution to band on, and its plate is one piece."""
+        config = dict(chandra.DEFAULT_CONFIG, flare_energy_ev=(500, 7000))
+
+        found = chandra.chandra_flare_curve_filter(
+            self._an_observation(detector="hrci", basis="hrc_trigger_rate", mode="imaging"),
+            self._position(),
+            self._regions(),
+            config,
+        )
+
+        assert "energy" not in found
+        assert "ccd_id" not in found
+
+    def test_continuous_clocking_uses_its_own_background_strips(self):
+        """A circle on the sky selects a smear in Continuous Clocking, so there is nothing
+        to cut out of a field; the strips already are the background."""
+        observation = self._an_observation(basis="acis_continuous_clocking", mode="cc")
+        regions = self._regions(source="[chipx=223:229]", background="[chipx=196:216,236:256]")
+
+        found = chandra.chandra_flare_curve_filter(
+            observation, self._position(), regions, dict(chandra.DEFAULT_CONFIG)
+        )
+
+        assert "[chipx=196:216,236:256]" in found
+        assert "field()" not in found
+
+    def test_the_bin_width_is_the_last_thing_in_the_filter(self):
+        config = dict(chandra.DEFAULT_CONFIG, flare_bin_seconds=200.0)
+
+        found = chandra.chandra_flare_curve_filter(
+            self._an_observation(), self._position(), self._regions(), config
+        )
+
+        assert found.endswith("[bin time=::200.0]")
+
+
+def a_chandra_lightcurve(path, rate, exposure=None, cadence=500.0, tstart=0.0):
+    """A ``dmextract opt=ltc1`` light curve, with the columns the real tool writes."""
+    rate = np.asarray(rate, dtype=float)
+    exposure = np.full(rate.size, cadence) if exposure is None else np.asarray(exposure, float)
+    time = tstart + cadence * (np.arange(rate.size) + 0.5)
+    columns = [
+        fits.Column("TIME", "1D", array=time),
+        fits.Column("COUNT_RATE", "1D", array=rate),
+        fits.Column("COUNTS", "1J", array=np.round(rate * exposure).astype(int)),
+        fits.Column("STAT_ERR", "1D", array=np.sqrt(np.abs(rate) / cadence)),
+        fits.Column("EXPOSURE", "1D", array=exposure),
+    ]
+    hdu = fits.BinTableHDU.from_columns(columns, name="LIGHTCURVE")
+    hdu.header["TIMEDEL"] = cadence
+    hdu.header["TSTART"] = tstart
+    hdu.header["TSTOP"] = tstart + cadence * rate.size
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestReadingTheFlareCurve:
+    def test_a_bin_with_no_exposure_is_not_a_quiet_bin(self, tmp_path):
+        """
+        ``dmextract`` emits every bin between ``TSTART`` and ``TSTOP``, including the ones
+        that fall in the gaps of the observation's own good times, and writes them with
+        zero exposure and zero rate. Obsid ``5644`` opens with three of them: its first
+        good time starts 1 729 s after ``TSTART``. Read as rates they are the quietest
+        bins in the observation, and they would pull the quiescent level down and the
+        threshold with it.
+        """
+        path = a_chandra_lightcurve(
+            tmp_path / "lc.fits", rate=[0.0, 0.0, 2.3, 2.5, 2.4], exposure=[0, 0, 500, 500, 500]
+        )
+
+        curve = chandra.read_chandra_lightcurve(path)
+
+        assert np.isnan(curve.rate[:2]).all()
+        assert curve.rate[2] == pytest.approx(2.3)
+
+    def test_the_cadence_comes_off_the_header(self, tmp_path):
+        path = a_chandra_lightcurve(tmp_path / "lc.fits", rate=[1.0, 1.0], cadence=200.0)
+
+        assert chandra.read_chandra_lightcurve(path).cadence == 200.0
+
+
+class TestDecidingWhatCountsAsAFlare:
+    def test_the_level_is_measured_from_the_quiet_bins_and_not_from_all_of_them(self):
+        """
+        A handful of flaring bins would drag a plain mean and, worse, inflate the standard
+        deviation, so a big flare raises its own threshold above itself and is kept. The
+        quiescent level is sigma-clipped first, which is what CIAO's own ``lc_sigma_clip``
+        does.
+        """
+        quiet = np.full(100, 2.0)
+        rate = np.concatenate([quiet, np.full(10, 50.0)])
+
+        found = chandra.chandra_flare_threshold(rate, dict(chandra.DEFAULT_CONFIG, flare_sigma=3.0))
+
+        assert found.level == pytest.approx(2.0, abs=0.01)
+        assert found.threshold < 10.0
+
+    def test_bins_with_no_exposure_take_no_part(self):
+        rate = np.array([np.nan, np.nan, 2.0, 2.1, 1.9, 2.0])
+
+        found = chandra.chandra_flare_threshold(
+            rate, dict(chandra.DEFAULT_CONFIG, flare_min_bins=4)
+        )
+
+        assert found.n_bins_used == 4
+        assert found.level == pytest.approx(2.0, abs=0.1)
+
+    def test_a_perfectly_flat_curve_still_gives_a_threshold_above_itself(self):
+        """Zero scatter is not a real light curve, but a short one can round to it, and a
+        threshold equal to the level would flag every bin."""
+        found = chandra.chandra_flare_threshold(np.full(50, 2.0), dict(chandra.DEFAULT_CONFIG))
+
+        assert found.threshold > 2.0
+
+    def test_too_few_usable_bins_is_no_threshold_rather_than_a_meaningless_one(self):
+        found = chandra.chandra_flare_threshold(
+            np.array([2.0, 2.1, np.nan]), dict(chandra.DEFAULT_CONFIG)
+        )
+
+        assert found.threshold is None
+        assert "bins" in found.reason
+
+
+def an_event_file_with_gti(path, gti, tstart=None, tstop=None):
+    """An event list carrying good time intervals, as every Chandra level-2 file does."""
+    gti = np.atleast_2d(np.asarray(gti, dtype=float))
+    events = fits.BinTableHDU.from_columns(
+        [fits.Column("time", "1D", array=np.linspace(gti[0][0], gti[-1][1], 20))], name="EVENTS"
+    )
+    events.header["TSTART"] = gti[0][0] if tstart is None else tstart
+    events.header["TSTOP"] = gti[-1][1] if tstop is None else tstop
+    good = fits.BinTableHDU.from_columns(
+        [
+            fits.Column("START", "1D", array=gti[:, 0]),
+            fits.Column("STOP", "1D", array=gti[:, 1]),
+        ],
+        name="GTI7",
+    )
+    fits.HDUList([fits.PrimaryHDU(), events, good]).writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestReadingTheObservationsOwnGoodTimes:
+    def test_the_gti_block_is_found_whatever_the_chip_number_names_it(self, tmp_path):
+        """ACIS names the block after the chip -- ``GTI7`` on obsid ``5644`` -- so looking
+        for an extension called ``GTI`` finds nothing at all."""
+        path = an_event_file_with_gti(tmp_path / "evt.fits", [[100.0, 200.0], [300.0, 400.0]])
+
+        assert chandra.read_observation_gti(path).tolist() == [[100.0, 200.0], [300.0, 400.0]]
+
+    def test_an_event_list_without_one_says_so_rather_than_inventing_times(self, tmp_path):
+        path = tmp_path / "evt.fits"
+        hdu = fits.BinTableHDU.from_columns(
+            [fits.Column("time", "1D", array=np.arange(5.0))], name="EVENTS"
+        )
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+        assert chandra.read_observation_gti(str(path)) is None
+
+
+class TestScreeningTheFlares:
+    def _observation(self, tmp_path, gti=((1000.0, 51000.0),)):
+        events = an_event_file_with_gti(tmp_path / "evt2.fits", list(gti), tstart=0.0)
+        return chandra.Observation(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=events,
+        )
+
+    def test_a_quiet_observation_is_kept_whole(self, tmp_path):
+        curve = a_chandra_lightcurve(
+            tmp_path / "lc.fits", rate=np.full(100, 2.0) + np.arange(100) % 3 * 0.01, cadence=500.0
+        )
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve
+        )
+
+        assert gti.tolist() == [[1000.0, 51000.0]]
+
+    def test_a_flare_is_cut_out_of_the_middle(self, tmp_path):
+        rate = np.full(100, 2.0)
+        rate[50:55] = 40.0
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=rate, cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve
+        )
+
+        assert len(gti) == 2
+        assert gti[0][1] == pytest.approx(25000.0)
+        assert gti[1][0] == pytest.approx(27500.0)
+
+    def test_the_result_never_reaches_outside_the_observations_own_good_times(self, tmp_path):
+        """
+        The light curve runs from ``TSTART``, and the observation's good times start
+        later -- 1 729 s later on obsid ``5644``. Writing back the wider interval would
+        make the recorded exposure larger than the file's, and the two numbers that are
+        supposed to describe the same thing would disagree.
+        """
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=np.full(120, 2.0), cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path, gti=((1000.0, 51000.0),)),
+            dict(chandra.DEFAULT_CONFIG),
+            curve,
+        )
+
+        assert gti[0][0] == 1000.0
+        assert gti[-1][1] == 51000.0
+
+    def test_a_stretch_the_curve_does_not_cover_is_kept_rather_than_cut(self, tmp_path):
+        """Not measured must not mean cut. A real ``dmextract`` curve runs from ``TSTART``
+        to ``TSTOP`` and so contains the good times outright, but a short one must not
+        quietly take the uncovered exposure with it."""
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=np.full(40, 2.0), cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve
+        )
+
+        assert gti.tolist() == [[1000.0, 51000.0]]
+
+    def test_a_gap_in_the_observations_good_times_survives_the_screening(self, tmp_path):
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=np.full(100, 2.0), cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path, gti=((1000.0, 20000.0), (30000.0, 49000.0))),
+            dict(chandra.DEFAULT_CONFIG),
+            curve,
+        )
+
+        assert gti.tolist() == [[1000.0, 20000.0], [30000.0, 49000.0]]
+
+    def test_a_cut_that_would_take_too_much_is_refused_and_the_observation_kept(self, tmp_path):
+        """
+        Matteo's rule for this step: the default must be gentle and must never throw away
+        a good observation. A screening that wants half the exposure is far more likely to
+        be a variable source leaking into the background region than a two-hour flare, so
+        it is reported and not applied.
+        """
+        rate = np.full(100, 2.0)
+        rate[:50] = 40.0
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=rate, cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(
+            self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve
+        )
+
+        assert gti.tolist() == [[1000.0, 51000.0]]
+
+    def test_what_was_cut_and_why_is_recorded(self, tmp_path):
+        rate = np.full(100, 2.0)
+        rate[50:55] = 40.0
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=rate, cadence=500.0)
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "5644", "flare_filtering") as rec:
+            chandra.chandra_flare_gti(
+                self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve, rec=rec
+            )
+
+        written = json.loads(next(directory.glob("*flare_filtering*.json")).read_text())
+        assert written["values"]["applied"] is True
+        assert written["values"]["exposure_after"] < written["values"]["exposure_before"]
+        assert written["values"]["threshold"] > 2.0
+
+    def test_a_curve_too_short_to_measure_leaves_the_observation_alone(self, tmp_path):
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=[2.0, 2.1], cadence=500.0)
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "5644", "flare_filtering") as rec:
+            gti = chandra.chandra_flare_gti(
+                self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve, rec=rec
+            )
+
+        assert gti.tolist() == [[1000.0, 51000.0]]
+        written = json.loads(next(directory.glob("*flare_filtering*.json")).read_text())
+        assert written["values"]["applied"] is False
+
+
+class TestWritingTheCleanedEventList:
+    def _observation(self, tmp_path):
+        return chandra.Observation(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "acisf05644N004_evt2.fits.gz"),
+        )
+
+    def test_the_good_times_reach_dmcopy_as_a_file_and_not_as_a_time_filter(
+        self, tmp_path, stub_ciao_tasks
+    ):
+        """
+        ``[@file]`` rather than ``[time=a:b,c:d]``. A written table has no length limit, and
+        ``dmcopy`` intersects it with the intervals the file already carries instead of
+        replacing them -- verified against a real ``dmcopy`` on obsid ``5644``.
+        """
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        gti = np.array([[1000.0, 20000.0], [25000.0, 51000.0]])
+
+        chandra.chandra_clean_event_list(self._observation(tmp_path), config, gti)
+
+        infile = [call for call in stub_ciao_tasks if call[0] == "dmcopy"][0][2]["infile"]
+        assert infile.endswith(
+            "[@" + str(tmp_path / "5644/event_cl/chandra05644_aciss_timed_flare.gti") + "]"
+        )
+
+    def test_the_intervals_written_are_the_intervals_computed(self, tmp_path, stub_ciao_tasks):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        gti = np.array([[1000.0, 20000.0], [25000.0, 51000.0]])
+
+        chandra.chandra_clean_event_list(self._observation(tmp_path), config, gti)
+
+        written = fits.open(tmp_path / "5644/event_cl/chandra05644_aciss_timed_flare.gti")[1].data
+        assert written["START"].tolist() == [1000.0, 25000.0]
+        assert written["STOP"].tolist() == [20000.0, 51000.0]
+
+    def test_the_output_names_the_observation_it_belongs_to(self, tmp_path, stub_ciao_tasks):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        found = chandra.chandra_clean_event_list(
+            self._observation(tmp_path), config, np.array([[0.0, 1.0]])
+        )
+
+        assert os.path.basename(found) == "chandra05644_aciss_timed_cl.evt"

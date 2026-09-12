@@ -53,7 +53,13 @@ import numpy as np
 from astropy.io import fits
 
 from .diagnostics import no_record
-from .utils import get_logger
+from .utils import (
+    get_logger,
+    good_intervals,
+    intersect_intervals,
+    intervals_above_threshold,
+    merge_intervals,
+)
 
 #: The pipeline's defaults for a Chandra run.
 #:
@@ -82,6 +88,11 @@ DEFAULT_CONFIG = {
     "bkg_inner_factor": 1.5,
     "bkg_outer_factor": 3.0,
     "flare_sigma": 3.0,
+    "flare_bin_seconds": 200.0,
+    "flare_energy_ev": (500, 7000),
+    "flare_min_bins": 20,
+    "flare_warn_fraction": 0.1,
+    "flare_max_removed_fraction": 0.3,
     "hrc_veto_ratio_threshold": 0.99,
     "pileup_percentile": 90.0,
     "cc_source_halfwidth_pix": 3,
@@ -1970,3 +1981,551 @@ def chandra_source_regions(observation, config, ra, dec, rec=None, env=None, log
     )
     get_logger().info(f"{observation.obsid}: {regions.reason}")
     return position, regions
+
+
+#: Where ``dmextract opt=ltc1`` puts the light curve.
+CHANDRA_LIGHTCURVE_EXTENSION = "LIGHTCURVE"
+
+
+def chandra_flare_curve_filter(observation, position, regions, config):
+    """
+    The Data Model filter the background light curve is extracted through.
+
+    **Not the background annulus.** That ring is a few arcseconds across and holds far too
+    few counts to see a flare in. What is wanted is as much of the detector as can be had
+    with the source kept out of it, which for ACIS imaging is the source's own chip minus
+    the source circle.
+
+    The source is cut out with region algebra, ``field()-circle(...)``, and not with the
+    Data Model's ``exclude``. That is not a style choice: an ``[exclude ...]`` alongside
+    any other filter is refused outright with *"cannot mix EXCLUDE and FILTER"*, so the
+    chip filter and the cut-out cannot both be written that way. Measured against a real
+    ``dmextract`` on 2026-09-12.
+
+    Three things differ by configuration.
+
+    * **ACIS** is banded in energy, because the particle background dominates outside the
+      band and adds noise to a measurement that is about counting. **HRC** is not: it has
+      no usable energy resolution, which is also why it gets no spectrum.
+    * **ACIS** is cut to the source's chip. **HRC** is not -- its plate is one piece.
+    * **Continuous Clocking** uses the background strips themselves. A circle on the sky
+      selects a smear there, so there is no source region to subtract from a field.
+
+    Parameters
+    ----------
+    observation : Observation
+    position : SourcePosition
+    regions : ExtractionRegions
+    config : dict
+        ``flare_energy_ev`` and ``flare_bin_seconds`` are read.
+
+    Returns
+    -------
+    str
+        A filter to append to the event list's name.
+    """
+    if observation.is_continuous_clocking:
+        parts = [regions.background]
+    else:
+        parts = []
+        if observation.detector.startswith("acis"):
+            band = config.get("flare_energy_ev")
+            if band is not None:
+                parts.append(f"[energy={band[0]:g}:{band[1]:g}]")
+            parts.append(f"[ccd_id={position.chip_id}]")
+        # regions.source is "[sky=<shape>]"; the shape alone is what field() subtracts.
+        shape = regions.source[len("[sky=") : -1]
+        parts.append(f"[sky=field()-{shape}]")
+
+    parts.append(f"[bin time=::{config['flare_bin_seconds']}]")
+    return "".join(parts)
+
+
+@dataclass(frozen=True)
+class FlareLightCurve:
+    """
+    The background time series a flare cut is made on.
+
+    Attributes
+    ----------
+    time : numpy.ndarray
+        Bin centres, in the mission time of the event list.
+    rate : numpy.ndarray
+        Livetime-corrected count rate, ``NaN`` where the bin had no exposure.
+    rate_error : numpy.ndarray or None
+        Recorded for the figure, not used in the arithmetic.
+    cadence : float
+        Bin width.
+    tstart, tstop : float
+        What the curve covers.
+    """
+
+    time: np.ndarray
+    rate: np.ndarray
+    rate_error: Optional[np.ndarray]
+    cadence: float
+    tstart: float
+    tstop: float
+
+
+def read_chandra_lightcurve(path):
+    """
+    Read what ``dmextract opt=ltc1`` wrote.
+
+    One thing has to be undone on the way in. ``dmextract`` emits a bin for every interval
+    between ``TSTART`` and ``TSTOP``, the ones inside the observation's good times and the
+    ones outside them alike, and writes the outside ones with zero exposure and a rate of
+    zero. Obsid ``5644`` opens with three: its first good time starts 1 729 s after
+    ``TSTART``. Read at face value they are the quietest bins in the observation, and they
+    would pull the quiescent level down and the threshold with it. They become ``NaN``
+    here, which is what the pipeline's interval utilities already understand.
+
+    Parameters
+    ----------
+    path : str
+        The light curve file.
+
+    Returns
+    -------
+    FlareLightCurve
+    """
+    with fits.open(path) as hdulist:
+        table = hdulist[CHANDRA_LIGHTCURVE_EXTENSION]
+        header = table.header
+        time = np.asarray(table.data["TIME"], dtype=float)
+        rate = np.asarray(table.data["COUNT_RATE"], dtype=float)
+        exposure = np.asarray(table.data["EXPOSURE"], dtype=float)
+        names = table.data.columns.names
+        error = np.asarray(table.data["STAT_ERR"], dtype=float) if "STAT_ERR" in names else None
+
+    rate = np.where(exposure > 0, rate, np.nan)
+
+    cadence = header.get("TIMEDEL")
+    if cadence is None:
+        cadence = float(np.median(np.diff(time))) if time.size > 1 else 0.0
+
+    return FlareLightCurve(
+        time=time,
+        rate=rate,
+        rate_error=error,
+        cadence=float(cadence),
+        tstart=float(header.get("TSTART", time[0] - cadence / 2 if time.size else 0.0)),
+        tstop=float(header.get("TSTOP", time[-1] + cadence / 2 if time.size else 0.0)),
+    )
+
+
+def read_observation_gti(path):
+    """
+    The good time intervals an event list already carries.
+
+    Found by class rather than by name, and that matters: ACIS names the block after the
+    chip it belongs to -- obsid ``5644``'s is ``GTI7`` -- so looking for an extension
+    called ``GTI`` finds nothing at all. Where several blocks exist, one per chip, they are
+    merged: the flare cut is applied to the whole file and cannot be per chip.
+
+    Parameters
+    ----------
+    path : str
+        An event list.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Shape ``(N, 2)``, sorted and disjoint, or ``None`` when the file carries none.
+    """
+    intervals = []
+    with fits.open(path) as hdulist:
+        for hdu in hdulist[1:]:
+            names = getattr(getattr(hdu, "columns", None), "names", []) or []
+            if "START" in names and "STOP" in names:
+                intervals.append(
+                    np.column_stack(
+                        [
+                            np.asarray(hdu.data["START"], dtype=float),
+                            np.asarray(hdu.data["STOP"], dtype=float),
+                        ]
+                    )
+                )
+
+    if not intervals:
+        return None
+    return merge_intervals(np.vstack(intervals))
+
+
+@dataclass(frozen=True)
+class FlareThreshold:
+    """
+    The rate above which a bin counts as flaring, and the evidence for it.
+
+    Attributes
+    ----------
+    threshold : float or None
+        ``None`` when there were too few usable bins to measure anything, which is not a
+        failure -- it means the observation is kept whole and the record says why.
+    level, scatter : float or None
+        The quiescent rate and its standard deviation, after clipping.
+    n_bins_used : int
+        How many bins the two above were measured from.
+    reason : str
+        Plain English, for the report page.
+    """
+
+    threshold: Optional[float]
+    level: Optional[float] = None
+    scatter: Optional[float] = None
+    n_bins_used: int = 0
+    reason: str = ""
+
+
+def chandra_flare_threshold(rate, config):
+    """
+    The rate above which this observation counts as flaring.
+
+    The quiescent level is measured with the flaring bins clipped out, which is what
+    CIAO's own ``lc_sigma_clip`` does and for the reason that makes it necessary: a plain
+    mean and standard deviation over a curve containing a flare are both raised *by* the
+    flare, so a big one lifts its own threshold above itself and is kept. Clipping first
+    breaks that circle.
+
+    **No fixed rate appears anywhere here**, and that is the same lesson XMM's flare step
+    learnt the hard way -- there, the SAS cookbook's 0.35 counts/s turned out to be wrong
+    by a factor of a hundred for the curves PPS actually writes. A Chandra background rate
+    depends on the chip, the subarray, the energy band and the epoch, so the only honest
+    threshold is one measured from the observation in hand.
+
+    Parameters
+    ----------
+    rate : numpy.ndarray
+        Count rates, ``NaN`` where a bin had no exposure.
+    config : dict
+        ``flare_sigma`` and ``flare_min_bins`` are read.
+
+    Returns
+    -------
+    FlareThreshold
+    """
+    sigma = config.get("flare_sigma", DEFAULT_CONFIG["flare_sigma"])
+    minimum = config.get("flare_min_bins", DEFAULT_CONFIG["flare_min_bins"])
+
+    usable = np.asarray(rate, dtype=float)
+    usable = usable[np.isfinite(usable)]
+    if usable.size < minimum:
+        return FlareThreshold(
+            threshold=None,
+            n_bins_used=int(usable.size),
+            reason=(
+                f"The light curve has {usable.size} usable bins, fewer than the "
+                f"{minimum} a quiescent level can be measured from. The observation is "
+                "kept whole rather than screened against a number that means nothing."
+            ),
+        )
+
+    level, scatter = _clipped_level(usable, sigma)
+    # A threshold equal to the level would flag every bin above it, which on a flat curve
+    # is half of them. Poisson noise on the quiescent level is the floor below which the
+    # scatter cannot be believed, and it keeps a short or rounded curve from cutting itself
+    # to pieces.
+    floor = np.sqrt(max(level, 0.0) / max(config["flare_bin_seconds"], 1.0))
+    threshold = level + sigma * max(scatter, floor, np.finfo(float).eps)
+
+    return FlareThreshold(
+        threshold=float(threshold),
+        level=float(level),
+        scatter=float(scatter),
+        n_bins_used=int(usable.size),
+        reason=(
+            f"The quiescent background is {level:.4g} counts/s with a scatter of "
+            f"{scatter:.3g}, measured from {usable.size} bins with the flaring ones "
+            f"clipped out. A bin counts as flaring above {threshold:.4g} counts/s, "
+            f"{sigma:g} sigma up."
+        ),
+    )
+
+
+def _clipped_level(values, sigma, iterations=5):
+    """
+    The mean and standard deviation of the quiet part of a curve.
+
+    Sigma clipping by hand rather than through ``astropy.stats``: five passes, each
+    dropping what lies more than ``sigma`` standard deviations from the current mean. It
+    is four lines, it has no options to get wrong, and it stops as soon as a pass drops
+    nothing.
+    """
+    kept = np.asarray(values, dtype=float)
+    for _ in range(iterations):
+        mean, scatter = float(np.mean(kept)), float(np.std(kept))
+        if scatter <= 0:
+            break
+        inside = np.abs(kept - mean) <= sigma * scatter
+        if inside.all() or not inside.any():
+            break
+        kept = kept[inside]
+    return float(np.mean(kept)), float(np.std(kept))
+
+
+def chandra_flare_gti(observation, config, lightcurve, rec=None):
+    """
+    The stretches of one observation the background was quiet enough to keep.
+
+    Pure Python over a curve CIAO has already made: the thresholding, the intervals and the
+    intersection with the observation's own good times are all
+    :mod:`heasarc_retrieve_pipeline.utils` functions that NuSTAR and XMM already use.
+
+    **This step is deliberately reluctant.** Chandra's background flares matter far less
+    than XMM's for the bright sources this pipeline is aimed at, and the failure mode that
+    actually costs something is not a missed flare but a cut that eats a good observation
+    -- a variable source leaking into the background region looks exactly like a flare. So
+    a screening that wants more than ``flare_max_removed_fraction`` of the exposure is
+    reported and *not applied*, and too short a curve to measure is likewise left alone.
+    Both of those are recorded with their numbers, never silent.
+
+    Parameters
+    ----------
+    observation : Observation
+        Its ``event_list`` supplies the good times the result is intersected with.
+    config : dict
+        A complete configuration.
+    lightcurve : str
+        The file :func:`chandra_flare_curve_filter` was extracted into.
+    rec : StepRecord, optional
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(N, 2)``. Never ``None``: an observation that cannot be screened is kept
+        whole, which is its own good time intervals unchanged.
+    """
+    rec = rec or no_record()
+    logger = get_logger()
+
+    curve = read_chandra_lightcurve(lightcurve)
+    whole = read_observation_gti(observation.event_list)
+    if whole is None:
+        whole = np.array([[curve.tstart, curve.tstop]], dtype=float)
+    before = float(np.sum(whole[:, 1] - whole[:, 0]))
+
+    found = chandra_flare_threshold(curve.rate, config)
+    if found.threshold is None:
+        logger.info(f"{observation.obsid}: not screening for flares. {found.reason}")
+        rec.value(
+            applied=False,
+            reason=found.reason,
+            n_bins_used=found.n_bins_used,
+            exposure_before=before,
+            exposure_after=before,
+            removed_fraction=0.0,
+        )
+        return whole
+
+    flaring = intervals_above_threshold(
+        curve.time, curve.rate, found.threshold, cadence=curve.cadence
+    )
+    # Bounded by whichever of the curve and the observation reaches further, so that a
+    # stretch of the observation the curve does not cover is *kept*. Real ``dmextract``
+    # curves run from TSTART to TSTOP and so contain the good times outright; where one
+    # does not, the honest reading is "not measured", and not measured must not mean cut.
+    quiet = good_intervals(
+        flaring,
+        min(curve.tstart, float(whole[0, 0])),
+        max(curve.tstop, float(whole[-1, 1])),
+    )
+    # Intersected rather than merely clipped, so that the exposure recorded here and the
+    # exposure the cleaned file ends up with are the same number. ``dmcopy`` intersects
+    # too -- verified on real data -- and two derivations of one answer is two answers
+    # waiting to disagree.
+    gti = intersect_intervals(quiet, whole) if quiet.size else np.empty((0, 2))
+    after = float(np.sum(gti[:, 1] - gti[:, 0])) if gti.size else 0.0
+    removed = 1.0 - after / before if before > 0 else 0.0
+
+    limit = config["flare_max_removed_fraction"]
+    applied = removed <= limit
+    if not applied:
+        reason = (
+            f"Screening at {found.threshold:.4g} counts/s would remove {removed:.0%} of "
+            f"the exposure, more than the {limit:.0%} this mission allows. At that size "
+            "a variable source leaking into the background region is a likelier "
+            "explanation than a flare, so the observation is kept whole and the cut is "
+            "reported instead of made."
+        )
+        logger.warning(f"{observation.obsid}: {reason}")
+        gti, after, removed = whole, before, 0.0
+    else:
+        reason = found.reason
+        if removed > config["flare_warn_fraction"]:
+            logger.warning(
+                f"{observation.obsid}: flare screening removed {removed:.0%} of the "
+                f"exposure ({before - after:.0f} s of {before:.0f} s)"
+            )
+        else:
+            logger.info(
+                f"{observation.obsid}: flare screening kept {after:.0f} s of {before:.0f} s"
+            )
+
+    rec.value(
+        applied=bool(applied),
+        reason=reason,
+        threshold=found.threshold,
+        quiescent_rate=found.level,
+        quiescent_scatter=found.scatter,
+        n_bins_used=found.n_bins_used,
+        bin_seconds=curve.cadence,
+        light_curve=os.path.basename(lightcurve),
+        exposure_before=before,
+        exposure_after=after,
+        removed_fraction=removed,
+        n_intervals_kept=len(gti),
+    )
+    arrays = dict(lc_time=curve.time, lc_rate=curve.rate, gti_before=whole, gti_after=gti)
+    if curve.rate_error is not None:
+        arrays["lc_rate_err"] = curve.rate_error
+    rec.array(**arrays)
+    return gti
+
+
+def chandra_flare_lightcurve_path(observation, config):
+    """Where this observation's background light curve goes."""
+    return os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{observation.stem}_bkg_lc.fits"
+    )
+
+
+def chandra_flare_gti_path(observation, config):
+    """Where the good time intervals the flare cut arrived at go."""
+    return os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{observation.stem}_flare.gti"
+    )
+
+
+def chandra_cleaned_event_list_path(observation, config):
+    """Where the screened event list goes."""
+    return os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{observation.stem}_cl.evt"
+    )
+
+
+def chandra_flare_lightcurve(observation, position, regions, config, env=None, log_to=None):
+    """
+    Extract the background light curve the flare cut is made on.
+
+    Parameters
+    ----------
+    observation : Observation
+    position : SourcePosition
+    regions : ExtractionRegions
+    config : dict
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    str
+        The light curve file.
+    """
+    from . import ciao
+
+    outfile = chandra_flare_lightcurve_path(observation, config)
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    ciao.run(
+        "dmextract",
+        produces=outfile,
+        env=env,
+        log_to=log_to,
+        infile=observation.event_list
+        + chandra_flare_curve_filter(observation, position, regions, config),
+        outfile=outfile,
+        opt="ltc1",
+        clobber=True,
+    )
+    return outfile
+
+
+def write_gti_file(path, gti):
+    """
+    Write good time intervals where CIAO's Data Model can read them.
+
+    ``dmcopy`` takes a good time interval table by name, as ``evt2.fits[@flare.gti]``, and
+    intersects it with the intervals the file already carries -- verified against a real
+    ``dmcopy`` on obsid ``5644``, where a deliberately over-wide table left ``ONTIME``
+    exactly as it was. Writing the intervals :func:`chandra_flare_gti` already computed,
+    rather than having CIAO derive them a second time, keeps the intervals that get
+    recorded on the report and the intervals that get applied to the events the same
+    intervals.
+
+    A near-copy of ``xmm.write_gti_file``, and left as one for the reason the whole CIAO
+    runner is: the two write for different readers, and tying them together at the one
+    place where the file formats might diverge would be a poor trade.
+
+    Parameters
+    ----------
+    path : str
+        File to write. Overwritten if it exists.
+    gti : numpy.ndarray
+        Shape ``(N, 2)``.
+
+    Returns
+    -------
+    str
+        The path written.
+    """
+    gti = np.atleast_2d(np.asarray(gti, dtype=float)).reshape(-1, 2)
+    hdu = fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="START", format="D", unit="s", array=gti[:, 0]),
+            fits.Column(name="STOP", format="D", unit="s", array=gti[:, 1]),
+        ],
+        name="GTI",
+    )
+    hdu.header["HDUCLASS"] = ("OGIP", "File conforms to OGIP standards")
+    hdu.header["HDUCLAS1"] = ("GTI", "Extension contains good time intervals")
+    hdu.header["HDUCLAS2"] = ("STANDARD", "Standard good time intervals")
+    path = str(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return path
+
+
+def chandra_clean_event_list(observation, config, gti, rec=None, env=None, log_to=None):
+    """
+    Write the screened event list every later step reads.
+
+    The whole field, not the source region: pile-up is measured on a chip, a spectrum
+    needs its own background, and the source cut-out happens later and from this file.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+    gti : numpy.ndarray
+        From :func:`chandra_flare_gti`.
+    rec : StepRecord, optional
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    str
+        The cleaned event list.
+    """
+    from . import ciao
+
+    rec = rec or no_record()
+    outfile = chandra_cleaned_event_list_path(observation, config)
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    gti_file = write_gti_file(chandra_flare_gti_path(observation, config), gti)
+    ciao.run(
+        "dmcopy",
+        produces=outfile,
+        env=env,
+        log_to=log_to,
+        infile=f"{observation.event_list}[@{gti_file}]",
+        outfile=outfile,
+        clobber=True,
+    )
+
+    rec.value(
+        cleaned_event_list=os.path.basename(outfile),
+        gti_file=os.path.basename(gti_file),
+    )
+    get_logger().info(f"{observation.obsid}: cleaned events in {os.path.basename(outfile)}")
+    return outfile
