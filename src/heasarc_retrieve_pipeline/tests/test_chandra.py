@@ -15,12 +15,13 @@ fast-timing mode, and ACIS-S behind a transmission grating.
 import json
 import os
 import re
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from astropy.io import fits
 
-from heasarc_retrieve_pipeline import chandra
+from heasarc_retrieve_pipeline import chandra, ciao
 from heasarc_retrieve_pipeline.diagnostics import record_step
 
 
@@ -161,6 +162,22 @@ ACIS_HETG_2749_DROPPED = [
     "secondary/ephem/solarf136814700N001_eph1.fits.gz",
     "secondary/ephem/anglesf02749_000N004_eph1.fits.gz",
     "00README",
+]
+
+# ``5644``: ACIS-S on chip 7 alone, Timed Exposure on a 128-row subarray at 0.44104 s,
+# and the observation Liu 2024 detected M82 X-2's 1.37 s pulsation in. Listed from S3 on
+# 2026-09-12 and downloaded through the pipeline's own filter on the same day: 8 files and
+# 27.6 MB of the archive's 39 files and 220.9 MB. Not one of the plan's three measured
+# configurations -- it is the known-answer test, and its subarray is why it is fast.
+ACIS_S_5644_KEPT = [
+    "oif.fits",
+    "primary/acisf05644N004_evt2.fits.gz",
+    "primary/acisf05644_000N004_bpix1.fits.gz",
+    "primary/acisf05644_000N004_fov1.fits.gz",
+    "primary/orbitf240581100N001_eph1.fits.gz",
+    "primary/pcadf05644_000N001_asol1.fits.gz",
+    "secondary/acisf05644_000N004_flt1.fits.gz",
+    "secondary/acisf05644_000N004_msk1.fits.gz",
 ]
 
 #: The three listings, keyed by the OBSID and the directory the archive files them under,
@@ -1174,3 +1191,428 @@ class TestReadingAnObservationOffTheArchive:
 
         assert found.time_resolution.basis == "hrc_documented"
         assert found.mode == "imaging"
+
+
+class TestAnglesAndSkyPixels:
+    def test_a_sky_pixel_is_the_0_492_arcseconds_dmcoords_reports(self):
+        assert chandra.SKY_PIXEL_ARCSEC == 0.492
+
+    def test_the_two_conversions_undo_each_other(self):
+        assert chandra.sky_pixels_to_arcsec(chandra.arcsec_to_sky_pixels(3.7)) == pytest.approx(3.7)
+
+
+class TestHowARegionIsSpelt:
+    """
+    CIAO's Data Model, not SAS. A region is a bare shape and the filter that carries it
+    names the column system, so the two are kept apart: the shape is what goes into a
+    region file, and ``[sky=...]`` is what goes onto a file name.
+    """
+
+    def test_a_circle_is_centre_and_radius_in_sky_pixels(self):
+        assert (
+            chandra.circle_region(4100.38, 4131.82, 0.984) == "circle(4100.3800,4131.8200,2.0000)"
+        )
+
+    def test_an_annulus_carries_both_radii(self):
+        assert chandra.annulus_region(4100.0, 4131.0, 0.984, 1.968) == (
+            "annulus(4100.0000,4131.0000,2.0000,4.0000)"
+        )
+
+    def test_a_sky_filter_is_the_shape_with_its_column_system(self):
+        assert chandra.sky_filter("circle(1.0,2.0,3.0)") == "[sky=circle(1.0,2.0,3.0)]"
+
+    def test_a_chip_strip_is_a_range_of_columns(self):
+        assert chandra.chipx_filter([(100, 106)]) == "[chipx=100:106]"
+
+    def test_two_strips_are_one_filter(self):
+        """Continuous Clocking's background is a strip on each side, and the Data Model
+        takes both in one filter rather than needing two passes over the file."""
+        assert chandra.chipx_filter([(80, 96), (110, 126)]) == "[chipx=80:96,110:126]"
+
+
+class TestReadingWhatATaskWorkedOut:
+    def test_pget_answers_one_value_to_a_line_in_the_order_asked(self):
+        said = "4100.380855260638\n4131.817158105547\n7\n"
+
+        assert chandra.parse_pget(said, ("x", "y", "chip_id")) == {
+            "x": 4100.380855260638,
+            "y": 4131.817158105547,
+            "chip_id": 7.0,
+        }
+
+    def test_too_few_values_raises_rather_than_pairing_them_up_wrongly(self):
+        """
+        The failure this guards against is silent and bad: one missing line would shift
+        every later name onto the wrong number, and a source position would come back as
+        a chip identifier without anything going wrong visibly.
+        """
+        with pytest.raises(ValueError, match="3 values"):
+            chandra.parse_pget("4100.4\n4131.8\n", ("x", "y", "chip_id"))
+
+    def test_blank_lines_are_not_values(self):
+        assert chandra.parse_pget("\n4100.4\n\n4131.8\n\n", ("x", "y")) == {
+            "x": 4100.4,
+            "y": 4131.8,
+        }
+
+
+def a_psf_region_file(path, radius_pixels=1.6874055297, near_chip_edge=False):
+    """
+    What ``psfsize_srcs`` leaves behind, with the columns it really writes.
+
+    The numbers are obsid ``5644``'s, measured on 2026-09-12 at M82 X-2's position with
+    ``energy=1.0`` and ``ecf=0.9``: 1.687 sky pixels, which is 0.830 arcseconds.
+    """
+    columns = [
+        fits.Column("SHAPE", "6A", array=np.array(["circle"])),
+        fits.Column("X", "1D", array=np.array([4100.3808552606])),
+        fits.Column("Y", "1D", array=np.array([4131.8171581055])),
+        fits.Column("R", "1D", array=np.array([radius_pixels])),
+        fits.Column("THETA", "1D", array=np.array([0.29134389680617])),
+        fits.Column("CHIP_ID", "1J", array=np.array([7])),
+        fits.Column("NEAR_CHIP_EDGE", "1L", array=np.array([near_chip_edge])),
+    ]
+    fits.BinTableHDU.from_columns(columns, name="REGION").writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestReadingThePsfSize:
+    def test_the_radius_comes_back_in_arcseconds(self, tmp_path):
+        """``psfsize_srcs`` writes ``R`` in sky pixels; everything in this module's
+        configuration is in arcseconds, so the conversion happens once, here."""
+        path = a_psf_region_file(tmp_path / "psf.reg")
+
+        size = chandra.read_psf_size(path)
+
+        assert size.radius_arcsec == pytest.approx(0.830, abs=0.001)
+
+    def test_only_the_radius_is_read_off_the_file(self, tmp_path):
+        """
+        The file also carries ``NEAR_CHIP_EDGE``, and that column is not trusted -- see
+        :class:`TestHowCloseTheSourceIsToAnEdge`. Reading it would put a warning that is
+        wrong on every subarray observation into every subarray observation's report.
+        """
+        path = a_psf_region_file(tmp_path / "psf.reg", near_chip_edge=True)
+
+        assert not hasattr(chandra.read_psf_size(path), "near_chip_edge")
+
+    def test_an_empty_region_file_says_the_position_is_not_on_the_detector(self, tmp_path):
+        path = tmp_path / "psf.reg"
+        fits.BinTableHDU.from_columns(
+            [fits.Column("R", "1D", array=np.array([]))], name="REGION"
+        ).writeto(path, overwrite=True)
+
+        with pytest.raises(ValueError, match="no source"):
+            chandra.read_psf_size(str(path))
+
+
+class TestSizingTheExtractionRegions:
+    def _a_position(self, **overrides):
+        values = dict(x=4100.38, y=4131.82, chip_id=7, chipx=226.3, chipy=496.95, theta_arcmin=0.29)
+        values.update(overrides)
+        return chandra.SourcePosition(**values)
+
+    def test_the_source_is_a_circle_at_the_position_asked_for(self, tmp_path):
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(), 0.984, dict(chandra.DEFAULT_CONFIG), continuous_clocking=False
+        )
+
+        assert regions.source == "[sky=circle(4100.3800,4131.8200,2.0000)]"
+
+    def test_the_background_is_an_annulus_scaled_from_the_source_radius(self, tmp_path):
+        config = dict(chandra.DEFAULT_CONFIG, bkg_inner_factor=1.5, bkg_outer_factor=3.0)
+
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(), 0.984, config, continuous_clocking=False
+        )
+
+        assert regions.background == "[sky=annulus(4100.3800,4131.8200,3.0000,6.0000)]"
+        assert regions.background_inner_arcsec == pytest.approx(1.476)
+        assert regions.background_outer_arcsec == pytest.approx(2.952)
+
+    def test_continuous_clocking_gets_strips_in_the_surviving_coordinate(self):
+        """
+        Continuous Clocking collapses one spatial dimension, so a circle on the sky
+        selects a smear rather than a source. The surviving coordinate is ``chipx``, and
+        the regions are the direct analogue of XMM Timing's ``RAWX`` strips.
+        """
+        config = dict(chandra.DEFAULT_CONFIG, cc_source_halfwidth_pix=3, cc_background_pix=(10, 30))
+
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(chipx=226.3), 0.984, config, continuous_clocking=True
+        )
+
+        assert regions.source == "[chipx=223:229]"
+        assert regions.background == "[chipx=196:216,236:256]"
+
+    def test_a_continuous_clocking_background_is_flagged_as_overlapping_the_source(self):
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(), 0.984, dict(chandra.DEFAULT_CONFIG), continuous_clocking=True
+        )
+
+        assert "collapsed" in regions.reason
+
+    def test_a_source_near_an_edge_says_so_in_plain_english(self):
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(),
+            0.984,
+            dict(chandra.DEFAULT_CONFIG),
+            continuous_clocking=False,
+            chip_edge=chandra.ChipEdge(margin_pix=27.2, near_edge=True, window=(449, 576)),
+        )
+
+        assert "27 chip pixels" in regions.reason
+        assert "dither" in regions.reason
+
+    def test_a_source_with_room_around_it_says_nothing_about_edges(self):
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(),
+            0.984,
+            dict(chandra.DEFAULT_CONFIG),
+            continuous_clocking=False,
+            chip_edge=chandra.ChipEdge(margin_pix=47.9, near_edge=False, window=(449, 576)),
+        )
+
+        assert "dither" not in regions.reason
+
+    def test_the_basis_says_where_the_radius_came_from(self):
+        regions = chandra.chandra_extraction_regions(
+            self._a_position(),
+            0.984,
+            dict(chandra.DEFAULT_CONFIG),
+            continuous_clocking=False,
+            basis="psfsize_srcs",
+        )
+
+        assert regions.basis == "psfsize_srcs"
+
+
+class TestWhetherTheReadoutCollapsedADimension:
+    """
+    The question is asked of the time resolution and not of ``mode``, because a grating
+    takes the mode label for itself: an HETG observation read out in Continuous Clocking
+    is labelled ``hetg``, and testing ``mode == "cc"`` would give it sky circles over a
+    smear.
+    """
+
+    def _an_observation(self, basis, mode):
+        return chandra.Observation(
+            obsid="2749",
+            detector="aciss",
+            grating="HETG",
+            mode=mode,
+            time_resolution=chandra.TimeResolution(seconds=2.85e-3, basis=basis, reason=""),
+            chips=(7,),
+            event_list="evt2.fits",
+        )
+
+    def test_a_grating_observation_in_continuous_clocking_is_still_collapsed(self):
+        assert self._an_observation("acis_continuous_clocking", "hetg").is_continuous_clocking
+
+    def test_a_timed_exposure_is_not(self):
+        assert not self._an_observation("acis_frame_time", "timed").is_continuous_clocking
+
+    def test_neither_is_hrc(self):
+        assert not self._an_observation("hrc_trigger_rate", "imaging").is_continuous_clocking
+
+
+@pytest.fixture
+def stub_ciao_tasks(monkeypatch):
+    """
+    A CIAO whose tasks do what the real ones do to the file system, and nothing else.
+
+    ``dmcoords`` answers through its parameter file, so the stub has ``pget`` print obsid
+    ``5644``'s real numbers; ``psfsize_srcs`` writes a region file holding that
+    observation's real 1.687-pixel radius.
+    """
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, args, kwargs))
+        if name == "psfsize_srcs":
+            a_psf_region_file(kwargs["outfile"])
+        if name == "pget":
+            said = "4100.380855260638\n4131.817158105547\n7\n226.298\n496.950\n0.29134\n"
+            return SimpleNamespace(stdout=said)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestWorkingOutWhereToExtract:
+    def _an_observation(self, tmp_path):
+        return chandra.Observation(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "acisf05644N004_evt2.fits.gz"),
+            aspect_solution=str(tmp_path / "pcadf05644_000N001_asol1.fits.gz"),
+        )
+
+    def test_the_position_asked_for_is_the_position_converted(self, tmp_path, stub_ciao_tasks):
+        """
+        The sharpest case in the whole module. Obsid ``5644``'s ``OBJECT`` is M82 X-1;
+        the published pulsation is M82 X-2's, 4.63 arcseconds away. Reducing at the
+        header's target would find nothing and would look like it had worked.
+        """
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        chandra.chandra_source_regions(self._an_observation(tmp_path), config, 148.96267, 69.67931)
+
+        dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
+        assert dmcoords[2]["ra"] == 148.96267
+        assert dmcoords[2]["dec"] == 69.67931
+
+    def test_the_aspect_solution_is_passed_when_there_is_one(self, tmp_path, stub_ciao_tasks):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        chandra.chandra_source_regions(self._an_observation(tmp_path), config, 148.96, 69.68)
+
+        dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
+        assert "asolfile" in dmcoords[2]
+
+    def test_an_observation_without_one_still_converts(self, tmp_path, stub_ciao_tasks):
+        observation = self._an_observation(tmp_path)
+        observation = chandra.Observation(**{**observation.__dict__, "aspect_solution": None})
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        chandra.chandra_source_regions(observation, config, 148.96, 69.68)
+
+        dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
+        assert "asolfile" not in dmcoords[2]
+
+    def test_by_default_the_radius_is_measured_rather_than_assumed(self, tmp_path, stub_ciao_tasks):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        _, regions = chandra.chandra_source_regions(
+            self._an_observation(tmp_path), config, 148.96, 69.68
+        )
+
+        assert regions.basis == "psfsize_srcs"
+        assert regions.radius_arcsec == pytest.approx(0.830, abs=0.001)
+
+    def test_a_configured_radius_skips_the_measurement_entirely(self, tmp_path, stub_ciao_tasks):
+        """Not merely overridden: ``psfsize_srcs`` is a contributed Python script, and a
+        run that does not need it should not depend on it being installed and working."""
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path), src_radius_arcsec=2.0)
+
+        _, regions = chandra.chandra_source_regions(
+            self._an_observation(tmp_path), config, 148.96, 69.68
+        )
+
+        assert regions.radius_arcsec == 2.0
+        assert regions.basis == "configured"
+        assert [call[0] for call in stub_ciao_tasks] == ["dmcoords", "pget"]
+
+    def test_what_was_done_and_why_is_recorded(self, tmp_path, stub_ciao_tasks):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "5644", "source_region") as rec:
+            chandra.chandra_source_regions(
+                self._an_observation(tmp_path), config, 148.96267, 69.67931, rec=rec
+            )
+
+        written = json.loads(next(directory.glob("*source_region*.json")).read_text())
+        assert written["values"]["chip_id"] == 7
+        assert written["values"]["radius_basis"] == "psfsize_srcs"
+        assert written["values"]["source_region"].startswith("[sky=circle(")
+        assert "off axis" in written["values"]["reason"]
+
+
+class TestHowCloseTheSourceIsToAnEdge:
+    """
+    Our own check, and the reason it is ours is a bug in ``psfsize_srcs``. It bounds a
+    subarray's rows at ``NROWS - 1 - edge`` where the bound is
+    ``FIRSTROW + NROWS - 1 - edge``, so on any subarray the upper bound falls *below* the
+    lower one and every position is flagged. Obsid ``5644`` has ``FIRSTROW = 449`` and
+    ``NROWS = 128``, so the tool's window is 481 to 95 -- which nothing can be inside, and
+    the real window is 481 to 544.
+
+    Both numbers here were measured against a real CIAO on 2026-09-12: ``5644`` has 48
+    pixels of clearance and ``8190`` has 27, and the tool calls both of them near an edge.
+    """
+
+    def _an_observation(self, detector="aciss", active_rows=(449, 128)):
+        return chandra.Observation(
+            obsid="5644",
+            detector=detector,
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list="evt2.fits",
+            active_rows=active_rows,
+        )
+
+    def _at(self, chipx, chipy):
+        return chandra.SourcePosition(0.0, 0.0, 7, chipx, chipy, 0.3)
+
+    def test_the_window_is_the_subarray_and_not_the_whole_chip(self):
+        edge = chandra.chandra_chip_edge(self._an_observation(), self._at(226.3, 496.95))
+
+        assert edge.window == (449, 576)
+
+    def test_a_source_well_inside_the_subarray_is_not_near_an_edge(self):
+        """Obsid ``5644``. ``psfsize_srcs`` says it is; it has 48 pixels of clearance."""
+        edge = chandra.chandra_chip_edge(self._an_observation(), self._at(226.3, 496.95))
+
+        assert edge.margin_pix == pytest.approx(47.95, abs=0.01)
+        assert edge.near_edge is False
+
+    def test_a_source_inside_the_dither_amplitude_is(self):
+        """Obsid ``8190``, whose source sits 27 pixels from the first clocked row."""
+        edge = chandra.chandra_chip_edge(self._an_observation(), self._at(654.6, 476.22))
+
+        assert edge.margin_pix == pytest.approx(27.22, abs=0.01)
+        assert edge.near_edge is True
+
+    def test_a_full_frame_is_assumed_when_the_header_does_not_say(self):
+        edge = chandra.chandra_chip_edge(self._an_observation(active_rows=None), self._at(500, 500))
+
+        assert edge.window == (1, 1024)
+        assert edge.near_edge is False
+
+    def test_the_columns_are_checked_as_well_as_the_rows(self):
+        edge = chandra.chandra_chip_edge(self._an_observation(), self._at(4.0, 500.0))
+
+        assert edge.margin_pix == pytest.approx(3.0)
+        assert edge.near_edge is True
+
+    def test_hrc_is_not_asked(self):
+        """The same choice ``psfsize_srcs`` makes. A microchannel plate has no CCD edges,
+        and a position near a segment boundary is not the failure mode a chip gap is."""
+        edge = chandra.chandra_chip_edge(self._an_observation(detector="hrci"), self._at(100, 100))
+
+        assert edge.margin_pix is None
+        assert edge.near_edge is None
+
+
+class TestTheSubarrayInTheHeader:
+    def test_it_is_read_off_a_real_observation_s_keywords(self, tmp_path):
+        """Obsid ``5644``'s own, measured 2026-09-12: 128 rows from row 449, which is why
+        its frame time is 0.44 s and not 3.2 s."""
+        config = an_archive_observation(
+            tmp_path,
+            obsid="5644",
+            names=ACIS_S_5644_KEPT,
+            dtf=None,
+            INSTRUME="ACIS",
+            DETNAM="ACIS-7",
+            READMODE="TIMED",
+            TIMEDEL=0.44104,
+            SIM_Z=-190.14006604987,
+            FIRSTROW=449,
+            NROWS=128,
+        )
+
+        assert chandra.chandra_archive_front_end("5644", config).active_rows == (449, 128)
+
+    def test_an_hrc_observation_has_none(self, tmp_path):
+        config = an_archive_observation(tmp_path)
+
+        assert chandra.chandra_archive_front_end("6298", config).active_rows is None

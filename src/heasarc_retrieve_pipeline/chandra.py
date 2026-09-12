@@ -52,6 +52,9 @@ from typing import Optional
 import numpy as np
 from astropy.io import fits
 
+from .diagnostics import no_record
+from .utils import get_logger
+
 #: The pipeline's defaults for a Chandra run.
 #:
 #: ``products`` chooses the route: ``"archive"`` reads the level-2 products the archive
@@ -63,6 +66,11 @@ from astropy.io import fits
 #: ``src_radius_arcsec = None`` means "ask ``psfsize_srcs``", and is the default because
 #: Chandra's PSF grows from about one arcsecond on-axis to over ten at eight arcminutes
 #: off-axis. A fixed radius -- XMM's approach -- would be wrong at both ends.
+#:
+#: ``cc_source_halfwidth_pix`` and ``cc_background_pix`` are Continuous Clocking's, where
+#: there is no circle to draw and the regions are strips of ``chipx``. They are a
+#: starting guess and are flagged as one: CC mode is 1.7% of the archive, none of it has
+#: been run through this module yet, and open item 6 of the plan is exactly this.
 DEFAULT_CONFIG = {
     "out_data_path": "./",
     "input_data_path": "./",
@@ -76,6 +84,8 @@ DEFAULT_CONFIG = {
     "flare_sigma": 3.0,
     "hrc_veto_ratio_threshold": 0.99,
     "pileup_percentile": 90.0,
+    "cc_source_halfwidth_pix": 3,
+    "cc_background_pix": (10, 30),
 }
 
 #: The archive's own reduction, and only the parts of it a reduction reads.
@@ -1148,6 +1158,11 @@ class Observation:
         The archive's ready-made grating products, collected and never re-made.
     caldb_version, ascds_version : str or None
         What the archive's own reduction was made with.
+    active_rows : tuple or None
+        ``(FIRSTROW, NROWS)`` for ACIS -- the rows of each CCD that were actually clocked
+        out. This is the subarray, and it is why obsid ``5644`` reads out every 0.44 s
+        instead of every 3.2 s: 128 rows of 1024. ``None`` for HRC, and for an ACIS header
+        that does not say, which means a full frame.
     """
 
     obsid: str
@@ -1167,11 +1182,25 @@ class Observation:
     grating_responses: tuple = ()
     caldb_version: Optional[str] = None
     ascds_version: Optional[str] = None
+    active_rows: Optional[tuple] = None
 
     @property
     def stem(self):
         """What every output file of this observation is named from."""
         return chandra_file_stem(self.obsid, self.detector, self.mode)
+
+    @property
+    def is_continuous_clocking(self):
+        """
+        Whether the readout collapsed a spatial dimension.
+
+        Asked of the time resolution rather than of ``mode``, and that is not a detail:
+        ``mode`` is the label in the file stem, and a grating in the beam takes that name
+        for itself -- an HETG observation read out in Continuous Clocking is labelled
+        ``hetg``, with no trace of ``cc`` in it. The time resolution's basis is derived
+        from ``READMODE`` and cannot be shadowed.
+        """
+        return self.time_resolution.basis == "acis_continuous_clocking"
 
     @property
     def caldb_is_stale(self):
@@ -1246,6 +1275,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         grating_responses=tuple(chandra_grating_responses(obsid, config)),
         caldb_version=_keyword(header, "CALDBVER"),
         ascds_version=_keyword(header, "ASCDSVER"),
+        active_rows=_active_rows(header),
     )
 
     if rec is not None:
@@ -1271,6 +1301,28 @@ def chandra_archive_front_end(obsid, config, rec=None):
     return observation
 
 
+def _active_rows(header):
+    """
+    ``(FIRSTROW, NROWS)`` from an event header, or ``None`` when it does not say.
+
+    The subarray, and the reason a Timed Exposure observation can be fast: obsid ``5644``
+    clocks out 128 rows starting at 449, which is what makes its frame time 0.44 s rather
+    than 3.2 s. HRC has no such keywords, and neither does an ACIS full frame in some
+    processing versions -- both come back ``None``, which downstream reads as 1 to 1024.
+
+    Examples
+    --------
+    >>> _active_rows({"FIRSTROW": 449, "NROWS": 128})
+    (449, 128)
+    >>> _active_rows({"DETNAM": "HRC-I"}) is None
+    True
+    """
+    first, nrows = header.get("FIRSTROW"), header.get("NROWS")
+    if first is None or nrows is None:
+        return None
+    return (int(first), int(nrows))
+
+
 def _keyword(header, name):
     """A header keyword as a stripped string, or ``None`` when it is absent or blank."""
     value = header.get(name)
@@ -1278,3 +1330,643 @@ def _keyword(header, name):
         return None
     text = str(value).strip()
     return text or None
+
+
+#: One Chandra sky pixel, in arcseconds. ``dmcoords`` reports it as the sky pixel scale on
+#: every observation, ACIS and HRC alike: the two detectors have very different physical
+#: pixels, but both are projected onto the same 8192 x 8192 sky plane.
+SKY_PIXEL_ARCSEC = 0.492
+
+
+def arcsec_to_sky_pixels(arcsec):
+    """
+    An angle on the sky, in Chandra sky pixels.
+
+    Examples
+    --------
+    >>> arcsec_to_sky_pixels(0.984)
+    2.0
+    """
+    return arcsec / SKY_PIXEL_ARCSEC
+
+
+def sky_pixels_to_arcsec(pixels):
+    """
+    Chandra sky pixels, as an angle on the sky.
+
+    Examples
+    --------
+    >>> sky_pixels_to_arcsec(2.0)
+    0.984
+    """
+    return pixels * SKY_PIXEL_ARCSEC
+
+
+def circle_region(x, y, radius_arcsec):
+    """
+    A circle, as CIAO's Data Model spells it.
+
+    The shape alone, with no column system in front of it -- see :func:`sky_filter`. Kept
+    apart so the same text can go into a region file, where naming a column would be
+    wrong, and onto a file name, where it is required.
+
+    Examples
+    --------
+    >>> circle_region(4100.38, 4131.82, 0.984)
+    'circle(4100.3800,4131.8200,2.0000)'
+    """
+    return f"circle({x:.4f},{y:.4f},{arcsec_to_sky_pixels(radius_arcsec):.4f})"
+
+
+def annulus_region(x, y, inner_arcsec, outer_arcsec):
+    """
+    An annulus, as CIAO's Data Model spells it.
+
+    Examples
+    --------
+    >>> annulus_region(4100.0, 4131.0, 0.984, 1.968)
+    'annulus(4100.0000,4131.0000,2.0000,4.0000)'
+    """
+    inner = arcsec_to_sky_pixels(inner_arcsec)
+    outer = arcsec_to_sky_pixels(outer_arcsec)
+    return f"annulus({x:.4f},{y:.4f},{inner:.4f},{outer:.4f})"
+
+
+def sky_filter(region):
+    """
+    A shape, as a Data Model filter on the sky columns.
+
+    Appended to a file name, this is what ``dmcopy`` and ``dmextract`` cut with. The
+    brackets and parentheses are exactly why :func:`heasarc_retrieve_pipeline.ciao.run`
+    never goes through a shell.
+
+    Examples
+    --------
+    >>> sky_filter(circle_region(4100.38, 4131.82, 0.984))
+    '[sky=circle(4100.3800,4131.8200,2.0000)]'
+    """
+    return f"[sky={region}]"
+
+
+def chipx_filter(spans):
+    """
+    A Data Model filter selecting ranges of detector columns.
+
+    Continuous Clocking's regions, and the reason they exist: the readout collapses one
+    spatial dimension, so the only coordinate that still separates source from background
+    is ``chipx``. Several ranges go into one filter, which is how a background strip on
+    each side of the source is selected in a single pass.
+
+    Parameters
+    ----------
+    spans : sequence of (int, int)
+        Inclusive first and last column of each range.
+
+    Examples
+    --------
+    >>> chipx_filter([(100, 106)])
+    '[chipx=100:106]'
+    >>> chipx_filter([(80, 96), (110, 126)])
+    '[chipx=80:96,110:126]'
+    """
+    return "[chipx=" + ",".join(f"{first}:{last}" for first, last in spans) + "]"
+
+
+def parse_pget(text, names):
+    """
+    Read back what ``pget`` printed, one value to a line.
+
+    ``dmcoords`` does not answer on standard output: it writes its results into its own
+    parameter file, and ``pget dmcoords x y`` is the tool that reads them out again. The
+    values come back in the order they were asked for and with nothing to label them, so
+    the count is checked -- a missing line would otherwise shift every later name onto the
+    wrong number and hand back a chip identifier as a sky coordinate, silently.
+
+    Parameters
+    ----------
+    text : str
+        What ``pget`` printed.
+    names : sequence of str
+        The parameters asked for, in the order they were asked for.
+
+    Returns
+    -------
+    dict
+        Name to float.
+
+    Raises
+    ------
+    ValueError
+        If the number of values does not match the number of names.
+
+    Examples
+    --------
+    >>> parse_pget("4100.4\\n4131.8\\n", ("x", "y"))
+    {'x': 4100.4, 'y': 4131.8}
+    """
+    values = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(values) != len(names):
+        raise ValueError(
+            f"pget was asked for {len(names)} values and printed {len(values)}: "
+            f"{text!r}. Pairing them up would put the wrong number under every later name."
+        )
+    return {name: float(value) for name, value in zip(names, values)}
+
+
+@dataclass(frozen=True)
+class SourcePosition:
+    """
+    Where the source sits, in every coordinate system the reduction needs.
+
+    Attributes
+    ----------
+    x, y : float
+        Sky coordinates, in the 8192 x 8192 sky plane. What a circular region is drawn in.
+    chip_id : int
+        Which CCD or HRC segment the source landed on. ``specextract`` and ``pileup_map``
+        both need it: a spectrum is built per chip, and pile-up is a per-frame quantity.
+    chipx, chipy : float
+        Position on that chip. ``chipx`` is Continuous Clocking's only surviving
+        coordinate.
+    theta_arcmin : float
+        Off-axis angle. Carried because it is what makes the PSF radius vary, so a report
+        that quotes a radius without it says nothing about whether the radius is sensible.
+    """
+
+    x: float
+    y: float
+    chip_id: int
+    chipx: float
+    chipy: float
+    theta_arcmin: float
+
+
+#: What ``dmcoords`` is asked for, in the order :func:`parse_pget` reads them back.
+_DMCOORDS_ANSWERS = ("x", "y", "chip_id", "chipx", "chipy", "theta")
+
+
+def chandra_source_position(observation, ra, dec, env=None, log_to=None):
+    """
+    Convert the position asked for into sky and chip coordinates.
+
+    **The position is the one the caller gave, never the header's.** That rule is Matteo's
+    for XMM and it is sharper here than anywhere else in this pipeline: obsid ``5644``'s
+    ``OBJECT`` is M82 X-1, the pulsation that Liu 2024 published is M82 X-2's, and the two
+    are 4.63 arcseconds apart. An implementation that extracted at ``RA_TARG`` would find
+    nothing and would look like it had worked.
+
+    ``dmcoords`` is used rather than ``psfsize_srcs``, which also reports a sky position,
+    for one reason: ``dmcoords`` is a compiled Data Model tool that every installation
+    has, and ``psfsize_srcs`` is a contributed Python script. The position must not depend
+    on the more fragile of the two -- and where a radius is configured outright,
+    ``psfsize_srcs`` is not run at all.
+
+    Parameters
+    ----------
+    observation : Observation
+        Its ``event_list`` sets the coordinate frame, and its ``aspect_solution`` refines
+        it. An observation with no aspect solution still converts, off the header alone.
+    ra, dec : float
+        Source position in degrees.
+    env : dict, optional
+        From :func:`heasarc_retrieve_pipeline.ciao.ciao_environment`. It matters here for
+        a second reason beyond ``ardlib.par``: ``dmcoords`` *answers* through its
+        parameter file, so two observations sharing one ``PFILES`` could read each other's
+        position.
+    log_to : str, optional
+        File the task's output goes to.
+
+    Returns
+    -------
+    SourcePosition
+    """
+    from . import ciao
+
+    parameters = dict(
+        infile=observation.event_list, option="cel", ra=float(ra), dec=float(dec), celfmt="deg"
+    )
+    if observation.aspect_solution is not None:
+        parameters["asolfile"] = observation.aspect_solution
+
+    ciao.run("dmcoords", produces=[], env=env, log_to=log_to, **parameters)
+    answer = ciao.run(
+        "pget",
+        args=("dmcoords",) + _DMCOORDS_ANSWERS,
+        produces=[],
+        capture=True,
+        env=env,
+    )
+    found = parse_pget(answer.stdout, _DMCOORDS_ANSWERS)
+
+    return SourcePosition(
+        x=found["x"],
+        y=found["y"],
+        chip_id=int(found["chip_id"]),
+        chipx=found["chipx"],
+        chipy=found["chipy"],
+        theta_arcmin=found["theta"],
+    )
+
+
+@dataclass(frozen=True)
+class PsfSize:
+    """
+    What ``psfsize_srcs`` measured at the source's off-axis angle.
+
+    Attributes
+    ----------
+    radius_arcsec : float
+        Radius enclosing ``psf_ecf`` of the counts at ``psf_energy_kev``.
+    """
+
+    radius_arcsec: float
+
+
+def read_psf_size(path):
+    """
+    Read the region file ``psfsize_srcs`` wrote.
+
+    The conversion to arcseconds happens once, here: the tool writes ``R`` in sky pixels
+    and every radius in this module's configuration is an angle.
+
+    Only ``R`` is read. The file also carries ``NEAR_CHIP_EDGE``, and that column is
+    **not** trusted: ``psfsize_srcs`` bounds a subarray's rows at ``NROWS - 1 - edge``
+    where the bound is ``FIRSTROW + NROWS - 1 - edge``, so on any subarray the upper bound
+    falls below the lower one and every position is flagged. Measured on obsid ``5644``
+    (``FIRSTROW = 449``, ``NROWS = 128``, dither margin 32): the tool's window is 481 to
+    95, which nothing can be inside. :func:`chandra_chip_edge` does the check instead, and
+    answers with a distance rather than a flag.
+
+    Parameters
+    ----------
+    path : str
+        The region file.
+
+    Returns
+    -------
+    PsfSize
+
+    Raises
+    ------
+    ValueError
+        If the file holds no row, which is what a position off the detector produces.
+    """
+    with fits.open(path) as hdulist:
+        table = hdulist[1].data
+        if table is None or len(table) == 0:
+            raise ValueError(
+                f"{path} holds no source: psfsize_srcs found nothing at that position, "
+                "which normally means it falls outside the detector."
+            )
+        radius = float(table["R"][0])
+
+    return PsfSize(radius_arcsec=sky_pixels_to_arcsec(radius))
+
+
+def chandra_psf_radius(observation, config, ra, dec, outfile, env=None, log_to=None):
+    """
+    Ask ``psfsize_srcs`` how big this source's point spread function is.
+
+    Chandra's PSF grows from about one arcsecond on-axis to over ten at eight arcminutes
+    off-axis, which is why this is measured per observation rather than configured once.
+    Obsid ``5644`` measures 0.830 arcseconds at M82 X-2's position, 0.29 arcminutes
+    off-axis, for ``ecf=0.9`` at 1 keV.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        ``psf_ecf`` and ``psf_energy_kev`` are read.
+    ra, dec : float
+        Source position in degrees.
+    outfile : str
+        Where the region file goes. Kept rather than thrown away: it carries the
+        off-axis angle and the chip-edge warning as well as the radius.
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    PsfSize
+    """
+    from . import ciao
+
+    os.makedirs(os.path.dirname(os.path.abspath(outfile)), exist_ok=True)
+    ciao.run(
+        "psfsize_srcs",
+        produces=outfile,
+        env=env,
+        log_to=log_to,
+        infile=observation.event_list,
+        # A space between the two numbers is rejected: psfsize_srcs wants a comma, a plus
+        # or a minus, and reads a bare space as a malformed sexagesimal.
+        pos=f"{float(ra)},{float(dec)}",
+        outfile=outfile,
+        energy=config["psf_energy_kev"],
+        ecf=config["psf_ecf"],
+        clobber=True,
+    )
+    return read_psf_size(outfile)
+
+
+#: How far an ACIS source has to be from the edge of its active window before a circular
+#: region is safe, in chip pixels.
+#:
+#: It is the dither pattern's amplitude, which is what ``psfsize_srcs`` uses and what
+#: matters: Chandra dithers during an observation, so a source a few pixels from an edge
+#: spends part of the exposure off the chip altogether and the region collects a fraction
+#: of the counts it was sized for.
+ACIS_DITHER_MARGIN_PIX = 32
+
+#: Columns and rows on one ACIS CCD.
+ACIS_CHIP_PIXELS = 1024
+
+
+@dataclass(frozen=True)
+class ChipEdge:
+    """
+    How close the source sits to the edge of the active detector area.
+
+    Reported, never acted on -- the same ruling as pile-up. A source near an edge is still
+    reduced; what changes is that the report says the enclosed fraction is not the one that
+    was asked for.
+
+    Attributes
+    ----------
+    margin_pix : float or None
+        Distance to the nearest edge of the active window, in chip pixels. ``None`` for
+        HRC, where the question is not asked.
+    near_edge : bool or None
+        Whether that distance is inside the dither margin.
+    window : tuple or None
+        ``(first row, last row)`` of the active window. A full frame is ``(1, 1024)``; a
+        subarray is narrower, and obsid ``5644``'s is ``(449, 576)``.
+    """
+
+    margin_pix: Optional[float] = None
+    near_edge: Optional[bool] = None
+    window: Optional[tuple] = None
+
+
+def chandra_chip_edge(observation, position, margin_pix=ACIS_DITHER_MARGIN_PIX):
+    """
+    How far the source sits from the edge of the active detector area.
+
+    Done here rather than read off ``psfsize_srcs``' ``NEAR_CHIP_EDGE``, which is wrong on
+    every ACIS subarray -- see :func:`read_psf_size`. It is also more useful as a distance
+    than as a flag: 48 pixels of clearance and 5 pixels of clearance are both "not near the
+    edge" to a boolean.
+
+    HRC is not checked, which is the same choice ``psfsize_srcs`` makes. Its microchannel
+    plate has no CCD edges, its segments are read out differently, and a position near one
+    is not the failure mode a chip gap is.
+
+    Parameters
+    ----------
+    observation : Observation
+        ``detector`` decides whether the question applies, and ``active_rows`` gives the
+        window. An ACIS observation with no ``active_rows`` recorded is treated as a full
+        frame, which is what a header with no ``FIRSTROW`` means.
+    position : SourcePosition
+    margin_pix : float, optional
+        How much clearance counts as enough. Defaults to the dither amplitude.
+
+    Returns
+    -------
+    ChipEdge
+
+    Examples
+    --------
+    >>> position = SourcePosition(0.0, 0.0, 7, 226.3, 496.95, 0.29)
+    >>> edge = chandra_chip_edge(_FullFrame(), position)
+    >>> round(edge.margin_pix, 1), edge.near_edge
+    (225.3, False)
+    """
+    if not observation.detector.startswith("acis"):
+        return ChipEdge()
+
+    first, nrows = observation.active_rows or (1, ACIS_CHIP_PIXELS)
+    last = first + nrows - 1
+    distances = (
+        position.chipx - 1,
+        ACIS_CHIP_PIXELS - position.chipx,
+        position.chipy - first,
+        last - position.chipy,
+    )
+    closest = float(min(distances))
+    return ChipEdge(margin_pix=closest, near_edge=closest < margin_pix, window=(first, last))
+
+
+class _FullFrame:
+    """A stand-in for the doctest of :func:`chandra_chip_edge`, which needs only two
+    attributes of an observation and not a whole event list to build one from."""
+
+    detector = "aciss"
+    active_rows = None
+
+
+@dataclass(frozen=True)
+class ExtractionRegions:
+    """
+    Where the source is, where the background is, and how both were arrived at.
+
+    Attributes
+    ----------
+    source, background : str
+        Data Model filters, ready to append to a file name.
+    radius_arcsec : float
+        The source radius. ``None`` in Continuous Clocking, which has no circle.
+    background_inner_arcsec, background_outer_arcsec : float or None
+        The annulus, for the record.
+    basis : str
+        ``"psfsize_srcs"`` or ``"configured"`` -- where the radius came from.
+    chip_edge : ChipEdge
+        How much clearance the source has, from :func:`chandra_chip_edge`.
+    reason : str
+        Plain English, for the report page.
+    """
+
+    source: str
+    background: str
+    radius_arcsec: Optional[float] = None
+    background_inner_arcsec: Optional[float] = None
+    background_outer_arcsec: Optional[float] = None
+    basis: str = "configured"
+    chip_edge: ChipEdge = ChipEdge()
+    reason: str = ""
+
+
+def chandra_extraction_regions(
+    position,
+    radius_arcsec,
+    config,
+    continuous_clocking=False,
+    basis="configured",
+    chip_edge=None,
+):
+    """
+    The source and background selections for a point source.
+
+    Two shapes, and which one applies is decided by the readout rather than by the
+    detector. **Imaging** -- every ACIS Timed Exposure observation and all of HRC -- gets
+    a circle with an annulus around it, the same reasoning as XMM's: the background varies
+    across the field of view and a concentric ring is the closest sample there is, and
+    ``bkg_inner_factor`` is what clears the wings of the point spread function.
+
+    **Continuous Clocking** gets strips of ``chipx`` instead. The readout collapses one
+    spatial dimension into the time axis, so a circle drawn on the sky selects a smear and
+    not a source, and ``chipx`` is the only coordinate that still separates the two. This
+    is the direct analogue of XMM Timing's ``RAWX`` strips -- and unlike them it has never
+    been run on real data, so its defaults are a starting guess and its record says so.
+
+    Parameters
+    ----------
+    position : SourcePosition
+    radius_arcsec : float
+        The source radius, from :func:`chandra_psf_radius` or from the configuration.
+    config : dict
+        ``bkg_inner_factor``, ``bkg_outer_factor``, and for Continuous Clocking
+        ``cc_source_halfwidth_pix`` and ``cc_background_pix``.
+    continuous_clocking : bool, optional
+        Whether the readout collapsed a spatial dimension.
+    basis : str, optional
+        Where ``radius_arcsec`` came from, for the record.
+    chip_edge : ChipEdge, optional
+        How much clearance the source has, for the record.
+
+    Returns
+    -------
+    ExtractionRegions
+    """
+    if continuous_clocking:
+        half = int(config["cc_source_halfwidth_pix"])
+        inner, outer = (int(value) for value in config["cc_background_pix"])
+        centre = int(round(position.chipx))
+        return ExtractionRegions(
+            source=chipx_filter([(centre - half, centre + half)]),
+            background=chipx_filter(
+                [(centre - outer, centre - inner), (centre + inner, centre + outer)]
+            ),
+            basis=basis,
+            chip_edge=chip_edge or ChipEdge(),
+            reason=(
+                f"Continuous Clocking collapsed one spatial dimension into the time axis, "
+                f"so the regions are strips of chipx around column {centre} rather than "
+                f"circles on the sky. Source and background overlap along the collapsed "
+                f"axis and cannot be separated by position, so the background strips "
+                f"carry some of the source. These widths have not been tested on real "
+                f"data -- see open item 6 of the Chandra plan."
+            ),
+        )
+
+    inner = radius_arcsec * config["bkg_inner_factor"]
+    outer = radius_arcsec * config["bkg_outer_factor"]
+    chip_edge = chip_edge or ChipEdge()
+    edge = (
+        f" The source sits {chip_edge.margin_pix:.0f} chip pixels from the edge of the "
+        f"active area, inside the {ACIS_DITHER_MARGIN_PIX}-pixel dither amplitude, so it "
+        "spends part of the exposure off the detector and the circle collects less than "
+        "the enclosed fraction it was sized for."
+        if chip_edge.near_edge
+        else ""
+    )
+    return ExtractionRegions(
+        source=sky_filter(circle_region(position.x, position.y, radius_arcsec)),
+        background=sky_filter(annulus_region(position.x, position.y, inner, outer)),
+        radius_arcsec=radius_arcsec,
+        background_inner_arcsec=inner,
+        background_outer_arcsec=outer,
+        basis=basis,
+        chip_edge=chip_edge,
+        reason=(
+            f"A {radius_arcsec:.2f} arcsecond circle at {position.theta_arcmin:.2f} "
+            f"arcminutes off axis, with the background taken from an annulus of "
+            f"{inner:.2f} to {outer:.2f} arcseconds around it." + edge
+        ),
+    )
+
+
+def chandra_source_regions(observation, config, ra, dec, rec=None, env=None, log_to=None):
+    """
+    Work out where to extract this observation's source and background from.
+
+    The step the reduction calls: convert the position, size the region, and record what
+    was done and why.
+
+    ``src_radius_arcsec`` in the configuration overrides the measurement. Where it is
+    ``None`` -- the default -- ``psfsize_srcs`` is asked, which is the right default
+    because a fixed radius is wrong at both ends of Chandra's field of view.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        A complete configuration.
+    ra, dec : float
+        Source position in degrees.
+    rec : StepRecord, optional
+    env : dict, optional
+    log_to : str, optional
+        File ``dmcoords``' output goes to. ``psfsize_srcs`` gets its own beside it.
+
+    Returns
+    -------
+    tuple
+        ``(SourcePosition, ExtractionRegions)``.
+    """
+    rec = rec or no_record()
+
+    position = chandra_source_position(observation, ra, dec, env=env, log_to=log_to)
+
+    edge = chandra_chip_edge(observation, position)
+
+    configured = config.get("src_radius_arcsec")
+    if configured is not None:
+        size = PsfSize(radius_arcsec=float(configured))
+        basis = "configured"
+    else:
+        size = chandra_psf_radius(
+            observation,
+            config,
+            ra,
+            dec,
+            os.path.join(
+                chandra_pipeline_output_path(observation.obsid, config),
+                f"{observation.stem}_psf.reg",
+            ),
+            env=env,
+            log_to=None if log_to is None else log_to.replace("dmcoords", "psfsize_srcs"),
+        )
+        basis = "psfsize_srcs"
+
+    regions = chandra_extraction_regions(
+        position,
+        size.radius_arcsec,
+        config,
+        continuous_clocking=observation.is_continuous_clocking,
+        basis=basis,
+        chip_edge=edge,
+    )
+
+    rec.value(
+        ra=float(ra),
+        dec=float(dec),
+        sky_x=position.x,
+        sky_y=position.y,
+        chip_id=position.chip_id,
+        chipx=position.chipx,
+        chipy=position.chipy,
+        theta_arcmin=position.theta_arcmin,
+        source_region=regions.source,
+        background_region=regions.background,
+        radius_arcsec=regions.radius_arcsec,
+        background_inner_arcsec=regions.background_inner_arcsec,
+        background_outer_arcsec=regions.background_outer_arcsec,
+        radius_basis=regions.basis,
+        chip_edge_margin_pix=edge.margin_pix,
+        near_chip_edge=edge.near_edge,
+        active_rows=list(edge.window) if edge.window else None,
+        reason=regions.reason,
+    )
+    get_logger().info(f"{observation.obsid}: {regions.reason}")
+    return position, regions
