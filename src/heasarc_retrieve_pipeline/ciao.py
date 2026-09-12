@@ -255,7 +255,8 @@ def ciao_environment(obsid, config):
         unpadded form is fine.
     config : dict
         The pipeline configuration. ``out_data_path`` says where the private directories
-        are made; ``caldb``, if set, becomes ``CALDB``.
+        are made; ``caldb``, if set, becomes ``CALDB``, and if it is not, a calibration
+        database beside the installation does.
 
     Returns
     -------
@@ -288,12 +289,29 @@ def ciao_environment(obsid, config):
     environment = dict(os.environ)
     environment["PFILES"] = f"{private};{':'.join(system)}"
     environment["ASCDS_WORK_PATH"] = work
+
+    # A conda CIAO keeps its calibration database at $ASCDS_INSTALL/CALDB, and where that
+    # exists it *is* this installation's calibration -- so it wins over whatever the
+    # machine set. The hazard is not hypothetical: this machine exports CALDB for HEASOFT,
+    # and a CIAO task sent there finds no Chandra data at all. A source installation keeps
+    # its calibration somewhere else and has no such directory, and then the machine knows
+    # better than we do and is left alone. Either way an explicit `caldb` in the config
+    # overrides both. Not in the step-5 plan.
+    beside_the_installation = os.path.join(install, "CALDB")
     if config.get("caldb") is not None:
         environment["CALDB"] = str(config["caldb"])
+    elif os.path.isdir(beside_the_installation):
+        environment["CALDB"] = beside_the_installation
+        # These two travel with CALDB -- they are what CIAO's activation script sets
+        # beside it -- and leaving HEASOFT's behind would point the index back at
+        # HEASOFT's tree while CALDB itself pointed here.
+        tools = os.path.join(beside_the_installation, "software", "tools")
+        environment["CALDBCONFIG"] = os.path.join(tools, "caldb.config")
+        environment["CALDBALIAS"] = os.path.join(tools, "alias_config.fits")
     return environment
 
 
-def run(name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params):
+def run(name, *, produces, args=(), log_to=None, capture=False, env=None, cwd=None, **params):
     """
     Run one CIAO task, one at a time in this process.
 
@@ -313,6 +331,12 @@ def run(name, *, produces, log_to=None, capture=False, env=None, cwd=None, **par
         What the call must leave behind -- see :func:`_check_outputs`. Mandatory on purpose:
         a caller who has to write the output down cannot forget that a zero return code
         proves nothing. Pass ``[]`` for a task that writes no file.
+    args : sequence, optional
+        Bare words to put after the task name and before the keywords. Almost no CIAO task
+        wants any, and the one that does is ``pget``: ``dmcoords`` answers by writing into
+        its own parameter file rather than onto standard output, and ``pget dmcoords x y``
+        is how the answer is read back -- with the task and the parameter names as
+        positional arguments. Not in the step-5 plan, which had keywords alone.
     log_to : str, optional
         Send the task's output to this file instead of the screen -- see
         :func:`_log_stream`. Standard error is merged into it, because CIAO writes its
@@ -357,7 +381,11 @@ def run(name, *, produces, log_to=None, capture=False, env=None, cwd=None, **par
             " -- see the module docstring of heasarc_retrieve_pipeline.ciao."
         )
 
-    argv = [name] + [_argument(key, value) for key, value in params.items()]
+    argv = (
+        [name]
+        + [str(arg) for arg in args]
+        + [_argument(key, value) for key, value in params.items()]
+    )
     get_logger().info(f"Running {' '.join(argv)}")
 
     stream = _log_stream(name, log_to) if log_to is not None and not capture else None

@@ -240,9 +240,37 @@ class TestThePerObservationParameterFiles:
 
         assert ciao.ciao_environment("6298", config)["CALDB"] == str(tmp_path / "caldb")
 
-    def test_an_unconfigured_calibration_database_is_left_as_the_machine_set_it(
+    def test_the_installation_s_own_calibration_database_wins_over_the_machine_s(
         self, tmp_path, monkeypatch
     ):
+        """
+        The hazard this closes is a real one on Matteo's machine, where the shell exports
+        ``CALDB=~/azure_software/caldb`` for HEASOFT. A conda CIAO keeps its own
+        calibration database at ``$ASCDS_INSTALL/CALDB``, and a CIAO task pointed at
+        HEASOFT's finds no Chandra data there at all.
+        """
+        install = tmp_path / "ciao"
+        (install / "CALDB").mkdir(parents=True)
+        monkeypatch.setenv("ASCDS_INSTALL", str(install))
+        monkeypatch.setenv("CALDB", "/machine/wide/heasoft/caldb")
+
+        environment = ciao.ciao_environment("6298", {"out_data_path": str(tmp_path)})
+
+        assert environment["CALDB"] == str(install / "CALDB")
+
+    def test_a_configured_one_still_wins_over_the_installation_s(self, tmp_path, monkeypatch):
+        install = tmp_path / "ciao"
+        (install / "CALDB").mkdir(parents=True)
+        monkeypatch.setenv("ASCDS_INSTALL", str(install))
+        config = {"out_data_path": str(tmp_path), "caldb": "/somewhere/else"}
+
+        assert ciao.ciao_environment("6298", config)["CALDB"] == "/somewhere/else"
+
+    def test_without_one_beside_the_installation_the_machine_s_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """A source installation keeps its calibration elsewhere, and then the machine
+        knows better than we do."""
         monkeypatch.setenv("ASCDS_INSTALL", str(tmp_path / "ciao"))
         monkeypatch.setenv("CALDB", "/machine/wide/caldb")
 
@@ -372,3 +400,28 @@ def test_produces_is_a_required_argument():
     assert "produces" in parameters, "ciao.run lost its produces argument"
     assert parameters["produces"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["produces"].default is inspect.Parameter.empty
+
+
+class TestPositionalArguments:
+    """
+    ``pget`` is why these exist, and it is not an exotic case: it is how CIAO hands back
+    what a task worked out. ``dmcoords`` answers by writing into its own parameter file
+    rather than onto standard output, and ``pget dmcoords x y`` is the tool that reads it
+    out again -- with the task name and the parameter names as bare words, not as
+    ``key=value``. Every other CIAO task in this pipeline is called with keywords alone.
+    """
+
+    def test_they_follow_the_task_name_and_come_before_the_keywords(self, stub_ciao):
+        ciao.run("pget", args=("dmcoords", "x", "y"), produces=[], mode="h")
+
+        assert stub_ciao[0].argv == ["pget", "dmcoords", "x", "y", "mode=h"]
+
+    def test_they_are_written_as_plain_text(self, stub_ciao):
+        ciao.run("pget", args=("dmcoords", 7), produces=[])
+
+        assert stub_ciao[0].argv == ["pget", "dmcoords", "7"]
+
+    def test_a_task_with_none_is_unchanged(self, stub_ciao):
+        ciao.run("dmcopy", produces=[], infile="a", outfile="b")
+
+        assert stub_ciao[0].argv == ["dmcopy", "infile=a", "outfile=b"]
