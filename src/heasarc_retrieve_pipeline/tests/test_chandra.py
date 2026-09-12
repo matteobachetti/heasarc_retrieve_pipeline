@@ -12,6 +12,7 @@ ones ``docs/chandra_integration_plan.md`` measured: they span HRC-I, HRC-S in it
 fast-timing mode, and ACIS-S behind a transmission grating.
 """
 
+import json
 import os
 import re
 
@@ -20,6 +21,7 @@ import pytest
 from astropy.io import fits
 
 from heasarc_retrieve_pipeline import chandra
+from heasarc_retrieve_pipeline.diagnostics import record_step
 
 
 # ``6298``: HRC-I, no grating. 28 files and 51.0 MB in the archive; the nine below are
@@ -971,3 +973,204 @@ class TestReadingTheDeadTimeFile:
 
         with pytest.raises(ValueError, match="no triggers"):
             chandra.read_dead_time_factors(path)
+
+
+def an_event_file(path, **keywords):
+    """A level-2 event list carrying the header keywords the front end reads."""
+    header = {
+        "INSTRUME": "HRC",
+        "DETNAM": "HRC-I",
+        "GRATING": "NONE",
+        "DATAMODE": "OBSERVING",
+        "TIMEDEL": 1.5625e-05,
+        "TIMESYS": "TT",
+        "MJDREF": 50814.0,
+        "ASCDSVER": "10.10",
+        "CALDBVER": "4.9.5",
+    }
+    header.update(keywords)
+    hdu = fits.BinTableHDU.from_columns(
+        [fits.Column("time", "1D", array=np.arange(10.0))], name="EVENTS"
+    )
+    for key, value in header.items():
+        if value is not None:
+            hdu.header[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+def an_archive_observation(tmp_path, obsid="6298", names=None, dtf=(469, 139), **keywords):
+    """
+    A downloaded observation with a real event list and a real dead-time file.
+
+    ``a_downloaded_observation`` writes empty placeholders, which is all the path finders
+    need. Anything that opens a file needs more than that, so the two files the front end
+    reads are written properly here. ``dtf`` is ``(TOTAL_EVT_COUNT, VALID_EVT_COUNT)``,
+    defaulting to obsid ``6298``'s real medians -- a heavily vetoed HRC-I observation.
+    """
+    names = HRC_I_6298_KEPT if names is None else names
+    config = a_downloaded_observation(tmp_path, obsid, names)
+    for name in names:
+        path = tmp_path / chandra.chandra_obsid(obsid) / name
+        if name.endswith("_evt2.fits.gz"):
+            path.unlink()
+            an_event_file(path.with_suffix(""), **keywords)
+        elif name.endswith("_dtf1.fits.gz") and dtf is not None:
+            path.unlink()
+            a_dead_time_file(path.with_suffix(""), total=dtf[0], valid=dtf[1])
+    return config
+
+
+class TestComparingCalibrationVersions:
+    """
+    The archive's level-2 products were made with the CALDB of their day, and with the
+    archive route as the default that becomes a number to report rather than a reason to
+    reprocess. Obsid ``2749`` says 4.9.4; the CALDB current on 2026-09-12 was 4.12.4.
+    """
+
+    def test_a_version_is_compared_as_numbers_and_not_as_a_string(self):
+        """
+        The trap: as text, ``"4.9.4" > "4.12.4"`` because ``9`` sorts after ``1``. A
+        string comparison would call the oldest products in the archive up to date.
+        """
+        assert "4.9.4" > "4.12.4"  # the wrong answer, stated so the test explains itself
+
+        assert chandra.caldb_version_tuple("4.9.4") < chandra.caldb_version_tuple("4.12.4")
+
+    @pytest.mark.parametrize(
+        "version, expected",
+        [("4.9.4", (4, 9, 4)), ("4.12.4", (4, 12, 4)), ("4.9", (4, 9)), ("4.11.1b", (4, 11, 1))],
+    )
+    def test_it_reads_the_versions_the_archive_actually_writes(self, version, expected):
+        assert chandra.caldb_version_tuple(version) == expected
+
+    @pytest.mark.parametrize("version", [None, "", "unknown"])
+    def test_an_unreadable_version_is_none_rather_than_an_error(self, version):
+        """A missing CALDBVER is a diagnostic that says so, not a failed reduction."""
+        assert chandra.caldb_version_tuple(version) is None
+
+
+class TestReadingAnObservationOffTheArchive:
+    def test_it_reads_an_hrc_observation_whole(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298")
+
+        found = chandra.chandra_archive_front_end("6298", config)
+
+        assert found.obsid == "6298"
+        assert found.detector == "hrci"
+        assert found.grating == "NONE"
+        assert os.path.basename(found.event_list).endswith("_evt2.fits")
+        assert found.dead_time_file is not None
+        assert found.orbit_ephemeris is not None
+        assert found.chips == ()
+
+    def test_it_reads_an_acis_grating_observation_whole(self, tmp_path):
+        config = an_archive_observation(
+            tmp_path,
+            "2749",
+            ACIS_HETG_2749_KEPT,
+            INSTRUME="ACIS",
+            DETNAM="ACIS-456789",
+            GRATING="HETG",
+            READMODE="TIMED",
+            DATAMODE="FAINT",
+            TIMEDEL=2.54104,
+            SIM_Z=-187.125,
+            CALDBVER="4.9.4",
+        )
+
+        found = chandra.chandra_archive_front_end("2749", config)
+
+        assert found.detector == "aciss"
+        assert found.mode == "hetg"
+        assert found.chips == (4, 5, 6, 7, 8, 9)
+        assert found.dead_time_file is None
+        assert len(found.grating_responses) == 24
+        assert found.time_resolution.seconds == pytest.approx(2.54104)
+
+    def test_the_stem_of_an_observation_names_it_fully(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298")
+
+        found = chandra.chandra_archive_front_end("6298", config)
+
+        assert found.stem == "chandra06298_hrci_imaging"
+
+    def test_a_fast_timing_hrc_observation_is_labelled_timing(self, tmp_path):
+        """
+        The two HRC observations have identical headers, so only the dead-time file can
+        make these two stems differ -- and it does.
+        """
+        config = an_archive_observation(
+            tmp_path, "17661", HRC_S_17661_KEPT, dtf=(123, 123), DETNAM="HRC-S"
+        )
+
+        found = chandra.chandra_archive_front_end("17661", config)
+
+        assert found.stem == "chandra17661_hrcs_timing"
+        assert found.time_resolution.seconds == pytest.approx(1.5625e-05)
+        assert found.time_resolution.fast_timing is True
+
+    def test_an_observation_with_no_event_list_is_none(self, tmp_path):
+        """``NO_SCIENCE_DATA`` is the caller's decision to make; this just reports."""
+        config = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+
+        assert chandra.chandra_archive_front_end("6298", config) is None
+
+    def test_it_records_how_stale_the_calibration_is(self, tmp_path):
+        config = an_archive_observation(
+            tmp_path,
+            "2749",
+            ACIS_HETG_2749_KEPT,
+            INSTRUME="ACIS",
+            DETNAM="ACIS-456789",
+            GRATING="HETG",
+            READMODE="TIMED",
+            TIMEDEL=2.54104,
+            SIM_Z=-187.125,
+            CALDBVER="4.9.4",
+            ASCDSVER="10.9.4",
+        )
+        directory = str(tmp_path / "diag")
+
+        with record_step(directory, "2749", "chandra_front_end") as rec:
+            found = chandra.chandra_archive_front_end("2749", config, rec=rec)
+
+        record = json.load(open(os.path.join(directory, "chandra_front_end.json")))
+
+        assert found.caldb_version == "4.9.4"
+        assert record["values"]["caldb_version"] == "4.9.4"
+        assert record["values"]["caldb_is_stale"] is True
+        assert record["values"]["detector"] == "aciss"
+        assert record["values"]["time_resolution_s"] == pytest.approx(2.54104)
+        assert record["values"]["time_resolution_basis"] == "acis_frame_time"
+
+    def test_a_current_calibration_is_not_called_stale(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298", CALDBVER=chandra.CURRENT_CALDB_VERSION)
+        directory = str(tmp_path / "diag")
+
+        with record_step(directory, "6298", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        record = json.load(open(os.path.join(directory, "chandra_front_end.json")))
+
+        assert record["values"]["caldb_is_stale"] is False
+
+    def test_it_works_without_a_record(self, tmp_path):
+        """Called from a test, or from a context with no output directory."""
+        config = an_archive_observation(tmp_path, "6298")
+
+        assert chandra.chandra_archive_front_end("6298", config) is not None
+
+    def test_an_hrc_observation_without_its_dead_time_file_still_reads(self, tmp_path):
+        """
+        Degraded, not failed: the resolution falls back to the documented ~4 ms and says
+        so. The observation is still reducible.
+        """
+        names = [n for n in HRC_I_6298_KEPT if "_dtf1." not in n]
+        config = an_archive_observation(tmp_path, "6298", names)
+
+        found = chandra.chandra_archive_front_end("6298", config)
+
+        assert found.time_resolution.basis == "hrc_documented"
+        assert found.mode == "imaging"

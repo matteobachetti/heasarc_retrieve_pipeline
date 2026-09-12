@@ -46,6 +46,7 @@ barycentres anything.
 import glob
 import os
 from dataclasses import dataclass
+from itertools import takewhile
 from typing import Optional
 
 import numpy as np
@@ -1063,3 +1064,217 @@ def chandra_time_resolution(header, dtf=None, config=None):
             ),
         )
     raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
+
+
+#: The CALDB current on the CXC's conda channel on 2026-09-12.
+#:
+#: Used only to say how stale an archive product's calibration is. It is a diagnostic and
+#: never a route decision: with archive level-2 as the default, the reduction reports the
+#: staleness and lets the user ask for ``products="repro"`` if they care. Bump it when the
+#: channel moves, or the report merely becomes less useful rather than wrong.
+CURRENT_CALDB_VERSION = "4.12.4"
+
+
+def caldb_version_tuple(version):
+    """
+    A CALDB version as integers, for comparing.
+
+    Compared as text, ``"4.9.4" > "4.12.4"``, because ``9`` sorts after ``1``. That would
+    call the oldest products in the archive up to date, so versions are never compared as
+    strings.
+
+    Parameters
+    ----------
+    version : str or None
+        As ``CALDBVER`` spells it: ``"4.9.4"``, ``"4.12.4"``, occasionally with a letter.
+
+    Returns
+    -------
+    tuple of int or None
+        ``None`` when there is nothing readable, which is a diagnostic that says so
+        rather than a failed reduction.
+
+    Examples
+    --------
+    >>> caldb_version_tuple("4.9.4") < caldb_version_tuple("4.12.4")
+    True
+    """
+    if not version:
+        return None
+    parts = []
+    for piece in str(version).split("."):
+        digits = "".join(takewhile(str.isdigit, piece))
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+@dataclass(frozen=True)
+class Observation:
+    """
+    One Chandra observation, and the files that hold it.
+
+    A Chandra observation is **one detector in one mode**, so unlike XMM's ``Exposure``
+    there is exactly one of these per OBSID and no fan-out: no ``(instrument, expid,
+    mode)`` key, and nothing downstream has to loop.
+
+    Attributes
+    ----------
+    obsid : str
+        Unpadded, as :func:`chandra_obsid` gives it.
+    detector : str
+        ``"acisi"``, ``"aciss"``, ``"hrci"`` or ``"hrcs"``.
+    grating : str
+        ``"NONE"``, ``"HETG"`` or ``"LETG"``, as the header spells it.
+    mode : str
+        The label :func:`chandra_mode_label` chose, which is what the file stem carries.
+    time_resolution : TimeResolution
+        What the data can actually support, with its reason. For HRC this is what decided
+        ``mode``.
+    chips : tuple of int
+        CCDs read out, empty for HRC. See :func:`chandra_chips`.
+    event_list : str
+        The level-2 event list. Every other path may be ``None``; this one may not, and an
+        observation without it is not an ``Observation`` at all.
+    aspect_solution, bad_pixel_file, mask_file, gti_file : str or None
+        Companion products.
+    dead_time_file : str or None
+        HRC only, and ``None`` for ACIS is normal rather than missing.
+    orbit_ephemeris : str or None
+        What ``axbary`` barycentres with.
+    grating_spectrum : str or None
+    grating_responses : tuple of str
+        The archive's ready-made grating products, collected and never re-made.
+    caldb_version, ascds_version : str or None
+        What the archive's own reduction was made with.
+    """
+
+    obsid: str
+    detector: str
+    grating: str
+    mode: str
+    time_resolution: TimeResolution
+    chips: tuple
+    event_list: str
+    aspect_solution: Optional[str] = None
+    bad_pixel_file: Optional[str] = None
+    mask_file: Optional[str] = None
+    gti_file: Optional[str] = None
+    dead_time_file: Optional[str] = None
+    orbit_ephemeris: Optional[str] = None
+    grating_spectrum: Optional[str] = None
+    grating_responses: tuple = ()
+    caldb_version: Optional[str] = None
+    ascds_version: Optional[str] = None
+
+    @property
+    def stem(self):
+        """What every output file of this observation is named from."""
+        return chandra_file_stem(self.obsid, self.detector, self.mode)
+
+    @property
+    def caldb_is_stale(self):
+        """
+        Whether the archive's reduction predates the current CALDB.
+
+        ``None`` when either version is unreadable. Reported, never acted on.
+        """
+        made_with = caldb_version_tuple(self.caldb_version)
+        current = caldb_version_tuple(CURRENT_CALDB_VERSION)
+        if made_with is None or current is None:
+            return None
+        return made_with < current
+
+
+def chandra_archive_front_end(obsid, config, rec=None):
+    """
+    Read one observation off the archive's own level-2 products.
+
+    The default route. No CIAO is involved: the archive's ``primary/`` products are what
+    CIAO would produce, so this reads their headers, finds the companions and works out
+    what the data can support.
+
+    The one place it does real work is the time resolution, and for HRC that is not in the
+    header: :func:`read_dead_time_factors` measures the on-board veto fraction, and its
+    answer is what separates a genuine 15.625 us observation from one 280 times coarser.
+    An HRC observation whose dead-time file was not downloaded still reads -- degraded to
+    the documented ~4 ms, and saying so.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``. ``hrc_veto_ratio_threshold`` is read.
+    rec : StepRecord, optional
+        Where to record what was found, including how stale the calibration is.
+
+    Returns
+    -------
+    Observation or None
+        ``None`` when the directory holds no level-2 event list. Whether that means
+        ``NO_SCIENCE_DATA`` is the caller's decision, as it is for XMM.
+    """
+    obsid = chandra_obsid(obsid)
+    events = chandra_event_list(obsid, config)
+    if events is None:
+        return None
+
+    with fits.open(events) as hdulist:
+        header = hdulist[1].header
+
+    dtf_path = chandra_dead_time_file(obsid, config)
+    dtf = read_dead_time_factors(dtf_path) if dtf_path is not None else None
+    resolution = chandra_time_resolution(header, dtf, config)
+
+    observation = Observation(
+        obsid=obsid,
+        detector=chandra_detector(header),
+        grating=str(header.get("GRATING", "NONE")).strip().upper(),
+        mode=chandra_mode_label(header, fast_timing=resolution.fast_timing),
+        time_resolution=resolution,
+        chips=tuple(chandra_chips(header)),
+        event_list=events,
+        aspect_solution=chandra_aspect_solution(obsid, config),
+        bad_pixel_file=chandra_bad_pixel_file(obsid, config),
+        mask_file=chandra_mask_file(obsid, config),
+        gti_file=chandra_gti_file(obsid, config),
+        dead_time_file=dtf_path,
+        orbit_ephemeris=chandra_orbit_ephemeris(obsid, config),
+        grating_spectrum=chandra_grating_spectrum(obsid, config),
+        grating_responses=tuple(chandra_grating_responses(obsid, config)),
+        caldb_version=_keyword(header, "CALDBVER"),
+        ascds_version=_keyword(header, "ASCDSVER"),
+    )
+
+    if rec is not None:
+        rec.value(
+            detector=observation.detector,
+            grating=observation.grating,
+            mode=observation.mode,
+            chips=list(observation.chips),
+            stem=observation.stem,
+            time_resolution_s=resolution.seconds,
+            time_resolution_basis=resolution.basis,
+            time_resolution_reason=resolution.reason,
+            hrc_veto_ratio=resolution.veto_ratio,
+            hrc_trigger_rate_hz=resolution.trigger_rate_hz,
+            caldb_version=observation.caldb_version,
+            caldb_current=CURRENT_CALDB_VERSION,
+            caldb_is_stale=observation.caldb_is_stale,
+            ascds_version=observation.ascds_version,
+            has_dead_time_file=dtf_path is not None,
+            n_grating_responses=len(observation.grating_responses),
+        )
+
+    return observation
+
+
+def _keyword(header, name):
+    """A header keyword as a stripped string, or ``None`` when it is absent or blank."""
+    value = header.get(name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
