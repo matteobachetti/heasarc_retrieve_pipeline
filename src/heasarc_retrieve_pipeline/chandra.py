@@ -1456,6 +1456,9 @@ class Observation:
         out. This is the subarray, and it is why obsid ``5644`` reads out every 0.44 s
         instead of every 3.2 s: 128 rows of 1024. ``None`` for HRC, and for an ACIS header
         that does not say, which means a full frame.
+    sky_pixel_arcsec : float or None
+        What one sky pixel is on the sky, as the event list declares it: 0.492 arcseconds
+        for ACIS and 0.1318 for HRC. Left ``None``, it is filled in from ``detector``.
     """
 
     obsid: str
@@ -1477,6 +1480,11 @@ class Observation:
     ascds_version: Optional[str] = None
     data_mode: Optional[str] = None
     active_rows: Optional[tuple] = None
+    sky_pixel_arcsec: Optional[float] = None
+
+    def __post_init__(self):
+        if self.sky_pixel_arcsec is None:
+            object.__setattr__(self, "sky_pixel_arcsec", nominal_sky_pixel_arcsec(self.detector))
 
     @property
     def stem(self):
@@ -1573,6 +1581,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         ascds_version=_keyword(header, "ASCDSVER"),
         data_mode=_keyword(header, "DATAMODE"),
         active_rows=_active_rows(header),
+        sky_pixel_arcsec=chandra_sky_pixel_arcsec(header),
     )
 
     if rec is not None:
@@ -1594,6 +1603,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
             data_mode=observation.data_mode,
             has_dead_time_file=dtf_path is not None,
             n_grating_responses=len(observation.grating_responses),
+            sky_pixel_arcsec=observation.sky_pixel_arcsec,
         )
 
     return observation
@@ -1770,37 +1780,82 @@ def _keyword(header, name):
     return text or None
 
 
-#: One Chandra sky pixel, in arcseconds. ``dmcoords`` reports it as the sky pixel scale on
-#: every observation, ACIS and HRC alike: the two detectors have very different physical
-#: pixels, but both are projected onto the same 8192 x 8192 sky plane.
-SKY_PIXEL_ARCSEC = 0.492
+#: One ACIS sky pixel, in arcseconds: an 8192 x 8192 sky plane, ``TCDLT`` 1.3667e-4 degrees.
+ACIS_SKY_PIXEL_ARCSEC = 0.492
+
+#: One HRC sky pixel, in arcseconds. The sky plane has the detector's own resolution, so an
+#: HRC-I plane is 32768 pixels across and an HRC-S one 65536, both at ``TCDLT`` 3.6611e-5
+#: degrees -- measured on obsids ``8189`` and ``23460``. It is not the ACIS value, and
+#: assuming it was put every HRC radius reported in arcseconds out by a factor of 3.7.
+HRC_SKY_PIXEL_ARCSEC = 0.1318
 
 
-def arcsec_to_sky_pixels(arcsec):
+def nominal_sky_pixel_arcsec(instrument):
     """
-    An angle on the sky, in Chandra sky pixels.
+    The sky pixel scale an instrument's files normally carry.
 
     Examples
     --------
-    >>> arcsec_to_sky_pixels(0.984)
+    >>> nominal_sky_pixel_arcsec("hrci")
+    0.1318
+    >>> nominal_sky_pixel_arcsec("ACIS")
+    0.492
+    """
+    return (
+        HRC_SKY_PIXEL_ARCSEC if str(instrument).upper().startswith("HRC") else ACIS_SKY_PIXEL_ARCSEC
+    )
+
+
+def chandra_sky_pixel_arcsec(header):
+    """
+    The sky pixel scale an event list declares, in arcseconds.
+
+    Read off the ``x`` column's ``TCDLT``, which is what every coordinate in the file is
+    measured in. A header that does not say falls back on :func:`nominal_sky_pixel_arcsec`
+    for its ``INSTRUME``.
+
+    Parameters
+    ----------
+    header : astropy.io.fits.Header
+        The events extension's header.
+
+    Returns
+    -------
+    float
+    """
+    for key in header:
+        if key.startswith("TTYPE") and str(header[key]).strip().lower() == "x":
+            increment = header.get(f"TCDLT{key[len('TTYPE') :]}")
+            if increment:
+                return abs(float(increment)) * 3600.0
+    return nominal_sky_pixel_arcsec(header.get("INSTRUME", "ACIS"))
+
+
+def arcsec_to_sky_pixels(arcsec, pixel_arcsec):
+    """
+    An angle on the sky, in Chandra sky pixels of ``pixel_arcsec`` arcseconds.
+
+    Examples
+    --------
+    >>> arcsec_to_sky_pixels(0.984, 0.492)
     2.0
     """
-    return arcsec / SKY_PIXEL_ARCSEC
+    return arcsec / pixel_arcsec
 
 
-def sky_pixels_to_arcsec(pixels):
+def sky_pixels_to_arcsec(pixels, pixel_arcsec):
     """
-    Chandra sky pixels, as an angle on the sky.
+    Chandra sky pixels of ``pixel_arcsec`` arcseconds, as an angle on the sky.
 
     Examples
     --------
-    >>> sky_pixels_to_arcsec(2.0)
+    >>> sky_pixels_to_arcsec(2.0, 0.492)
     0.984
     """
-    return pixels * SKY_PIXEL_ARCSEC
+    return pixels * pixel_arcsec
 
 
-def circle_region(x, y, radius_arcsec):
+def circle_region(x, y, radius_arcsec, pixel_arcsec):
     """
     A circle, as CIAO's Data Model spells it.
 
@@ -1810,23 +1865,23 @@ def circle_region(x, y, radius_arcsec):
 
     Examples
     --------
-    >>> circle_region(4100.38, 4131.82, 0.984)
+    >>> circle_region(4100.38, 4131.82, 0.984, 0.492)
     'circle(4100.3800,4131.8200,2.0000)'
     """
-    return f"circle({x:.4f},{y:.4f},{arcsec_to_sky_pixels(radius_arcsec):.4f})"
+    return f"circle({x:.4f},{y:.4f},{arcsec_to_sky_pixels(radius_arcsec, pixel_arcsec):.4f})"
 
 
-def annulus_region(x, y, inner_arcsec, outer_arcsec):
+def annulus_region(x, y, inner_arcsec, outer_arcsec, pixel_arcsec):
     """
     An annulus, as CIAO's Data Model spells it.
 
     Examples
     --------
-    >>> annulus_region(4100.0, 4131.0, 0.984, 1.968)
+    >>> annulus_region(4100.0, 4131.0, 0.984, 1.968, 0.492)
     'annulus(4100.0000,4131.0000,2.0000,4.0000)'
     """
-    inner = arcsec_to_sky_pixels(inner_arcsec)
-    outer = arcsec_to_sky_pixels(outer_arcsec)
+    inner = arcsec_to_sky_pixels(inner_arcsec, pixel_arcsec)
+    outer = arcsec_to_sky_pixels(outer_arcsec, pixel_arcsec)
     return f"annulus({x:.4f},{y:.4f},{inner:.4f},{outer:.4f})"
 
 
@@ -1840,7 +1895,7 @@ def sky_filter(region):
 
     Examples
     --------
-    >>> sky_filter(circle_region(4100.38, 4131.82, 0.984))
+    >>> sky_filter(circle_region(4100.38, 4131.82, 0.984, 0.492))
     '[sky=circle(4100.3800,4131.8200,2.0000)]'
     """
     return f"[sky={region}]"
@@ -2020,12 +2075,13 @@ class PsfSize:
     radius_arcsec: float
 
 
-def read_psf_size(path):
+def read_psf_size(path, pixel_arcsec):
     """
     Read the region file ``psfsize_srcs`` wrote.
 
     The conversion to arcseconds happens once, here: the tool writes ``R`` in sky pixels
-    and every radius in this module's configuration is an angle.
+    and every radius in this module's configuration is an angle. The file carries no scale
+    of its own, so the observation's has to be passed in.
 
     Only ``R`` is read. The file also carries ``NEAR_CHIP_EDGE``, and that column is
     **not** trusted: ``psfsize_srcs`` bounds a subarray's rows at ``NROWS - 1 - edge``
@@ -2039,6 +2095,8 @@ def read_psf_size(path):
     ----------
     path : str
         The region file.
+    pixel_arcsec : float
+        The observation's sky pixel scale, :attr:`Observation.sky_pixel_arcsec`.
 
     Returns
     -------
@@ -2058,7 +2116,7 @@ def read_psf_size(path):
             )
         radius = float(table["R"][0])
 
-    return PsfSize(radius_arcsec=sky_pixels_to_arcsec(radius))
+    return PsfSize(radius_arcsec=sky_pixels_to_arcsec(radius, pixel_arcsec))
 
 
 def chandra_psf_radius(observation, config, ra, dec, outfile, env=None, log_to=None):
@@ -2104,7 +2162,7 @@ def chandra_psf_radius(observation, config, ra, dec, outfile, env=None, log_to=N
         ecf=config["psf_ecf"],
         clobber=True,
     )
-    return read_psf_size(outfile)
+    return read_psf_size(outfile, observation.sky_pixel_arcsec)
 
 
 #: How far an ACIS source has to be from the edge of its active window before a circular
@@ -2241,6 +2299,8 @@ def chandra_extraction_regions(
     continuous_clocking=False,
     basis="configured",
     chip_edge=None,
+    *,
+    pixel_arcsec,
 ):
     """
     The source and background selections for a point source.
@@ -2271,6 +2331,8 @@ def chandra_extraction_regions(
         Where ``radius_arcsec`` came from, for the record.
     chip_edge : ChipEdge, optional
         How much clearance the source has, for the record.
+    pixel_arcsec : float
+        The observation's sky pixel scale, which the circles are drawn in.
 
     Returns
     -------
@@ -2309,8 +2371,8 @@ def chandra_extraction_regions(
         else ""
     )
     return ExtractionRegions(
-        source=sky_filter(circle_region(position.x, position.y, radius_arcsec)),
-        background=sky_filter(annulus_region(position.x, position.y, inner, outer)),
+        source=sky_filter(circle_region(position.x, position.y, radius_arcsec, pixel_arcsec)),
+        background=sky_filter(annulus_region(position.x, position.y, inner, outer, pixel_arcsec)),
         radius_arcsec=radius_arcsec,
         background_inner_arcsec=inner,
         background_outer_arcsec=outer,
@@ -2384,6 +2446,7 @@ def chandra_source_regions(observation, config, ra, dec, rec=None, env=None, log
         continuous_clocking=observation.is_continuous_clocking,
         basis=basis,
         chip_edge=edge,
+        pixel_arcsec=observation.sky_pixel_arcsec,
     )
 
     rec.value(
@@ -3307,7 +3370,7 @@ class PileUpCounts:
     pixels: int
 
 
-def read_pileup_map(path, x, y, radius_arcsec, percentile):
+def read_pileup_map(path, x, y, radius_arcsec, percentile, *, pixel_arcsec):
     """
     Read the counts per frame inside the source circle.
 
@@ -3324,6 +3387,8 @@ def read_pileup_map(path, x, y, radius_arcsec, percentile):
         The source, in sky pixels.
     radius_arcsec : float
     percentile : float
+    pixel_arcsec : float
+        The observation's sky pixel scale.
 
     Returns
     -------
@@ -3337,7 +3402,9 @@ def read_pileup_map(path, x, y, radius_arcsec, percentile):
         header = hdu.header
 
     column, row = sky_to_image_pixel(header, x, y)
-    radius_pixels = arcsec_to_sky_pixels(radius_arcsec) * abs(float(header.get("LTM1_1", 1.0)))
+    radius_pixels = arcsec_to_sky_pixels(radius_arcsec, pixel_arcsec) * abs(
+        float(header.get("LTM1_1", 1.0))
+    )
     rows, columns = np.indices(data.shape)
     inside = (columns - column) ** 2 + (rows - row) ** 2 <= radius_pixels**2
     if not inside.any():
@@ -3513,7 +3580,14 @@ def chandra_pileup(
     )
 
     percentile = float(config["pileup_percentile"])
-    counts = read_pileup_map(mapped, position.x, position.y, regions.radius_arcsec, percentile)
+    counts = read_pileup_map(
+        mapped,
+        position.x,
+        position.y,
+        regions.radius_arcsec,
+        percentile,
+        pixel_arcsec=observation.sky_pixel_arcsec,
+    )
     if counts is None:
         reason = (
             "The source circle fell outside the pile-up map, which means the map was made "

@@ -998,8 +998,13 @@ class TestReadingTheDeadTimeFile:
             chandra.read_dead_time_factors(path)
 
 
-def an_event_file(path, **keywords):
-    """A level-2 event list carrying the header keywords the front end reads."""
+def an_event_file(path, sky_pixel_deg=None, **keywords):
+    """
+    A level-2 event list carrying the header keywords the front end reads.
+
+    ``sky_pixel_deg`` adds an ``x`` column with that ``TCDLT``, the way the archive's
+    files carry the sky pixel scale.
+    """
     header = {
         "INSTRUME": "HRC",
         "DETNAM": "HRC-I",
@@ -1012,9 +1017,10 @@ def an_event_file(path, **keywords):
         "CALDBVER": "4.9.5",
     }
     header.update(keywords)
-    hdu = fits.BinTableHDU.from_columns(
-        [fits.Column("time", "1D", array=np.arange(10.0))], name="EVENTS"
-    )
+    columns = [fits.Column("time", "1D", array=np.arange(10.0))]
+    if sky_pixel_deg is not None:
+        columns.append(fits.Column("x", "1E", array=np.zeros(10), coord_inc=sky_pixel_deg))
+    hdu = fits.BinTableHDU.from_columns(columns, name="EVENTS")
     for key, value in header.items():
         if value is not None:
             hdu.header[key] = value
@@ -1075,6 +1081,17 @@ class TestComparingCalibrationVersions:
 
 
 class TestReadingAnObservationOffTheArchive:
+    def test_the_sky_pixel_scale_is_the_event_list_s_own_and_is_recorded(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298", sky_pixel_deg=-3.6611111111111e-05)
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            found = chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        assert found.sky_pixel_arcsec == pytest.approx(0.1318)
+        written = json.loads(next(directory.glob("*chandra_front_end*.json")).read_text())
+        assert written["values"]["sky_pixel_arcsec"] == pytest.approx(0.1318)
+
     def test_it_reads_an_hrc_observation_whole(self, tmp_path):
         config = an_archive_observation(tmp_path, "6298")
 
@@ -1215,11 +1232,64 @@ class TestReadingAnObservationOffTheArchive:
 
 
 class TestAnglesAndSkyPixels:
-    def test_a_sky_pixel_is_the_0_492_arcseconds_dmcoords_reports(self):
-        assert chandra.SKY_PIXEL_ARCSEC == 0.492
+    """
+    An ACIS sky pixel is 0.492 arcseconds and an HRC one is 0.1318. This used to be one
+    constant, the ACIS value, and every HRC radius reported in arcseconds came out 3.7
+    times too large.
+    """
+
+    @staticmethod
+    def _a_header(tcdlt, instrument):
+        return fits.Header(
+            [("INSTRUME", instrument), ("TTYPE1", "time"), ("TTYPE2", "x"), ("TCDLT2", tcdlt)]
+        )
+
+    def test_an_hrc_scale_is_read_off_the_sky_column(self):
+        """Obsid ``8189``'s and ``23460``'s own ``TCDLT`` for ``x``."""
+        header = self._a_header(-3.6611111111111e-05, "HRC")
+
+        assert chandra.chandra_sky_pixel_arcsec(header) == pytest.approx(0.1318)
+
+    def test_an_acis_scale_is_read_off_the_sky_column(self):
+        header = self._a_header(-1.3666666666667e-04, "ACIS")
+
+        assert chandra.chandra_sky_pixel_arcsec(header) == pytest.approx(0.492)
+
+    def test_the_column_is_believed_over_the_instrument(self):
+        header = self._a_header(-1.3666666666667e-04, "HRC")
+
+        assert chandra.chandra_sky_pixel_arcsec(header) == pytest.approx(0.492)
+
+    def test_a_header_without_the_column_falls_back_on_the_instrument(self):
+        hrc = fits.Header([("INSTRUME", "HRC")])
+        acis = fits.Header([("INSTRUME", "ACIS")])
+
+        assert chandra.chandra_sky_pixel_arcsec(hrc) == chandra.HRC_SKY_PIXEL_ARCSEC
+        assert chandra.chandra_sky_pixel_arcsec(acis) == chandra.ACIS_SKY_PIXEL_ARCSEC
+
+    def test_an_observation_built_without_one_takes_its_detector_s(self, tmp_path):
+        fields = dict(
+            obsid="1",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=chandra.TimeResolution(1.5625e-05, "hrc_imaging", ""),
+            chips=(),
+            event_list=str(tmp_path / "evt2.fits"),
+        )
+
+        hrc = chandra.Observation(detector="hrci", **fields)
+        acis = chandra.Observation(detector="aciss", **fields)
+
+        assert hrc.sky_pixel_arcsec == chandra.HRC_SKY_PIXEL_ARCSEC
+        assert acis.sky_pixel_arcsec == chandra.ACIS_SKY_PIXEL_ARCSEC
+
+    def test_the_conversion_uses_the_scale_it_is_given(self):
+        assert chandra.arcsec_to_sky_pixels(0.492, 0.1318) == pytest.approx(3.733, abs=0.001)
 
     def test_the_two_conversions_undo_each_other(self):
-        assert chandra.sky_pixels_to_arcsec(chandra.arcsec_to_sky_pixels(3.7)) == pytest.approx(3.7)
+        pixels = chandra.arcsec_to_sky_pixels(3.7, 0.1318)
+
+        assert chandra.sky_pixels_to_arcsec(pixels, 0.1318) == pytest.approx(3.7)
 
 
 class TestHowARegionIsSpelt:
@@ -1231,11 +1301,18 @@ class TestHowARegionIsSpelt:
 
     def test_a_circle_is_centre_and_radius_in_sky_pixels(self):
         assert (
-            chandra.circle_region(4100.38, 4131.82, 0.984) == "circle(4100.3800,4131.8200,2.0000)"
+            chandra.circle_region(4100.38, 4131.82, 0.984, 0.492)
+            == "circle(4100.3800,4131.8200,2.0000)"
+        )
+
+    def test_an_hrc_circle_is_measured_in_hrc_pixels(self):
+        assert (
+            chandra.circle_region(16384.5, 16384.5, 0.2636, 0.1318)
+            == "circle(16384.5000,16384.5000,2.0000)"
         )
 
     def test_an_annulus_carries_both_radii(self):
-        assert chandra.annulus_region(4100.0, 4131.0, 0.984, 1.968) == (
+        assert chandra.annulus_region(4100.0, 4131.0, 0.984, 1.968, 0.492) == (
             "annulus(4100.0000,4131.0000,2.0000,4.0000)"
         )
 
@@ -1303,7 +1380,15 @@ class TestReadingThePsfSize:
         configuration is in arcseconds, so the conversion happens once, here."""
         path = a_psf_region_file(tmp_path / "psf.reg")
 
-        size = chandra.read_psf_size(path)
+        size = chandra.read_psf_size(path, chandra.ACIS_SKY_PIXEL_ARCSEC)
+
+        assert size.radius_arcsec == pytest.approx(0.830, abs=0.001)
+
+    def test_an_hrc_radius_is_converted_at_the_hrc_scale(self, tmp_path):
+        """The file carries no scale of its own, so the observation's has to be passed."""
+        path = a_psf_region_file(tmp_path / "psf.reg", radius_pixels=6.3)
+
+        size = chandra.read_psf_size(path, chandra.HRC_SKY_PIXEL_ARCSEC)
 
         assert size.radius_arcsec == pytest.approx(0.830, abs=0.001)
 
@@ -1315,7 +1400,7 @@ class TestReadingThePsfSize:
         """
         path = a_psf_region_file(tmp_path / "psf.reg", near_chip_edge=True)
 
-        assert not hasattr(chandra.read_psf_size(path), "near_chip_edge")
+        assert not hasattr(chandra.read_psf_size(path, 0.492), "near_chip_edge")
 
     def test_an_empty_region_file_says_the_position_is_not_on_the_detector(self, tmp_path):
         path = tmp_path / "psf.reg"
@@ -1324,7 +1409,7 @@ class TestReadingThePsfSize:
         ).writeto(path, overwrite=True)
 
         with pytest.raises(ValueError, match="no source"):
-            chandra.read_psf_size(str(path))
+            chandra.read_psf_size(str(path), 0.492)
 
 
 class TestSizingTheExtractionRegions:
@@ -1335,7 +1420,11 @@ class TestSizingTheExtractionRegions:
 
     def test_the_source_is_a_circle_at_the_position_asked_for(self, tmp_path):
         regions = chandra.chandra_extraction_regions(
-            self._a_position(), 0.984, dict(chandra.DEFAULT_CONFIG), continuous_clocking=False
+            self._a_position(),
+            0.984,
+            dict(chandra.DEFAULT_CONFIG),
+            continuous_clocking=False,
+            pixel_arcsec=0.492,
         )
 
         assert regions.source == "[sky=circle(4100.3800,4131.8200,2.0000)]"
@@ -1344,7 +1433,7 @@ class TestSizingTheExtractionRegions:
         config = dict(chandra.DEFAULT_CONFIG, bkg_inner_factor=1.5, bkg_outer_factor=3.0)
 
         regions = chandra.chandra_extraction_regions(
-            self._a_position(), 0.984, config, continuous_clocking=False
+            self._a_position(), 0.984, config, continuous_clocking=False, pixel_arcsec=0.492
         )
 
         assert regions.background == "[sky=annulus(4100.3800,4131.8200,3.0000,6.0000)]"
@@ -1360,7 +1449,11 @@ class TestSizingTheExtractionRegions:
         config = dict(chandra.DEFAULT_CONFIG, cc_source_halfwidth_pix=3, cc_background_pix=(10, 30))
 
         regions = chandra.chandra_extraction_regions(
-            self._a_position(chipx=226.3), 0.984, config, continuous_clocking=True
+            self._a_position(chipx=226.3),
+            0.984,
+            config,
+            continuous_clocking=True,
+            pixel_arcsec=0.492,
         )
 
         assert regions.source == "[chipx=223:229]"
@@ -1368,7 +1461,11 @@ class TestSizingTheExtractionRegions:
 
     def test_a_continuous_clocking_background_is_flagged_as_overlapping_the_source(self):
         regions = chandra.chandra_extraction_regions(
-            self._a_position(), 0.984, dict(chandra.DEFAULT_CONFIG), continuous_clocking=True
+            self._a_position(),
+            0.984,
+            dict(chandra.DEFAULT_CONFIG),
+            continuous_clocking=True,
+            pixel_arcsec=0.492,
         )
 
         assert "collapsed" in regions.reason
@@ -1379,6 +1476,7 @@ class TestSizingTheExtractionRegions:
             0.984,
             dict(chandra.DEFAULT_CONFIG),
             continuous_clocking=False,
+            pixel_arcsec=0.492,
             chip_edge=chandra.ChipEdge(margin_pix=27.2, near_edge=True, window=(449, 576)),
         )
 
@@ -1391,6 +1489,7 @@ class TestSizingTheExtractionRegions:
             0.984,
             dict(chandra.DEFAULT_CONFIG),
             continuous_clocking=False,
+            pixel_arcsec=0.492,
             chip_edge=chandra.ChipEdge(margin_pix=47.9, near_edge=False, window=(449, 576)),
         )
 
@@ -1402,6 +1501,7 @@ class TestSizingTheExtractionRegions:
             0.984,
             dict(chandra.DEFAULT_CONFIG),
             continuous_clocking=False,
+            pixel_arcsec=0.492,
             basis="psfsize_srcs",
         )
 
@@ -1515,6 +1615,27 @@ class TestWorkingOutWhereToExtract:
 
         assert regions.basis == "psfsize_srcs"
         assert regions.radius_arcsec == pytest.approx(0.830, abs=0.001)
+
+    def test_an_hrc_circle_is_the_size_psfsize_srcs_measured(self, tmp_path, stub_ciao_tasks):
+        """
+        The tool answers in sky pixels and the circle is drawn in sky pixels, so the circle
+        is the tool's answer whatever the scale. What the scale changes is the number of
+        arcseconds reported, and at the ACIS scale an HRC one was 3.7 times too large.
+        """
+        observation = chandra.Observation(
+            **{
+                **self._an_observation(tmp_path).__dict__,
+                "detector": "hrci",
+                "chips": (),
+                "sky_pixel_arcsec": chandra.HRC_SKY_PIXEL_ARCSEC,
+            },
+        )
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        _, regions = chandra.chandra_source_regions(observation, config, 148.96, 69.68)
+
+        assert regions.source.endswith(",1.6874)]")
+        assert regions.radius_arcsec == pytest.approx(1.6874055297 * 0.1318)
 
     def test_a_configured_radius_skips_the_measurement_entirely(self, tmp_path, stub_ciao_tasks):
         """Not merely overridden: ``psfsize_srcs`` is a contributed Python script, and a
@@ -2337,23 +2458,36 @@ class TestReadingThePileUpMap:
     def test_only_the_pixels_inside_the_circle_are_read(self, tmp_path):
         """The bright corner pixel is 5.7 pixels away and must not be seen: a pile-up
         measurement is of the source, and any other source on the chip is not it."""
-        radius = chandra.sky_pixels_to_arcsec(1.0)
-        found = chandra.read_pileup_map(self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0)
+        radius = chandra.sky_pixels_to_arcsec(1.0, 0.492)
+        found = chandra.read_pileup_map(
+            self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0, pixel_arcsec=0.492
+        )
 
         assert found.peak_counts_per_frame == pytest.approx(0.30)
         assert found.pixels == 5
 
     def test_the_percentile_is_taken_over_those_pixels(self, tmp_path):
-        radius = chandra.sky_pixels_to_arcsec(1.0)
-        found = chandra.read_pileup_map(self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0)
+        radius = chandra.sky_pixels_to_arcsec(1.0, 0.492)
+        found = chandra.read_pileup_map(
+            self._a_map(tmp_path), 4004.0, 4504.0, radius, 90.0, pixel_arcsec=0.492
+        )
 
         assert found.percentile_counts_per_frame == pytest.approx(
             np.percentile([0.30, 0.10, 0.06, 0.02, 0.0], 90.0)
         )
 
+    def test_the_radius_is_converted_at_the_scale_it_is_given(self, tmp_path):
+        found = chandra.read_pileup_map(
+            self._a_map(tmp_path), 4004.0, 4504.0, 2.0, 90.0, pixel_arcsec=2.0
+        )
+
+        assert found.pixels == 5
+
     def test_a_radius_that_lands_on_nothing_is_not_a_measurement(self, tmp_path):
-        radius = chandra.sky_pixels_to_arcsec(1.0)
-        found = chandra.read_pileup_map(self._a_map(tmp_path), 9000.0, 9000.0, radius, 90.0)
+        radius = chandra.sky_pixels_to_arcsec(1.0, 0.492)
+        found = chandra.read_pileup_map(
+            self._a_map(tmp_path), 9000.0, 9000.0, radius, 90.0, pixel_arcsec=0.492
+        )
 
         assert found is None
 
@@ -2456,7 +2590,7 @@ class TestMeasuringPileUp:
         return chandra.ExtractionRegions(
             source="[sky=circle(4100,4100,4)]",
             background="[sky=annulus(4100,4100,8,16)]",
-            radius_arcsec=chandra.sky_pixels_to_arcsec(1.0),
+            radius_arcsec=chandra.sky_pixels_to_arcsec(1.0, 0.492),
         )
 
     def test_a_map_that_misses_the_source_reports_no_number_rather_than_a_wrong_one(

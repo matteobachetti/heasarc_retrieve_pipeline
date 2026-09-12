@@ -187,8 +187,8 @@ class TestTheFlareLightCurve:
             x=4100.0, y=4100.0, chip_id=7, chipx=500.0, chipy=500.0, theta_arcmin=0.3
         )
         regions = chandra.ExtractionRegions(
-            source=chandra.sky_filter(chandra.circle_region(4100.0, 4100.0, 5.0)),
-            background=chandra.sky_filter(chandra.annulus_region(4100.0, 4100.0, 7.5, 15.0)),
+            source=chandra.sky_filter(chandra.circle_region(4100.0, 4100.0, 5.0, 0.492)),
+            background=chandra.sky_filter(chandra.annulus_region(4100.0, 4100.0, 7.5, 15.0, 0.492)),
             radius_arcsec=5.0,
         )
         return position, regions
