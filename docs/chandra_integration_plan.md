@@ -1,15 +1,16 @@
 # Adding Chandra (ACIS + HRC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-12 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `1153f58`). **Steps 1 and 2 have landed**; steps 3 onwards are
+> `various_fixes` (HEAD `1153f58`). **Steps 1 to 5 have landed**; steps 6 onwards are
 > still the agreed design rather than a report on work done. It is written to be picked up
 > cold, by a person or a session with no memory of the conversation that produced it.
 > Every number in it was measured against the live HEASARC archive, the live CXC conda
 > channel, or real Chandra data files on 2026-09-12; the snippets under *Reproducing the
 > archive facts* re-derive them, so none of it has to be taken on trust.
 >
-> **Steps 6 onwards need CIAO, which is not installed on Matteo's machine.** Steps 3, 4
-> and 5 do not, and are the work available before that is sorted.
+> **Steps 6 onwards need CIAO, which is not installed on Matteo's machine.** That is
+> where this stops: everything doable without a CIAO installation is in, and step 6 is
+> the first line that cannot be written honestly without one.
 >
 > Decisions marked **decided** were made by Matteo and should not be relitigated without
 > him. Items under *Open items* are genuinely unresolved and need a machine with CIAO.
@@ -410,8 +411,9 @@ The test is the same one `test_sas.py` uses: `ciao_environment` never mutates
 
 ## Steps
 
-Ordered so that everything testable without CIAO comes first. Steps 1–4 need no CIAO
-installed at all, which means real progress is possible before the environment is sorted.
+Ordered so that everything testable without CIAO comes first. Steps 1–5 need no CIAO
+installed at all, and all five are now in; step 6 is where an installation becomes
+unavoidable.
 
 ### ~~Step 1 — `MISSION_CONFIG` entry and the download filter~~ **Done, `5377cfd`.**
 
@@ -478,7 +480,7 @@ Path helpers mirroring `xmm.py`'s: `chandra_base_output_path`, `chandra_product_
 
 *Commit:* `Add chandra.py: configuration, output paths and product discovery`
 
-### Step 3 — the time-resolution record
+### ~~Step 3 — the time-resolution record~~ **Done, `335f747`.**
 
 The `chandra_time_resolution` function described above, its `TimeResolution` dataclass, and
 the `dtf1` reader. Pure Python, no CIAO, no network.
@@ -490,7 +492,7 @@ function and it is the first test to write.
 
 *Commit:* `Say what time resolution a Chandra observation can actually support`
 
-### Step 4 — the archive front end
+### ~~Step 4 — the archive front end~~ **Done, `2cc8199`.**
 
 `chandra_archive_front_end(obsid, config)` → one `Observation`, or `None` when the
 directory holds no level-2 event list. Reads `DETNAM`, `GRATING`, `DATAMODE`, `READMODE`,
@@ -501,7 +503,7 @@ diagnostic.
 
 *Commit:* `Read a Chandra observation off the archive's level-2 products`
 
-### Step 5 — `src/heasarc_retrieve_pipeline/ciao.py`
+### ~~Step 5 — `src/heasarc_retrieve_pipeline/ciao.py`~~ **Done, `9f39121`.**
 
 Mirrors `sas.py`'s public shape; standalone **by decision**, duplicating it a third time.
 
@@ -509,19 +511,35 @@ Mirrors `sas.py`'s public shape; standalone **by decision**, duplicating it a th
 HAS_CIAO      # ASCDS_INSTALL set and `dmlist` on PATH
 CIAO_LOCK     # threading.RLock(), same reasoning as heasoft.HEASOFT_LOCK
 IN_PLACE      # marker class, copied from heasoft.py:259
-run(name, *, produces, log_to=None, env=None, **params)
+run(name, *, produces, log_to=None, capture=False, env=None, cwd=None, **params)
 ciao_environment(obsid, config)   # per-observation PFILES — see the ardlib hazard
 ```
 
 Module docstring says why this duplicates `sas.py` rather than sharing with it, and each
-copied helper carries a one-line pointer to its twin. Extend the AST guard at
-`tests/test_heasoft.py:401` so `ciao.run` also fails CI without `produces=`.
+copied helper carries a one-line pointer to its twin. The `produces=` guard at
+`tests/test_heasoft.py:401` is repeated in `tests/test_ciao.py`, which is where
+`test_sas.py` keeps its copy too — each runner's guard lives beside that runner's
+tests rather than in one list that has to be remembered.
 
 *Tests* (`tests/test_ciao.py`, offline, `subprocess.run` monkeypatched): argv order and
 `k=v` formatting; a `dmcopy` filter expression containing `[`, `]`, `#` and spaces
 survives unchanged; a non-zero return code raises naming the task; a zero return code with
 a missing output raises; `ciao_environment` never mutates `os.environ` and gives two
 OBSIDs two different `PFILES`.
+
+**One deviation, flagged 2026-09-12.** `run` also took `capture` and `cwd`, which the
+signature above did not have. They are carried over from `sas.run` so the two runners
+are the same shape, and Chandra needs both for the reasons XMM did: `dmlist` answers on
+standard output and nowhere else, so `capture` is the only way to read it; and
+`specextract` writes the file names it was *given* into `BACKFILE`, `RESPFILE` and
+`ANCRFILE`, where a FITS header card holds 80 characters, so `cwd` is what lets the
+caller pass short names. Both are tested rather than left as untested spare parts.
+
+Two things not in the plan came out of writing it. `chandra_repro` produces a
+*directory*, so `_check_outputs` had to keep the SAS version's "a directory must exist
+and hold at least one entry" branch rather than only checking files. And `PFILES` needs
+`$ASCDS_INSTALL/contrib/param` on the fallback beside `$ASCDS_INSTALL/param`, because
+the contributed scripts — `chandra_repro` among them — keep their parameters there.
 
 *Commit:* `Add ciao.py: run CIAO tasks with checked outputs and per-observation PFILES`
 
