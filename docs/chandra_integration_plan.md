@@ -61,7 +61,7 @@ ARF and RMF, with the same diagnostics records and HTML page every other mission
 | Refactor | **None.** `ciao.py` is standalone and duplicates `sas.py`'s ~80 lines a third time. `heasoft.py` and `sas.py` are untouched. **Decided 2026-09-12.** |
 | CI | **Offline and stubbed**, as XMM's is. Real-CIAO tests run locally behind a `ciao` marker, as `tests/test_heasoft_tools.py` does for HEASOFT. **Decided 2026-09-12.** |
 | Pile-up | Measure and report. **Never correct.** Same ruling Matteo gave for XMM on 2026-09-08. |
-| Barycentring | HEASOFT `barycorr`, DE430, via the existing `barycenter.barycenter_file`. **Not** CIAO's `axbary`, which defaults to DE405. |
+| Barycentring | CIAO's `axbary`, `refframe=ICRS` (DE405). **Not** HEASOFT `barycorr`, which cannot read Chandra's orbit ephemeris — measured 2026-09-12, see *Step 10*. Chandra is therefore the one mission not on DE430, and the cost of that is **0.377 µs**, also measured. |
 | Spectra from HRC | None. HRC has no usable energy resolution; the report says so rather than silently omitting it. |
 
 ### Decisions still open
@@ -493,10 +493,80 @@ nothing and say so.
 
 ### Step 10 — barycentring
 
-The existing `barycenter.barycenter_file` with `primary/orbitf*_eph1.fits` as `attorb`,
-DE430, at the position asked for. **Not** `axbary`.
+**This step was the plan's one open dependency, and it was settled by measurement on
+2026-09-12. The answer is not the one the plan first assumed.**
 
-*Commit:* `Barycentre Chandra events at the searched position, with DE430`
+#### HEASOFT `barycorr` does not work on Chandra
+
+Run on the real `6298` HRC-I event list with its own `orbitf235397100N001_eph1.fits`, in
+`henv313`. `barycorr` *does* recognise the mission — it starts, loads DE-430, and applies
+a (zero) clock correction — and then dies inside `hdaxbary`:
+
+```
+ERROR: no bracketing sample found for time   235695882.04482999
+ERROR: failed to find valid orbit ephem data for time   235695882.04482999
+barycorr: Invalid Observatory/Spacecraft position vector
+hdaxbary: Error 104 correcting TSTART/TSTOP in HDU 0
+```
+
+**The orbit file is not at fault.** Checked directly: 5 616 rows, strictly monotonic,
+300.0 s median step, no gaps, spanning 235 397 100 – 237 081 600, and the event list's
+`TSTART` of 235 695 882 is bracketed by the samples at 235 695 600 and 235 695 900. Both
+files carry `TIMESYS = 'TT'` and `MJDREF = 50814`. The position magnitude at that sample
+is 125 336 km, consistent with Chandra's apogee, so the units are metres.
+
+Four things were tried and none of them helped:
+
+* naming the extension explicitly — `+1`, and `[ORBITEPHEM]`;
+* rewriting `TELESCOP` from `CHANDRA` to `AXAF`. `AXAF` *does* appear in `hdaxbary`'s
+  string table, which is what suggested it, but the string belongs to the ephemeris code
+  and not to the orbit reader;
+* renaming the columns to the RXTE convention `hdaxbary` advertises — Chandra writes
+  `Time` and `Vx, Vy, Vz`, and the tool's own error text names `{X,Y,Z} {VX,VY,VZ}`;
+* converting the positions from metres to kilometres.
+
+`barycorr` itself contains **no** Chandra branch — `grep -i 'chandra\|axaf'` over the
+script returns nothing. It hands the orbit file straight to `hdaxbary`, whose only orbit
+readers are `xtescorbit`, `nicerscorbit` and `swiftscorbit`. There is no Chandra reader,
+and the fact that `hdaxbary` identifies itself as "axBary" — the tool's Chandra ancestor —
+does not mean the port kept the Chandra path.
+
+#### So: `axbary`, and what that costs
+
+CIAO's `axbary` is the native tool and is what CXC's own thread uses. Its `refframe`
+parameter admits exactly two values: `FK5` (DE200) and `ICRS` (**DE405**). There is no
+DE430. That breaks the pipeline's one-ephemeris rule, so the question is what the break
+is worth — and it is worth almost nothing.
+
+Computed with astropy over this observation's own time span and position, geocentric so
+that only the ephemerides differ:
+
+| | |
+|---|---|
+| Barycentric delay | 492.263555 – 492.290393 s, identical to six decimals in both |
+| **DE430 − DE405** | **+0.377 µs mean** |
+| Variation across the 2-hour observation | **0.0016 µs peak-to-peak** |
+| As a fraction of the HRC spec bin (15.625 µs) | 0.024 |
+| As a fraction of an HRC-I bin (4 370 µs) | 0.000086 |
+
+The difference is a **constant offset, not a drift** — one and a half nanoseconds of
+variation across the whole observation. It therefore cannot distort a pulse profile, a
+period, or a periodogram *within* an observation, at any Chandra time resolution. It
+survives only as an absolute phase offset when Chandra times are combined with DE430
+times from another mission, and 0.377 µs against M82 X-2's 1.37 s spin is 2.7e−7 in
+phase.
+
+**Decision:** use `axbary` with `refframe=ICRS`, record `PLEPHEM`/`refframe` in the
+diagnostics for every observation so the choice is never invisible, and state the 0.377 µs
+in `docs/technical_details.rst` next to the DE430 rule it breaks. Do **not** call
+`barycenter.barycenter_file`; leave it untouched for the missions it serves.
+
+`axbary` does not modify in place, so the existing `barycentered_file_name` still names
+the output. The aspect solution must be barycentred alongside the events and `ASOLFILE`
+updated, per the CXC thread — otherwise a later `specextract` mixes corrected and
+uncorrected times.
+
+*Commit:* `Barycentre Chandra with axbary at the searched position, and record DE405`
 
 ### Step 11 — the reprocessing route
 
@@ -581,14 +651,88 @@ is the shape `HAS_SAS` settled on after `import pysas` proved to be the wrong pr
 
 ---
 
+## Acceptance target: every HRC observation of M82, judged on timing
+
+**Set by Matteo on 2026-09-12**, as the direct counterpart of the XMM acceptance target —
+"every XMM observation of M82 X-2, as a batch" — but **concentrated on the timing side**,
+because that is where Chandra is hard and where this module claims to add something.
+
+The same field, so the two runs are comparable; the other instrument, so the failure modes
+are different.
+
+### What the archive holds
+
+Measured 2026-09-12, a 12-arcminute cone on M82 (148.9685, +69.6797) against
+`chanmaster`: **68 observations, 59 archived** — ACIS-I 27, ACIS-S 25, **HRC-I 14,
+HRC-S 2**. All 16 HRC observations are archived, none proprietary:
+
+| OBSID | Detector | Grating | `data_mode` | Exposure | Target |
+|---|---|---|---|---|---|
+| `1411` | HRC-I | NONE | `DEFAULT` | 54.0 ks | M82 |
+| `8189` | **HRC-S** | NONE | **`S_TIMING`** | 61.6 ks | M82 |
+| `8505` | **HRC-S** | NONE | **`S_TIMING`** | 83.6 ks | M82 |
+| `23460`–`23471` | HRC-I | NONE (`23469` LETG) | `OBS20743` | ~5.2 ks each | M82 X-2 |
+| `26111` | HRC-I | NONE | `OBS20743` | 5.2 ks | M82 X-2 |
+
+Sixteen observations, **266 ks** in total. The split is exactly what the timing function
+has to get right: **two observations that genuinely deliver 15.625 µs** and **fourteen
+that do not**, with the same `TIMEDEL` in all sixteen headers.
+
+Three properties make this a better test than it looks:
+
+* **Thirteen of them point at M82 X-2 by name** — the same source as the XMM batch, and a
+  ULX pulsar with a 1.37 s spin period. So the timing claim is checkable against a real
+  signal rather than only against metadata.
+* **`data_mode` is `OBS20743` for thirteen of them** — a custom mode string, neither
+  `DEFAULT` nor `S_TIMING`. Any implementation that inferred the HRC mode by matching the
+  catalogue's `data_mode` against a list of known strings would fail on thirteen of
+  sixteen. **This is the argument for the `dtf1` veto-ratio discriminator**, which reads a
+  number rather than parsing a name, and it is why that design should not be simplified
+  away later.
+* **`23469` carries LETG on HRC-I**, so the grating-collection path gets exercised on the
+  detector where we produce no spectrum of our own. The right behaviour there is not
+  obvious and the run will settle it.
+
+### What counts as passing
+
+1. **All 16 reduce**, or any that do not are reported with a reason, as the XMM batch's
+   four `NO_SCIENCE_DATA` results were.
+2. **`8189` and `8505` are reported at 15.625 µs; the other fourteen are not.** No
+   observation is reported at the spec resolution on the strength of `TIMEDEL` alone.
+   This is the single assertion the whole timing design exists to support.
+3. **The fourteen carry a measured resolution and a stated reason**, each with its own
+   veto fraction and trigger rate — not a shared constant, and not the plan's nominal
+   "~4 ms".
+4. **All 16 are barycentred**, at the position asked for, with `refframe=ICRS` and DE405
+   recorded in the diagnostics.
+5. **A spot check that the numbers are physical**: the veto fraction should be near 1.0
+   for the two `S_TIMING` observations and well below it for the rest, and the trigger
+   rates should be consistent across the thirteen `OBS20743` pointings of the same field
+   at similar exposure.
+
+**Not** a pass criterion: detecting the 1.37 s pulsation. M82 X-2 is faint, crowded, and
+blended with other sources in the field, and a 5 ks HRC-I pointing may or may not show it.
+If a coherent search on `8189` or `8505` does recover it, that is strong independent
+evidence the barycentring and the time stamps are right, and it should be recorded — but
+a non-detection is not evidence of a pipeline fault and must not be read as one.
+
+### Cost
+
+The three long observations are the bulk. At the HRC ratio measured on `17661` — 88.7 MB
+kept of 264.5 MB, for 29.8 ks — the 266 ks should come to roughly 700–800 MB after the
+filter, against something over 2 GB unfiltered. That is an ordinary overnight batch, not a
+special arrangement.
+
+---
+
 ## Open items, to settle on the first run with CIAO
 
-1. **Does `barycorr` handle Chandra correctly?** The plan assumes HEASOFT's `barycorr`
-   with `orbitf*_eph1.fits` works on Chandra event files and preserves DE430. This has not
-   been run. If it does not, the fallback is `axbary` with `refframe` forced — and then
-   Chandra would be the one mission not on DE430, which needs Matteo's ruling.
-   **Check this before step 10, because it is the only step with no fallback inside the
-   plan.**
+1. ~~**Does `barycorr` handle Chandra correctly?**~~ **Settled 2026-09-12: it does not.**
+   HEASOFT has no Chandra orbit reader, `axbary` is the route, and the DE405 it forces
+   costs a constant 0.377 µs. Full workings in *Step 10*. Nothing here is open any more,
+   but Matteo has not yet seen the 0.377 µs figure — if he wants DE430 regardless, the
+   only remaining route is computing the correction in astropy ourselves, which is real
+   work and needs its own validation.
 2. **The `S_TIMING` threshold.** `hrc_veto_ratio_threshold = 0.99` is chosen from two
    observations, one at 1.000 and one at 0.296. The gap is enormous, so almost any
    threshold works, but the distribution across the ~1 669 HRC-S observations has not been
@@ -719,4 +863,57 @@ curl -s https://cxc.cfa.harvard.edu/conda/ciao/osx-arm64/repodata.json |
   print(sorted({v['name']+' '+v['version'] for v in d.get('packages.conda',{}).values()}))"
 # Expect ciao 4.18.0 among them. The noarch subdir carries caldb_main 4.12.4 and
 # ciao-contrib 4.18.2.
+```
+
+```python
+# 7. The M82 acceptance target: 68 observations in the cone, 16 of them HRC.
+q = """SELECT obsid, detector, grating, data_mode, exposure, status FROM chanmaster
+       WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', 148.9685, 69.6797, 0.2))=1
+       ORDER BY obsid"""
+t = tap.search(q).to_table()
+hrc = t[[str(d).startswith("HRC") for d in t["detector"]]]
+print(len(t), "in cone;", len(hrc), "HRC")
+for r in hrc:
+    print(r["obsid"], r["detector"], r["grating"], r["data_mode"], int(r["exposure"]), r["status"])
+# Expect: 68 in cone; 16 HRC. 8189 and 8505 are HRC-S S_TIMING; 23460-23471 and 26111
+# are HRC-I with data_mode OBS20743 -- a custom string, which is why the mode must be
+# inferred from the dtf1 veto ratio and not by matching data_mode against known names.
+```
+
+```bash
+# 8. HEASOFT barycorr does NOT work on Chandra. Needs the 6298 evt2 and its orbit file,
+#    ungzipped side by side. Run under henv313, per the SAS/HEASOFT recipe.
+export PATH=/Users/meo/mamba/envs/henv313/bin:$PATH
+export CONDA_PREFIX=/Users/meo/mamba/envs/henv313
+. $CONDA_PREFIX/etc/conda/activate.d/heainit.sh
+mkdir -p pfiles && export PFILES="$PWD/pfiles;$HEADAS/syspfiles"
+hdaxbary -i orbitf235397100N001_eph1.fits -f hrcf06298N006_evt2.fits -o out.fits \
+         -ra 272.11834 -dec -36.98337 -ref ICRS
+# Expect: "ERROR: no bracketing sample found for time 235695882.04482999", no output file.
+# The orbit file is fine -- 5616 monotonic rows, 300 s step, no gaps, bracketing the
+# event TSTART. barycorr has no Chandra branch (grep -i 'chandra\|axaf' on it is empty)
+# and hdaxbary's only orbit readers are xtescorbit, nicerscorbit and swiftscorbit.
+```
+
+```python
+# 9. What using axbary's DE405 instead of DE430 costs: 0.377 us, constant.
+from astropy.time import Time
+from astropy.coordinates import SkyCoord, solar_system_ephemeris, EarthLocation
+import astropy.units as u, numpy as np
+
+P = "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/"
+t = Time(
+    50814.0 + np.linspace(235695882.04483, 235703017.07016, 25) / 86400.0, format="mjd", scale="tt"
+)
+src = SkyCoord(272.11834, -36.98337, unit="deg", frame="icrs")
+geo = EarthLocation.from_geocentric(0, 0, 0, unit="m")
+out = {}
+for label, eph in (("DE405", P + "a_old_versions/de405.bsp"), ("DE430", P + "de430.bsp")):
+    with solar_system_ephemeris.set(eph):
+        out[label] = t.light_travel_time(src, kind="barycentric", location=geo).to(u.s).value
+d = (out["DE430"] - out["DE405"]) * 1e6
+print(f"mean {d.mean():+.4f} us, peak-to-peak {np.ptp(d):.4f} us")
+# Expect: mean +0.3769 us, peak-to-peak 0.0016 us. A constant offset, not a drift:
+# 2.4% of one HRC spec bin, and it cannot distort anything within an observation.
+# Note de405.bsp lives under a_old_versions/; astropy's own "de405" name 404s.
 ```
