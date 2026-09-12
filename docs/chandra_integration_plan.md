@@ -648,12 +648,50 @@ record. ACIS Timed Exposure only.
 
 *Commit:* `Measure ACIS pile-up with pileup_map and report it without correcting`
 
-### Step 9 — spectra
+### ~~Step 9 — spectra~~ **Done, see the commit below.**
 
 `specextract` for ACIS imaging, producing source and background spectra with ARF and RMF —
 the direct analogue of XMM's `especget`. For grating observations, **collect** the
 archive's `pha2` and `responses/` set and record them; run nothing. For HRC, produce
 nothing and say so.
+
+**Four things found by running it, all now tested:**
+
+* **`specextract`'s own grouping does nothing.** With `grouptype=NUM_CTS binspec=15` on
+  obsid `5644`, CIAO 4.18.0 returned a spectrum with `GROUPING = 0`, no `GROUPING` column,
+  and no warning of any kind. `dmgroup` called separately does group it — 351 groups from
+  10 577 counts — and carries `BACKFILE`, `RESPFILE` and `ANCRFILE` through untouched. The
+  module therefore asks `specextract` for `grouptype=NONE` and groups in a second call.
+* **`correctpsf=yes` is mandatory here, not optional.** Step 6 sizes the extraction circle
+  *from* the PSF, so it always leaves some of the source outside it. The corrected
+  effective area lands in `<stem>_src.corr.arf` and `ANCRFILE` points at that, not at
+  `.arf`. Without it every fitted normalisation would be low by the encircled-energy
+  fraction.
+* **The output names are `specextract`'s own, and `outroot` is chosen to make them the
+  plan's.** It writes the names it generates into three header cards of two files, so
+  renaming afterwards means keeping those cards in step forever. `outroot = <stem>_src`
+  gives `<stem>_src.pi` exactly as *Output names* asks. The price is `<stem>_src_bkg.pi`
+  for the background, which is ugly and costs nothing.
+* **The grating products keep the archive's names**, against the output-naming rule and on
+  purpose: a `pha2` and its dozen responses are cross-referenced in ways this pipeline did
+  not create and cannot check. The archive's names carry the obsid already.
+
+**One deviation, small and worth a look.** `read_xmm_spectrum` was mission-neutral in
+everything but its name, and Chandra needed the identical function. Rather than write a
+third copy — NuSTAR has `read_spectrum` too — the body moved to
+`utils.read_pha_spectrum`, and `read_xmm_spectrum` and `read_chandra_spectrum` are both
+one-line wrappers on it. No XMM caller changed and the XMM suite is green. NuSTAR's copy
+was left alone; folding it in is a separate job.
+
+**A caveat the report page now carries:** obsid `5644` is `DATAMODE = GRADED`. ACIS sent
+down a grade and a summed pulse height per event and discarded the pixel island, so the
+CTI correction cannot be recomputed and VFAINT background cleaning is unavailable. The
+extraction works and says nothing; `Observation` now carries `data_mode` so that the page
+can. **And in this field the background annulus is not background**: 2.49″–8.3″ around
+M82 X-2 contains M82 X-1, and holds 85 706 counts against the source circle's 10 577.
+Scaled by the `BACKSCAL` ratio of 91 that is ~940 counts under a 10 577-count source, so
+the subtraction is not ruinous — but it is a subtraction of a second bright source, and
+nobody fitting these spectra should find that out for themselves.
 
 *Commit:* `Extract ACIS spectra, collect grating products, and say why HRC has neither`
 

@@ -45,6 +45,7 @@ barycentres anything.
 
 import glob
 import os
+import shutil
 from dataclasses import dataclass
 from itertools import takewhile
 from typing import Optional
@@ -59,6 +60,7 @@ from .utils import (
     intersect_intervals,
     intervals_above_threshold,
     merge_intervals,
+    read_pha_spectrum,
 )
 
 #: The pipeline's defaults for a Chandra run.
@@ -96,6 +98,9 @@ DEFAULT_CONFIG = {
     "hrc_veto_ratio_threshold": 0.99,
     "pileup_percentile": 90.0,
     "pileup_image_pixels": 1024,
+    "spectrum_min_counts": 15,
+    "spectrum_weight": False,
+    "spectrum_correct_psf": True,
     "cc_source_halfwidth_pix": 3,
     "cc_background_pix": (10, 30),
 }
@@ -1170,6 +1175,11 @@ class Observation:
         The archive's ready-made grating products, collected and never re-made.
     caldb_version, ascds_version : str or None
         What the archive's own reduction was made with.
+    data_mode : str or None
+        ``DATAMODE``, as the header spells it. ``FAINT``, ``VFAINT`` and ``GRADED`` for
+        ACIS; ``OBSERVING`` for HRC. It is not the mode in the file stem and is not used
+        to choose anything -- it is carried because ``GRADED`` changes what a spectrum is
+        worth, and the report page should say so rather than leave it to be discovered.
     active_rows : tuple or None
         ``(FIRSTROW, NROWS)`` for ACIS -- the rows of each CCD that were actually clocked
         out. This is the subarray, and it is why obsid ``5644`` reads out every 0.44 s
@@ -1194,6 +1204,7 @@ class Observation:
     grating_responses: tuple = ()
     caldb_version: Optional[str] = None
     ascds_version: Optional[str] = None
+    data_mode: Optional[str] = None
     active_rows: Optional[tuple] = None
 
     @property
@@ -1287,6 +1298,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         grating_responses=tuple(chandra_grating_responses(obsid, config)),
         caldb_version=_keyword(header, "CALDBVER"),
         ascds_version=_keyword(header, "ASCDSVER"),
+        data_mode=_keyword(header, "DATAMODE"),
         active_rows=_active_rows(header),
     )
 
@@ -1306,6 +1318,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
             caldb_current=CURRENT_CALDB_VERSION,
             caldb_is_stale=observation.caldb_is_stale,
             ascds_version=observation.ascds_version,
+            data_mode=observation.data_mode,
             has_dead_time_file=dtf_path is not None,
             n_grating_responses=len(observation.grating_responses),
         )
@@ -3132,3 +3145,336 @@ def chandra_pileup(
         applies=True,
         reason=reason,
     )
+
+
+#: What a Chandra spectrum is worth plotting over, in keV. ACIS is calibrated from about
+#: 0.3 keV and has very little effective area past 8, so a wider band is empty axis.
+#: ``report.spectrum_figure`` falls back on NuSTAR's 3-79 keV without this.
+CHANDRA_SPECTRUM_BAND_KEV = (0.3, 8.0)
+
+
+@dataclass(frozen=True)
+class SpectrumProducts:
+    """
+    The files one observation's spectrum is made of.
+
+    Attributes
+    ----------
+    source, background : str
+        The two spectra. ``BACKSCAL`` holds each region's area, so the ratio the fit needs
+        is in the files rather than in a note somewhere.
+    arf : str
+        Effective area.
+    corrected_arf : str
+        The same, times the fraction of the point spread function the extraction circle
+        actually caught. This -- not ``arf`` -- is what ``ANCRFILE`` points at, because the
+        circle is sized from the PSF and therefore always misses some of the source.
+    rmf : str
+        Redistribution matrix.
+    background_arf, background_rmf : str
+        The background's own responses. ``bkgresp=yes`` makes them; they matter when the
+        background is fitted rather than subtracted.
+    grouped : str
+        The source spectrum binned for fitting, and the file to open in XSPEC: it carries
+        ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, so the rest follow it.
+    """
+
+    source: str
+    background: str
+    arf: str
+    corrected_arf: str
+    rmf: str
+    background_arf: str
+    background_rmf: str
+    grouped: str
+
+
+def chandra_spectrum_route(observation):
+    """
+    Which of the three things this observation's spectrum is.
+
+    Parameters
+    ----------
+    observation : Observation
+
+    Returns
+    -------
+    tuple
+        ``(route, reason)``. ``route`` is ``"specextract"``, ``"collect"`` or ``"none"``;
+        ``reason`` is empty for the first and plain English for the other two.
+    """
+    if observation.grating in ("HETG", "LETG"):
+        return "collect", (
+            f"{observation.grating} is in the beam, so the spectrum is the dispersed one "
+            f"the archive already made. The pha2 and its responses are collected; "
+            f"tgextract is not run and specextract would extract the zeroth order only."
+        )
+    if not observation.detector.startswith("acis"):
+        return "none", (
+            "HRC has almost no energy resolution -- its pulse height says roughly whether "
+            "a photon was soft or hard and no more -- so there is no spectrum to extract. "
+            "An HRC observation is a timing and imaging instrument in this pipeline."
+        )
+    return "specextract", ""
+
+
+def chandra_spectrum_paths(observation, config):
+    """
+    Where one observation's spectral products go, and what they are called.
+
+    The names are ``specextract``'s, and that is deliberate. It builds every output from
+    ``outroot`` and writes those names into the spectrum's ``BACKFILE``, ``RESPFILE`` and
+    ``ANCRFILE``, so renaming afterwards means rewriting three cards in two files and
+    keeping them in step forever. Choosing ``outroot`` so that its own convention lands on
+    the plan's ``<stem>_src.pi`` costs nothing and removes the whole problem. The one
+    oddity it buys is ``_src_bkg.pi`` for the background, which is ugly and correct.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    SpectrumProducts
+        Paths under ``<out_data_path>/<OBSID>/products``.
+    """
+    root = os.path.join(
+        chandra_product_output_path(observation.obsid, config), f"{observation.stem}_src"
+    )
+    return SpectrumProducts(
+        source=f"{root}.pi",
+        background=f"{root}_bkg.pi",
+        arf=f"{root}.arf",
+        corrected_arf=f"{root}.corr.arf",
+        rmf=f"{root}.rmf",
+        background_arf=f"{root}_bkg.arf",
+        background_rmf=f"{root}_bkg.rmf",
+        grouped=f"{root}_grp.pi",
+    )
+
+
+def read_chandra_spectrum(spectrum, rmf):
+    """
+    One spectrum as a drawable curve, for the report page.
+
+    See :func:`heasarc_retrieve_pipeline.utils.read_pha_spectrum`, which does the work and
+    is shared with XMM.
+
+    Parameters
+    ----------
+    spectrum, rmf : str
+
+    Returns
+    -------
+    dict or None
+    """
+    return read_pha_spectrum(spectrum, rmf)
+
+
+#: What ``DATAMODE`` costs a spectrum, where it costs anything. ``GRADED`` is the one that
+#: matters and obsid ``5644`` is in it: ACIS telemetered a grade and a summed pulse height
+#: per event and discarded the 3x3 pixel island, so nothing downstream can recompute the
+#: charge-transfer-inefficiency correction or apply the VFAINT background cleaning. The
+#: spectrum extracts without a word of complaint and is worth less than a ``FAINT`` one,
+#: which is exactly the kind of thing a report page exists to say out loud.
+SPECTRUM_DATA_MODE_CAVEATS = {
+    "GRADED": (
+        "DATAMODE is GRADED: ACIS sent down a grade and a summed pulse height per event "
+        "and threw away the pixel island, so the CTI correction cannot be recomputed and "
+        "the VFAINT background cleaning is not available. The spectrum is real and its "
+        "energy scale is coarser than a FAINT observation's."
+    )
+}
+
+
+def chandra_collect_grating_products(observation, config, rec=None):
+    """
+    Copy the archive's grating spectrum and responses into the products directory.
+
+    Collection, never extraction: by Matteo's ruling of 2026-09-12 the archive's ``pha2``
+    *is* the spectrum of a grating observation and ``tgextract`` is never run. Running
+    ``specextract`` instead would silently extract the zeroth order -- a real spectrum, of
+    the wrong thing.
+
+    **The archive's names are kept**, against the output-naming rule. A ``pha2`` and its
+    responses -- twelve of them for HETG -- are cross-referenced by name and by row order
+    in ways this pipeline did not create and cannot check, so renaming risks breaking a
+    set it did not make. The archive's names carry the obsid already, which is what the
+    rule was for.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        Must contain ``out_data_path``.
+    rec : StepRecord, optional
+
+    Returns
+    -------
+    list of str
+        The copies, spectrum first.
+    """
+    rec = rec or no_record()
+    products = chandra_product_output_path(observation.obsid, config)
+    os.makedirs(products, exist_ok=True)
+
+    sources = [observation.grating_spectrum] if observation.grating_spectrum else []
+    sources += list(observation.grating_responses)
+
+    collected = []
+    for source in sources:
+        destination = os.path.join(products, os.path.basename(source))
+        if os.path.abspath(source) != os.path.abspath(destination):
+            shutil.copy2(source, destination)
+        collected.append(destination)
+
+    _, reason = chandra_spectrum_route(observation)
+    rec.value(
+        spectrum_route="collect",
+        spectrum_reason=reason,
+        grating=observation.grating,
+        n_grating_files=len(collected),
+        grating_files=[os.path.basename(one) for one in collected],
+    )
+    get_logger().info(
+        f"{observation.obsid}: collected {len(collected)} {observation.grating} files; "
+        f"tgextract was not run"
+    )
+    return collected
+
+
+def chandra_calculate_spectra(
+    observation, config, cleaned, regions, rec=None, env=None, log_to=None
+):
+    """
+    Extract the source and background spectra with their responses.
+
+    ``specextract`` is CIAO's metatask and the direct analogue of XMM's ``especget``: it
+    runs ``dmextract`` for both spectra, ``mkarf`` and ``arfcorr`` for the effective area
+    and its aperture correction, and ``mkacisrmf`` for the redistribution matrix, and it
+    writes the names of the companions into the source spectrum's header.
+
+    **Unweighted responses, aperture corrected.** ``weight=no`` makes the response at the
+    source's own position instead of averaging it over the region, which is what a point
+    source wants; ``correctpsf=yes`` then scales the effective area by the fraction of the
+    point spread function the circle actually caught. The second is not optional here,
+    because step 6 sizes that circle *from* the PSF and so always leaves some of the source
+    outside it -- without the correction every fitted normalisation would be low by the
+    encircled-energy fraction.
+
+    **Grouping is a separate ``dmgroup`` call.** ``specextract``'s own ``grouptype`` and
+    ``binspec`` did nothing whatever in CIAO 4.18.0 -- measured on obsid ``5644``, the
+    spectrum came back with ``GROUPING = 0``, no ``GROUPING`` column and no warning of any
+    kind. Calling ``dmgroup`` is explicit, keeps ``BACKFILE``, ``RESPFILE`` and
+    ``ANCRFILE`` on the way through, and does not depend on a contributed script's
+    conventions.
+
+    Parameters
+    ----------
+    observation : Observation
+    config : dict
+        ``spectrum_min_counts``, ``spectrum_weight``, ``spectrum_correct_psf``.
+    cleaned : str or None
+        The screened event list. ``None`` means there is nothing to extract from.
+    regions : ExtractionRegions
+        From :func:`chandra_source_regions`.
+    rec : StepRecord, optional
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    SpectrumProducts or None
+        ``None`` when this observation gets no spectrum of its own -- HRC, a grating
+        observation, or no cleaned list. The record says which.
+    """
+    from . import ciao
+
+    rec = rec or no_record()
+    route, reason = chandra_spectrum_route(observation)
+
+    if route == "collect":
+        chandra_collect_grating_products(observation, config, rec=rec)
+        return None
+    if route == "none" or cleaned is None:
+        reason = reason or "There is no cleaned event list to extract a spectrum from."
+        rec.value(spectrum_route="none", spectrum_reason=reason)
+        get_logger().info(f"{observation.obsid}: no spectrum -- {reason}")
+        return None
+
+    paths = chandra_spectrum_paths(observation, config)
+    products = os.path.dirname(paths.source)
+    os.makedirs(products, exist_ok=True)
+    root = paths.source[: -len(".pi")]
+
+    get_logger().info(
+        f"{observation.obsid}: extracting the spectrum from {regions.source}. "
+        f"mkacisrmf is the slow part of this."
+    )
+    ciao.run(
+        "specextract",
+        produces=[paths.source, paths.background, paths.arf, paths.rmf],
+        env=env,
+        log_to=log_to,
+        infile=cleaned + regions.source,
+        outroot=root,
+        bkgfile=cleaned + regions.background,
+        asp=observation.aspect_solution or "",
+        mskfile=observation.mask_file or "",
+        badpixfile=observation.bad_pixel_file or "",
+        bkgresp="yes",
+        weight="yes" if config["spectrum_weight"] else "no",
+        correctpsf="yes" if config["spectrum_correct_psf"] else "no",
+        grouptype="NONE",
+        binspec="NONE",
+        clobber=True,
+    )
+
+    ciao.run(
+        "dmgroup",
+        produces=paths.grouped,
+        env=env,
+        log_to=log_to,
+        infile=paths.source,
+        outfile=paths.grouped,
+        grouptype="NUM_CTS",
+        grouptypeval=config["spectrum_min_counts"],
+        binspec="",
+        xcolumn="CHANNEL",
+        ycolumn="COUNTS",
+        clobber=True,
+    )
+
+    caveat = SPECTRUM_DATA_MODE_CAVEATS.get((observation.data_mode or "").strip().upper(), "")
+    for which, path in (("src", paths.source), ("bkg", paths.background)):
+        curve = read_chandra_spectrum(path, paths.rmf)
+        if curve is not None:
+            # ``spec_<stem>_<src|bkg>_<...>`` is report.spectrum_figure's convention, and
+            # following it is what makes the spectra draw.
+            rec.array(
+                **{f"spec_{observation.stem}_{which}_{key}": value for key, value in curve.items()}
+            )
+
+    rec.value(
+        spectrum_route="specextract",
+        spectrum_reason="",
+        spectrum_caveat=caveat,
+        data_mode=observation.data_mode,
+        source_spectrum=os.path.basename(paths.source),
+        background_spectrum=os.path.basename(paths.background),
+        arf=os.path.basename(paths.arf),
+        corrected_arf=os.path.basename(paths.corrected_arf),
+        rmf=os.path.basename(paths.rmf),
+        grouped_spectrum=os.path.basename(paths.grouped),
+        source_region=regions.source,
+        background_region=regions.background,
+        min_counts=config["spectrum_min_counts"],
+        weighted=bool(config["spectrum_weight"]),
+        psf_corrected=bool(config["spectrum_correct_psf"]),
+        energy_band=list(CHANDRA_SPECTRUM_BAND_KEV),
+    )
+    if caveat:
+        get_logger().warning(f"{observation.obsid}: {caveat}")
+    return paths

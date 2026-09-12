@@ -2498,3 +2498,417 @@ class TestMeasuringPileUp:
 
         assert found.counts is None
         assert stub_pileup_tasks == []
+
+
+def a_pha_spectrum(path, counts, exposure=1000.0, backfile="none", respfile="x.rmf"):
+    """A PHA spectrum of the shape ``specextract`` writes."""
+    channels = np.arange(1, len(counts) + 1, dtype=np.int16)
+    columns = fits.ColDefs(
+        [
+            fits.Column(name="CHANNEL", format="I", array=channels),
+            fits.Column(name="COUNTS", format="J", array=np.asarray(counts, dtype=np.int32)),
+        ]
+    )
+    hdu = fits.BinTableHDU.from_columns(columns, name="SPECTRUM")
+    hdu.header["EXPOSURE"] = exposure
+    hdu.header["BACKFILE"] = backfile
+    hdu.header["RESPFILE"] = respfile
+    hdu.header["TOTCTS"] = int(np.sum(counts))
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return path
+
+
+def an_rmf_with_ebounds(path, n_channels):
+    """Just the ``EBOUNDS`` an energy scale is read from, at 10 eV per channel."""
+    low = 0.3 + 0.01 * np.arange(n_channels)
+    columns = fits.ColDefs(
+        [
+            fits.Column(name="CHANNEL", format="I", array=np.arange(1, n_channels + 1)),
+            fits.Column(name="E_MIN", format="E", array=low),
+            fits.Column(name="E_MAX", format="E", array=low + 0.01),
+        ]
+    )
+    hdu = fits.BinTableHDU.from_columns(columns, name="EBOUNDS")
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return path
+
+
+class TestWhichSpectrumRouteAnObservationTakes:
+    def _observation(self, tmp_path, **kwargs):
+        fields = dict(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+        )
+        fields.update(kwargs)
+        return chandra.Observation(**fields)
+
+    def test_acis_with_no_grating_is_extracted(self, tmp_path):
+        route, why = chandra.chandra_spectrum_route(self._observation(tmp_path))
+
+        assert route == "specextract"
+        assert why == ""
+
+    def test_a_grating_observation_is_collected_and_never_re_extracted(self, tmp_path):
+        """Matteo's ruling of 2026-09-12: the archive's ``pha2`` *is* the spectrum, and
+        ``tgextract`` is never run."""
+        route, why = chandra.chandra_spectrum_route(
+            self._observation(tmp_path, grating="HETG", mode="hetg")
+        )
+
+        assert route == "collect"
+        assert "HETG" in why
+
+    def test_hrc_has_no_useful_spectrum_and_says_so(self, tmp_path):
+        route, why = chandra.chandra_spectrum_route(
+            self._observation(
+                tmp_path,
+                detector="hrcs",
+                mode="imaging",
+                chips=(),
+                time_resolution=chandra.TimeResolution(1.5625e-05, "hrc_imaging", ""),
+            )
+        )
+
+        assert route == "none"
+        assert "energy resolution" in why
+
+    def test_continuous_clocking_is_still_extracted(self, tmp_path):
+        """One spatial dimension is gone, but the energies are not, and the strips in
+        step 6 are exactly the source and background ``specextract`` needs."""
+        route, why = chandra.chandra_spectrum_route(
+            self._observation(
+                tmp_path,
+                mode="cc",
+                time_resolution=chandra.TimeResolution(0.00285, "acis_continuous_clocking", ""),
+            )
+        )
+
+        assert route == "specextract"
+
+
+class TestWhatTheSpectraAreCalled:
+    def _observation(self, tmp_path):
+        return chandra.Observation(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+        )
+
+    def test_the_names_are_specextracts_own_so_that_nothing_has_to_be_renamed(self, tmp_path):
+        """
+        ``specextract`` writes its own names from ``outroot`` and writes those names into
+        ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``. Renaming afterwards would mean
+        rewriting three header cards in two files to match -- so the stem is chosen to
+        make ``specextract``'s own names the ones the plan asks for.
+        """
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path)
+
+        paths = chandra.chandra_spectrum_paths(self._observation(tmp_path), config)
+
+        assert os.path.basename(paths.source) == "chandra05644_aciss_timed_src.pi"
+        assert os.path.basename(paths.background) == "chandra05644_aciss_timed_src_bkg.pi"
+        assert os.path.basename(paths.arf) == "chandra05644_aciss_timed_src.arf"
+        assert os.path.basename(paths.rmf) == "chandra05644_aciss_timed_src.rmf"
+        assert os.path.basename(paths.corrected_arf) == "chandra05644_aciss_timed_src.corr.arf"
+        assert os.path.basename(paths.grouped) == "chandra05644_aciss_timed_src_grp.pi"
+
+    def test_every_name_fits_in_a_fits_header_card(self, tmp_path):
+        """80 characters is the limit, and these names are written into other files."""
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path)
+
+        paths = chandra.chandra_spectrum_paths(self._observation(tmp_path), config)
+
+        for path in vars(paths).values():
+            assert len(os.path.basename(path)) < 60
+
+
+class TestReadingASpectrumBack:
+    def test_the_energy_scale_comes_from_the_response(self, tmp_path):
+        spectrum = a_pha_spectrum(str(tmp_path / "src.pi"), [10, 20, 30], exposure=100.0)
+        rmf = an_rmf_with_ebounds(str(tmp_path / "src.rmf"), 3)
+
+        found = chandra.read_chandra_spectrum(spectrum, rmf)
+
+        assert found["energy"] == pytest.approx([0.305, 0.315, 0.325])
+        assert found["rate"] == pytest.approx([10.0, 20.0, 30.0], rel=1e-4)
+
+    def test_a_spectrum_that_cannot_be_drawn_is_not_a_failed_extraction(self, tmp_path):
+        assert chandra.read_chandra_spectrum(str(tmp_path / "gone.pi"), str(tmp_path)) is None
+
+
+@pytest.fixture
+def stub_specextract(monkeypatch):
+    """A ``specextract`` that writes the seven files it really writes, and a ``dmgroup``
+    that copies its input."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "specextract":
+            root = kwargs["outroot"]
+            an_rmf_with_ebounds(f"{root}.rmf", 4)
+            an_rmf_with_ebounds(f"{root}_bkg.rmf", 4)
+            for suffix in (".arf", ".corr.arf", "_bkg.arf"):
+                an_rmf_with_ebounds(f"{root}{suffix}", 4)
+            a_pha_spectrum(f"{root}.pi", [4, 3, 2, 1], respfile=f"{os.path.basename(root)}.rmf")
+            a_pha_spectrum(f"{root}_bkg.pi", [1, 1, 1, 1])
+        if name == "dmgroup":
+            a_pha_spectrum(kwargs["outfile"], [4, 3, 2, 1])
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestExtractingAnAcisSpectrum:
+    def _observation(self, tmp_path, **kwargs):
+        fields = dict(
+            obsid="5644",
+            detector="aciss",
+            grating="NONE",
+            mode="timed",
+            time_resolution=chandra.TimeResolution(0.44104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+            aspect_solution=str(tmp_path / "asol1.fits"),
+            bad_pixel_file=str(tmp_path / "bpix1.fits"),
+            mask_file=str(tmp_path / "msk1.fits"),
+            data_mode="FAINT",
+        )
+        fields.update(kwargs)
+        return chandra.Observation(**fields)
+
+    def _config(self, tmp_path):
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path / "out")
+        return config
+
+    def _regions(self):
+        return chandra.ExtractionRegions(
+            source="[sky=circle(4100,4131,1.69)]",
+            background="[sky=annulus(4100,4131,5.06,16.87)]",
+            radius_arcsec=0.83,
+        )
+
+    def test_the_source_and_background_are_the_regions_step_six_chose(
+        self, tmp_path, stub_specextract
+    ):
+        chandra.chandra_calculate_spectra(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._regions(),
+        )
+
+        call = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        assert call["infile"].endswith("[sky=circle(4100,4131,1.69)]")
+        assert call["bkgfile"].endswith("[sky=annulus(4100,4131,5.06,16.87)]")
+
+    def test_the_responses_are_unweighted_and_aperture_corrected(self, tmp_path, stub_specextract):
+        """
+        A point source wants ``weight=no``, which makes the response at the source's own
+        position rather than averaged over the region. And because the circle is sized
+        from the PSF it always misses some of the source, so ``correctpsf=yes`` is what
+        makes the normalisation of a fit mean anything.
+        """
+        chandra.chandra_calculate_spectra(
+            self._observation(tmp_path),
+            self._config(tmp_path),
+            str(tmp_path / "cl.evt"),
+            self._regions(),
+        )
+
+        call = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        assert call["weight"] == "no"
+        assert call["correctpsf"] == "yes"
+
+    def test_the_companion_files_are_handed_over(self, tmp_path, stub_specextract):
+        observation = self._observation(tmp_path)
+
+        chandra.chandra_calculate_spectra(
+            observation, self._config(tmp_path), str(tmp_path / "cl.evt"), self._regions()
+        )
+
+        call = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        assert call["asp"] == observation.aspect_solution
+        assert call["mskfile"] == observation.mask_file
+        assert call["badpixfile"] == observation.bad_pixel_file
+
+    def test_grouping_is_a_separate_call_and_not_specextracts(self, tmp_path, stub_specextract):
+        """
+        ``specextract``'s own ``grouptype``/``binspec`` did nothing at all in CIAO 4.18.0
+        -- the spectrum came back with ``GROUPING = 0`` and no ``GROUPING`` column, with
+        no warning. ``dmgroup`` called separately does the job, keeps ``BACKFILE``,
+        ``RESPFILE`` and ``ANCRFILE``, and does not depend on a script's conventions.
+        """
+        config = self._config(tmp_path)
+        chandra.chandra_calculate_spectra(
+            self._observation(tmp_path), config, str(tmp_path / "cl.evt"), self._regions()
+        )
+
+        extract = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        group = [one for one in stub_specextract if one[0] == "dmgroup"][0][1]
+        assert extract["grouptype"] == "NONE"
+        assert group["grouptypeval"] == config["spectrum_min_counts"]
+        assert group["outfile"].endswith("_src_grp.pi")
+
+    def test_what_it_returns_and_records(self, tmp_path, stub_specextract):
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "spectra") as rec:
+            found = chandra.chandra_calculate_spectra(
+                self._observation(tmp_path),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*spectra*.json")).read_text())["values"]
+        assert os.path.basename(found.grouped) == "chandra05644_aciss_timed_src_grp.pi"
+        assert values["source_spectrum"] == "chandra05644_aciss_timed_src.pi"
+        assert values["grouped_spectrum"] == "chandra05644_aciss_timed_src_grp.pi"
+        assert values["energy_band"] == list(chandra.CHANDRA_SPECTRUM_BAND_KEV)
+        assert values["min_counts"] == 15
+
+    def test_a_graded_observation_says_what_that_costs(self, tmp_path, stub_specextract):
+        """
+        Obsid ``5644`` is ``DATAMODE = GRADED``: ACIS telemetered a grade and a summed
+        pulse height per event and threw the pixel values away. The spectrum extracts
+        without complaint, and it is worth less than a ``FAINT`` one -- no CTI correction
+        can be recomputed and no VFAINT background cleaning is possible. Saying so on the
+        page is the whole of this pipeline's job here.
+        """
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "spectra") as rec:
+            chandra.chandra_calculate_spectra(
+                self._observation(tmp_path, data_mode="GRADED"),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*spectra*.json")).read_text())["values"]
+        assert values["data_mode"] == "GRADED"
+        assert "GRADED" in values["spectrum_caveat"]
+
+    def test_a_faint_observation_has_no_caveat(self, tmp_path, stub_specextract):
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "spectra") as rec:
+            chandra.chandra_calculate_spectra(
+                self._observation(tmp_path),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*spectra*.json")).read_text())["values"]
+        assert values["spectrum_caveat"] == ""
+
+    def test_hrc_extracts_nothing_and_says_why(self, tmp_path, stub_specextract):
+        observation = self._observation(
+            tmp_path,
+            detector="hrcs",
+            mode="imaging",
+            chips=(),
+            time_resolution=chandra.TimeResolution(1.5625e-05, "hrc_imaging", ""),
+            data_mode="OBSERVING",
+        )
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "spectra") as rec:
+            found = chandra.chandra_calculate_spectra(
+                observation,
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._regions(),
+                rec=rec,
+            )
+
+        values = json.loads(next(directory.glob("*spectra*.json")).read_text())["values"]
+        assert found is None
+        assert "energy resolution" in values["spectrum_reason"]
+        assert stub_specextract == []
+
+    def test_with_no_cleaned_list_nothing_is_extracted(self, tmp_path, stub_specextract):
+        found = chandra.chandra_calculate_spectra(
+            self._observation(tmp_path), self._config(tmp_path), None, self._regions()
+        )
+
+        assert found is None
+        assert stub_specextract == []
+
+
+class TestCollectingTheGratingProducts:
+    def _observation(self, tmp_path):
+        archive = tmp_path / "archive"
+        archive.mkdir()
+        pha2 = archive / "acisf02749N004_pha2.fits.gz"
+        pha2.write_bytes(b"spectrum")
+        responses = [archive / "acisf02749N004HEG_-1_arf2.fits.gz"]
+        responses[0].write_bytes(b"response")
+        return chandra.Observation(
+            obsid="2749",
+            detector="aciss",
+            grating="HETG",
+            mode="hetg",
+            time_resolution=chandra.TimeResolution(2.54104, "acis_frame_time", ""),
+            chips=(7,),
+            event_list=str(tmp_path / "evt2.fits"),
+            grating_spectrum=str(pha2),
+            grating_responses=tuple(str(one) for one in responses),
+        )
+
+    def test_the_archives_own_files_are_copied_and_nothing_is_run(self, tmp_path):
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path / "out")
+
+        found = chandra.chandra_collect_grating_products(self._observation(tmp_path), config)
+
+        assert [os.path.basename(one) for one in found] == [
+            "acisf02749N004_pha2.fits.gz",
+            "acisf02749N004HEG_-1_arf2.fits.gz",
+        ]
+        assert all(os.path.exists(one) for one in found)
+
+    def test_the_archives_names_are_kept(self, tmp_path):
+        """
+        Against the output-naming rule, and on purpose. A ``pha2`` and its dozen responses
+        are cross-referenced by name and by order in ways this pipeline does not control,
+        so renaming them risks breaking a set it did not make. The archive's names already
+        carry the obsid, which is what the rule is for.
+        """
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path / "out")
+
+        found = chandra.chandra_collect_grating_products(self._observation(tmp_path), config)
+
+        assert all("02749" in os.path.basename(one) for one in found)
+
+    def test_what_it_records(self, tmp_path):
+        config = dict(chandra.DEFAULT_CONFIG)
+        config["out_data_path"] = str(tmp_path / "out")
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "2749", "spectra") as rec:
+            chandra.chandra_collect_grating_products(self._observation(tmp_path), config, rec=rec)
+
+        values = json.loads(next(directory.glob("*spectra*.json")).read_text())["values"]
+        assert values["grating"] == "HETG"
+        assert values["n_grating_files"] == 2
+        assert "tgextract" in values["spectrum_reason"]

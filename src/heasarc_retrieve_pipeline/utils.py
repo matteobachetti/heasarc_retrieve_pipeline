@@ -29,6 +29,7 @@ __all__ = [
     "gti_to_array",
     "intersect_intervals",
     "intervals_above_threshold",
+    "read_pha_spectrum",
     "intervals_removed",
     "log_version",
     "merge_intervals",
@@ -1547,3 +1548,77 @@ def record_skipped_input(obsid, config, item, reason):
                     os.unlink(temporary)
 
     return skipped
+
+
+def read_pha_spectrum(spectrum, rmf):
+    """
+    One spectrum as a drawable curve, with its energy scale taken from its response.
+
+    The energy scale comes from the response rather than from a hardcoded per-mission
+    relation: the ``EBOUNDS`` extension of an OGIP RMF says what each channel is worth,
+    which is exact, mission-neutral, and survives a change of spectral binning. It lived
+    in ``xmm.py`` until Chandra wanted the same thing.
+
+    This is for looking at, not for fitting. The uncertainty is Poisson on the counts,
+    which is right for an ungrouped spectrum and an underestimate for a grouped one, so it
+    is the ungrouped spectrum that a reduction should record rather than the grouped one
+    it also writes.
+
+    Parameters
+    ----------
+    spectrum : str
+        A PHA spectrum, carrying ``CHANNEL`` and either ``COUNTS`` or ``RATE``.
+    rmf : str
+        A response with an ``EBOUNDS`` extension.
+
+    Returns
+    -------
+    dict or None
+        ``energy`` (keV), ``rate`` (counts/s/keV) and ``rate_err``, or ``None`` if either
+        file is missing or does not hold what this needs. A diagnostic that cannot be
+        drawn is not a failed extraction.
+    """
+    from astropy.io import fits
+
+    logger = get_logger()
+    try:
+        with fits.open(rmf) as hdul:
+            bounds = hdul["EBOUNDS"].data
+            edges = {
+                int(channel): (float(low), float(high))
+                for channel, low, high in zip(bounds["CHANNEL"], bounds["E_MIN"], bounds["E_MAX"])
+            }
+
+        with fits.open(spectrum) as hdul:
+            data = hdul["SPECTRUM"].data
+            header = hdul["SPECTRUM"].header
+            columns = {name.upper() for name in data.columns.names}
+            exposure = float(header.get("EXPOSURE") or header.get("ONTIME") or 1.0)
+            if exposure <= 0:
+                exposure = 1.0
+            if "COUNTS" in columns:
+                counts = np.asarray(data["COUNTS"], dtype=float)
+            elif "RATE" in columns:
+                counts = np.asarray(data["RATE"], dtype=float) * exposure
+            else:
+                return None
+            channels = np.asarray(data["CHANNEL"], dtype=int)
+    except (OSError, KeyError, AttributeError) as error:
+        logger.warning(f"Could not read the spectrum {spectrum}: {error}")
+        return None
+
+    # Matched on channel number, not on row order: a spectrum need not start at channel
+    # zero, and a response may describe channels the spectrum does not carry.
+    described = np.array([channel in edges for channel in channels])
+    channels, counts = channels[described], counts[described]
+    if channels.size == 0:
+        return None
+    low = np.array([edges[channel][0] for channel in channels])
+    high = np.array([edges[channel][1] for channel in channels])
+    width = np.where(high > low, high - low, 1.0)
+
+    return dict(
+        energy=0.5 * (low + high),
+        rate=counts / exposure / width,
+        rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
+    )

@@ -62,6 +62,7 @@ from .utils import (
     good_intervals,
     intervals_above_threshold,
     intervals_removed,
+    read_pha_spectrum,
     tool_log_file,
 )
 
@@ -2691,17 +2692,12 @@ def xmm_calculate_spectra(
 
 def read_xmm_spectrum(spectrum, rmf):
     """
-    One spectrum as a drawable curve, with its energy scale taken from its response.
+    One exposure's spectrum as a drawable curve.
 
-    NuSTAR's equivalent converts channel to energy with that mission's linear relation.
-    XMM has no such number to hardcode and needs none: the ``EBOUNDS`` extension of the
-    RMF ``especget`` just produced says what each channel is worth, which is exact and
-    survives a change of spectral binning.
-
-    This is for looking at, not for fitting. The uncertainty is Poisson on the counts,
-    which is right for an ungrouped spectrum and an underestimate for a grouped one, so it
-    is the ungrouped ``_src.pi`` that the reduction records rather than the ``_grp.pi``
-    it also writes.
+    A thin wrapper on :func:`heasarc_retrieve_pipeline.utils.read_pha_spectrum`, which is
+    where this used to live in full. Nothing about it was ever XMM-specific -- the
+    ``EBOUNDS`` extension of an OGIP response says what each channel is worth for any
+    mission -- and Chandra needed the same thing, so the body moved and the name stayed.
 
     Parameters
     ----------
@@ -2713,54 +2709,8 @@ def read_xmm_spectrum(spectrum, rmf):
     Returns
     -------
     dict or None
-        ``energy`` (keV), ``rate`` (counts/s/keV) and ``rate_err``, or ``None`` if either
-        file is missing or does not hold what this needs. A diagnostic that cannot be
-        drawn is not a failed extraction.
     """
-    from astropy.io import fits
-
-    logger = get_logger()
-    try:
-        with fits.open(rmf) as hdul:
-            bounds = hdul["EBOUNDS"].data
-            edges = {
-                int(channel): (float(low), float(high))
-                for channel, low, high in zip(bounds["CHANNEL"], bounds["E_MIN"], bounds["E_MAX"])
-            }
-
-        with fits.open(spectrum) as hdul:
-            data = hdul["SPECTRUM"].data
-            header = hdul["SPECTRUM"].header
-            columns = {name.upper() for name in data.columns.names}
-            exposure = float(header.get("EXPOSURE") or header.get("ONTIME") or 1.0)
-            if exposure <= 0:
-                exposure = 1.0
-            if "COUNTS" in columns:
-                counts = np.asarray(data["COUNTS"], dtype=float)
-            elif "RATE" in columns:
-                counts = np.asarray(data["RATE"], dtype=float) * exposure
-            else:
-                return None
-            channels = np.asarray(data["CHANNEL"], dtype=int)
-    except (OSError, KeyError, AttributeError) as error:
-        logger.warning(f"Could not read the spectrum {spectrum}: {error}")
-        return None
-
-    # Matched on channel number, not on row order: a spectrum need not start at channel
-    # zero, and a response may describe channels the spectrum does not carry.
-    described = np.array([channel in edges for channel in channels])
-    channels, counts = channels[described], counts[described]
-    if channels.size == 0:
-        return None
-    low = np.array([edges[channel][0] for channel in channels])
-    high = np.array([edges[channel][1] for channel in channels])
-    width = np.where(high > low, high - low, 1.0)
-
-    return dict(
-        energy=0.5 * (low + high),
-        rate=counts / exposure / width,
-        rate_err=np.sqrt(np.maximum(counts, 0)) / exposure / width,
-    )
+    return read_pha_spectrum(spectrum, rmf)
 
 
 def _time_system(event_list):
