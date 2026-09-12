@@ -25,6 +25,43 @@
 > Read `docs/xmm_integration_plan.md` first. This plan is deliberately the same shape, and
 > most of what it does not explain is explained there.
 
+## Where this stands
+
+**Last updated 2026-09-12, after step 5.** Branch `various_fixes`, everything unpushed.
+
+| | |
+|---|---|
+| Landed | Steps 1–5, five commits, `5377cfd` → `9f39121` |
+| Blocked | Steps 6–13, on a CIAO installation that does not exist on this machine |
+| Code | `src/heasarc_retrieve_pipeline/chandra.py`, `src/heasarc_retrieve_pipeline/ciao.py` |
+| Tests | `tests/test_chandra.py` (140), `tests/test_ciao.py` (36), all offline |
+| Suite | 1444 passed, 33 skipped, all green. The 15 `test_nustar.py` failures that stood during this work were a shared Prefect database, fixed separately in `23ab765` |
+
+What exists and works, verified against the live archive on 2026-09-12 with obsid `6298`
+downloaded through the pipeline's own filter (15.4 MB, 9 files, the numbers this plan
+predicts):
+
+* `chandra_download_filter` — the `archive` and `repro` routes.
+* Naming: `chandra06298_hrci_imaging`. Archive *directories* use the unpadded OBSID and
+  archive *file names* pad to five digits; both spellings are handled.
+* `chandra_detector` — from `SIM_Z`, not `DETNAM`. See *Which ACIS configuration an
+  observation is*.
+* `chandra_time_resolution` — obsid `6298` comes out at **4371.002 µs** where every header
+  in the file claims 16 µs, and obsid `17661` at **15.625 µs**. Both branches confirmed
+  against the real `dtf1` files.
+* `chandra_archive_front_end` — one `Observation`, all seven companion files found, and
+  `caldb 4.9.5` correctly flagged stale against `4.12.4`.
+* `ciao.py` — argument vector, return code, output check, and a private `PFILES` per
+  observation. Nothing in it has ever spoken to a real CIAO.
+
+**The first thing to do on a machine with CIAO** is not step 6. It is to run
+`chandra_archive_front_end` on obsid `5644` and then the known-answer test in *Acceptance
+target* — the M82 X-2 pulsation at 1.3453202 s, which was recovered by hand before any of
+this code existed. If that still comes out, the front end is trustworthy and step 6 can
+start.
+
+---
+
 ## Context
 
 The pipeline reduces HEASARC data automatically: query a master catalogue, download an
@@ -737,8 +774,23 @@ This also means, unlike SAS, a real-CIAO CI job would be *possible*. Matteo rule
 2026-09-12 that CI stays offline and stubbed anyway; revisit only if the module's coverage
 turns out to need it.
 
-`HAS_CIAO` should probe `ASCDS_INSTALL` in the environment and `dmlist` on `PATH`, which
-is the shape `HAS_SAS` settled on after `import pysas` proved to be the wrong probe.
+`HAS_CIAO` probes `ASCDS_INSTALL` in the environment and `dmlist` on `PATH`, which is the
+shape `HAS_SAS` settled on after `import pysas` proved to be the wrong probe. It is
+resolved once, at import, so a session that installs CIAO *after* importing the package
+has to restart the interpreter.
+
+So the install, when the 2.3 GB is available:
+
+```bash
+micromamba create -n ciao -c https://cxc.cfa.harvard.edu/conda/ciao -c conda-forge \
+    ciao ciao-contrib caldb_main sherpa
+```
+
+and the check that it reached the process, which is what every step from 6 on assumes:
+
+```bash
+python -c "from heasarc_retrieve_pipeline import ciao; print(ciao.HAS_CIAO)"
+```
 
 ---
 
