@@ -45,6 +45,7 @@ barycentres anything.
 
 import copy
 import glob
+import gzip
 import os
 import re
 import shutil
@@ -3274,6 +3275,54 @@ def chandra_barycentered_source_events(
     return output
 
 
+#: How hard :func:`chandra_compress_barycentered_events` compresses. Measured on obsid
+#: ``8505``'s 319 MB list: level 1 leaves 244 MB in 6 s, level 6 leaves 240 MB in 15 s.
+#: HRC event lists are mostly incompressible numbers, so the extra effort buys nothing.
+BARYCENTRED_GZIP_LEVEL = 1
+
+
+def chandra_compress_barycentered_events(barycentered, rec=None):
+    """
+    Gzip the whole-field barycentred list, once the source has been cut out of it.
+
+    Nothing in the reduction reads it again: the timing analysis reads the source cut, and
+    every other step reads the cleaned list. It is kept rather than deleted because a
+    different region -- another source in the field -- can still be cut from it, and
+    CIAO reads a gzipped event list directly.
+
+    The file is written under a temporary name and renamed at the end, so an interrupted
+    run cannot leave a truncated ``.gz`` that looks finished.
+
+    Parameters
+    ----------
+    barycentered : str or None
+        From :func:`chandra_barycenter`. ``None`` means there is nothing to compress.
+    rec : StepRecord, optional
+        The ``barycenter`` step's record, whose ``barycentered_file`` is renamed to match.
+
+    Returns
+    -------
+    str or None
+        The compressed file.
+    """
+    if barycentered is None:
+        return None
+
+    rec = rec or no_record()
+    output = barycentered + ".gz"
+    partial = output + ".part"
+    with (
+        open(barycentered, "rb") as source,
+        gzip.open(partial, "wb", compresslevel=BARYCENTRED_GZIP_LEVEL) as target,
+    ):
+        shutil.copyfileobj(source, target, length=1 << 20)
+    os.replace(partial, output)
+    os.remove(barycentered)
+
+    rec.value(barycentered_file=os.path.basename(output))
+    return output
+
+
 #: The CXC's conversion from counts per ACIS frame to pile-up fraction, from
 #: `ahelp pileup_map <https://cxc.harvard.edu/ciao/ahelp/pileup_map.html>`_, with the
 #: origin added because an empty pixel is not piled. The three tabulated points lie
@@ -4119,6 +4168,7 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
                 env=env,
                 log_to=tool_log_file("dmcopy_src_bary", obsid, config),
             )
+            chandra_compress_barycentered_events(barycentered, rec=rec)
 
     with record_step(diagnostics, obsid, "calculate_spectra") as rec:
         chandra_calculate_spectra(

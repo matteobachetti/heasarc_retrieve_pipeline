@@ -2380,6 +2380,47 @@ class TestBarycentringWithAxbary:
         assert stub_axbary == []
 
 
+class TestCompressingTheBarycentredList:
+    """
+    The whole-field barycentred list is read once, to cut the source out of it, and kept
+    compressed after that. HRC event lists do not compress well -- obsid ``8505``'s went
+    from 319 to 244 MB -- but a batch of them is still most of the disk a run takes.
+    """
+
+    def test_the_compressed_file_holds_the_same_events(self, tmp_path):
+        original = a_barycentred_file(tmp_path / "cl_bary.evt")
+        with fits.open(original) as hdulist:
+            expected = hdulist["EVENTS"].data["time"].copy()
+
+        found = chandra.chandra_compress_barycentered_events(original)
+
+        assert found == original + ".gz"
+        with fits.open(found) as hdulist:
+            np.testing.assert_array_equal(hdulist["EVENTS"].data["time"], expected)
+            assert hdulist["EVENTS"].header["TIMESYS"] == "TDB"
+
+    def test_only_the_compressed_file_is_left(self, tmp_path):
+        original = a_barycentred_file(tmp_path / "cl_bary.evt")
+
+        chandra.chandra_compress_barycentered_events(original)
+
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["cl_bary.evt.gz"]
+
+    def test_the_record_names_the_file_that_is_left(self, tmp_path):
+        directory = tmp_path / "diagnostics"
+        original = a_barycentred_file(tmp_path / "cl_bary.evt")
+
+        with record_step(str(directory), "5644", "barycenter") as rec:
+            rec.value(barycentered_file="cl_bary.evt")
+            chandra.chandra_compress_barycentered_events(original, rec=rec)
+
+        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
+        assert values["barycentered_file"] == "cl_bary.evt.gz"
+
+    def test_with_nothing_corrected_there_is_nothing_to_compress(self):
+        assert chandra.chandra_compress_barycentered_events(None) is None
+
+
 def a_pileup_map(path, values, x0=4000, y0=4500):
     """
     A counts-per-frame image the way ``pileup_map`` writes one.
@@ -3689,6 +3730,7 @@ def stub_every_step(monkeypatch):
         ("chandra_pileup", None),
         ("chandra_barycenter", "cl_bary.evt"),
         ("chandra_barycentered_source_events", "src_bary.evt"),
+        ("chandra_compress_barycentered_events", "cl_bary.evt.gz"),
         ("chandra_calculate_spectra", None),
     ):
         monkeypatch.setattr(chandra, name, recording(name, returns))
@@ -3725,6 +3767,7 @@ class TestReducingAnObservation:
             "chandra_pileup",
             "chandra_barycenter",
             "chandra_barycentered_source_events",
+            "chandra_compress_barycentered_events",
             "chandra_calculate_spectra",
         ]
 
@@ -3748,6 +3791,14 @@ class TestReducingAnObservation:
             c for c in stub_every_step if c[0] == "chandra_barycentered_source_events"
         ]
         assert args[2] == "cl_bary.evt"
+
+    def test_it_is_the_barycentred_list_that_is_compressed(self, tmp_path, stub_every_step):
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        ((_, args, _),) = [
+            c for c in stub_every_step if c[0] == "chandra_compress_barycentered_events"
+        ]
+        assert args[0] == "cl_bary.evt"
 
     def test_every_later_step_reads_the_cleaned_list(self, tmp_path, stub_every_step):
         self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
@@ -3777,6 +3828,7 @@ class TestReducingAnObservation:
         self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
 
         assert "chandra_barycentered_source_events" not in self.steps(stub_every_step)
+        assert "chandra_compress_barycentered_events" not in self.steps(stub_every_step)
         assert "chandra_calculate_spectra" in self.steps(stub_every_step)
 
     def test_an_observation_with_nothing_to_reduce_is_not_a_failure(
