@@ -1,16 +1,13 @@
 # Adding Chandra (ACIS + HRC) to `heasarc_retrieve_pipeline`
 
 > **Handoff document.** Written 2026-09-12 against `heasarc_retrieve_pipeline` on branch
-> `various_fixes` (HEAD `1153f58`). **Steps 1 to 5 have landed**; steps 6 onwards are
-> still the agreed design rather than a report on work done. It is written to be picked up
-> cold, by a person or a session with no memory of the conversation that produced it.
-> Every number in it was measured against the live HEASARC archive, the live CXC conda
-> channel, or real Chandra data files on 2026-09-12; the snippets under *Reproducing the
-> archive facts* re-derive them, so none of it has to be taken on trust.
->
-> **Steps 6 onwards need CIAO, which is not installed on Matteo's machine.** That is
-> where this stops: everything doable without a CIAO installation is in, and step 6 is
-> the first line that cannot be written honestly without one.
+> `various_fixes` (HEAD `1153f58`). **All thirteen steps have landed**, and the permanent
+> record of what they found is now *Chandra / ACIS and HRC* in
+> `docs/technical_details.rst`. It is written to be picked up cold, by a person or a
+> session with no memory of the conversation that produced it. Every number in it was
+> measured against the live HEASARC archive, the live CXC conda channel, or real Chandra
+> data files on 2026-09-12; the snippets under *Reproducing the archive facts* re-derive
+> them, so none of it has to be taken on trust.
 >
 > Decisions marked **decided** were made by Matteo and should not be relitigated without
 > him. Items under *Open items* are genuinely unresolved and need a machine with CIAO.
@@ -27,15 +24,15 @@
 
 ## Where this stands
 
-**Last updated 2026-09-12, after step 12.** Branch `various_fixes`,
+**Last updated 2026-09-12, after step 13.** Branch `various_fixes`,
 everything unpushed.
 
 | | |
 |---|---|
-| Landed | Steps 1–12, thirteen commits, `5377cfd` → the step 12 commit |
-| Left | Step 13, then an end-to-end batch run |
+| Landed | Steps 1–13, `5377cfd` → the commit after `7fabc2d` |
+| Left | An end-to-end batch run through `core`, then delete this file |
 | Code | `src/heasarc_retrieve_pipeline/chandra.py`, `src/heasarc_retrieve_pipeline/ciao.py` |
-| Tests | `tests/test_chandra.py` (296 + 22 doctests), `tests/test_ciao.py` (41), all offline; 1616 in the whole suite |
+| Tests | `tests/test_chandra.py` (303 + 22 doctests), `tests/test_ciao.py` (41), offline; `tests/test_ciao_tools.py` (9, real CIAO, `ciao` marker); whole offline suite 1718 passed, 36 skipped |
 | CIAO | 4.18.0 + CALDB 4.12.4 in the `ciao` micromamba environment, driven by `subprocess` from `py313-x64` — the pipeline never enters CIAO's Python |
 
 **The acceptance test passes on both verification observations.** Run through the module end
@@ -889,7 +886,7 @@ genuinely differ.
 
 *Commit:* `Add the chandra_repro route behind products="repro"`
 
-### ~~Step 12 — wire it in~~ **Done, see the commit below.**
+### ~~Step 12 — wire it in~~ **Done, `7fabc2d`.**
 
 `chandra_resolve_config` probes the archive directory and falls back to the reprocessing
 route when no level-2 product exists, the way `xmm_resolve_config` does. `process_chandra_obsid`
@@ -948,11 +945,36 @@ list removed.
 
 *Commit:* `Wire Chandra into the pipeline, with diagnostics and a report page`
 
-### Step 13 — tests, docs, output names
+### ~~Step 13 — tests, docs, output names~~ **Done.**
 
 Round out the offline suite, add the `ciao` marker for real-tool tests, document the
 module in `docs/technical_details.rst`, and add `chandra_integration_plan.md` to
 `docs/conf.py`'s `exclude_patterns`.
+
+**What landed:** the `ciao` marker, registered in `pyproject.toml` and `conftest.py`
+and skipped unless `ciao.has_ciao()`; `tests/test_ciao_tools.py`, nine tests on a
+fabricated event list that check the three flare-step beliefs against real `dmcopy` and
+`dmextract` (GTI intersection, `exclude` refused, zero-exposure gap bins), that the
+module's own filter strings parse, that `dmlist` answers on standard output, and that
+parameter files land in the private `PFILES`; a *Chandra / ACIS and HRC* section in
+`technical_details.rst`, plus the dispatch-table row, the environment variables, the
+marker and `api.rst` entries. The `conf.py` exclusion was already in.
+
+**Rounding out the offline suite found two faulty tests, both fixed:**
+
+* **The flare-refusal test never refused anything.** A curve flaring for half the
+  observation inflates the clipped scatter so far that nothing is flagged — threshold 78
+  counts/s against a 40 counts/s flare — and the test's assertion ("the observation is
+  kept whole") passed for the wrong reason. It now lowers `flare_max_removed_fraction`
+  below a real 5% cut and asserts `applied is False`.
+* **The pile-up tests wrote into the working directory.** Their config set an `outdir`
+  key nothing reads, so every run left `./5644/event_cl/` behind wherever pytest was
+  started — which is where the stray `5644/` in the repository root came from.
+
+Seven tests were added for branches nothing reached (the warning band of the flare cut, an
+event list with no GTI block, the `dmextract` call, a pile-up map that misses the source,
+a malformed HRC `DETNAM`, an unreadable `CALDBVER`, the spectrum step on a grating
+observation). Coverage of `chandra.py` is 99%, from 97%.
 
 *Commit:* `Document Chandra support and mark its real-tool tests`
 

@@ -128,6 +128,7 @@ addopts = "--doctest-glob=*.rst"
 markers = [
   "slow: expensive test, deselected unless --run-slow is given",
   "heasoft: needs a real HEASOFT installation, not a recorded double",
+  "ciao: needs a real CIAO installation, not a recorded double",
 ]
 
 [tool.coverage.run]

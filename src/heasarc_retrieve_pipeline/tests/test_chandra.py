@@ -12,6 +12,7 @@ ones ``docs/chandra_integration_plan.md`` measured: they span HRC-I, HRC-S in it
 fast-timing mode, and ACIS-S behind a transmission grating.
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -496,6 +497,10 @@ class TestWhichAcisConfigurationAnObservationIs:
     def test_an_unknown_instrument_is_an_error(self):
         with pytest.raises(ValueError, match="INSTRUME"):
             chandra.chandra_detector({"INSTRUME": "EPIC", "DETNAM": "PN"})
+
+    def test_an_hrc_detnam_naming_neither_detector_is_an_error(self):
+        with pytest.raises(ValueError, match="HRC-X"):
+            chandra.chandra_detector({"INSTRUME": "HRC", "DETNAM": "HRC-X"})
 
 
 def a_downloaded_observation(tmp_path, obsid="6298", names=None):
@@ -1174,6 +1179,21 @@ class TestReadingAnObservationOffTheArchive:
 
         assert record["values"]["caldb_is_stale"] is False
 
+    def test_an_unreadable_calibration_version_is_called_neither(self):
+        """``None``, not ``False``: an unknown calibration is not a current one."""
+        observation = chandra.Observation(
+            obsid="6298",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=chandra.TimeResolution(4.37e-3, "hrc_trigger_rate", ""),
+            chips=(),
+            event_list="evt2.fits",
+            caldb_version="unknown",
+        )
+
+        assert observation.caldb_is_stale is None
+
     def test_it_works_without_a_record(self, tmp_path):
         """Called from a test, or from a context with no output directory."""
         config = an_archive_observation(tmp_path, "6298")
@@ -1715,6 +1735,25 @@ class TestWhereTheFlareCurveIsMeasured:
 
         assert found.endswith("[bin time=::200.0]")
 
+    def test_the_curve_is_extracted_through_that_filter_into_a_named_file(
+        self, tmp_path, stub_ciao_tasks
+    ):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        observation = self._an_observation()
+
+        found = chandra.chandra_flare_lightcurve(
+            observation, self._position(), self._regions(), config
+        )
+
+        name, _, kwargs = stub_ciao_tasks[-1]
+        assert name == "dmextract"
+        assert kwargs["opt"] == "ltc1"
+        assert kwargs["infile"] == "evt2.fits" + chandra.chandra_flare_curve_filter(
+            observation, self._position(), self._regions(), config
+        )
+        assert found == kwargs["outfile"]
+        assert found == str(tmp_path / "5644/event_cl/chandra05644_aciss_timed_bkg_lc.fits")
+
 
 def a_chandra_lightcurve(path, rate, exposure=None, cadence=500.0, tstart=0.0):
     """A ``dmextract opt=ltc1`` light curve, with the columns the real tool writes."""
@@ -1924,16 +1963,54 @@ class TestScreeningTheFlares:
         a good observation. A screening that wants half the exposure is far more likely to
         be a variable source leaking into the background region than a two-hour flare, so
         it is reported and not applied.
+
+        The limit is lowered below a real 5% cut rather than a curve built to flare for half
+        the observation, because such a curve cannot reach this branch at all: half the
+        bins at 40 counts/s raise the clipped scatter to 19, the threshold to 78, and
+        nothing is flagged. An earlier version of this test did exactly that and passed
+        without ever refusing anything -- measured on 2026-09-12.
         """
         rate = np.full(100, 2.0)
-        rate[:50] = 40.0
+        rate[50:55] = 40.0
         curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=rate, cadence=500.0)
+        config = dict(chandra.DEFAULT_CONFIG, flare_max_removed_fraction=0.04)
+        directory = tmp_path / "diagnostics"
 
-        gti = chandra.chandra_flare_gti(
-            self._observation(tmp_path), dict(chandra.DEFAULT_CONFIG), curve
-        )
+        with record_step(str(directory), "5644", "flare_filtering") as rec:
+            gti = chandra.chandra_flare_gti(self._observation(tmp_path), config, curve, rec=rec)
 
         assert gti.tolist() == [[1000.0, 51000.0]]
+        written = json.loads(next(directory.glob("*flare_filtering*.json")).read_text())
+        assert written["values"]["applied"] is False
+        assert written["values"]["removed_fraction"] == 0.0
+        assert written["values"]["exposure_after"] == written["values"]["exposure_before"]
+        assert "would remove 5%" in written["values"]["reason"]
+
+    def test_a_large_cut_within_the_limit_is_made_and_warned_about(self, tmp_path, caplog):
+        rate = np.full(100, 2.0)
+        rate[50:55] = 40.0
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=rate, cadence=500.0)
+        config = dict(chandra.DEFAULT_CONFIG, flare_warn_fraction=0.01)
+
+        with caplog.at_level("WARNING"):
+            gti = chandra.chandra_flare_gti(self._observation(tmp_path), config, curve)
+
+        assert len(gti) == 2
+        assert "flare screening removed 5%" in caplog.text
+
+    def test_an_event_list_without_good_times_is_bounded_by_the_curve(self, tmp_path):
+        """No GTI block to intersect with, so the curve's own span stands in for it."""
+        events = tmp_path / "no_gti_evt2.fits"
+        hdu = fits.BinTableHDU.from_columns(
+            [fits.Column("time", "1D", array=np.arange(5.0))], name="EVENTS"
+        )
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(events, overwrite=True)
+        observation = dataclasses.replace(self._observation(tmp_path), event_list=str(events))
+        curve = a_chandra_lightcurve(tmp_path / "lc.fits", rate=np.full(100, 2.0), cadence=500.0)
+
+        gti = chandra.chandra_flare_gti(observation, dict(chandra.DEFAULT_CONFIG), curve)
+
+        assert gti.tolist() == [[0.0, 50000.0]]
 
     def test_what_was_cut_and_why_is_recorded(self, tmp_path):
         rate = np.full(100, 2.0)
@@ -2364,7 +2441,10 @@ class TestMeasuringPileUp:
 
     def _config(self, tmp_path):
         config = dict(chandra.DEFAULT_CONFIG)
-        config["outdir"] = str(tmp_path / "out")
+        # ``out_data_path``, which is what the path helpers read. This used to set an
+        # ``outdir`` key nothing reads, so every test in the class wrote its chip image and
+        # pile-up map under ``./5644/event_cl`` wherever pytest happened to be started.
+        config["out_data_path"] = str(tmp_path / "out")
         return config
 
     def _position(self):
@@ -2378,6 +2458,32 @@ class TestMeasuringPileUp:
             background="[sky=annulus(4100,4100,8,16)]",
             radius_arcsec=chandra.sky_pixels_to_arcsec(1.0),
         )
+
+    def test_a_map_that_misses_the_source_reports_no_number_rather_than_a_wrong_one(
+        self, tmp_path, monkeypatch
+    ):
+        def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+            a_pileup_map(kwargs["outfile"], np.full((9, 9), 0.3), x0=9000, y0=9000)
+            return SimpleNamespace(stdout="")
+
+        monkeypatch.setattr(ciao, "run", fake_run)
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "5644", "pileup_check") as rec:
+            found = chandra.chandra_pileup(
+                self._observation(tmp_path),
+                self._config(tmp_path),
+                str(tmp_path / "cl.evt"),
+                self._position(),
+                self._regions(),
+                rec=rec,
+            )
+
+        assert found.applies is True
+        assert found.fraction is None
+        assert "wrong chip" in found.reason
+        values = json.loads(next(directory.glob("*pileup_check*.json")).read_text())["values"]
+        assert values["pileup_measured"] is False
 
     def test_the_map_is_made_of_the_source_chip_at_single_pixel_binning(
         self, tmp_path, stub_pileup_tasks
@@ -2913,6 +3019,22 @@ class TestCollectingTheGratingProducts:
         assert values["grating"] == "HETG"
         assert values["n_grating_files"] == 2
         assert "tgextract" in values["spectrum_reason"]
+
+    def test_the_spectrum_step_hands_a_grating_observation_here_and_runs_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        def refuse(name, **kwargs):
+            raise AssertionError(f"a grating observation ran {name}")
+
+        monkeypatch.setattr(ciao, "run", refuse)
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path / "out"))
+
+        found = chandra.chandra_calculate_spectra(
+            self._observation(tmp_path), config, str(tmp_path / "cl.evt"), regions=None
+        )
+
+        assert found is None
+        assert list((tmp_path / "out").glob("**/acisf02749N004_pha2.fits.gz"))
 
 
 #: What ``chandra_repro`` left in ``repro/`` on obsid ``5644``, measured on 2026-09-12.

@@ -1,7 +1,7 @@
 """
 Test configuration shared by every test module in the package.
 
-Two markers live here.
+Three markers live here.
 
 ``slow``
     Deselected by default, run with ``--run-slow``. The bar for it is real time on a
@@ -13,6 +13,11 @@ Two markers live here.
 ``heasoft``
     Skipped unless a real HEASOFT installation is importable *and* ``HEADAS`` is set.
     These are the tests that call a real ftool rather than a recorded double.
+
+``ciao``
+    Skipped unless ``ASCDS_INSTALL`` is set *and* ``dmlist`` is on ``PATH`` -- the same two
+    questions :func:`heasarc_retrieve_pipeline.ciao.has_ciao` asks. These are the tests
+    that call a real CIAO task. Continuous integration has no CIAO, so they run locally.
 """
 
 import importlib.metadata
@@ -73,7 +78,7 @@ os.makedirs(os.environ["PREFECT_HOME"], exist_ok=True)
 
 import pytest  # noqa: E402
 
-from . import heasoft  # noqa: E402
+from . import ciao, heasoft  # noqa: E402
 
 
 def pytest_addoption(parser):
@@ -99,6 +104,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "heasoft: needs a real HEASOFT installation, not a recorded double"
     )
+    config.addinivalue_line(
+        "markers", "ciao: needs a real CIAO installation, not a recorded double"
+    )
 
 
 def has_heasoft():
@@ -114,10 +122,15 @@ def has_heasoft():
 def pytest_collection_modifyitems(config, items):
     run_slow = config.getoption("--run-slow")
     skip_heasoft = pytest.mark.skip(reason="needs a real HEASOFT installation ($HEADAS)")
+    skip_ciao = pytest.mark.skip(reason="needs a real CIAO installation ($ASCDS_INSTALL)")
     deselected = []
     kept = []
 
     heasoft_available = has_heasoft()
+    # Asked afresh rather than read off ``ciao.HAS_CIAO``: that flag is resolved when the
+    # module is first imported, and conftest.py imports it before a test has had any chance
+    # to change the environment. Nothing does today, but the probe is two lookups.
+    ciao_available = ciao.has_ciao()
 
     for item in items:
         if "slow" in item.keywords and not run_slow:
@@ -125,6 +138,8 @@ def pytest_collection_modifyitems(config, items):
             continue
         if "heasoft" in item.keywords and not heasoft_available:
             item.add_marker(skip_heasoft)
+        if "ciao" in item.keywords and not ciao_available:
+            item.add_marker(skip_ciao)
         kept.append(item)
 
     if deselected:
