@@ -762,25 +762,91 @@ with a published detection. `5644` is therefore the regression test for the ACIS
 step 5, and it should be in the offline suite as a recorded header the moment that branch
 is written.
 
-Two cautions, both to be resolved by reading the paper before this is used as a
-*quantitative* benchmark:
+One caution stands: **`DATAMODE = GRADED`.** ACIS graded mode telemeters grade and total
+pulse height only. It is fine for timing, which is what is wanted here, but it constrains
+spectroscopy and CTI correction. Step 9 should detect `GRADED` and say so in the report
+rather than producing a spectrum that looks ordinary and is not.
 
-* **The source is not yet pinned down here.** The target name is M82 X-1; M82 X-2, the
-  1.37 s pulsar, is a couple of arcseconds away and in the same field. Which of them
-  Liu 2024 reports, at what period, and with what search, has **not** been checked in this
-  session — only the observation's timing capability has. Get the period and the source
-  position from the paper and put them in this document before treating 7.7 σ as a target
-  to reproduce.
-* **`DATAMODE = GRADED`.** ACIS graded mode telemeters grade and total pulse height only.
-  It is fine for timing, which is what is wanted here, but it constrains spectroscopy and
-  CTI correction. Step 9 should detect `GRADED` and say so in the report rather than
-  producing a spectrum that looks ordinary and is not.
+#### The test was run, by hand, on 2026-09-12 — and it passes
 
-**What passing looks like:** `5644` reduces; its reported time resolution is 0.44104 s and
-not 3.2 s; it is barycentred at the position asked for; and a coherent search of the
-barycentred event list recovers the published signal at a comparable significance. A
-shortfall in significance is worth investigating — barycentring, GTI handling, or the
-extraction region — before it is attributed to the search.
+**The pulsation is recovered.** This was done before any of this module exists, using only
+the archive, astropy and HENDRICS, precisely to find out whether the plan's central claim
+survives contact with real data. It does.
+
+| | |
+|---|---|
+| **Measured frequency** | **0.7433174711 Hz** |
+| **Measured period** | **1.3453202 s** |
+| Liu 2024 (doi:10.3847/1538-4357/ad17c7), via Matteo | 1.345317(2) s |
+| Difference | **+3.19 µs, i.e. +1.6 σ of the quoted error** |
+| Z²₂ power (0.98″ extraction) | **69.27** |
+| Significance | **7.6 σ single-trial, 5.9 σ after full trials correction** |
+| Liu 2024's reported significance | 7.7 σ |
+| Pulsed amplitude | **10.8 ± 1.5 %** |
+
+Matteo warned that Liu may have used a slightly different orbital ephemeris, so the period
+could move by more than its error bar. +1.6 σ is comfortably inside that.
+
+**The detection is robust to the extraction region.** All three radii return the *identical*
+frequency, and only the significance moves with the counts:
+
+| Radius | Events | Z²₂ | Pulsed amplitude |
+|---|---|---|---|
+| 1.5 px (0.74″) | 9 743 | 50.16 | 10.15 ± 1.71 % |
+| 2.0 px (0.98″) | 11 796 | **69.27** | 10.84 ± 1.51 % |
+| 3.0 px (1.48″) | 13 753 | 81.83 | 10.91 ± 1.39 % |
+
+**And the source is now pinned down: it is M82 X-2, not the header target.** The two are
+4.63″ apart and both are bright — X-1 carries 51 573 counts within 1″, X-2 11 796 — but
+the signal is at X-2's position, at X-2's period. The header's `OBJECT` is M82 X-1, so
+**an implementation that extracted at `RA_TARG`/`DEC_TARG` would have found nothing.**
+That is the sharpest possible vindication of the rule that the position asked for is the
+position extracted, never the header's.
+
+**What made it work, in order of how easily each could have been got wrong:**
+
+1. **Deorbiting is not optional.** Without it, the same data give Z²₂ = 25.68, no
+   candidate, and an upper limit of 9.1 % — i.e. a *non-detection of a real 10.8 % signal*.
+   Over 75 ks the orbit drifts the pulse by roughly 33 cycles. Nor can an `fdot` search
+   absorb it: a third of an orbit is not a constant frequency derivative.
+2. **`PBDOT` is not a refinement.** Extrapolating the ephemeris back 1 728 orbits to 2005,
+   the orbital-decay term alone is **0.0863 orbits** of correction. Omit it and the fold is
+   wrong by 8.6 % of an orbit. The residual uncertainty after applying it is 0.168 spin
+   cycles, dominated by `PBDOT`'s own error — tolerable, and it is why the recovered period
+   sits 1.6 σ off rather than dead on.
+3. **The spacecraft term in the barycentring matters.** Chandra is up to 125 000 km from
+   Earth. The geocentre correction drifts 2.1 s across this observation (1.6 spin cycles);
+   the spacecraft-to-geocentre term adds another 0.129 s (0.10 cycles). Barycentring to the
+   geocentre alone would cost a tenth of a cycle of smearing.
+4. **The 0.44104 s frame time is fast enough, and had to be read rather than assumed.**
+   3.05 samples per cycle. The frame acts as a 0.328-phase boxcar, attenuating the
+   fundamental by ~0.83 — visible in the profile as a broad, near-sinusoidal shape, and no
+   obstacle to detection.
+
+**Reproduced with:** events and `orbitf*_eph1.fits` straight from S3; barycentring in
+astropy (DE405, Roemer + Shapiro at the geocentre, plus the interpolated spacecraft term,
+plus TT→TDB); extraction at M82 X-2's position; `HENzsearch --fast -N 2 -p orbital_decay.par`.
+**The ephemeris used was `~/tmp/nustar_2026/orbital_decay.par` (1 159 bytes, 2026-09-05)**,
+which is *not* the file Matteo pointed at on Google Drive (1 148 bytes, 2026-09-08) — that
+one is unreadable from this machine's sandbox. The detection is strong enough that the
+difference plainly does not matter for *whether* the signal is there, but the newer file
+should be used before the recovered period is quoted anywhere.
+
+**Consequence for the plan: the ACIS timing branch is de-risked before it is written.**
+Step 5's resolution logic, step 10's barycentring and the position rule have all now been
+exercised end to end on real data with a known answer. What remains is to put this inside
+the module, not to find out whether it works. `5644` should become the module's
+highest-value integration test.
+
+#### A by-product: the astropy barycentring route is no longer hypothetical
+
+Open item 1 offered a third option for the DE430 question — computing the barycentric
+correction ourselves — and dismissed it as "real work with its own validation". **That work
+has now been done**, in about forty lines, and validated in the strongest available way: it
+recovered a published pulsation at the published period. So if Matteo prefers DE430 over
+`axbary`'s DE405, the route exists and is proven. This does **not** overturn the `axbary`
+decision — a CIAO task is still less to maintain than our own ephemeris code — but the
+fallback is now real rather than notional.
 
 ### Cost
 
@@ -795,10 +861,9 @@ special arrangement.
 
 1. ~~**Does `barycorr` handle Chandra correctly?**~~ **Settled 2026-09-12: it does not.**
    HEASOFT has no Chandra orbit reader, `axbary` is the route, and the DE405 it forces
-   costs a constant 0.377 µs. Full workings in *Step 10*. Nothing here is open any more,
-   but Matteo has not yet seen the 0.377 µs figure — if he wants DE430 regardless, the
-   only remaining route is computing the correction in astropy ourselves, which is real
-   work and needs its own validation.
+   costs a constant 0.377 µs. Full workings in *Step 10*. The astropy fallback, floated
+   here as untested, was then written and used to recover the `5644` pulsation — so it is
+   proven, not notional, if Matteo wants DE430 after all. Only that preference is open.
 2. **The `S_TIMING` threshold.** `hrc_veto_ratio_threshold = 0.99` is chosen from two
    observations, one at 1.000 and one at 0.296. The gap is enormous, so almost any
    threshold works, but the distribution across the ~1 669 HRC-S observations has not been
