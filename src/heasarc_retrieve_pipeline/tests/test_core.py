@@ -656,6 +656,17 @@ CATALOGUE_COLUMNS = {
         tar_no target_name time time_awarded
         """.split()
     ),
+    # Chandra is not in MISSION_CONFIG yet -- its reduction lands at the wiring step --
+    # but the schema was measured off the live TAP service on 2026-09-12 while the
+    # download filter was being written, and recording it here is what stops the guard
+    # below from being silently skipped when the mission does arrive.
+    "chanmaster": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec bii category class cycle data_mode dec
+        detector exposure grating lii name obsid pi proposal public_date ra
+        sequence_number status time type
+        """.split()
+    ),
     "xmmmaster": set(
         """
         __row __x_ra_dec __y_ra_dec __z_ra_dec bii class data_in_heasarc dec
