@@ -83,8 +83,23 @@ Listed under *Open items*, at the end. None of them block step 1.
 | Grating (archived) | NONE 23 931, HETG 2 082, LETG 1 109 |
 | Data mode (archived) | `TE_*` 22 953 (85%), `CC_*` 458 (**1.7%**), HRC `DEFAULT`/`S_*`/`SCENTER`/… the rest |
 
-Two things follow. **The fast-timing subset of Chandra is small** — CC mode plus all HRC
-is roughly 4 100 observations of 27 122. And **gratings are 12% of the archive but the
+Two things follow. **The fast-timing subset of Chandra is bigger than the mode counts
+suggest, and the catalogue cannot tell you how big.** It is tempting to read the table
+above as "CC mode plus HRC, roughly 4 100 of 27 122, and the other 85% is stuck at 3.2 s".
+That is wrong, and an earlier draft of this plan said it. **ACIS Timed Exposure on a
+subarray reaches a few tenths of a second**, which is fast enough for a large class of
+pulsars — and `data_mode` does not reveal it. Counter-example, measured 2026-09-12:
+obsid `5644` is `TE_006AC` in the catalogue and `EXPTIME = 0.4 s`, `TIMEDEL = 0.44104 s`
+in the event header, on a single chip (`DETNAM = ACIS-7`). See *The known-answer test*.
+
+This is the same lesson as the HRC one, in a second place: **the catalogue's mode string
+never tells you the true time resolution; the event header does.** The design already
+does the right thing — step 5 reads `TIMEDEL` for ACIS rather than assuming 3.2 s — but
+do not let anyone "optimise" the module by pre-filtering candidate observations on
+`data_mode`. That filter would have discarded the one M82 observation with a published
+pulsation detection.
+
+And **gratings are 12% of the archive but the
 large majority of the bright-source ACIS data**: of the twelve archived ACIS observations
 of Her X-1 and SAX J1808.4−3658, nine carry HETG or LETG, because gratings are how you
 observe a bright source with ACIS at all. Ruling gratings out of scope would have
@@ -170,7 +185,7 @@ valuable thing this module can do.
 | Configuration | Achievable time resolution | Share of archive |
 |---|---|---|
 | ACIS Timed Exposure, full frame | **3.2 s** — the frame time, in `TIMEDEL` | 85%, with subarrays |
-| ACIS Timed Exposure, subarray | the frame time, down to a few tenths of a second | (part of the above) |
+| ACIS Timed Exposure, subarray | **down to ~0.4 s**; `5644` measures `TIMEDEL = 0.44104` | (part of the above, share unmeasured) |
 | ACIS Continuous Clocking | **2.85 ms**, one spatial dimension destroyed | 1.7% |
 | HRC-I, and HRC-S in ordinary imaging | **~4 ms**, *not* 16 µs — the wiring error | ~13% |
 | HRC-S in `S_TIMING` | **15.625 µs**, fully recovered | a small part of the above |
@@ -716,6 +731,57 @@ If a coherent search on `8189` or `8505` does recover it, that is strong indepen
 evidence the barycentring and the time stamps are right, and it should be recorded — but
 a non-detection is not evidence of a pipeline fault and must not be read as one.
 
+### The known-answer test: obsid `5644`
+
+**Matteo, 2026-09-12: Liu 2024 detects pulsations in obsid `5644` at 7.7 σ.**
+
+This is the most valuable single item in the whole verification, and it is worth more than
+the sixteen HRC observations put together, because it is the only place where the pipeline
+can be checked against **a published answer** rather than against its own self-consistency.
+Everything else here asks "did the module do what it said?"; this asks "did the module
+recover a real astrophysical signal that someone else already found in the same data?"
+
+`5644` is **not** one of the sixteen. From `chanmaster` and its event header, measured
+2026-09-12:
+
+| | |
+|---|---|
+| Detector | **ACIS-S**, `DETNAM = ACIS-7` (S3 alone) |
+| Read mode | `READMODE = TIMED` — **Timed Exposure, not CC, not HRC** |
+| Catalogue `data_mode` | `TE_006AC` |
+| **Frame time** | **`EXPTIME = 0.4 s`, `TIMEDEL = 0.44104 s`** |
+| `DATAMODE` | **`GRADED`** |
+| Exposure | 75.1 ks on, 68.1 ks live |
+| Target | `CXOM82 J095550.2+694047`, PI Strohmayer, cycle 6 |
+
+At `TIMEDEL = 0.44104 s` the Nyquist period is 0.88 s, so a 1.37 s ULX-pulsar spin is
+sampled about 3.1 times per cycle — comfortably detectable. **This is why the subarray
+correction above matters:** any design that assumed ACIS Timed Exposure means 3.2 s would
+report `5644` as far too slow to time, and would have thrown away the one M82 observation
+with a published detection. `5644` is therefore the regression test for the ACIS branch of
+step 5, and it should be in the offline suite as a recorded header the moment that branch
+is written.
+
+Two cautions, both to be resolved by reading the paper before this is used as a
+*quantitative* benchmark:
+
+* **The source is not yet pinned down here.** The target name is M82 X-1; M82 X-2, the
+  1.37 s pulsar, is a couple of arcseconds away and in the same field. Which of them
+  Liu 2024 reports, at what period, and with what search, has **not** been checked in this
+  session — only the observation's timing capability has. Get the period and the source
+  position from the paper and put them in this document before treating 7.7 σ as a target
+  to reproduce.
+* **`DATAMODE = GRADED`.** ACIS graded mode telemeters grade and total pulse height only.
+  It is fine for timing, which is what is wanted here, but it constrains spectroscopy and
+  CTI correction. Step 9 should detect `GRADED` and say so in the report rather than
+  producing a spectrum that looks ordinary and is not.
+
+**What passing looks like:** `5644` reduces; its reported time resolution is 0.44104 s and
+not 3.2 s; it is barycentred at the position asked for; and a coherent search of the
+barycentred event list recovers the published signal at a comparable significance. A
+shortfall in significance is worth investigating — barycentring, GTI handling, or the
+extraction region — before it is attributed to the search.
+
 ### Cost
 
 The three long observations are the bulk. At the HRC ratio measured on `17661` — 88.7 MB
@@ -744,9 +810,16 @@ special arrangement.
    makes it unnecessary; raise it only if the inference proves unreliable.
 4. **How long `chandra_repro` actually takes**, which decides whether the reprocessing
    route is usable in a batch. Unmeasured.
-5. **ACIS subarray frame times.** `2749` measured `TIMEDEL = 2.54104` with `EXPTIME = 2.5`,
-   not the nominal 3.2 s. The plan reads `TIMEDEL` and so is correct regardless, but the
-   range across the archive is unmeasured and worth one query.
+5. **ACIS subarray frame times — now known to matter, and still unsurveyed.** `2749`
+   measures `TIMEDEL = 2.54104` (`EXPTIME = 2.5`) and `5644` measures **`0.44104`**
+   (`EXPTIME = 0.4`), against a nominal 3.2 s. The plan reads `TIMEDEL` and so is correct
+   regardless, but the *distribution* across the 22 953 `TE_*` observations is unmeasured
+   and **cannot be got from the catalogue** — `data_mode` does not carry the frame time,
+   so it needs an event-header read per observation. Worth doing: it is the only way to
+   say how much fast-timing ACIS data the archive actually holds, and `5644` shows the
+   answer is not "none". Until then, do not quote a share for subarrays.
+   **Liu 2024's detection in `5644` is the standing argument that this is science and not
+   bookkeeping.**
 6. **CC-mode background.** Continuous Clocking collapses one spatial dimension, so source
    and background overlap in it. The 1-D strip in step 6 is the XMM Timing analogue, but
    Chandra's geometry differs and the strip positions are a guess until tested.
@@ -916,4 +989,25 @@ print(f"mean {d.mean():+.4f} us, peak-to-peak {np.ptp(d):.4f} us")
 # Expect: mean +0.3769 us, peak-to-peak 0.0016 us. A constant offset, not a drift:
 # 2.4% of one HRC spec bin, and it cannot distort anything within an observation.
 # Note de405.bsp lives under a_old_versions/; astropy's own "de405" name 404s.
+```
+
+```python
+# 10. The known-answer test: obsid 5644 is ACIS Timed Exposure at 0.44 s, not 3.2 s.
+#     This is the counter-example to "TE means 3.2 s" and to filtering on data_mode.
+import boto3, zlib, io
+from botocore import UNSIGNED
+from botocore.client import Config
+from astropy.io import fits
+
+c = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+key = "chandra/data/byobsid/4/5644/primary/acisf05644N004_evt2.fits.gz"
+r = c.get_object(Bucket="nasa-heasarc", Key=key, Range="bytes=0-600000")
+raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(r["Body"].read())
+h = fits.open(io.BytesIO(raw))[1].header  # warns about truncation; the header is complete
+for k in ("DETNAM", "DATAMODE", "READMODE", "EXPTIME", "TIMEDEL", "ONTIME", "OBJECT"):
+    print(f"{k:<9} = {h[k]!r}")
+# Expect: DETNAM 'ACIS-7', DATAMODE 'GRADED', READMODE 'TIMED', EXPTIME 0.4,
+#         TIMEDEL 0.44104, ONTIME 75131.2, OBJECT 'CXOM82 J095550.2+694047'.
+# Nyquist period 0.88 s, so a 1.37 s ULX-pulsar spin is sampled ~3.1 times per cycle.
+# The catalogue says only data_mode = 'TE_006AC', which reveals none of this.
 ```
