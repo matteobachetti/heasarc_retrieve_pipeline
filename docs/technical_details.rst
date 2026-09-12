@@ -2735,3 +2735,51 @@ in under a minute. Four markers divide up what is not:
 
 Continuous integration runs all of this through ``tox``; see ``tox.ini`` and
 ``.github/workflows/ci_tests.yml``. Every environment CI uses can be run locally by name.
+
+One temporary Prefect server per environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Several tests call a flow's ``.fn`` to run its body without Prefect, and that body then
+calls a task -- ``filter_from_solar_flares`` calls ``record_flare_filtering`` this way.
+A task invoked with no flow context makes Prefect start a **temporary server**, and a
+server starting runs ``alembic upgrade head`` on ``$PREFECT_HOME/prefect.db``.
+
+``PREFECT_HOME`` defaults to ``~/.prefect``, so **every environment on the machine shares
+one database**, and they do not all have the same Prefect. The first run in the newer one
+migrates the file and stamps a revision the older one's migration scripts do not contain;
+from then on the older environment cannot start a server at all::
+
+    alembic.util.exc.CommandError: Can't locate revision identified by 'f416ea180ae1'
+    ERROR | uvicorn.error - Application startup failed. Exiting.
+
+Nothing says so where it happens. ``filter_from_solar_flares`` logs its diagnostic's
+failure rather than raising it -- the science product is already written -- so the
+``RuntimeError: Timed out while attempting to connect to ephemeral Prefect API server``
+appears only as a warning, and the test fails later on a record that is simply missing
+everything ``record_flare_filtering`` would have put in it::
+
+    KeyError: 'n_intervals_removed'
+
+``conftest.py`` therefore gives the suite a database of its own, before Prefect is
+imported, under the system temporary directory and **named after the installed Prefect**::
+
+    $TMPDIR/heasarc_retrieve_pipeline-prefect-3.7.4
+
+Keying the directory on the version is what makes this a fix rather than a reprieve:
+emptying the shared database works until the next run in the newer environment migrates it
+forward again, while two versions that never share a file cannot collide at all. It is
+``setdefault``, so a run that wants a particular database -- the real one, or the scratch
+one a parallel reduction is pointed at -- still says so from the outside. Four guards in
+``tests/test_prefect_wiring.py`` hold it.
+
+Measured on 2026-09-12, ``test_nustar.py`` in an environment with Prefect 3.7.4 against a
+``~/.prefect`` last migrated by 3.8.4: **15 failed** in 150 s, every one of them waiting out
+a server timeout. With the private home: **164 passed, 6 skipped in 11 s**.
+
+A **production** run is not covered by any of this -- nothing imports ``conftest.py`` -- so
+set ``PREFECT_HOME`` for it as above, which the parallel-run recipe earlier in this document
+already does for a different reason. To tell the failure apart from a real one, compare the
+database's stamp with the migrations the installed Prefect actually has::
+
+    sqlite3 ~/.prefect/prefect.db 'select * from alembic_version'
+    ls $CONDA_PREFIX/lib/python3.*/site-packages/prefect/server/database/_migrations/versions/sqlite/

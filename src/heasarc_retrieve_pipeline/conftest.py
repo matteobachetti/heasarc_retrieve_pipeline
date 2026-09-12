@@ -15,12 +15,61 @@ Two markers live here.
     These are the tests that call a real ftool rather than a recorded double.
 """
 
+import importlib.metadata
 import os
+import tempfile
 
 # Most tests call Prefect tasks through ``.fn``, outside any flow run. Prefect's API log
 # handler warns about that on every call; it has nothing to report to. This has to happen
 # before Prefect is imported, and conftest.py is imported before any test module.
 os.environ.setdefault("PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW", "ignore")
+
+
+def private_prefect_home(prefect_version):
+    """
+    A ``PREFECT_HOME`` for this suite alone, named after the Prefect that will migrate it.
+
+    ``PREFECT_HOME`` defaults to ``~/.prefect``, so every environment on a machine shares
+    one SQLite database. A Prefect server starting runs ``alembic upgrade head`` on it, and
+    a Prefect *older* than whatever last migrated it cannot start a server at all --
+    ``Can't locate revision identified by ...``, then ``Application startup failed``. The
+    suite needs a server more often than it looks: a task called outside a flow, which is
+    what ``.fn`` on a flow whose body calls a task ends up doing, starts a temporary one.
+
+    Keying the directory on the version is what makes this a fix rather than a reprieve.
+    Emptying the shared database works until the next run in a newer environment migrates
+    it forward again; two versions that never share a file cannot collide at all.
+
+    Under the system temporary directory, so it is on local disk -- SQLite locking over a
+    network-mounted home is unreliable -- and so it survives between runs, which means the
+    migration happens once rather than on every invocation of pytest.
+
+    Examples
+    --------
+    >>> private_prefect_home("3.7.4") == private_prefect_home("3.8.4")
+    False
+    >>> private_prefect_home("3.7.4").endswith("prefect-3.7.4")
+    True
+    """
+    return os.path.join(
+        tempfile.gettempdir(), f"heasarc_retrieve_pipeline-prefect-{prefect_version}"
+    )
+
+
+try:
+    _PREFECT_VERSION = importlib.metadata.version("prefect")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    # Prefect is a hard dependency, so this is a broken installation rather than a
+    # configuration. Leave a home that is still nobody else's and let the import fail.
+    _PREFECT_VERSION = "absent"
+
+# Like the setting above, this has to happen before Prefect is imported: its settings are
+# resolved once, at import, and ``PREFECT_HOME`` is read then. ``setdefault``, so a run
+# that wants a particular database -- the user's own, or a scratch one for a parallel
+# reduction -- still says so from the outside. The directory is created here because it is
+# read before anything would create it.
+os.environ.setdefault("PREFECT_HOME", private_prefect_home(_PREFECT_VERSION))
+os.makedirs(os.environ["PREFECT_HOME"], exist_ok=True)
 
 import pytest  # noqa: E402
 
