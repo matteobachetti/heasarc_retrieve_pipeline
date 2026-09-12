@@ -27,38 +27,44 @@
 
 ## Where this stands
 
-**Last updated 2026-09-12, after step 5.** Branch `various_fixes`, everything unpushed.
+**Last updated 2026-09-12, after step 10 and the acceptance test.** Branch `various_fixes`,
+everything unpushed.
 
 | | |
 |---|---|
-| Landed | Steps 1–5, five commits, `5377cfd` → `9f39121` |
-| Blocked | Steps 6–13, on a CIAO installation that does not exist on this machine |
+| Landed | Steps 1–7 and 10, eight commits, `5377cfd` → `98635d2` |
+| Left | Steps 8, 9, 11, 12, 13 |
 | Code | `src/heasarc_retrieve_pipeline/chandra.py`, `src/heasarc_retrieve_pipeline/ciao.py` |
-| Tests | `tests/test_chandra.py` (140), `tests/test_ciao.py` (36), all offline |
-| Suite | 1444 passed, 33 skipped, all green. The 15 `test_nustar.py` failures that stood during this work were a shared Prefect database, fixed separately in `23ab765` |
+| Tests | `tests/test_chandra.py` (202 + 19 doctests), `tests/test_ciao.py` (41), all offline |
+| CIAO | 4.18.0 + CALDB 4.12.4 in the `ciao` micromamba environment, driven by `subprocess` from `py313-x64` — the pipeline never enters CIAO's Python |
 
-What exists and works, verified against the live archive on 2026-09-12 with obsid `6298`
-downloaded through the pipeline's own filter (15.4 MB, 9 files, the numbers this plan
-predicts):
+**The acceptance test passes on both verification observations.** Run through the module end
+to end on 2026-09-12: `5644` gives `P = 1.3453202 s` at `Z²₁ = 59.32` (6.2 σ after trials),
+`8190` gives `P = 1.3504294 s` at `Z²₁ = 26.55` (2.7 σ) — both within 0.2 σ of Liu 2024,
+from a blind 34 mHz search. Numbers, method and the two folded profiles in
+*The known-answer test*. **Search with `-N 1` and without `--fast`**; the reasons are there
+too.
 
-* `chandra_download_filter` — the `archive` and `repro` routes.
-* Naming: `chandra06298_hrci_imaging`. Archive *directories* use the unpadded OBSID and
-  archive *file names* pad to five digits; both spellings are handled.
-* `chandra_detector` — from `SIM_Z`, not `DETNAM`. See *Which ACIS configuration an
-  observation is*.
-* `chandra_time_resolution` — obsid `6298` comes out at **4371.002 µs** where every header
-  in the file claims 16 µs, and obsid `17661` at **15.625 µs**. Both branches confirmed
-  against the real `dtf1` files.
-* `chandra_archive_front_end` — one `Observation`, all seven companion files found, and
-  `caldb 4.9.5` correctly flagged stale against `4.12.4`.
-* `ciao.py` — argument vector, return code, output check, and a private `PFILES` per
-  observation. Nothing in it has ever spoken to a real CIAO.
+**Three deviations from this plan are in force and two of them want a verdict:**
 
-**The first thing to do on a machine with CIAO** is not step 6. It is to run
-`chandra_archive_front_end` on obsid `5644` and then the known-answer test in *Acceptance
-target* — the M82 X-2 pulsation at 1.3453202 s, which was recovered by hand before any of
-this code existed. If that still comes out, the front end is trustworthy and step 6 can
-start.
+1. `ciao.run` grew an `args=` parameter, and `ciao_environment` now defaults `CALDB` to the
+   tree beside the installation. Both are in `f202ab1`; neither was in step 5. This machine
+   exports `CALDB=/Users/meo/azure_software/caldb/` for HEASOFT, which has no Chandra data
+   in it, so without the default every CIAO task would silently use the wrong calibration.
+   *Not controversial, but recorded.*
+2. **`psfsize_srcs`' `NEAR_CHIP_EDGE` is not used**, because it is wrong on every ACIS
+   subarray. Details in step 6.
+3. **The aspect solution is not barycentred**, against step 10's text. Details and the
+   argument in step 10. **This one needs Matteo's yes or no.**
+
+**Two environment notes for whoever picks this up:**
+
+* `micromamba` is at `/opt/homebrew/bin/micromamba` with `MAMBA_ROOT_PREFIX=$HOME/mamba`.
+* The `ciao` environment shipped **numpy 2.5.3**, which removed `np.chararray` and so broke
+  `pycrates` and with it *every* Python CIAO tool — `psfsize_srcs`, `specextract`,
+  `chandra_repro`, `acis_set_ardlib`. Pinned to **2.4.6** (inside CIAO's declared
+  `>=2.3.5,<3`) with Matteo's approval. If a fresh install fails at `import pycrates`, this
+  is why.
 
 ---
 
@@ -580,7 +586,20 @@ the contributed scripts — `chandra_repro` among them — keep their parameters
 
 *Commit:* `Add ciao.py: run CIAO tasks with checked outputs and per-observation PFILES`
 
-### Step 6 — position and extraction regions
+### ~~Step 6 — position and extraction regions~~ **Done, `caddefd`.**
+
+**One deviation.** `psfsize_srcs` also returns a `NEAR_CHIP_EDGE` flag, and it is wrong on
+every ACIS subarray: `check_chip_edge` computes the top of the window as `(NROWS-1) - edge`
+instead of `FIRSTROW + NROWS - 1 - edge`, so for `5644` (`FIRSTROW = 449`, `NROWS = 128`,
+`edge = 32`) the window runs 481 → 95 and *every* position is flagged. The column is not
+read. `chandra_chip_edge` computes the margin itself from `FIRSTROW`/`NROWS` and reports a
+**distance in chip pixels**, not a boolean, which is more useful anyway: `5644` has 47.95 px
+of clearance, `8190` has 27.22 px — genuinely inside the 32-px dither amplitude.
+
+The `src_radius_arcsec = None` default is vindicated on the two verification observations:
+`5644` at 0.29′ off-axis gets **0.830″**, `8190` at 3.58′ gets **2.186″**. A single fixed
+radius would have been wrong for one of them.
+
 
 `dmcoords` converts the given RA/Dec to sky and chip coordinates; `psfsize_srcs` gives the
 radius enclosing `psf_ecf` of the counts at `psf_energy_kev`. Background is an annulus
@@ -593,7 +612,26 @@ the default is `None`.
 
 *Commit:* `Size Chandra extraction regions from the PSF at the source's off-axis angle`
 
-### Step 7 — flare screening and the cleaned event list
+### ~~Step 7 — flare screening and the cleaned event list~~ **Done, `2633ac0`.**
+
+Two things the plan did not anticipate, both found on real data and both now tested:
+
+* **`dmextract` emits bins outside the observation's GTI** with `EXPOSURE = 0` and
+  `COUNT_RATE = 0` — 16 of 393 on `5644`. Read at face value they are the quietest bins in
+  the observation and drag the threshold down. `read_chandra_lightcurve` turns them into
+  `NaN`.
+* **A curve shorter than the observation must not cut the uncovered stretch.** Intersecting
+  the flare intervals with the observation GTI silently discarded good time wherever the
+  light curve did not reach. `good_intervals` is now bounded by the union of the two spans,
+  so an uncovered stretch is *kept*.
+
+`[exclude sky=circle(...)]` does not compose with other Data Model filters — "cannot mix
+EXCLUDE and FILTER". Region algebra, `[sky=field()-circle(...)]`, does.
+
+The default is as gentle as intended: `5644` loses 200 s of 75 131 (0.3%), `8190` loses
+nothing. `dmcopy "evt[@gti]"` **intersects** with the existing GTI rather than replacing
+it, and the recorded exposure matches the output file's `ONTIME` exactly.
+
 
 A background light curve with `dmextract`, thresholded with the **existing** pure-Python
 interval utilities, written as a GTI, applied with `dmcopy`. Chandra background flares
@@ -619,10 +657,24 @@ nothing and say so.
 
 *Commit:* `Extract ACIS spectra, collect grating products, and say why HRC has neither`
 
-### Step 10 — barycentring
+### ~~Step 10 — barycentring~~ **Done, `98635d2`.**
 
 **This step was the plan's one open dependency, and it was settled by measurement on
 2026-09-12. The answer is not the one the plan first assumed.**
+
+**One deviation, and it needs Matteo's sign-off.** The text below says the aspect solution
+must be barycentred alongside the events. It is **not**, deliberately. Nothing in this
+architecture ever pairs the barycentred events with an aspect solution: pile-up and
+`specextract` run on the *uncorrected* cleaned list, which is the only list an asol belongs
+with, and the barycentred list exists solely to be folded. Barycentring the asol as well
+would write ~17 MB of dead weight per observation to guard against a mixing that cannot
+happen. Say the word and it goes back in.
+
+Measured on both verification observations: `TIMESYS = TDB`, `TIMEREF = SOLARSYSTEM`,
+`PLEPHEM = JPL-DE405`, corrections of **−280.89 s** (`5644`) and **−207.16 s** (`8190`)
+applied to every HDU including the GTI blocks. `axbary` will not read a **gzipped input**
+event or aspect file ("Failed to re-open output file", error 112) — it reads a gzipped
+*orbit* file fine. Ours come from `dmcopy` uncompressed, so nothing had to change.
 
 #### HEASOFT `barycorr` does not work on Chandra
 
@@ -966,6 +1018,61 @@ exercised end to end on real data with a known answer. What remains is to put th
 the module, not to find out whether it works. `5644` should become the module's
 highest-value integration test.
 
+#### Run again through the module, on 2026-09-12, on `5644` **and** `8190`
+
+Everything above was done by hand. This was done by the module: `chandra_archive_front_end`
+→ `chandra_extraction_regions` → `chandra_clean_event_list` → `chandra_barycenter`, then
+HENDRICS on what came out. **Both observations return the published period.**
+
+**Use `Z²₁`, not `Z²₂`.** Matteo's call, and the profiles below show why: they are
+single-peaked and close to sinusoidal, so a second harmonic adds no signal. Worse, at
+`TIMEDEL = 0.44104 s` the second harmonic (1.487 Hz) sits *above* the Nyquist frequency
+(1.134 Hz), so `n = 2` is summing aliased noise into the statistic. The `--fast` accelerated
+search compounds this: over the same band it reports `Z²₁ = 30.30` for `5644` where an exact
+fdot = 0 search reports **59.32**, because its coarse phase binning attenuates the very peak
+it is looking for. **Search `-N 1`, and without `--fast` unless an `fdot` is actually needed
+— the accelerated search costs 8× the trials and, here, half the power.**
+
+| | `5644` | `8190` |
+|---|---|---|
+| Extraction | 0.830″ (PSF at 0.29′ off-axis) | 2.186″ (PSF at 3.58′ off-axis) |
+| Events | 10 577 | 19 025 |
+| Exposure after screening | 74 933 s | 58 179 s |
+| Barycentric correction | −280.89 s | −207.16 s |
+| **Measured period** | **1.3453202 s** | **1.3504294 s** |
+| Liu 2024 | 1.345321(5) s | 1.350429(4) s |
+| Difference | **−0.2 σ** | **+0.1 σ** |
+| **Z²₁** | **59.32** | **26.55** |
+| Highest other peak in the band | 14.60 | 21.58 |
+| Significance after 2 554 / 1 977 trials | **6.2 σ** | **2.7 σ** |
+| Sinusoid amplitude | 10.6 ± 1.4 % | 5.3 ± 1.0 % |
+| Liu 2024's amplitude | 12 ± 2 % | 6 ± 2 % (lower limit) |
+
+`5644` is unambiguous: the peak stands at 59.32 in a band whose next-highest excursion is
+14.60. `8190` is exactly what Matteo said it would be — **lower significance**. Liu 2024
+declares it at 3.3 σ; this search puts it at 2.7 σ after trials, and its peak is only 5
+units of `Z²₁` above the tallest noise peak in the band. On its own it would not be claimed.
+
+**What makes `8190` a verification rather than a coincidence is that nothing about the
+answer was fed in.** A blind search over 0.722–0.756 Hz — 34 mHz, wide enough to hold every
+frequency this source has ever shown — puts its tallest peak **0.1 σ** from a period
+published independently, and its amplitude within 0.4 σ of the published amplitude. The
+probability that a noise peak lands inside a 4 µs window by chance is ~10⁻³.
+
+The two observations also bracket the spin-down: 1.3453202 s in 2005-08, 1.3504294 s in
+2007-06, +5.1 ms in 655 days.
+
+`8190` is off-axis and blended, which is why its amplitude is half `5644`'s and why Liu
+calls theirs a lower limit. **Restricting to Liu's own 2–8 keV band reproduces Liu's own
+number**: at the same 2.186″ radius, `Z²₁` rises from 26.55 to **30.00**, the tallest noise
+peak in the band drops from 21.58 to 18.02, and the significance after trials becomes
+**3.24 σ** against Liu 2024's declared 3.3 σ. The period moves by 4 µs, to +1.1 σ of theirs.
+So the band is worth having — but the module's default, whole band at the PSF radius,
+already recovers the signal, and that default is what was being tested.
+
+*Figure:* `/private/tmp/hrp_chandra/verify/m82x2_profiles.pdf` — the two folded
+profiles, both single-peaked. The whole verification workspace is under that directory.
+
 #### A by-product: the astropy barycentring route is no longer hypothetical
 
 Open item 1 offered a third option for the DE430 question — computing the barycentric
@@ -1016,6 +1123,33 @@ special arrangement.
 6. **CC-mode background.** Continuous Clocking collapses one spatial dimension, so source
    and background overlap in it. The 1-D strip in step 6 is the XMM Timing analogue, but
    Chandra's geometry differs and the strip positions are a guess until tested.
+7. **A pulsation survey of the fast-frame ACIS-S observations of M82, once the module
+   runs end to end.** Added by Matteo 2026-09-12, after `5644` and `8190` were both
+   recovered. Item 5 asks *how much* fast-timing ACIS data the archive holds; this asks
+   what is *in* it. The two verification observations are short by the standards of what
+   is available:
+
+   | obsid | detector | `data_mode` | exposure | date |
+   |---|---|---|---|---|
+   | `5644` | ACIS-S | `TE_006AC` | 75.1 ks | 2005-08-17 |
+   | `8190` | ACIS-S | `TE_003C4` | 58.2 ks | 2007-06-02 |
+   | **`10542`** | ACIS-S | `TE_0085E` | **120.2 ks** | 2009-06-24 |
+   | **`10543`** | ACIS-S | `TE_0085E` | **120.0 ks** | 2009-07-02 |
+   | **`10544`** | ACIS-S | `TE_0085E` | **74.5 ks** | 2009-07-08 |
+
+   `10542`/`10543`/`10544` are the obvious first targets: the same detector, one `data_mode`
+   between them, and 315 ks together — more than four times the counts of `5644`, which is
+   the difference between a marginal detection and a measurement. Their **frame time is not
+   yet known**: the catalogue's `TE_xxxxx` code does not decode to one (`5644` and `8190`
+   carry different codes and the same `TIMEDEL = 0.44104 s`), so it takes an event-header
+   read per observation, exactly the survey item 5 describes. Select on `TIMEDEL` short
+   enough to sample 1.35 s — say `TIMEDEL < 0.5 s`, three or more samples per cycle — and
+   not on the mode string.
+
+   The search itself is the one run for the acceptance target, unchanged: deorbit with
+   `orbital_decay.par`, `axbary`, then **Z²₁**. Use `n = 1`: the profile is close to
+   sinusoidal, and at these frame times the second harmonic sits above the Nyquist
+   frequency, so `n = 2` is buying aliased noise, not signal. See *The known-answer test*.
 
 ---
 
