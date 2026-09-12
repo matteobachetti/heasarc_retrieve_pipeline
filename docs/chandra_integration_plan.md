@@ -42,8 +42,8 @@ everything unpushed.
 to end on 2026-09-12: `5644` gives `P = 1.3453202 s` at `Z²₁ = 59.32` (6.2 σ after trials),
 `8190` gives `P = 1.3504294 s` at `Z²₁ = 26.55` (2.7 σ) — both within 0.2 σ of Liu 2024,
 from a blind 34 mHz search. Numbers, method and the two folded profiles in
-*The known-answer test*. **Search with `-N 1` and without `--fast`**; the reasons are there
-too.
+*The known-answer test*. **Search with `-N 1 --oversample 16`** — the default sampling loses
+half the power and turned `5644` into a non-detection once; the measured table is there too.
 
 **Three deviations from this plan are in force and two of them want a verdict:**
 
@@ -1027,11 +1027,37 @@ HENDRICS on what came out. **Both observations return the published period.**
 **Use `Z²₁`, not `Z²₂`.** Matteo's call, and the profiles below show why: they are
 single-peaked and close to sinusoidal, so a second harmonic adds no signal. Worse, at
 `TIMEDEL = 0.44104 s` the second harmonic (1.487 Hz) sits *above* the Nyquist frequency
-(1.134 Hz), so `n = 2` is summing aliased noise into the statistic. The `--fast` accelerated
-search compounds this: over the same band it reports `Z²₁ = 30.30` for `5644` where an exact
-fdot = 0 search reports **59.32**, because its coarse phase binning attenuates the very peak
-it is looking for. **Search `-N 1`, and without `--fast` unless an `fdot` is actually needed
-— the accelerated search costs 8× the trials and, here, half the power.**
+(1.134 Hz), so `n = 2` is summing aliased noise into the statistic.
+
+**And oversample the frequency grid — `--oversample 16`.** This cost a real non-detection
+before Matteo named it. `HENzsearch --fast` at its default sampling puts the grid points too
+far apart for a `Z²ₙ` peak, whose width is about `1/T`; the true peak then falls between
+samples and what is reported is the attenuated value. Measured on both observations, same
+data, same band, `-N 1`:
+
+| `--oversample` | `5644` `Z²₁` | after trials | `8190` `Z²₁` | after trials |
+|---|---|---|---|---|
+| 2 | 25.18 | 1.8 σ | 14.08 | — |
+| 4 | 30.30 | 2.6 σ | 24.69 | 1.5 σ |
+| 8 | 56.79 | 5.5 σ | 26.65 | 1.6 σ |
+| **16** | **59.05** | **5.6 σ** | **28.55** | **1.8 σ** |
+| 32 | 59.65 | 5.5 σ | 29.13 | 1.6 σ |
+| *exact search, fdot = 0* | *59.32* | *6.2 σ* | *26.55* | *2.7 σ* |
+
+At the default the search reports 30.30 on `5644` — 2.6 σ, a **non-detection of a 10.6 %
+signal that is really there at 6 σ**. Sixteen recovers essentially all of it, and past 16 the
+extra trials cost more than the extra power gains, so the significance turns over. The
+diagnostic to recognise this by: the peak *frequency* wanders between runs that should agree
+— across extraction radii on `8190` it moved between 0.7398, 0.7405 and 0.7414 Hz, which
+looks exactly like noise and is really a grid moving under an unsampled peak.
+
+`Z²₂` hid this for a while. At the default sampling it reported 59.85 on `5644`, a healthy
+number, because the extra degrees of freedom were absorbing the leakage from the mismatched
+grid. The problem only became visible on switching to `-N 1`.
+
+**So: `-N 1 --oversample 16`.** Keep `--fast` — it searches `fdot` for 8× the trials, which
+`8190` repays and `5644` does not. Where no `fdot` is wanted, the exact search at
+`--oversample 8` is the cheaper equivalent, and the two agree to better than 1 % of `Z²₁`.
 
 | | `5644` | `8190` |
 |---|---|---|
