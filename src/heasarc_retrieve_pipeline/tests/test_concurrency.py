@@ -217,6 +217,19 @@ class TestObservationWorkItems:
         assert items[0]["url"] == "s3://bucket/90901333002"
         assert items[1]["url"] == "s3://bucket/80002092008"
 
+    def test_a_numeric_obsid_becomes_a_string(self):
+        """``chanmaster`` answers with ``int32`` OBSIDs, and every path is built from one."""
+        import numpy as np
+
+        table = catalogue((1411, "1", 148.9, 69.6))
+        table["obsid"] = table["obsid"].astype(np.int32)
+        links = datalink(("http://x/?1", "s3://bucket/chandra/1411/", "https://h/1411/"))
+
+        items = observation_work_items(table, links, "aws", mission="chandra")
+
+        assert items[0]["obsid"] == "1411"
+        assert isinstance(items[0]["obsid"], str)
+
 
 class TestObsidQuery:
     """The catalogue query behind "reduce these observations"."""

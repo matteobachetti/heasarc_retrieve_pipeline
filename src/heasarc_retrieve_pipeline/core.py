@@ -1643,7 +1643,8 @@ def observation_work_items(
 
     items = []
     for row in result_table:
-        obsid = row["obsid"]
+        # chanmaster answers with int32 OBSIDs, and every path downstream is built from one.
+        obsid = str(row["obsid"])
         link = link_by_row.get(row["__row"])
 
         url = None
