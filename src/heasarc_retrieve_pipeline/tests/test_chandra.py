@@ -15,7 +15,9 @@ fast-timing mode, and ACIS-S behind a transmission grating.
 import os
 import re
 
+import numpy as np
 import pytest
+from astropy.io import fits
 
 from heasarc_retrieve_pipeline import chandra
 
@@ -718,3 +720,254 @@ class TestTheModeLabelInAFileName:
             label = chandra.chandra_mode_label(header, **kwargs)
 
             assert chandra.chandra_file_stem(6298, "hrci", label).endswith(label)
+
+
+def a_dead_time_file(path, total, valid, sample_interval=2.05, n=200, bad_rows=0):
+    """
+    A ``dtf1`` file with the real column structure, and values chosen by the caller.
+
+    The columns and their formats are copied from the real files: ``STATUS`` is ``8X``,
+    eight bits, and a row counts only when every one of them is zero.
+    """
+    n_good = n - bad_rows
+    status = np.zeros((n, 8), dtype=bool)
+    status[n_good:, 0] = True
+    columns = fits.ColDefs(
+        [
+            fits.Column("TIME", "1D", "s", array=np.arange(n) * sample_interval + 1.0e8),
+            fits.Column("DTF", "1D", array=np.full(n, 0.9)),
+            fits.Column("DTF_ERR", "1D", array=np.full(n, 0.01)),
+            fits.Column("PROC_EVT_COUNT", "1J", "count", array=np.full(n, valid)),
+            fits.Column("TOTAL_EVT_COUNT", "1J", "count", array=np.full(n, total)),
+            fits.Column("VALID_EVT_COUNT", "1J", "count", array=np.full(n, valid)),
+            fits.Column("STATUS", "8X", array=status),
+        ]
+    )
+    hdu = fits.BinTableHDU.from_columns(columns, name="DTF")
+    # The real files carry this, and it is the sampling interval of the table -- NOT the
+    # event time resolution. Putting it here keeps the test honest about the confusion.
+    hdu.header["TIMEDEL"] = 2.0
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return str(path)
+
+
+class TestWhatTimeResolutionTheDataSupports:
+    """
+    The part of Chandra a naive reduction gets wrong.
+
+    Every HRC event header reads ``TIMEDEL = 1.5625e-05`` whether or not that resolution
+    is real. A backplane wiring error latches the event time on every front-end *trigger*
+    rather than every telemetered *event*, so each event carries the following trigger's
+    time; where on-board vetoing threw the intervening triggers away, the shift cannot be
+    undone and the resolution is about one over the trigger rate. ``S_TIMING`` disables
+    all vetoing, so there the shift is recoverable and the full 15.625 us stands.
+
+    The discriminator is the dead-time file's veto ratio, and it is already on disk.
+    """
+
+    def test_no_vetoing_means_the_header_is_right_and_the_rate_formula_is_not(self):
+        """
+        The whole point of the function, and the first test written.
+
+        Obsid ``17661`` is HRC-S ``S_TIMING``: ``VALID/TOTAL = 1.000`` at 60.0 triggers
+        per second. Applying ``1 / rate`` to it gives 16.67 ms -- **a thousand times
+        worse than the truth**. The ratio has to be tested first.
+        """
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-S", "TIMEDEL": 1.5625e-05}
+        dtf = chandra.DeadTimeFactors(
+            veto_ratio=1.0,
+            trigger_rate_hz=60.0,
+            sample_interval=2.05,
+            n_good_rows=14586,
+            n_rows=14588,
+        )
+
+        found = chandra.chandra_time_resolution(header, dtf)
+
+        assert found.seconds == pytest.approx(1.5625e-05)
+        assert found.seconds != pytest.approx(1 / 60.0)
+        assert found.fast_timing is True
+
+    def test_heavy_vetoing_gives_the_documented_four_milliseconds(self):
+        """
+        Obsid ``6298`` is HRC-I: ``VALID/TOTAL = 0.296`` at 228.8 triggers per second,
+        which is 4.37 ms -- and the CXC documents "about 4 milliseconds" for exactly this.
+        The header claims 15.625 us, so believing it would be wrong by a factor of 280.
+        """
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-I", "TIMEDEL": 1.5625e-05}
+        dtf = chandra.DeadTimeFactors(
+            veto_ratio=0.2964,
+            trigger_rate_hz=228.78,
+            sample_interval=2.05,
+            n_good_rows=2392,
+            n_rows=2769,
+        )
+
+        found = chandra.chandra_time_resolution(header, dtf)
+
+        assert found.seconds == pytest.approx(4.371e-3, rel=1e-3)
+        assert found.seconds / 1.5625e-05 == pytest.approx(280, rel=0.02)
+        assert found.fast_timing is False
+
+    def test_the_two_hrc_observations_have_identical_headers(self):
+        """
+        The reason the dead-time file is consulted at all: nothing in the event header
+        separates a real 15.625 us observation from one 280 times coarser.
+        """
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-I", "TIMEDEL": 1.5625e-05}
+        timing = chandra.DeadTimeFactors(1.0, 60.0, 2.05, 14586, 14588)
+        imaging = chandra.DeadTimeFactors(0.2964, 228.78, 2.05, 2392, 2769)
+
+        assert chandra.chandra_time_resolution(header, timing).seconds != pytest.approx(
+            chandra.chandra_time_resolution(header, imaging).seconds
+        )
+
+    def test_hrc_without_a_dead_time_file_assumes_the_documented_value_and_says_so(self):
+        """Never the header's 15.625 us, which would be an unearned claim."""
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-I", "TIMEDEL": 1.5625e-05}
+
+        found = chandra.chandra_time_resolution(header, None)
+
+        assert found.seconds == pytest.approx(chandra.HRC_DOCUMENTED_RESOLUTION)
+        assert found.fast_timing is False
+        assert "assum" in found.reason.lower()
+
+    @pytest.mark.parametrize("ratio, expected_fast", [(0.989, False), (0.99, True), (1.0, True)])
+    def test_the_threshold_is_where_the_configuration_puts_it(self, ratio, expected_fast):
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-S", "TIMEDEL": 1.5625e-05}
+        dtf = chandra.DeadTimeFactors(ratio, 100.0, 2.05, 100, 100)
+
+        found = chandra.chandra_time_resolution(header, dtf)
+
+        assert found.fast_timing is expected_fast
+
+    def test_a_stricter_threshold_can_be_configured(self):
+        """
+        0.99 was chosen from two observations, one at 1.000 and one at 0.296. The gap is
+        enormous so almost any threshold works, but the distribution across the ~1669
+        HRC-S observations is unmeasured -- so it stays a knob.
+        """
+        header = {"INSTRUME": "HRC", "DETNAM": "HRC-S", "TIMEDEL": 1.5625e-05}
+        dtf = chandra.DeadTimeFactors(0.995, 100.0, 2.05, 100, 100)
+
+        strict = chandra.chandra_time_resolution(header, dtf, {"hrc_veto_ratio_threshold": 0.999})
+
+        assert strict.fast_timing is False
+
+    def test_acis_timed_exposure_is_the_frame_time_in_the_header(self):
+        """Obsid 2749: 2.54104 s, and honest about it."""
+        header = {"INSTRUME": "ACIS", "READMODE": "TIMED", "TIMEDEL": 2.54104}
+
+        found = chandra.chandra_time_resolution(header)
+
+        assert found.seconds == pytest.approx(2.54104)
+        assert found.fast_timing is None
+
+    def test_an_acis_subarray_is_read_from_the_header_and_not_assumed_to_be_slow(self):
+        """
+        Obsid ``5644``, the known-answer test: ``TIMEDEL = 0.44104``, not the nominal
+        3.2 s. Nyquist period 0.88 s, so M82 X-2's 1.37 s spin is sampled 3.1 times a
+        cycle -- which is how Liu 2024 detected it. Assuming 3.2 s would have discarded
+        the one M82 observation with a published detection.
+        """
+        header = {"INSTRUME": "ACIS", "READMODE": "TIMED", "TIMEDEL": 0.44104}
+
+        found = chandra.chandra_time_resolution(header)
+
+        assert found.seconds == pytest.approx(0.44104)
+        assert 2 * found.seconds < 1.345
+
+    def test_continuous_clocking_is_milliseconds_and_warns_about_the_lost_dimension(self):
+        """Measured on obsid 31917: ``TIMEDEL = 0.00285``, i.e. 2.85 ms."""
+        header = {"INSTRUME": "ACIS", "READMODE": "CONTINUOUS", "TIMEDEL": 0.00285}
+
+        found = chandra.chandra_time_resolution(header)
+
+        assert found.seconds == pytest.approx(0.00285)
+        assert "spatial" in found.reason.lower()
+
+    def test_every_branch_says_why_in_plain_english(self):
+        """The reason is recorded in the diagnostics for every observation."""
+        cases = [
+            ({"INSTRUME": "ACIS", "READMODE": "TIMED", "TIMEDEL": 3.14104}, None),
+            ({"INSTRUME": "ACIS", "READMODE": "CONTINUOUS", "TIMEDEL": 0.00285}, None),
+            ({"INSTRUME": "HRC", "TIMEDEL": 1.5625e-05}, None),
+            (
+                {"INSTRUME": "HRC", "TIMEDEL": 1.5625e-05},
+                chandra.DeadTimeFactors(1.0, 60.0, 2.05, 9, 9),
+            ),
+            (
+                {"INSTRUME": "HRC", "TIMEDEL": 1.5625e-05},
+                chandra.DeadTimeFactors(0.2964, 228.78, 2.05, 9, 9),
+            ),
+        ]
+        seen = set()
+        for header, dtf in cases:
+            found = chandra.chandra_time_resolution(header, dtf)
+
+            assert found.seconds > 0
+            assert len(found.reason.split()) >= 5
+            seen.add(found.basis)
+        assert len(seen) == len(cases), "each branch must be distinguishable in the record"
+
+    def test_an_acis_readmode_it_does_not_know_is_an_error(self):
+        header = {"INSTRUME": "ACIS", "READMODE": "SOMETHING_NEW", "TIMEDEL": 3.2}
+
+        with pytest.raises(ValueError, match="READMODE"):
+            chandra.chandra_time_resolution(header)
+
+    def test_a_header_with_no_timedel_is_an_error(self):
+        """Every branch but the HRC fallback needs it, and inventing one would be a lie."""
+        with pytest.raises(ValueError, match="TIMEDEL"):
+            chandra.chandra_time_resolution({"INSTRUME": "ACIS", "READMODE": "TIMED"})
+
+
+class TestReadingTheDeadTimeFile:
+    def test_it_reproduces_the_two_measured_observations(self, tmp_path):
+        """
+        The real medians, from the real files, read on 2026-09-12: ``6298`` gives
+        469 total and 139 valid per 2.05 s sample, ``17661`` gives 123 and 123.
+        """
+        hrc_i = a_dead_time_file(tmp_path / "i.fits", total=469, valid=139)
+        hrc_s = a_dead_time_file(tmp_path / "s.fits", total=123, valid=123)
+
+        assert chandra.read_dead_time_factors(hrc_i).veto_ratio == pytest.approx(0.2964, rel=1e-3)
+        assert chandra.read_dead_time_factors(hrc_i).trigger_rate_hz == pytest.approx(
+            228.78, rel=1e-3
+        )
+        assert chandra.read_dead_time_factors(hrc_s).veto_ratio == pytest.approx(1.0)
+        assert chandra.read_dead_time_factors(hrc_s).trigger_rate_hz == pytest.approx(60.0)
+
+    def test_rows_with_a_status_bit_set_are_left_out(self, tmp_path):
+        """
+        ``STATUS`` is eight bits and a row counts only when every one is zero. On the
+        real ``6298`` that drops 377 rows of 2769.
+        """
+        path = a_dead_time_file(tmp_path / "d.fits", total=469, valid=139, n=100, bad_rows=40)
+
+        found = chandra.read_dead_time_factors(path)
+
+        assert (found.n_good_rows, found.n_rows) == (60, 100)
+
+    def test_the_sample_interval_is_measured_not_taken_from_the_header(self, tmp_path):
+        """
+        The file's own ``TIMEDEL`` says 2.0 and the rows are 2.05 s apart. That keyword
+        is the sampling interval's nominal value -- and it is *not* the event time
+        resolution either, which is the confusion this whole module is about.
+        """
+        path = a_dead_time_file(tmp_path / "d.fits", total=469, valid=139, sample_interval=2.05)
+
+        assert chandra.read_dead_time_factors(path).sample_interval == pytest.approx(2.05)
+
+    def test_a_file_with_no_usable_rows_is_an_error(self, tmp_path):
+        path = a_dead_time_file(tmp_path / "d.fits", total=469, valid=139, n=10, bad_rows=10)
+
+        with pytest.raises(ValueError, match="no usable rows"):
+            chandra.read_dead_time_factors(path)
+
+    def test_a_file_with_no_triggers_is_an_error(self, tmp_path):
+        """Dividing by a zero trigger rate would give an infinite time resolution."""
+        path = a_dead_time_file(tmp_path / "d.fits", total=0, valid=0)
+
+        with pytest.raises(ValueError, match="no triggers"):
+            chandra.read_dead_time_factors(path)

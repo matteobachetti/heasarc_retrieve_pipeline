@@ -45,6 +45,11 @@ barycentres anything.
 
 import glob
 import os
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from astropy.io import fits
 
 #: The pipeline's defaults for a Chandra run.
 #:
@@ -53,6 +58,7 @@ import os
 #: archive is the default by Matteo's ruling of 2026-09-12, mirroring XMM's PPS/ODF split
 #: -- with ``CALDBVER`` reported as a staleness diagnostic rather than used to decide the
 #: route.
+#:
 #: ``src_radius_arcsec = None`` means "ask ``psfsize_srcs``", and is the default because
 #: Chandra's PSF grows from about one arcsecond on-axis to over ten at eight arcminutes
 #: off-axis. A fixed radius -- XMM's approach -- would be wrong at both ends.
@@ -798,3 +804,262 @@ def chandra_mode_label(header, fast_timing=None):
     if read_mode not in ACIS_READ_MODES:
         raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
     return ACIS_READ_MODES[read_mode]
+
+
+#: The time resolution the CXC documents for HRC where the wiring error is not
+#: recoverable: "about 4 milliseconds". Used only when there is no dead-time file to
+#: measure the trigger rate from, and always flagged as the assumption it is.
+#:
+#: See https://cxc.cfa.harvard.edu/ciao/caveats/hrc_timing.html
+HRC_DOCUMENTED_RESOLUTION = 4.0e-3
+
+
+@dataclass
+class DeadTimeFactors:
+    """
+    What the dead-time-factor file says about on-board vetoing.
+
+    Attributes
+    ----------
+    veto_ratio : float
+        ``VALID_EVT_COUNT / TOTAL_EVT_COUNT``, from medians over the usable rows. One
+        means nothing was vetoed; ``6298`` measures 0.296.
+    trigger_rate_hz : float
+        Front-end triggers per second: median ``TOTAL_EVT_COUNT`` over the sample
+        interval.
+    sample_interval : float
+        Seconds between rows, measured rather than read from the header.
+    n_good_rows, n_rows : int
+        Rows with every ``STATUS`` bit clear, and rows in the file.
+    """
+
+    veto_ratio: float
+    trigger_rate_hz: float
+    sample_interval: float
+    n_good_rows: int
+    n_rows: int
+
+
+@dataclass
+class TimeResolution:
+    """
+    What time resolution an observation can actually support, and why.
+
+    Recorded in the diagnostics for every observation, so that a user reads the honest
+    number rather than one off a spec sheet.
+
+    Attributes
+    ----------
+    seconds : float
+        The resolution itself.
+    basis : str
+        Which branch produced it, as a short key for the diagnostics record.
+    reason : str
+        The same thing in plain English, for the report page.
+    fast_timing : bool or None
+        For HRC, whether the wiring error is recoverable and the header's 15.625 us
+        stands. ``None`` for ACIS, where the question does not arise. This is what
+        :func:`chandra_mode_label` needs to label an HRC observation.
+    veto_ratio, trigger_rate_hz : float or None
+        Carried through from :class:`DeadTimeFactors` when there was one, so the record
+        shows the evidence and not only the conclusion.
+    """
+
+    seconds: float
+    basis: str
+    reason: str
+    fast_timing: Optional[bool] = None
+    veto_ratio: Optional[float] = None
+    trigger_rate_hz: Optional[float] = None
+
+
+def read_dead_time_factors(path):
+    """
+    Measure the on-board veto fraction and trigger rate from a ``dtf1`` file.
+
+    The file is 71-109 kB, is already downloaded because HRC rates need it, and samples
+    ``TOTAL_EVT_COUNT`` and ``VALID_EVT_COUNT`` every 2.05 s. Their ratio is the veto
+    fraction, which is exactly what decides whether the HRC wiring error is recoverable.
+
+    Medians rather than sums, and only rows with every ``STATUS`` bit clear: on the real
+    ``6298`` that is 2 392 rows of 2 769.
+
+    Parameters
+    ----------
+    path : str
+        Path to the ``dtf1`` file, gzipped or not.
+
+    Returns
+    -------
+    DeadTimeFactors
+
+    Raises
+    ------
+    ValueError
+        If no row has a clear ``STATUS``, or if the median trigger count is zero -- which
+        would make the derived resolution infinite rather than merely wrong.
+
+    Notes
+    -----
+    The file's own ``TIMEDEL`` keyword reads 2.0 and is the *sampling* interval's nominal
+    value. It is not the event time resolution, and it is not the measured sampling
+    interval either, which is 2.05 s. Three different things, one keyword name.
+    """
+    with fits.open(path) as hdulist:
+        table = hdulist["DTF"].data
+        status = table["STATUS"]
+        clear = status.sum(axis=1) == 0 if np.ndim(status) > 1 else status == 0
+        good = table[clear]
+        n_rows = len(table)
+
+    if len(good) == 0:
+        raise ValueError(f"{path} has no usable rows: every STATUS is flagged")
+
+    times = np.sort(np.asarray(good["TIME"], dtype=float))
+    sample_interval = float(np.median(np.diff(times))) if len(times) > 1 else float("nan")
+    total = float(np.median(good["TOTAL_EVT_COUNT"]))
+    valid = float(np.median(good["VALID_EVT_COUNT"]))
+
+    if total <= 0:
+        raise ValueError(f"{path} records no triggers, so no trigger rate can be measured")
+
+    return DeadTimeFactors(
+        veto_ratio=valid / total,
+        trigger_rate_hz=total / sample_interval,
+        sample_interval=sample_interval,
+        n_good_rows=len(good),
+        n_rows=n_rows,
+    )
+
+
+def chandra_time_resolution(header, dtf=None, config=None):
+    """
+    What time resolution an observation can actually support, with its reason.
+
+    This is the honest analogue of XMM's extraction-window check: the pipeline states what
+    timing the data carry instead of letting a user read 16 us off a spec sheet. Pure
+    Python, no CIAO, no network.
+
+    The branches:
+
+    * **ACIS, Timed Exposure** -- the frame time, from ``TIMEDEL``. Read and never
+      assumed: obsid ``2749`` measures 2.54104 s and ``5644`` measures **0.44104 s**
+      against a nominal 3.2 s, and it was ``5644``'s subarray that let Liu 2024 detect a
+      1.37 s pulsation.
+    * **ACIS, Continuous Clocking** -- also ``TIMEDEL``, which measures 2.85 ms, with the
+      warning that one spatial dimension is gone and source and background overlap in it.
+    * **HRC with no dead-time file** -- the documented ~4 ms, flagged as an assumption.
+      Never the header's 15.625 us, which would be an unearned claim.
+    * **HRC, veto ratio at or above the threshold** -- ``TIMEDEL``, the full 15.625 us:
+      every trigger was telemetered, so the wiring error is recoverable.
+    * **HRC, veto ratio below it** -- one over the trigger rate.
+
+    **The order of those last two matters and is the point of the function.** Applying the
+    rate formula to a ``S_TIMING`` observation gives 16.67 ms, a thousand times worse than
+    the truth, so the ratio is tested first.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        The event list header: ``INSTRUME``, ``TIMEDEL``, and ``READMODE`` for ACIS.
+    dtf : DeadTimeFactors, optional
+        What :func:`read_dead_time_factors` found, for HRC. Ignored for ACIS.
+    config : dict, optional
+        Only ``hrc_veto_ratio_threshold`` is read; defaults to
+        :data:`DEFAULT_CONFIG`'s 0.99.
+
+    Returns
+    -------
+    TimeResolution
+
+    Raises
+    ------
+    ValueError
+        For a missing ``TIMEDEL``, or an ACIS ``READMODE`` this does not know.
+
+    Examples
+    --------
+    >>> hrc_s = DeadTimeFactors(1.0, 60.0, 2.05, 14586, 14588)
+    >>> found = chandra_time_resolution({"INSTRUME": "HRC", "TIMEDEL": 1.5625e-05}, hrc_s)
+    >>> found.seconds, found.fast_timing
+    (1.5625e-05, True)
+    """
+    config = DEFAULT_CONFIG if config is None else config
+    threshold = config.get("hrc_veto_ratio_threshold", DEFAULT_CONFIG["hrc_veto_ratio_threshold"])
+    instrument = str(header.get("INSTRUME", "")).strip().upper()
+
+    timedel = header.get("TIMEDEL")
+    if timedel is None and not (instrument == "HRC" and dtf is None):
+        raise ValueError("the event header carries no TIMEDEL, and inventing one would be a lie")
+
+    if instrument == "HRC":
+        if dtf is None:
+            return TimeResolution(
+                seconds=HRC_DOCUMENTED_RESOLUTION,
+                basis="hrc_documented",
+                reason=(
+                    "No dead-time file was downloaded, so the on-board veto fraction "
+                    "could not be measured. Assuming the CXC's documented ~4 ms for HRC, "
+                    "rather than the 15.625 us the header claims: a backplane wiring "
+                    "error time-tags each event with the following trigger, and only an "
+                    "unvetoed observation can have that undone."
+                ),
+                fast_timing=False,
+            )
+        if dtf.veto_ratio >= threshold:
+            return TimeResolution(
+                seconds=float(timedel),
+                basis="hrc_unvetoed",
+                reason=(
+                    f"{dtf.veto_ratio:.3f} of front-end triggers were telemetered, at or "
+                    f"above the {threshold:g} threshold, so no vetoing took place and the "
+                    "wiring error's time-tag shift can be undone. The header's "
+                    f"{float(timedel) * 1e6:.3f} us therefore stands. This is the "
+                    "S_TIMING signature."
+                ),
+                fast_timing=True,
+                veto_ratio=dtf.veto_ratio,
+                trigger_rate_hz=dtf.trigger_rate_hz,
+            )
+        return TimeResolution(
+            seconds=1.0 / dtf.trigger_rate_hz,
+            basis="hrc_trigger_rate",
+            reason=(
+                f"Only {dtf.veto_ratio:.3f} of front-end triggers were telemetered, so "
+                f"{(1 - dtf.veto_ratio) * 100:.1f} per cent were vetoed on board and the "
+                "wiring error's time-tag shift cannot be undone. The resolution is one "
+                f"over the trigger rate of {dtf.trigger_rate_hz:.1f} per second, not the "
+                f"{float(timedel) * 1e6:.3f} us the header claims."
+            ),
+            fast_timing=False,
+            veto_ratio=dtf.veto_ratio,
+            trigger_rate_hz=dtf.trigger_rate_hz,
+        )
+
+    if instrument != "ACIS":
+        raise ValueError(f"INSTRUME {instrument!r} is neither ACIS nor HRC")
+
+    read_mode = str(header.get("READMODE", "")).strip().upper()
+    if read_mode == "TIMED":
+        return TimeResolution(
+            seconds=float(timedel),
+            basis="acis_frame_time",
+            reason=(
+                f"ACIS Timed Exposure reads out every {float(timedel):.5f} s, and that "
+                "frame time is the finest timing the events carry. It is read from the "
+                "header rather than assumed: a subarray runs far faster than the nominal "
+                "3.2 s."
+            ),
+        )
+    if read_mode == "CONTINUOUS":
+        return TimeResolution(
+            seconds=float(timedel),
+            basis="acis_continuous_clocking",
+            reason=(
+                f"ACIS Continuous Clocking reads out a row every {float(timedel) * 1e3:.2f} "
+                "ms. One spatial dimension is destroyed to buy that, so source and "
+                "background overlap along the collapsed axis and cannot be separated by "
+                "position."
+            ),
+        )
+    raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
