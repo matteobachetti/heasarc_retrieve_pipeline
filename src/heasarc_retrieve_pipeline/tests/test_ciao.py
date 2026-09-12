@@ -288,6 +288,46 @@ class TestThePerObservationParameterFiles:
         assert "6298" in environment["ASCDS_WORK_PATH"]
         assert os.path.isdir(environment["ASCDS_WORK_PATH"])
 
+    def test_the_scratch_path_is_the_observation_s_own_too(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ASCDS_INSTALL", str(tmp_path / "ciao"))
+        monkeypatch.setenv("ASCDS_TMP", "/shared/tmp")
+
+        environment = ciao.ciao_environment("6298", {"out_data_path": str(tmp_path)})
+
+        assert environment["ASCDS_TMP"] == environment["ASCDS_WORK_PATH"]
+
+    def test_the_activation_script_s_variables_are_filled_in_from_the_installation(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Putting ``$ASCDS_INSTALL/bin`` on ``PATH`` is not activating CIAO. ``psfsize_srcs``
+        then stops with "Please set the $ASCDS_CALIB environment variable", which is what
+        the first M82 HRC batch did to every observation on 2026-09-12.
+        """
+        install = tmp_path / "ciao"
+        monkeypatch.setenv("ASCDS_INSTALL", str(install))
+        for name in ("ASCDS_CALIB", "ASCDS_BIN", "ASCDS_LIB", "ASCDS_OTS", "ASCDS_CONTRIB"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("XPA_METHOD", raising=False)
+
+        environment = ciao.ciao_environment("6298", {"out_data_path": str(tmp_path)})
+
+        assert environment["ASCDS_CALIB"] == str(install / "data")
+        assert environment["ASCDS_BIN"] == str(install / "bin")
+        assert environment["ASCDS_LIB"] == str(install / "lib")
+        assert environment["ASCDS_OTS"] == str(install)
+        assert environment["ASCDS_CONTRIB"] == str(install)
+        assert environment["XPA_METHOD"] == "local"
+
+    def test_an_activated_shell_s_values_are_left_alone(self, tmp_path, monkeypatch):
+        """A source installation lays itself out differently, and its own script knows."""
+        monkeypatch.setenv("ASCDS_INSTALL", str(tmp_path / "ciao"))
+        monkeypatch.setenv("ASCDS_CALIB", "/source/install/data")
+
+        environment = ciao.ciao_environment("6298", {"out_data_path": str(tmp_path)})
+
+        assert environment["ASCDS_CALIB"] == "/source/install/data"
+
     def test_without_an_installation_it_says_so(self, tmp_path, monkeypatch):
         monkeypatch.delenv("ASCDS_INSTALL", raising=False)
 

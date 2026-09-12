@@ -289,6 +289,21 @@ def ciao_environment(obsid, config):
     environment = dict(os.environ)
     environment["PFILES"] = f"{private};{':'.join(system)}"
     environment["ASCDS_WORK_PATH"] = work
+    environment["ASCDS_TMP"] = work
+
+    # Putting $ASCDS_INSTALL/bin on PATH is not activating CIAO: psfsize_srcs then stops at
+    # "Please set the $ASCDS_CALIB environment variable". These are the variables CIAO's
+    # conda activation script derives from the installation alone. An activated shell's
+    # own values are kept, because a source installation lays itself out differently.
+    for name, value in (
+        ("ASCDS_CALIB", os.path.join(install, "data")),
+        ("ASCDS_BIN", os.path.join(install, "bin")),
+        ("ASCDS_LIB", os.path.join(install, "lib")),
+        ("ASCDS_OTS", install),
+        ("ASCDS_CONTRIB", install),
+        ("XPA_METHOD", "local"),
+    ):
+        environment.setdefault(name, value)
 
     # A conda CIAO keeps its calibration database at $ASCDS_INSTALL/CALDB, and where that
     # exists it *is* this installation's calibration -- so it wins over whatever the
