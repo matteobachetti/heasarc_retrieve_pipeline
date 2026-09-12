@@ -12,6 +12,7 @@ ones ``docs/chandra_integration_plan.md`` measured: they span HRC-I, HRC-S in it
 fast-timing mode, and ACIS-S behind a transmission grating.
 """
 
+import os
 import re
 
 import pytest
@@ -362,3 +363,358 @@ class TestTheFilterItself:
         """Falling back to "download everything" would answer a typo with half a gigabyte."""
         with pytest.raises(ValueError, match="archive"):
             chandra.chandra_download_filter({"products": "Archive "})
+
+
+class TestNamingAnObservation:
+    """
+    The padding asymmetry, which is the one thing here that is easy to get wrong.
+
+    ``chanmaster.obsid`` is an integer and the archive files an observation under its
+    unpadded decimal form -- ``byobsid/8/6298/`` -- so that is what the download directory
+    is called and what the pipeline's own directories must match. But the archive's *file*
+    names are zero-padded to five digits (``hrcf06298``, ``acisf02749``), and output files
+    leave the tree that gives them context, so their stems pad too.
+    """
+
+    @pytest.mark.parametrize("given", [6298, "6298", "06298", "0006298"])
+    def test_a_directory_is_named_the_way_the_archive_files_it(self, given):
+        assert chandra.chandra_obsid(given) == "6298"
+
+    @pytest.mark.parametrize("given", [6298, "6298", "06298"])
+    def test_a_file_stem_pads_to_five_digits(self, given):
+        assert chandra.chandra_padded_obsid(given) == "06298"
+
+    def test_an_obsid_too_long_to_pad_is_left_alone(self):
+        """Chandra has not reached six digits, but truncating one would be worse."""
+        assert chandra.chandra_padded_obsid(123456) == "123456"
+
+    @pytest.mark.parametrize("given", ["", "abc", "62 98", "../6298", None])
+    def test_something_that_is_not_an_obsid_is_an_error(self, given):
+        with pytest.raises((ValueError, TypeError)):
+            chandra.chandra_obsid(given)
+
+    def test_the_stem_names_the_observation_the_detector_and_the_mode(self):
+        """The rule Matteo set for XMM on 2026-09-08: every file names its own OBSID."""
+        assert chandra.chandra_file_stem(6298, "hrci", "imaging") == "chandra06298_hrci_imaging"
+        assert chandra.chandra_file_stem("2749", "aciss", "hetg") == "chandra02749_aciss_hetg"
+
+    def test_the_longest_stem_leaves_room_in_a_fits_card(self):
+        """
+        ``BACKFILE`` and friends are 80-character cards, and FTOOLS truncate at that.
+        The longest stem a real observation can produce is well inside it.
+        """
+        stem = chandra.chandra_file_stem(99999, "aciss", "continuous_clocking")
+
+        assert len(stem + "_bkg.pi") < 60
+
+
+class TestWhichAcisConfigurationAnObservationIs:
+    """
+    ACIS-I or ACIS-S, which the chip set cannot answer and ``SIM_Z`` can.
+
+    ``DETNAM`` names the chips that were switched on, not the configuration. Measured on
+    2026-09-12 over 150 randomly chosen archived ACIS observations: **50 of them had both
+    chip 3 (I3) and chip 7 (S3) on**, and those 50 span both configurations, so no rule
+    written on the chip set can decide. ``SIM_Z`` -- where the Science Instrument Module
+    was parked -- separates them with an 18.1 mm gap and no overlap:
+
+    ============ ========================= =========================
+    Catalogue    ``SIM_Z`` range (75 each) Median (= nominal aimpoint)
+    ============ ========================= =========================
+    ``ACIS-I``   -238.274 .. -214.099      -233.587
+    ``ACIS-S``   -195.973 .. -182.134      -190.143
+    ============ ========================= =========================
+    """
+
+    @pytest.mark.parametrize(
+        "detnam, sim_z, expected",
+        [
+            # The four observations the plan measures, with their real header values.
+            ("ACIS-456789", -187.125, "aciss"),  # 2749, ACIS-S + HETG
+            ("ACIS-7", -190.140, "aciss"),  # 5644, the known-answer subarray
+            ("ACIS-01236", -225.783, "acisi"),  # 14022, ACIS-I
+            ("ACIS-012378", -233.587, "acisi"),  # 62520, ACIS-I at the nominal aimpoint
+            # The two chip sets that defeat every chip rule, with the SIM_Z that decides.
+            ("ACIS-235678", -190.133, "aciss"),  # ACIS-S, yet chip 3 is on
+            ("ACIS-012367", -233.587, "acisi"),  # ACIS-I, yet chip 7 is on
+            # The extremes of the measured ranges, either side of the gap.
+            ("ACIS-0123", -214.099, "acisi"),
+            ("ACIS-56789", -195.973, "aciss"),
+            ("ACIS-0123", -238.274, "acisi"),
+            ("ACIS-567", -182.134, "aciss"),
+        ],
+    )
+    def test_the_sim_position_decides(self, detnam, sim_z, expected):
+        header = {"INSTRUME": "ACIS", "DETNAM": detnam, "SIM_Z": sim_z}
+
+        assert chandra.chandra_detector(header) == expected
+
+    def test_the_chip_set_alone_would_get_a_third_of_the_archive_wrong(self):
+        """
+        Both configurations below have chips 3 and 7 on. A rule reading either chip
+        answers the same for both, and one of the answers is wrong.
+        """
+        acis_i = {"INSTRUME": "ACIS", "DETNAM": "ACIS-012367", "SIM_Z": -233.587}
+        acis_s = {"INSTRUME": "ACIS", "DETNAM": "ACIS-235678", "SIM_Z": -190.133}
+
+        assert chandra.chandra_detector(acis_i) != chandra.chandra_detector(acis_s)
+
+    @pytest.mark.parametrize("detnam, expected", [("HRC-I", "hrci"), ("HRC-S", "hrcs")])
+    def test_hrc_says_so_in_its_own_detnam_and_needs_no_sim_position(self, detnam, expected):
+        """``DETNAM`` is the configuration itself for HRC, so ``SIM_Z`` is never consulted."""
+        header = {"INSTRUME": "HRC", "DETNAM": detnam}
+
+        assert chandra.chandra_detector(header) == expected
+
+    def test_an_acis_header_without_a_sim_position_is_an_error(self):
+        """Guessing would put a wrong detector into every output file name."""
+        with pytest.raises(ValueError, match="SIM_Z"):
+            chandra.chandra_detector({"INSTRUME": "ACIS", "DETNAM": "ACIS-01236"})
+
+    def test_an_unknown_instrument_is_an_error(self):
+        with pytest.raises(ValueError, match="INSTRUME"):
+            chandra.chandra_detector({"INSTRUME": "EPIC", "DETNAM": "PN"})
+
+
+def a_downloaded_observation(tmp_path, obsid="6298", names=None):
+    """Lay the named archive files out where a download would have put them."""
+    names = HRC_I_6298_KEPT if names is None else names
+    config = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+    for name in names:
+        path = tmp_path / chandra.chandra_obsid(obsid) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")
+    return config
+
+
+class TestWhereEverythingGoes:
+    def test_the_download_directory_is_the_archives_own_spelling(self, tmp_path):
+        """
+        The download lands in ``<input>/6298`` because that is the last component of the
+        archive prefix. Looking in ``<input>/06298`` would find an empty directory and
+        report an observation with no science data.
+        """
+        config = a_downloaded_observation(tmp_path)
+
+        assert chandra.chandra_archive_path("06298", config) == str(tmp_path / "6298")
+
+    def test_the_output_tree_uses_the_names_the_report_already_knows(self, tmp_path):
+        """
+        ``event_cl`` and ``products`` are NuSTAR's names, kept so that
+        ``report.OBSERVATION_SUBDIRECTORIES`` finds a Chandra tree untaught -- the same
+        reason :mod:`heasarc_retrieve_pipeline.xmm` kept them.
+        """
+        config = {"out_data_path": str(tmp_path)}
+
+        assert chandra.chandra_base_output_path(6298, config) == str(tmp_path / "6298")
+        assert chandra.chandra_pipeline_output_path(6298, config) == str(
+            tmp_path / "6298" / "event_cl"
+        )
+        assert chandra.chandra_product_output_path(6298, config) == str(
+            tmp_path / "6298" / "products"
+        )
+
+
+class TestFindingTheProductsOfAnObservation:
+    def test_it_finds_every_family_of_an_hrc_observation(self, tmp_path):
+        config = a_downloaded_observation(tmp_path, "6298", HRC_I_6298_KEPT)
+
+        def base(found):
+            return None if found is None else os.path.basename(found)
+
+        assert base(chandra.chandra_event_list("6298", config)) == "hrcf06298N006_evt2.fits.gz"
+        assert base(chandra.chandra_aspect_solution("6298", config)) == (
+            "pcadf06298_000N001_asol1.fits.gz"
+        )
+        assert base(chandra.chandra_bad_pixel_file("6298", config)) == (
+            "hrcf06298_000N006_bpix1.fits.gz"
+        )
+        assert base(chandra.chandra_dead_time_file("6298", config)) == (
+            "hrcf06298_000N006_dtf1.fits.gz"
+        )
+        assert base(chandra.chandra_orbit_ephemeris("6298", config)) == (
+            "orbitf235397100N001_eph1.fits.gz"
+        )
+        assert base(chandra.chandra_mask_file("6298", config)) == "hrcf06298_000N006_msk1.fits.gz"
+
+    def test_it_finds_the_bad_pixel_file_of_an_acis_observation_in_the_other_directory(
+        self, tmp_path
+    ):
+        """
+        The trap again, one layer up: ACIS files ``bpix1`` under ``primary/`` and HRC
+        under ``secondary/``. The finder must look in both, whichever instrument it has.
+        """
+        config = a_downloaded_observation(tmp_path, "2749", ACIS_HETG_2749_KEPT)
+
+        found = chandra.chandra_bad_pixel_file("2749", config)
+
+        assert os.path.basename(found) == "acisf02749_000N004_bpix1.fits.gz"
+        assert os.path.dirname(found).endswith("primary")
+
+    def test_acis_has_no_dead_time_file_and_that_is_not_an_error(self, tmp_path):
+        """Only HRC writes one, so ``None`` is the answer, not an exception."""
+        config = a_downloaded_observation(tmp_path, "2749", ACIS_HETG_2749_KEPT)
+
+        assert chandra.chandra_dead_time_file("2749", config) is None
+
+    def test_it_collects_the_grating_products_whole(self, tmp_path):
+        """Twelve ARF/RMF pairs and one ``pha2``: these are the spectra, already made."""
+        config = a_downloaded_observation(tmp_path, "2749", ACIS_HETG_2749_KEPT)
+
+        assert os.path.basename(chandra.chandra_grating_spectrum("2749", config)) == (
+            "acisf02749N004_pha2.fits.gz"
+        )
+        assert len(chandra.chandra_grating_responses("2749", config)) == 24
+
+    def test_an_observation_without_gratings_collects_none(self, tmp_path):
+        config = a_downloaded_observation(tmp_path, "6298", HRC_I_6298_KEPT)
+
+        assert chandra.chandra_grating_spectrum("6298", config) is None
+        assert chandra.chandra_grating_responses("6298", config) == []
+
+    def test_an_observation_never_downloaded_finds_nothing_rather_than_raising(self, tmp_path):
+        """Whether there is anything to reduce is the caller's decision, as for XMM."""
+        config = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+
+        assert chandra.chandra_event_list("6298", config) is None
+        assert chandra.chandra_grating_responses("6298", config) == []
+
+    def test_an_ungzipped_product_is_found_too(self, tmp_path):
+        """``chandra_repro`` writes plain FITS; the archive gzips. Both are products."""
+        config = a_downloaded_observation(tmp_path, "6298", ["primary/hrcf06298N006_evt2.fits"])
+
+        assert os.path.basename(chandra.chandra_event_list("6298", config)) == (
+            "hrcf06298N006_evt2.fits"
+        )
+
+    def test_two_event_lists_are_an_error_rather_than_a_coin_toss(self, tmp_path):
+        """
+        A Chandra observation is one detector in one mode and so has one level-2 event
+        list. Two means something is wrong -- a half-finished reprocessing, most likely --
+        and picking one at random would reduce the wrong data in silence.
+        """
+        config = a_downloaded_observation(
+            tmp_path,
+            "6298",
+            ["primary/hrcf06298N006_evt2.fits.gz", "primary/hrcf06298N005_evt2.fits.gz"],
+        )
+
+        with pytest.raises(ValueError, match="evt2"):
+            chandra.chandra_event_list("6298", config)
+
+
+class TestWhichChipsWereReadOut:
+    """
+    ``DETNAM`` is a chip list, and the digits are chip identifiers.
+
+    Chips 0-3 are the ACIS-I array (I0-I3) and chips 4-9 are the ACIS-S array (S0-S5).
+    The aimpoint is I3 -- chip 3 -- for ACIS-I and S3 -- chip 7 -- for ACIS-S. An
+    observation routinely switches on chips from both arrays: ``ACIS-012367`` is the
+    whole ACIS-I array read out with S2 and S3 alongside it. Step 6 needs the list to
+    know which chip the source lands on.
+    """
+
+    @pytest.mark.parametrize(
+        "detnam, chips",
+        [
+            ("ACIS-012367", [0, 1, 2, 3, 6, 7]),  # the ACIS-I array plus S2 and S3
+            ("ACIS-456789", [4, 5, 6, 7, 8, 9]),  # the whole ACIS-S array
+            ("ACIS-0123", [0, 1, 2, 3]),  # the ACIS-I array alone
+            ("ACIS-7", [7]),  # one chip: obsid 5644's subarray
+            ("ACIS-235678", [2, 3, 5, 6, 7, 8]),
+        ],
+    )
+    def test_it_reads_the_chip_list_off_detnam(self, detnam, chips):
+        assert chandra.chandra_chips({"INSTRUME": "ACIS", "DETNAM": detnam}) == chips
+
+    @pytest.mark.parametrize("detnam", ["HRC-I", "HRC-S"])
+    def test_hrc_has_no_chips(self, detnam):
+        """HRC is a microchannel plate, not a CCD array, so the answer is empty."""
+        assert chandra.chandra_chips({"INSTRUME": "HRC", "DETNAM": detnam}) == []
+
+    def test_the_aimpoint_chip_is_named_for_each_configuration(self):
+        """I3 for ACIS-I and S3 for ACIS-S, which is where an on-axis source lands."""
+        assert chandra.ACIS_AIMPOINT_CHIP == {"acisi": 3, "aciss": 7}
+
+    def test_both_aimpoint_chips_can_be_on_at_once(self):
+        """
+        Which is the whole reason ``chandra_detector`` reads ``SIM_Z``: this chip list
+        contains both aimpoints, so it cannot say which one the telescope was focused on.
+        """
+        chips = chandra.chandra_chips({"INSTRUME": "ACIS", "DETNAM": "ACIS-012367"})
+
+        assert set(chandra.ACIS_AIMPOINT_CHIP.values()) <= set(chips)
+
+
+class TestTheModeLabelInAFileName:
+    """
+    The third field of an output stem, and the one the header cannot always supply.
+
+    A grating in the beam names the mode, because a grating observation's products *are*
+    the grating products. Otherwise ACIS says its readout mode in ``READMODE``. HRC says
+    nothing usable at all -- every HRC header reads ``DATAMODE = 'OBSERVING'`` whether or
+    not the observation has real 15.625 us resolution -- so the caller settles that from
+    the dead-time file and passes the answer in.
+    """
+
+    @pytest.mark.parametrize("grating, expected", [("HETG", "hetg"), ("LETG", "letg")])
+    def test_a_grating_names_the_mode(self, grating, expected):
+        header = {"INSTRUME": "ACIS", "GRATING": grating, "READMODE": "TIMED"}
+
+        assert chandra.chandra_mode_label(header) == expected
+
+    def test_a_grating_names_it_for_hrc_too(self, tmp_path):
+        header = {"INSTRUME": "HRC", "GRATING": "LETG"}
+
+        assert chandra.chandra_mode_label(header) == "letg"
+
+    def test_timed_exposure_is_timed(self):
+        """Obsid 2749's mode, and 85% of the archive's."""
+        header = {"INSTRUME": "ACIS", "GRATING": "NONE", "READMODE": "TIMED"}
+
+        assert chandra.chandra_mode_label(header) == "timed"
+
+    def test_continuous_clocking_is_cc(self):
+        """Measured on obsid 31917: ``READMODE = 'CONTINUOUS'``, and TIMEDEL 2.85 ms."""
+        header = {"INSTRUME": "ACIS", "GRATING": "NONE", "READMODE": "CONTINUOUS"}
+
+        assert chandra.chandra_mode_label(header) == "cc"
+
+    @pytest.mark.parametrize("fast_timing, expected", [(True, "timing"), (False, "imaging")])
+    def test_hrc_is_labelled_from_the_answer_it_is_given(self, fast_timing, expected):
+        """
+        ``17661`` and ``6298`` have identical headers and differ by a factor of 280 in
+        real time resolution. Only the dead-time file tells them apart, so only a caller
+        that has read it can label them.
+        """
+        header = {"INSTRUME": "HRC", "GRATING": "NONE", "DATAMODE": "OBSERVING"}
+
+        assert chandra.chandra_mode_label(header, fast_timing=fast_timing) == expected
+
+    def test_an_hrc_header_with_no_answer_supplied_is_an_error(self):
+        """
+        Defaulting to "imaging" would label ``17661`` -- a real ``S_TIMING`` observation
+        -- exactly as it labels ``6298``, which is the confusion this module exists to
+        prevent.
+        """
+        header = {"INSTRUME": "HRC", "GRATING": "NONE", "DATAMODE": "OBSERVING"}
+
+        with pytest.raises(ValueError, match="fast_timing"):
+            chandra.chandra_mode_label(header)
+
+    def test_an_acis_header_with_an_unknown_readmode_is_an_error(self):
+        header = {"INSTRUME": "ACIS", "GRATING": "NONE", "READMODE": "SOMETHING_NEW"}
+
+        with pytest.raises(ValueError, match="READMODE"):
+            chandra.chandra_mode_label(header)
+
+    def test_the_label_is_always_usable_in_a_file_stem(self):
+        """Whatever it returns has to survive ``chandra_file_stem``'s validation."""
+        for header, kwargs in [
+            ({"INSTRUME": "ACIS", "GRATING": "HETG", "READMODE": "TIMED"}, {}),
+            ({"INSTRUME": "ACIS", "GRATING": "NONE", "READMODE": "CONTINUOUS"}, {}),
+            ({"INSTRUME": "HRC", "GRATING": "NONE"}, {"fast_timing": True}),
+        ]:
+            label = chandra.chandra_mode_label(header, **kwargs)
+
+            assert chandra.chandra_file_stem(6298, "hrci", label).endswith(label)

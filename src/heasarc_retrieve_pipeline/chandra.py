@@ -43,6 +43,9 @@ one directory silently drops it for a whole instrument. And four different files
 barycentres anything.
 """
 
+import glob
+import os
+
 #: The pipeline's defaults for a Chandra run.
 #:
 #: ``products`` chooses the route: ``"archive"`` reads the level-2 products the archive
@@ -50,10 +53,22 @@ barycentres anything.
 #: archive is the default by Matteo's ruling of 2026-09-12, mirroring XMM's PPS/ODF split
 #: -- with ``CALDBVER`` reported as a staleness diagnostic rather than used to decide the
 #: route.
+#: ``src_radius_arcsec = None`` means "ask ``psfsize_srcs``", and is the default because
+#: Chandra's PSF grows from about one arcsecond on-axis to over ten at eight arcminutes
+#: off-axis. A fixed radius -- XMM's approach -- would be wrong at both ends.
 DEFAULT_CONFIG = {
     "out_data_path": "./",
     "input_data_path": "./",
     "products": "archive",
+    "caldb": None,
+    "psf_ecf": 0.9,
+    "psf_energy_kev": 1.0,
+    "src_radius_arcsec": None,
+    "bkg_inner_factor": 1.5,
+    "bkg_outer_factor": 3.0,
+    "flare_sigma": 3.0,
+    "hrc_veto_ratio_threshold": 0.99,
+    "pileup_percentile": 90.0,
 }
 
 #: The archive's own reduction, and only the parts of it a reduction reads.
@@ -142,3 +157,644 @@ def chandra_download_filter(config):
     if products == "repro":
         return {"re_exclude": REPRO_DOWNLOAD_EXCLUDE_RE}
     raise ValueError(f"Chandra has an 'archive' route and a 'repro' route, not {products!r}.")
+
+
+def chandra_obsid(obsid):
+    """
+    An observation identifier as the archive files it: decimal, unpadded.
+
+    ``chanmaster.obsid`` is an integer, and HEASARC mirrors an observation under that
+    integer's plain decimal form -- ``chandra/data/byobsid/8/6298/``. The download
+    therefore lands in ``<input_data_path>/6298``, and every directory this pipeline makes
+    for the observation matches it. File *names* are the other convention; see
+    :func:`chandra_padded_obsid`.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier, in any spelling: an ``int``, a NumPy integer, ``"6298"``
+        or the zero-padded ``"06298"``.
+
+    Returns
+    -------
+    str
+        The unpadded decimal form.
+
+    Raises
+    ------
+    ValueError
+        If it is not an integer identifier. Accepting anything else would build a path
+        out of it, and a mistyped OBSID that silently becomes a directory name is found
+        much later than one that raises here.
+
+    Examples
+    --------
+    >>> chandra_obsid(6298), chandra_obsid("06298")
+    ('6298', '6298')
+    """
+    text = str(obsid).strip()
+    if not text.isdigit():
+        raise ValueError(f"{obsid!r} is not a Chandra OBSID")
+    return str(int(text))
+
+
+def chandra_padded_obsid(obsid):
+    """
+    An observation identifier as the archive *names files* with it: five digits, padded.
+
+    The archive's own file names pad -- ``hrcf06298N006_evt2.fits.gz``,
+    ``acisf02749N004_evt2.fits.gz`` -- so output stems pad too, and an unpadded stem would
+    both sort wrongly and fail to match the archive it came from.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier, in any spelling :func:`chandra_obsid` accepts.
+
+    Returns
+    -------
+    str
+        Five digits, or more for an identifier too long to fit. Chandra has not reached
+        six digits; truncating one if it ever did would be worse than a long name.
+
+    Examples
+    --------
+    >>> chandra_padded_obsid(6298), chandra_padded_obsid(2749)
+    ('06298', '02749')
+    """
+    return chandra_obsid(obsid).zfill(5)
+
+
+def chandra_file_stem(obsid, detector, mode):
+    """
+    The stem every output file of an observation is named from.
+
+    Following the rule Matteo set for XMM on 2026-09-08: every file names its own
+    observation, because these files leave the tree that gives them context. Because a
+    Chandra observation is one detector in one mode, the stem is simpler than XMM's --
+    there is no exposure to name::
+
+        chandra06298_hrci_imaging_src.evt
+        chandra17661_hrcs_timing_bary.evt
+        chandra02749_aciss_hetg_src.pi
+
+    ``mode`` is taken rather than worked out. For HRC the honest mode is not in the header
+    at all -- it follows from the dead-time file's veto ratio -- so the caller settles it
+    and hands it here. See ``docs/chandra_integration_plan.md``.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    detector : str
+        One of the labels :func:`chandra_detector` returns.
+    mode : str
+        Short mode label, already decided.
+
+    Returns
+    -------
+    str
+        ``chandra<padded obsid>_<detector>_<mode>``.
+
+    Raises
+    ------
+    ValueError
+        If ``detector`` or ``mode`` is empty or carries anything but letters, digits and
+        underscores. A path separator reaching a file name is how an output escapes the
+        directory it was meant for.
+
+    Examples
+    --------
+    >>> chandra_file_stem(6298, "hrci", "imaging")
+    'chandra06298_hrci_imaging'
+    """
+    for label, value in (("detector", detector), ("mode", mode)):
+        if not value or not str(value).replace("_", "").isalnum():
+            raise ValueError(f"{label} must be a plain label, not {value!r}")
+    return f"chandra{chandra_padded_obsid(obsid)}_{detector}_{mode}"
+
+
+#: Where the Science Instrument Module parks for each ACIS configuration, in millimetres.
+#:
+#: These are the nominal aimpoints, and they are also the medians of the measurement
+#: below: an observation that does not offset the SIM sits exactly here.
+ACIS_NOMINAL_SIM_Z = {"acisi": -233.587, "aciss": -190.143}
+
+#: ``SIM_Z`` above this is ACIS-S, below it is ACIS-I.
+#:
+#: Measured on 2026-09-12 over 150 randomly chosen archived ACIS observations, 75 of each
+#: configuration as ``chanmaster.detector`` labels them:
+#:
+#: ============ ========================= ==========
+#: Catalogue    ``SIM_Z`` range           Median
+#: ============ ========================= ==========
+#: ``ACIS-I``   -238.274 .. -214.099      -233.587
+#: ``ACIS-S``   -195.973 .. -182.134      -190.143
+#: ============ ========================= ==========
+#:
+#: The two do not overlap: 18.126 mm separate the most positive ACIS-I from the most
+#: negative ACIS-S. This threshold sits in that gap with about 9 mm of margin either way.
+ACIS_SIM_Z_THRESHOLD = -205.0
+
+#: The chip an on-axis source lands on, per configuration: I3 for ACIS-I, S3 for ACIS-S.
+ACIS_AIMPOINT_CHIP = {"acisi": 3, "aciss": 7}
+
+
+def chandra_chips(header):
+    """
+    Which CCDs were read out, from ``DETNAM``.
+
+    ``DETNAM`` is a chip list and its digits are chip identifiers: **0-3 are the ACIS-I
+    array** (I0-I3) and **4-9 are the ACIS-S array** (S0-S5). So ``ACIS-012367`` is the
+    whole ACIS-I array read out with S2 and S3 alongside it, and ``ACIS-456789`` is the
+    whole ACIS-S array.
+
+    Observations routinely switch on chips from both arrays, which is why this cannot say
+    which configuration an observation is -- :func:`chandra_detector` reads ``SIM_Z`` for
+    that -- but it is what says which chip a source lands on.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        An event list header. ``DETNAM`` is read; ``INSTRUME`` decides whether it is a
+        chip list at all.
+
+    Returns
+    -------
+    list of int
+        Chip identifiers in order, or an empty list for HRC, which is a microchannel
+        plate and has no CCDs.
+
+    Examples
+    --------
+    >>> chandra_chips({"INSTRUME": "ACIS", "DETNAM": "ACIS-012367"})
+    [0, 1, 2, 3, 6, 7]
+    """
+    if str(header.get("INSTRUME", "")).upper().startswith("HRC"):
+        return []
+    detnam = str(header.get("DETNAM", ""))
+    return [int(digit) for digit in detnam.partition("-")[2] if digit.isdigit()]
+
+
+def chandra_detector(header):
+    """
+    Which detector configuration an observation used, as an output-name label.
+
+    HRC says so itself: its ``DETNAM`` *is* the configuration, ``HRC-I`` or ``HRC-S``.
+
+    ACIS does not. Its ``DETNAM`` names the chips that were switched on, and both
+    aimpoint chips are frequently on at once -- measured on 2026-09-12, **50 of 150
+    randomly chosen archived ACIS observations had both chip 3 and chip 7 reading out**,
+    and those 50 span both configurations. No rule written on the chip set can tell them
+    apart. What can is ``SIM_Z``, the Science Instrument Module's parked position, which
+    separates the two with an 18.1 mm gap and no overlap. See :data:`ACIS_SIM_Z_THRESHOLD`.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        An event list header, carrying ``INSTRUME``, ``DETNAM`` and -- for ACIS --
+        ``SIM_Z``.
+
+    Returns
+    -------
+    str
+        ``"acisi"``, ``"aciss"``, ``"hrci"`` or ``"hrcs"``.
+
+    Raises
+    ------
+    ValueError
+        If ``INSTRUME`` is neither ACIS nor HRC, if an HRC ``DETNAM`` names neither
+        detector, or if an ACIS header carries no ``SIM_Z``. Guessing at any of these
+        would put a wrong detector into every output file name of the observation, and
+        nothing downstream would notice.
+
+    Examples
+    --------
+    >>> chandra_detector({"INSTRUME": "ACIS", "DETNAM": "ACIS-456789", "SIM_Z": -187.125})
+    'aciss'
+    >>> chandra_detector({"INSTRUME": "HRC", "DETNAM": "HRC-S"})
+    'hrcs'
+    """
+    instrument = str(header.get("INSTRUME", "")).strip().upper()
+    detnam = str(header.get("DETNAM", "")).strip().upper()
+
+    if instrument == "HRC":
+        if detnam in ("HRC-I", "HRC-S"):
+            return detnam.replace("-", "").lower()
+        raise ValueError(f"DETNAM {detnam!r} is neither HRC-I nor HRC-S")
+
+    if instrument != "ACIS":
+        raise ValueError(f"INSTRUME {instrument!r} is neither ACIS nor HRC")
+
+    sim_z = header.get("SIM_Z")
+    if sim_z is None:
+        raise ValueError(
+            "an ACIS header with no SIM_Z cannot be told from an ACIS-I one: DETNAM "
+            f"{detnam!r} names chips, not a configuration"
+        )
+    return "aciss" if float(sim_z) > ACIS_SIM_Z_THRESHOLD else "acisi"
+
+
+def chandra_archive_path(obsid, config):
+    """
+    Directory the observation was downloaded into.
+
+    Named with :func:`chandra_obsid`, the archive's own unpadded spelling, because that is
+    what the transports produce: the last component of the bucket prefix
+    ``chandra/data/byobsid/8/6298/`` is kept, so the files land under ``<input>/6298``.
+    Looking under the padded ``06298`` finds an empty directory and reports an observation
+    with no science data.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str
+        ``<input_data_path>/<OBSID>``.
+    """
+    return os.path.join(config["input_data_path"], chandra_obsid(obsid))
+
+
+def chandra_base_output_path(obsid, config):
+    """
+    Top-level output directory of an observation.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>``, unpadded to match the download.
+    """
+    return os.path.join(config["out_data_path"], chandra_obsid(obsid))
+
+
+def chandra_pipeline_output_path(obsid, config):
+    """
+    Where the cleaned event lists go.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/event_cl``. The name is NuSTAR's, and deliberately so:
+        ``report.OBSERVATION_SUBDIRECTORIES`` already recognises it, so ``hrp-report``
+        finds a Chandra tree without being taught anything. XMM kept it for the same
+        reason.
+    """
+    return os.path.join(chandra_base_output_path(obsid, config), "event_cl")
+
+
+def chandra_product_output_path(obsid, config):
+    """
+    Where the spectra and their responses go.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/products``, for the same reason as
+        :func:`chandra_pipeline_output_path`.
+    """
+    return os.path.join(chandra_base_output_path(obsid, config), "products")
+
+
+def _archive_products(obsid, config, pattern):
+    """
+    Every downloaded file matching a glob, sorted, gzipped or not.
+
+    The archive gzips its products and ``chandra_repro`` does not, so each pattern is
+    tried both ways. An observation that was never downloaded gives an empty list rather
+    than raising: whether there is anything to reduce is the caller's decision to make,
+    as it is in :mod:`heasarc_retrieve_pipeline.xmm`.
+    """
+    root = chandra_archive_path(obsid, config)
+    found = set()
+    for suffix in ("", ".gz"):
+        found.update(glob.glob(os.path.join(root, pattern + suffix)))
+    return sorted(found)
+
+
+def _one_archive_product(obsid, config, pattern, what):
+    """
+    The single downloaded file matching a glob, or ``None``.
+
+    A Chandra observation is one detector in one mode, so each of these families has
+    exactly one member. Two is not a tie to break at random -- it means a half-finished
+    reprocessing or two archive versions side by side, and reducing the wrong one in
+    silence is the worst available outcome.
+    """
+    found = _archive_products(obsid, config, pattern)
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ValueError(
+            f"observation {chandra_obsid(obsid)} has {len(found)} {what} files, and one "
+            f"of them would be reduced in silence: {[os.path.basename(p) for p in found]}"
+        )
+    return found[0]
+
+
+def chandra_event_list(obsid, config):
+    """
+    The archive's level-2 event list, or ``None`` if the observation has none.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``primary/*_evt2.fits[.gz]``.
+
+    Raises
+    ------
+    ValueError
+        If there is more than one.
+    """
+    return _one_archive_product(obsid, config, os.path.join("primary", "*_evt2.fits"), "evt2")
+
+
+def chandra_aspect_solution(obsid, config):
+    """
+    The aspect solution, which ``specextract`` and ``axbary`` both need.
+
+    Note it is ``asol1`` and not ``osol1``: the archive writes both, and the one-second
+    ``osol1`` under ``secondary/aspect/`` is a different file.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``primary/*_asol1.fits[.gz]``.
+    """
+    return _one_archive_product(obsid, config, os.path.join("primary", "*_asol1.fits"), "asol1")
+
+
+def chandra_bad_pixel_file(obsid, config):
+    """
+    The bad-pixel list, from whichever directory this instrument's lives in.
+
+    **ACIS files it under** ``primary/`` **and HRC under** ``secondary/``. Looking in one
+    directory finds it for one instrument and silently misses it for the other, and the
+    symptom does not appear until ``specextract`` runs.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``{primary,secondary}/*_bpix1.fits[.gz]``.
+    """
+    for directory in ("primary", "secondary"):
+        found = _one_archive_product(
+            obsid, config, os.path.join(directory, "*_bpix1.fits"), "bpix1"
+        )
+        if found is not None:
+            return found
+    return None
+
+
+def chandra_dead_time_file(obsid, config):
+    """
+    The dead-time-factor file, which only HRC writes.
+
+    This is the file the whole timing story rests on: its veto ratio, and not the event
+    header, says whether an HRC observation really has the 15.625 us resolution every HRC
+    header claims. ACIS has none, and ``None`` is the answer rather than an error.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``primary/*_dtf1.fits[.gz]``, or ``None`` for ACIS.
+    """
+    return _one_archive_product(obsid, config, os.path.join("primary", "*_dtf1.fits"), "dtf1")
+
+
+def chandra_orbit_ephemeris(obsid, config):
+    """
+    The orbit ephemeris ``axbary`` barycentres with.
+
+    Four files of an observation end in ``_eph1.fits.gz`` -- orbit, lunar, solar and
+    angles -- and only this one describes where the spacecraft was.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``primary/orbitf*_eph1.fits[.gz]``.
+    """
+    return _one_archive_product(
+        obsid, config, os.path.join("primary", "orbitf*_eph1.fits"), "orbit ephemeris"
+    )
+
+
+def chandra_mask_file(obsid, config):
+    """
+    The detector mask.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``secondary/*_msk1.fits[.gz]``.
+    """
+    return _one_archive_product(obsid, config, os.path.join("secondary", "*_msk1.fits"), "msk1")
+
+
+def chandra_gti_file(obsid, config):
+    """
+    The observation's own good-time intervals, as the archive's pipeline found them.
+
+    Named ``flt1``, and usually ``*_std_flt1.fits.gz``. This is the starting point the
+    flare screening narrows, not a replacement for it.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``secondary/*_flt1.fits[.gz]``.
+    """
+    return _one_archive_product(obsid, config, os.path.join("secondary", "*_flt1.fits"), "flt1")
+
+
+def chandra_grating_spectrum(obsid, config):
+    """
+    The archive's ready-made grating spectra, or ``None`` where there is no grating.
+
+    Collected, never re-made: by Matteo's ruling of 2026-09-12 gratings are in scope as
+    collection only, and ``tgextract`` is never run. This file *is* the spectrum.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``primary/*_pha2.fits[.gz]``.
+    """
+    return _one_archive_product(obsid, config, os.path.join("primary", "*_pha2.fits"), "pha2")
+
+
+def chandra_grating_responses(obsid, config):
+    """
+    The responses belonging to :func:`chandra_grating_spectrum`.
+
+    Twelve ARF/RMF pairs for a HETG observation -- HEG and MEG, orders plus and minus one
+    to three -- which is 155 MB of the 180 downloaded for ``2749`` and the price of the
+    gratings decision.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    list of str
+        Paths to ``primary/responses/*_{arf,rmf}2.fits[.gz]``, sorted; empty where there
+        is no grating.
+    """
+    found = []
+    for kind in ("arf", "rmf"):
+        found += _archive_products(
+            obsid, config, os.path.join("primary", "responses", f"*_{kind}2.fits")
+        )
+    return sorted(found)
+
+
+#: ``READMODE`` as the header spells it, against the label an output file carries.
+ACIS_READ_MODES = {"TIMED": "timed", "CONTINUOUS": "cc"}
+
+
+def chandra_mode_label(header, fast_timing=None):
+    """
+    The mode field of an output file's stem.
+
+    Three rules, in order.
+
+    A **grating** in the beam names the mode, because a grating observation's products are
+    the grating products: ``chandra02749_aciss_hetg_src.pi``.
+
+    Otherwise **ACIS** says its readout mode in ``READMODE``: ``TIMED`` or ``CONTINUOUS``,
+    which become ``timed`` and ``cc``. Note the label says nothing about how fast the
+    observation actually is -- ``timed`` covers both a 3.2 s full frame and obsid
+    ``5644``'s 0.44 s subarray, and the honest number comes from ``TIMEDEL``.
+
+    Otherwise **HRC**, which says nothing usable at all. Every HRC event header reads
+    ``DATAMODE = 'OBSERVING'`` and ``TIMEDEL = 1.5625e-05`` whether or not that resolution
+    is real, so the caller must have read the dead-time file and must pass the answer in.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        An event list header, carrying ``INSTRUME``, ``GRATING`` and -- for ACIS --
+        ``READMODE``.
+    fast_timing : bool, optional
+        For HRC only: whether this observation really has the 15.625 us resolution its
+        header claims, as the dead-time file's veto ratio decides it.
+
+    Returns
+    -------
+    str
+        ``"hetg"``, ``"letg"``, ``"timed"``, ``"cc"``, ``"timing"`` or ``"imaging"``.
+
+    Raises
+    ------
+    ValueError
+        For an HRC header with no ``fast_timing`` given, or an ACIS ``READMODE`` this does
+        not know. Defaulting the first would label ``17661``, a real fast-timing
+        observation, exactly as it labels ``6298``, which is the confusion this module
+        exists to prevent.
+
+    Examples
+    --------
+    >>> chandra_mode_label({"INSTRUME": "ACIS", "GRATING": "HETG", "READMODE": "TIMED"})
+    'hetg'
+    >>> chandra_mode_label({"INSTRUME": "HRC", "GRATING": "NONE"}, fast_timing=True)
+    'timing'
+    """
+    grating = str(header.get("GRATING", "NONE")).strip().upper()
+    if grating in ("HETG", "LETG"):
+        return grating.lower()
+
+    if str(header.get("INSTRUME", "")).strip().upper() == "HRC":
+        if fast_timing is None:
+            raise ValueError(
+                "an HRC header cannot say whether its 15.625 us resolution is real, so "
+                "fast_timing must be given -- read it off the dead-time file"
+            )
+        return "timing" if fast_timing else "imaging"
+
+    read_mode = str(header.get("READMODE", "")).strip().upper()
+    if read_mode not in ACIS_READ_MODES:
+        raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
+    return ACIS_READ_MODES[read_mode]
