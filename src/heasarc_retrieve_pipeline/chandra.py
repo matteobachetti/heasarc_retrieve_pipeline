@@ -515,32 +515,90 @@ def chandra_product_output_path(obsid, config):
     return os.path.join(chandra_base_output_path(obsid, config), "products")
 
 
-def _archive_products(obsid, config, pattern):
+def chandra_repro_path(obsid, config):
     """
-    Every downloaded file matching a glob, sorted, gzipped or not.
+    Where ``chandra_repro`` writes, and where the reprocessing route reads first.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/repro``. Its own directory beside ``event_cl`` and
+        ``products``, not inside either: ``chandra_repro`` writes a dozen files of its own
+        choosing, and a glob over ``event_cl`` would then have to tell them apart from the
+        cleaned lists. The last component is ``repro`` because that is what CIAO's own
+        default calls it, so a directory listing reads the same as the documentation.
+    """
+    return os.path.join(chandra_base_output_path(obsid, config), "repro")
+
+
+def _glob_both_ways(root, pattern):
+    """
+    Every file under one root matching a glob, sorted, gzipped or not.
 
     The archive gzips its products and ``chandra_repro`` does not, so each pattern is
-    tried both ways. An observation that was never downloaded gives an empty list rather
-    than raising: whether there is anything to reduce is the caller's decision to make,
-    as it is in :mod:`heasarc_retrieve_pipeline.xmm`.
+    tried both ways.
     """
-    root = chandra_archive_path(obsid, config)
     found = set()
     for suffix in ("", ".gz"):
         found.update(glob.glob(os.path.join(root, pattern + suffix)))
     return sorted(found)
 
 
-def _one_archive_product(obsid, config, pattern, what):
+def _product_candidates(obsid, config, archive, repro):
     """
-    The single downloaded file matching a glob, or ``None``.
+    The ``(root, pattern)`` pairs to try for one family of product, best first.
+
+    On the archive route there is one pair and it is the download directory. On the
+    reprocessing route the ``repro/`` directory is tried first and the download directory
+    second, because ``chandra_repro`` re-makes four products and copies a few more but
+    leaves the rest where it found them -- the orbit ephemeris, the HRC dead-time file and
+    the grating set are never in ``repro/`` at all, and reading them still means reading
+    what was downloaded.
+
+    ``repro`` is ``None`` for a family the reprocessing does not write, which skips the
+    ``repro/`` directory for it rather than finding the archive's own copy there under an
+    archive name.
+    """
+    candidates = []
+    if config.get("products", DEFAULT_CONFIG["products"]) == "repro" and repro is not None:
+        candidates.append((chandra_repro_path(obsid, config), repro))
+    candidates.append((chandra_archive_path(obsid, config), archive))
+    return candidates
+
+
+def _archive_products(obsid, config, archive, repro=None):
+    """
+    Every file of one family this run should read, sorted.
+
+    The first root that holds anything wins; the rest are not consulted. An observation
+    that was never downloaded gives an empty list rather than raising: whether there is
+    anything to reduce is the caller's decision to make, as it is in
+    :mod:`heasarc_retrieve_pipeline.xmm`.
+    """
+    for root, pattern in _product_candidates(obsid, config, archive, repro):
+        found = _glob_both_ways(root, pattern)
+        if found:
+            return found
+    return []
+
+
+def _one_archive_product(obsid, config, archive, what, repro=None):
+    """
+    The single file of one family this run should read, or ``None``.
 
     A Chandra observation is one detector in one mode, so each of these families has
     exactly one member. Two is not a tie to break at random -- it means a half-finished
     reprocessing or two archive versions side by side, and reducing the wrong one in
     silence is the worst available outcome.
     """
-    found = _archive_products(obsid, config, pattern)
+    found = _archive_products(obsid, config, archive, repro)
     if not found:
         return None
     if len(found) > 1:
@@ -553,7 +611,11 @@ def _one_archive_product(obsid, config, pattern, what):
 
 def chandra_event_list(obsid, config):
     """
-    The archive's level-2 event list, or ``None`` if the observation has none.
+    The level-2 event list this run should reduce, or ``None`` if there is none.
+
+    On the archive route that is the one the archive shipped. On the reprocessing route it
+    is ``chandra_repro``'s ``*_repro_evt2.fits``, and the archive's own is not consulted --
+    see :func:`_product_candidates`.
 
     Parameters
     ----------
@@ -565,14 +627,21 @@ def chandra_event_list(obsid, config):
     Returns
     -------
     str or None
-        Path to ``primary/*_evt2.fits[.gz]``.
+        Path to ``primary/*_evt2.fits[.gz]``, or to ``repro/*_repro_evt2.fits`` on the
+        reprocessing route.
 
     Raises
     ------
     ValueError
         If there is more than one.
     """
-    return _one_archive_product(obsid, config, os.path.join("primary", "*_evt2.fits"), "evt2")
+    return _one_archive_product(
+        obsid,
+        config,
+        os.path.join("primary", "*_evt2.fits"),
+        "evt2",
+        repro="*_repro_evt2.fits",
+    )
 
 
 def chandra_aspect_solution(obsid, config):
@@ -592,9 +661,17 @@ def chandra_aspect_solution(obsid, config):
     Returns
     -------
     str or None
-        Path to ``primary/*_asol1.fits[.gz]``.
+        Path to ``primary/*_asol1.fits[.gz]``. ``chandra_repro`` copies it in uncompressed,
+        and may have applied a boresight correction to it, so on the reprocessing route the
+        copy in ``repro/`` is the one to use.
     """
-    return _one_archive_product(obsid, config, os.path.join("primary", "*_asol1.fits"), "asol1")
+    return _one_archive_product(
+        obsid,
+        config,
+        os.path.join("primary", "*_asol1.fits"),
+        "asol1",
+        repro="pcadf*_asol1.fits",
+    )
 
 
 def chandra_bad_pixel_file(obsid, config):
@@ -604,6 +681,11 @@ def chandra_bad_pixel_file(obsid, config):
     **ACIS files it under** ``primary/`` **and HRC under** ``secondary/``. Looking in one
     directory finds it for one instrument and silently misses it for the other, and the
     symptom does not appear until ``specextract`` runs.
+
+    On the reprocessing route the name is asked for as ``*_repro_bpix1.fits`` and not as a
+    bare ``*_bpix1.fits``, because ``chandra_repro`` copies the archive's list in beside
+    the one it just made: the loose glob matches two files in one directory and the
+    one-or-raise guard fires on a perfectly healthy reprocessing.
 
     Parameters
     ----------
@@ -615,15 +697,44 @@ def chandra_bad_pixel_file(obsid, config):
     Returns
     -------
     str or None
-        Path to ``{primary,secondary}/*_bpix1.fits[.gz]``.
+        Path to ``{primary,secondary}/*_bpix1.fits[.gz]``, or to
+        ``repro/*_repro_bpix1.fits`` on the reprocessing route.
     """
     for directory in ("primary", "secondary"):
         found = _one_archive_product(
-            obsid, config, os.path.join(directory, "*_bpix1.fits"), "bpix1"
+            obsid,
+            config,
+            os.path.join(directory, "*_bpix1.fits"),
+            "bpix1",
+            repro="*_repro_bpix1.fits",
         )
         if found is not None:
             return found
     return None
+
+
+def chandra_level1_event_list(obsid, config):
+    """
+    The level-1 event list, which is what ``chandra_repro`` reprocesses.
+
+    Never read on the reprocessing route's own output: ``chandra_repro`` consumes this
+    file and does not copy it, so it is always the download's, and the search path is not
+    consulted.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+        Path to ``secondary/*_evt1.fits[.gz]``. ``None`` says this observation was
+        downloaded with the archive route's filter, which does not fetch level 1.
+    """
+    return _one_archive_product(obsid, config, os.path.join("secondary", "*_evt1.fits"), "evt1")
 
 
 def chandra_dead_time_file(obsid, config):
@@ -633,6 +744,8 @@ def chandra_dead_time_file(obsid, config):
     This is the file the whole timing story rests on: its veto ratio, and not the event
     header, says whether an HRC observation really has the 15.625 us resolution every HRC
     header claims. ACIS has none, and ``None`` is the answer rather than an error.
+
+    ``chandra_repro`` does not copy it, so this is read from the download on both routes.
 
     Parameters
     ----------
@@ -655,6 +768,9 @@ def chandra_orbit_ephemeris(obsid, config):
 
     Four files of an observation end in ``_eph1.fits.gz`` -- orbit, lunar, solar and
     angles -- and only this one describes where the spacecraft was.
+
+    ``chandra_repro`` does not copy it either, so barycentring reads the download on both
+    routes.
 
     Parameters
     ----------
@@ -687,9 +803,17 @@ def chandra_mask_file(obsid, config):
     Returns
     -------
     str or None
-        Path to ``secondary/*_msk1.fits[.gz]``.
+        Path to ``secondary/*_msk1.fits[.gz]``. ``chandra_repro`` copies this one in
+        unchanged, so on the reprocessing route it is read from ``repro/`` under the
+        archive's own name.
     """
-    return _one_archive_product(obsid, config, os.path.join("secondary", "*_msk1.fits"), "msk1")
+    return _one_archive_product(
+        obsid,
+        config,
+        os.path.join("secondary", "*_msk1.fits"),
+        "msk1",
+        repro="*_msk1.fits",
+    )
 
 
 def chandra_gti_file(obsid, config):
@@ -698,6 +822,11 @@ def chandra_gti_file(obsid, config):
 
     Named ``flt1``, and usually ``*_std_flt1.fits.gz``. This is the starting point the
     flare screening narrows, not a replacement for it.
+
+    ``chandra_repro`` calls its own **``flt2``**, so the reprocessing route asks for a
+    different name rather than the same one in a different place. A run that asked for
+    ``flt1`` there would find nothing, fall through to the download, and screen flares
+    against good times that belong to the file it is not reducing.
 
     Parameters
     ----------
@@ -709,9 +838,16 @@ def chandra_gti_file(obsid, config):
     Returns
     -------
     str or None
-        Path to ``secondary/*_flt1.fits[.gz]``.
+        Path to ``secondary/*_flt1.fits[.gz]``, or to ``repro/*_repro_flt2.fits`` on the
+        reprocessing route.
     """
-    return _one_archive_product(obsid, config, os.path.join("secondary", "*_flt1.fits"), "flt1")
+    return _one_archive_product(
+        obsid,
+        config,
+        os.path.join("secondary", "*_flt1.fits"),
+        "flt1",
+        repro="*_repro_flt2.fits",
+    )
 
 
 def chandra_grating_spectrum(obsid, config):
@@ -1241,11 +1377,13 @@ class Observation:
 
 def chandra_archive_front_end(obsid, config, rec=None):
     """
-    Read one observation off the archive's own level-2 products.
+    Read one observation off the level-2 products, whichever route made them.
 
-    The default route. No CIAO is involved: the archive's ``primary/`` products are what
-    CIAO would produce, so this reads their headers, finds the companions and works out
-    what the data can support.
+    The default route, and **also the reader the reprocessing route uses**: the getters
+    above are route-aware, so :func:`chandra_repro_front_end` runs the task and then calls
+    this to read the result. No CIAO is involved here. The archive's ``primary/`` products
+    are what CIAO would produce, so this reads their headers, finds the companions and
+    works out what the data can support.
 
     The one place it does real work is the time resolution, and for HRC that is not in the
     header: :func:`read_dead_time_factors` measures the on-board veto fraction, and its
@@ -1321,6 +1459,146 @@ def chandra_archive_front_end(obsid, config, rec=None):
             data_mode=observation.data_mode,
             has_dead_time_file=dtf_path is not None,
             n_grating_responses=len(observation.grating_responses),
+        )
+
+    return observation
+
+
+#: Products ``chandra_repro`` re-makes, against the ones it merely copies beside them.
+#:
+#: Measured on obsid ``5644`` on 2026-09-12. The twelve files it left were::
+#:
+#:     acisf05644_repro_evt2.fits      <- new: the level-2 event list
+#:     acisf05644_repro_bpix1.fits     <- new: bad pixels, with afterglows re-found
+#:     acisf05644_repro_flt2.fits      <- new: the good-time intervals, and note flt2
+#:     acisf05644_repro_fov1.fits      <- new: the field of view
+#:     acisf05644_000N004_bpix1.fits   <- copied, and the archive's own name
+#:     acisf05644_000N004_fov1.fits    <- copied
+#:     acisf05644_000N004_msk1.fits    <- copied
+#:     acisf05644_000N004_mtl1.fits    <- copied
+#:     acisf05644_000N004_stat1.fits   <- copied
+#:     acisf240626566N004_pbk0.fits    <- copied
+#:     pcadf05644_000N001_asol1.fits   <- copied, uncompressed
+#:     acisf05644_asol1.lis            <- written for its own use
+#:
+#: Two things in that list are traps and both are handled in the getters above. The
+#: copies mean a bare ``*_bpix1.fits`` glob matches **two** files in one directory, so the
+#: reprocessing route asks for ``*_repro_bpix1.fits`` and gets the new one; and the new
+#: good-time file is ``flt2``, not the ``flt1`` the archive ships, so the same getter asks
+#: for a different name on each route.
+#:
+#: What is *not* there matters as much: no orbit ephemeris, no dead-time file, no grating
+#: spectrum or responses. Those are read from the download, which is why the search path
+#: has two roots and not one.
+REPRO_EVENT_LIST_PATTERN = "*_repro_evt2.fits"
+
+
+def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
+    """
+    Re-run the archive's pipeline with ``chandra_repro``, then read what it wrote.
+
+    The route behind ``config["products"] = "repro"``. It exists for the observations the
+    archive's own products are too old for -- the calibration has moved, or the level-2
+    file was made by a CIAO the reduction no longer trusts -- and for the ones that have no
+    level-2 product at all.
+
+    ``set_ardlib=no`` is not a detail. ``chandra_repro`` would otherwise write this
+    observation's bad-pixel list into whichever ``ardlib.par`` it can reach, and
+    :func:`heasarc_retrieve_pipeline.ciao.ciao_environment` already gives every observation
+    a private one; letting the task do it as well means the file is written twice from two
+    directions. See that module's docstring.
+
+    **Nothing is renamed afterwards.** The reprocessed products keep ``chandra_repro``'s
+    own names, against the output-naming rule and for the reason the grating products keep
+    theirs: the task cross-references them in headers this pipeline did not write. Its
+    names carry the obsid already, and :func:`chandra_repro_path` puts them in a directory
+    that carries it too.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path`` and ``out_data_path``.
+    rec : StepRecord, optional
+        Where to record what was reprocessed, and what of the observation the reprocessing
+        did not touch.
+    env : dict, optional
+        Environment for the task; :func:`~heasarc_retrieve_pipeline.ciao.ciao_environment`
+        by default.
+    log_to : str, optional
+        Where to write the task's output.
+
+    Returns
+    -------
+    Observation or None
+        ``None`` when nothing at all was downloaded, which is the caller's cue for
+        ``NO_SCIENCE_DATA``. Reading the reprocessed products is
+        :func:`chandra_archive_front_end`'s job on this route as on the other one.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the observation was downloaded but holds no level-1 event list, so there is
+        nothing to reprocess. That is the archive route's download filter, which does not
+        fetch level 1 -- an unrecoverable mismatch between the filter a run downloaded
+        with and the route it is now reducing on, and silently falling back to the
+        archive's level-2 file would answer a configuration error with the wrong data.
+    RuntimeError
+        If ``chandra_repro`` returns cleanly and leaves no event list.
+    """
+    from . import ciao
+
+    obsid = chandra_obsid(obsid)
+    indir = chandra_archive_path(obsid, config)
+    outdir = chandra_repro_path(obsid, config)
+
+    if not os.path.isdir(indir) or not os.listdir(indir):
+        return None
+
+    if chandra_level1_event_list(obsid, config) is None:
+        raise FileNotFoundError(
+            f"{obsid}: products='repro' was asked for and no level-1 event list was "
+            f"downloaded to {indir}. The archive route's download filter does not fetch "
+            f"one; re-download with products='repro' set."
+        )
+
+    # chandra_repro creates the last component of outdir and refuses to create any above
+    # it, so it is made here. An existing empty directory it accepts even with clobber=no.
+    os.makedirs(outdir, exist_ok=True)
+
+    ciao.run(
+        "chandra_repro",
+        produces=[],  # the names are chandra_repro's own; the event list is checked below
+        indir=indir,
+        outdir=outdir,
+        set_ardlib="no",
+        clobber="yes",
+        env=env if env is not None else ciao.ciao_environment(obsid, config),
+        log_to=log_to,
+    )
+
+    reprocessed = _glob_both_ways(outdir, REPRO_EVENT_LIST_PATTERN)
+    if not reprocessed:
+        raise RuntimeError(
+            f"{obsid}: chandra_repro returned cleanly and wrote no {REPRO_EVENT_LIST_PATTERN} "
+            f"into {outdir}. A zero return code proves nothing; see ciao.run."
+        )
+
+    observation = chandra_archive_front_end(obsid, config, rec=rec)
+
+    if rec is not None:
+        rec.value(
+            repro_directory=outdir,
+            repro_event_list=observation.event_list if observation else None,
+            reprocessed_products=sorted(
+                os.path.basename(path) for path in _glob_both_ways(outdir, "*_repro_*.fits")
+            ),
+            # chandra_repro leaves CALDBVER at the value the archive's file carried -- on
+            # 5644 it still read 4.9.2 after a run with CALDB 4.12.4 installed -- so on this
+            # route the header's calibration version is not evidence of anything, and
+            # ASCDSVER is the keyword that moves.
+            caldb_version_is_from_the_archive=True,
         )
 
     return observation

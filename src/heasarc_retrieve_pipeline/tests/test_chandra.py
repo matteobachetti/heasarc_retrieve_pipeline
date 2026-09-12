@@ -14,6 +14,7 @@ fast-timing mode, and ACIS-S behind a transmission grating.
 
 import json
 import os
+import pathlib
 import re
 from types import SimpleNamespace
 
@@ -2912,3 +2913,309 @@ class TestCollectingTheGratingProducts:
         assert values["grating"] == "HETG"
         assert values["n_grating_files"] == 2
         assert "tgextract" in values["spectrum_reason"]
+
+
+#: What ``chandra_repro`` left in ``repro/`` on obsid ``5644``, measured on 2026-09-12.
+#:
+#: The exact listing, because two of its features are what the reprocessing route has to
+#: get right: the archive's own ``bpix1`` and ``fov1`` are copied in beside the newly made
+#: ones, so a loose glob finds two of each; and the new good-time file is ``flt2``, not the
+#: ``flt1`` the archive ships.
+REPRO_5644_WROTE = [
+    "acisf05644_000N004_bpix1.fits",
+    "acisf05644_000N004_fov1.fits",
+    "acisf05644_000N004_msk1.fits",
+    "acisf05644_000N004_mtl1.fits",
+    "acisf05644_000N004_stat1.fits",
+    "acisf05644_asol1.lis",
+    "acisf05644_repro_bpix1.fits",
+    "acisf05644_repro_evt2.fits",
+    "acisf05644_repro_flt2.fits",
+    "acisf05644_repro_fov1.fits",
+    "acisf240626566N004_pbk0.fits",
+    "pcadf05644_000N001_asol1.fits",
+]
+
+#: Enough of a level-1 download for the reprocessing route to accept the observation.
+ACIS_5644_LEVEL1 = [
+    "oif.fits",
+    "primary/acisf05644N004_evt2.fits.gz",
+    "primary/acisf05644_000N004_bpix1.fits.gz",
+    "primary/orbitf240581100N001_eph1.fits.gz",
+    "primary/pcadf05644_000N001_asol1.fits.gz",
+    "secondary/acisf05644_000N004_evt1.fits.gz",
+    "secondary/acisf05644_000N004_flt1.fits.gz",
+    "secondary/acisf05644_000N004_msk1.fits.gz",
+]
+
+
+def a_reprocessed_observation(tmp_path, obsid="5644", names=None, **keywords):
+    """
+    A download plus a ``repro/`` directory holding what ``chandra_repro`` really leaves.
+
+    The event list in ``repro/`` is a real file so that the front end can open it; the
+    rest are placeholders, which is all the path finders need. ``keywords`` go into the
+    reprocessed event list's header.
+    """
+    config = a_downloaded_observation(tmp_path, obsid, ACIS_5644_LEVEL1)
+    config["products"] = "repro"
+    repro = pathlib.Path(chandra.chandra_repro_path(obsid, config))
+    repro.mkdir(parents=True, exist_ok=True)
+    for name in REPRO_5644_WROTE if names is None else names:
+        if name == "acisf05644_repro_evt2.fits":
+            an_event_file(repro / name, **keywords)
+        else:
+            (repro / name).write_bytes(b"")
+    return config
+
+
+@pytest.fixture
+def stub_chandra_repro(monkeypatch):
+    """A ``chandra_repro`` that writes what the real one wrote on obsid ``5644``."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "chandra_repro":
+            repro = pathlib.Path(kwargs["outdir"])
+            for written in REPRO_5644_WROTE:
+                if written == "acisf05644_repro_evt2.fits":
+                    an_event_file(
+                        repro / written,
+                        INSTRUME="ACIS",
+                        DETNAM="ACIS-7",
+                        READMODE="TIMED",
+                        DATAMODE="GRADED",
+                        TIMEDEL=0.44104,
+                        SIM_Z=-190.1,
+                        ASCDSVER="CIAO 4.18.0",
+                    )
+                else:
+                    (repro / written).write_bytes(b"")
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestWhereTheReprocessingGoes:
+    def test_it_has_its_own_directory_beside_the_others(self, tmp_path):
+        """
+        ``chandra_repro`` writes a dozen files of its own choosing, so they get a
+        directory rather than being mixed in with the cleaned lists in ``event_cl``.
+        """
+        config = {"out_data_path": str(tmp_path)}
+
+        assert chandra.chandra_repro_path(5644, config) == str(tmp_path / "5644" / "repro")
+
+    def test_it_is_the_unpadded_obsid_like_every_other_output(self, tmp_path):
+        config = {"out_data_path": str(tmp_path)}
+
+        assert chandra.chandra_repro_path("05644", config) == str(tmp_path / "5644" / "repro")
+
+
+class TestWhichProductsTheReprocessingRouteReads:
+    """
+    The reprocessing route reads two directories, not one, and the plan said one.
+
+    ``chandra_repro`` re-makes four products, copies a handful more, and leaves the rest
+    where it found them. So each family is looked for in ``repro/`` first and in the
+    download second, and the families the task never writes skip ``repro/`` altogether.
+    """
+
+    def test_the_event_list_is_the_reprocessed_one(self, tmp_path):
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_event_list("5644", config)
+
+        assert os.path.basename(found) == "acisf05644_repro_evt2.fits"
+
+    def test_the_archive_route_ignores_the_repro_directory_entirely(self, tmp_path):
+        """
+        The same tree read with ``products="archive"`` gives the archive's own file. The
+        two routes can share one download without either seeing the other's products.
+        """
+        config = a_reprocessed_observation(tmp_path)
+        config["products"] = "archive"
+
+        found = chandra.chandra_event_list("5644", config)
+
+        assert os.path.basename(found) == "acisf05644N004_evt2.fits.gz"
+
+    def test_the_bad_pixel_list_is_the_new_one_and_not_the_copied_one(self, tmp_path):
+        """
+        Both are in ``repro/``. A bare ``*_bpix1.fits`` glob matches two files, and the
+        one-or-raise guard would fire on a healthy reprocessing.
+        """
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_bad_pixel_file("5644", config)
+
+        assert os.path.basename(found) == "acisf05644_repro_bpix1.fits"
+
+    def test_the_good_times_come_from_flt2_and_not_from_flt1(self, tmp_path):
+        """
+        ``chandra_repro`` calls its own good-time file ``flt2``. Asking for ``flt1`` there
+        finds nothing, falls through to the download, and screens flares against the good
+        times of the file that is not being reduced.
+        """
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_gti_file("5644", config)
+
+        assert os.path.basename(found) == "acisf05644_repro_flt2.fits"
+
+    def test_the_mask_is_the_copy_in_the_repro_directory(self, tmp_path):
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_mask_file("5644", config)
+
+        assert os.path.dirname(found) == chandra.chandra_repro_path("5644", config)
+
+    def test_the_aspect_solution_is_the_copy_the_boresight_may_have_moved(self, tmp_path):
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_aspect_solution("5644", config)
+
+        assert os.path.dirname(found) == chandra.chandra_repro_path("5644", config)
+
+    def test_the_orbit_ephemeris_falls_through_to_the_download(self, tmp_path):
+        """``chandra_repro`` does not copy it, so barycentring reads the download."""
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_orbit_ephemeris("5644", config)
+
+        assert os.path.dirname(found).endswith(os.path.join("5644", "primary"))
+
+    def test_a_family_absent_from_both_directories_is_still_none(self, tmp_path):
+        """ACIS has no dead-time file, and the search path must not turn that into an error."""
+        config = a_reprocessed_observation(tmp_path)
+
+        assert chandra.chandra_dead_time_file("5644", config) is None
+
+    def test_two_files_in_the_winning_directory_still_raise(self, tmp_path):
+        """
+        The search path decides *where* to look, and changes nothing about what an
+        ambiguous answer means once it has looked.
+        """
+        config = a_reprocessed_observation(tmp_path)
+        repro = pathlib.Path(chandra.chandra_repro_path("5644", config))
+        (repro / "acisf05644_repro_evt2.fits").rename(repro / "a_repro_evt2.fits")
+        (repro / "b_repro_evt2.fits").write_bytes(b"")
+
+        with pytest.raises(ValueError, match="2 evt2 files"):
+            chandra.chandra_event_list("5644", config)
+
+
+class TestFindingTheLevelOneEventList:
+    def test_it_is_in_the_download_and_never_in_the_repro_directory(self, tmp_path):
+        config = a_reprocessed_observation(tmp_path)
+
+        found = chandra.chandra_level1_event_list("5644", config)
+
+        assert os.path.basename(found) == "acisf05644_000N004_evt1.fits.gz"
+
+    def test_an_archive_route_download_has_none(self, tmp_path):
+        """The archive route's filter does not fetch level 1, and that is not an error here."""
+        config = a_downloaded_observation(tmp_path, "6298")
+
+        assert chandra.chandra_level1_event_list("6298", config) is None
+
+
+class TestReprocessingAnObservation:
+    def test_it_runs_chandra_repro_the_way_the_plan_says(self, tmp_path, stub_chandra_repro):
+        config = a_downloaded_observation(tmp_path, "5644", ACIS_5644_LEVEL1)
+        config["products"] = "repro"
+
+        chandra.chandra_repro_front_end("5644", config, env={})
+
+        name, kwargs = stub_chandra_repro[0]
+        assert name == "chandra_repro"
+        assert kwargs["indir"] == chandra.chandra_archive_path("5644", config)
+        assert kwargs["outdir"] == chandra.chandra_repro_path("5644", config)
+        assert kwargs["set_ardlib"] == "no"
+
+    def test_it_makes_the_output_directory_itself(self, tmp_path, stub_chandra_repro):
+        """
+        ``chandra_repro`` creates the last component of ``outdir`` and refuses to create
+        any above it: pointed at ``<out>/5644/repro`` with no ``<out>/5644``, it stops with
+        "Unable to create output directory". Measured on 2026-09-12.
+        """
+        config = a_downloaded_observation(tmp_path, "5644", ACIS_5644_LEVEL1)
+        config["products"] = "repro"
+        config["out_data_path"] = str(tmp_path / "somewhere" / "new")
+
+        chandra.chandra_repro_front_end("5644", config, env={})
+
+        assert os.path.isdir(chandra.chandra_repro_path("5644", config))
+
+    def test_it_reads_the_reprocessed_observation_back(self, tmp_path, stub_chandra_repro):
+        """
+        The plan's shape survives: the task runs, and then step 4's reader reads what it
+        wrote, giving the same :class:`Observation` the archive route gives.
+        """
+        config = a_downloaded_observation(tmp_path, "5644", ACIS_5644_LEVEL1)
+        config["products"] = "repro"
+
+        found = chandra.chandra_repro_front_end("5644", config, env={})
+
+        assert found.obsid == "5644"
+        assert found.detector == "aciss"
+        assert found.data_mode == "GRADED"
+        assert os.path.basename(found.event_list) == "acisf05644_repro_evt2.fits"
+        assert os.path.basename(found.gti_file) == "acisf05644_repro_flt2.fits"
+        assert os.path.basename(found.bad_pixel_file) == "acisf05644_repro_bpix1.fits"
+        assert found.orbit_ephemeris.endswith("orbitf240581100N001_eph1.fits.gz")
+
+    def test_nothing_downloaded_is_not_an_error(self, tmp_path, stub_chandra_repro):
+        """Whether an empty directory means ``NO_SCIENCE_DATA`` is the caller's call."""
+        config = {
+            "input_data_path": str(tmp_path),
+            "out_data_path": str(tmp_path),
+            "products": "repro",
+        }
+
+        assert chandra.chandra_repro_front_end("5644", config, env={}) is None
+        assert stub_chandra_repro == []
+
+    def test_a_download_with_no_level_one_says_so_instead_of_reducing_level_two(
+        self, tmp_path, stub_chandra_repro
+    ):
+        """
+        This is the mismatch worth being loud about: the observation was downloaded with
+        the archive route's filter and is being reduced with the reprocessing route. Quietly
+        reducing the archive's level-2 file would answer a configuration error with the
+        wrong data.
+        """
+        config = a_downloaded_observation(tmp_path, "6298")
+        config["products"] = "repro"
+
+        with pytest.raises(FileNotFoundError, match="no level-1 event list"):
+            chandra.chandra_repro_front_end("6298", config, env={})
+
+        assert stub_chandra_repro == []
+
+    def test_a_clean_return_code_with_no_event_list_is_an_error(self, tmp_path, monkeypatch):
+        """A zero return code proves nothing; ``ciao.run`` cannot check names it never chose."""
+        config = a_downloaded_observation(tmp_path, "5644", ACIS_5644_LEVEL1)
+        config["products"] = "repro"
+        monkeypatch.setattr(ciao, "run", lambda name, **kwargs: SimpleNamespace(stdout=""))
+
+        with pytest.raises(RuntimeError, match="wrote no"):
+            chandra.chandra_repro_front_end("5644", config, env={})
+
+    def test_it_records_what_was_remade_and_what_was_not(self, tmp_path, stub_chandra_repro):
+        config = a_downloaded_observation(tmp_path, "5644", ACIS_5644_LEVEL1)
+        config["products"] = "repro"
+        directory = tmp_path / "records"
+
+        with record_step(str(directory), "5644", "chandra_repro") as rec:
+            chandra.chandra_repro_front_end("5644", config, rec=rec, env={})
+
+        values = json.loads(next(directory.glob("*repro*.json")).read_text())["values"]
+        assert values["repro_directory"] == chandra.chandra_repro_path("5644", config)
+        assert "acisf05644_repro_evt2.fits" in values["reprocessed_products"]
+        assert "acisf05644_000N004_msk1.fits" not in values["reprocessed_products"]
+        # The header's CALDBVER is the archive's even after a reprocessing; ASCDSVER moves.
+        assert values["caldb_version_is_from_the_archive"] is True
+        assert values["ascds_version"] == "CIAO 4.18.0"

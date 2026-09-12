@@ -27,15 +27,15 @@
 
 ## Where this stands
 
-**Last updated 2026-09-12, after step 10 and the acceptance test.** Branch `various_fixes`,
+**Last updated 2026-09-12, after step 11.** Branch `various_fixes`,
 everything unpushed.
 
 | | |
 |---|---|
-| Landed | Steps 1–7 and 10, eight commits, `5377cfd` → `98635d2` |
-| Left | Steps 8, 9, 11, 12, 13 |
+| Landed | Steps 1–11, twelve commits, `5377cfd` → the step 11 commit |
+| Left | Steps 12, 13 |
 | Code | `src/heasarc_retrieve_pipeline/chandra.py`, `src/heasarc_retrieve_pipeline/ciao.py` |
-| Tests | `tests/test_chandra.py` (202 + 19 doctests), `tests/test_ciao.py` (41), all offline |
+| Tests | `tests/test_chandra.py` (261 + 20 doctests), `tests/test_ciao.py` (41), all offline |
 | CIAO | 4.18.0 + CALDB 4.12.4 in the `ciao` micromamba environment, driven by `subprocess` from `py313-x64` — the pipeline never enters CIAO's Python |
 
 **The acceptance test passes on both verification observations.** Run through the module end
@@ -45,7 +45,7 @@ from a blind 34 mHz search. Numbers, method and the two folded profiles in
 *The known-answer test*. **Search with `-N 1 --oversample 16`** — the default sampling loses
 half the power and turned `5644` into a non-detection once; the measured table is there too.
 
-**Three deviations from this plan are in force and two of them want a verdict:**
+**Four deviations from this plan are in force and one of them wants a verdict:**
 
 1. `ciao.run` grew an `args=` parameter, and `ciao_environment` now defaults `CALDB` to the
    tree beside the installation. Both are in `f202ab1`; neither was in step 5. This machine
@@ -56,6 +56,10 @@ half the power and turned `5644` into a non-detection once; the measured table i
    subarray. Details in step 6.
 3. **The aspect solution is not barycentred**, against step 10's text. Details and the
    argument in step 10. **This one needs Matteo's yes or no.**
+4. **The reprocessing route reads two directories, not one.** Step 11 said "the same
+   reader step 4 wrote"; `chandra_repro`'s flat, partial, `flt2`-not-`flt1` output made
+   that need a search path. The reader is still the same one. Details in step 11.
+   *Forced by the tool, but recorded.*
 
 **Two environment notes for whoever picks this up:**
 
@@ -390,14 +394,14 @@ The plan, mirroring XMM's `epatplot` step and Matteo's 2026-09-08 ruling:
 
 ```
 Archive route (default)                  Reprocessing route (config: products="repro")
-  primary/*_evt2.fits.gz ─┐                chandra_repro indir=. outdir=repro
-  primary/*_asol1        │                   → repro/*_repro_evt2.fits
-  {primary,secondary}/*_bpix1              → repro/*_repro_bpix1.fits
-  secondary/*_{msk1,flt1}│                   → repro/tg/*  (grating products)
-  primary/*_dtf1  (HRC)  │                                  │
-  primary/orbitf*_eph1   │                                  │
-  primary/*_pha2 + responses/  (grating)                    │
-                         ▼                                  │
+  primary/*_evt2.fits.gz ─┐                chandra_repro indir=<download> outdir=repro
+  primary/*_asol1         │                  → repro/*_repro_evt2.fits   (new)
+  {primary,secondary}/*_bpix1                → repro/*_repro_bpix1.fits  (new)
+  secondary/*_{msk1,flt1} │                  → repro/*_repro_flt2.fits   (new, NOT flt1)
+  primary/*_dtf1  (HRC)   │                  → repro/*_{msk1,asol1}      (copied)
+  primary/orbitf*_eph1    │                  and for the rest -- orbit ephemeris,
+  primary/*_pha2 + responses/  (grating)     dtf1, pha2 -- back to the download
+                          ▼                                 │
               ┌─────────────────────────────────────────────┘
               ▼
    Observation(detector, grating, mode, events, asol, bpix, msk, flt, dtf,
@@ -411,11 +415,14 @@ Archive route (default)                  Reprocessing route (config: products="r
               ├─ pile-up            pileup_map                      ← ACIS imaging only
               ├─ spectra            specextract                     ← ACIS only
               │                     or collect the archive's pha2 + responses (grating)
-              └─ barycentre         barycorr, DE430, orbitf*_eph1
+              └─ barycentre         axbary, DE405, orbitf*_eph1
 ```
 
 Only the front end differs, which is the anti-duplication shape XMM established: one
-mission module, one downstream path, one set of diagnostics records.
+mission module, one downstream path, one set of diagnostics records. The two routes join
+sooner than drawn, in fact: the reprocessing front end runs the task and then calls
+`chandra_archive_front_end` to read the result, because the product getters know both
+spellings of every file. See step 11.
 
 The pure-Python reuse is real and worth naming, exactly as it was for XMM. Thresholding a
 light curve uses `utils.intervals_above_threshold`, `utils.merge_intervals` and
@@ -640,7 +647,7 @@ never throw away a good observation.
 
 *Commit:* `Screen Chandra background flares and write a cleaned event list`
 
-### Step 8 — pile-up
+### ~~Step 8 — pile-up~~ **Done, `0e08b6f`.**
 
 `pileup_map` on the source chip, unfiltered in energy, single-pixel binning; peak and
 percentile counts-per-frame inside the source region; the implied fraction; a diagnostics
@@ -648,7 +655,7 @@ record. ACIS Timed Exposure only.
 
 *Commit:* `Measure ACIS pile-up with pileup_map and report it without correcting`
 
-### ~~Step 9 — spectra~~ **Done, see the commit below.**
+### ~~Step 9 — spectra~~ **Done, `79510fa`.**
 
 `specextract` for ACIS imaging, producing source and background spectra with ARF and RMF —
 the direct analogue of XMM's `especget`. For grating observations, **collect** the
@@ -786,12 +793,99 @@ uncorrected times.
 
 *Commit:* `Barycentre Chandra with axbary at the searched position, and record DE405`
 
-### Step 11 — the reprocessing route
+### ~~Step 11 — the reprocessing route~~ **Done, see the commit below.**
 
 `chandra_repro_front_end(obsid, config)`, behind `products="repro"`. `chandra_repro
 indir=<obsid dir> outdir=<pipeline dir> set_ardlib=no`, then read the `repro/` products
 with the same reader step 4 wrote. `set_ardlib=no` matters: we manage `ardlib.par`
 ourselves, per observation.
+
+**One deviation, and it is this step's whole story: "the same reader" needed a search
+path.** The plan assumed `chandra_repro` leaves a directory the step-4 reader can be
+pointed at unchanged. It does not. Run on obsid `5644` on 2026-09-12 — 12 files, and the
+first column is what the reader has to cope with:
+
+```
+new     acisf05644_repro_evt2.fits      the level-2 event list
+new     acisf05644_repro_bpix1.fits     bad pixels, afterglows re-found
+new     acisf05644_repro_flt2.fits      good-time intervals -- and note flt2
+new     acisf05644_repro_fov1.fits      field of view
+copied  acisf05644_000N004_bpix1.fits   the archive's own, under the archive's own name
+copied  acisf05644_000N004_fov1.fits
+copied  acisf05644_000N004_msk1.fits
+copied  acisf05644_000N004_mtl1.fits
+copied  acisf05644_000N004_stat1.fits
+copied  acisf240626566N004_pbk0.fits
+copied  pcadf05644_000N001_asol1.fits   uncompressed, boresight possibly applied
+own use acisf05644_asol1.lis
+```
+
+Four things break the one-directory assumption:
+
+* **The layout is flat.** Every step-4 pattern is anchored on `primary/` or `secondary/`
+  and none of them match here.
+* **`bpix1` and `fov1` are ambiguous.** The copy sits beside the new file, so a bare
+  `*_bpix1.fits` matches two and step 4's deliberate one-or-raise guard fires on a
+  perfectly healthy reprocessing. The route asks for `*_repro_bpix1.fits`.
+* **The good-time file is `flt2`, not `flt1`.** Asking for `flt1` there finds nothing,
+  falls through to the download, and screens flares against the good times of the file
+  that is *not* being reduced. Silent, and wrong in the direction that matters.
+* **Three families are not in `repro/` at all** — the orbit ephemeris, the HRC dead-time
+  file, and the grating spectrum with its responses. Barycentring and the HRC timing
+  discriminator still read the download.
+
+So `_archive_products` grew a second argument: each getter now names the file on *each*
+route, `_product_candidates` turns that into an ordered list of `(root, pattern)` pairs,
+and the first root holding anything wins. `repro=None` means a family the reprocessing
+never writes, which skips `repro/` rather than finding the archive's copy there. Nine
+getters each gained one keyword; no public signature changed, and `products="archive"`
+reading the same tree still sees only the archive's own files — there is a test for that.
+The plan's *shape* survives intact: the task runs, then `chandra_archive_front_end` reads
+the result and returns the same `Observation`.
+
+**Three smaller findings, all measured:**
+
+* **`chandra_repro` will not create a nested output directory.** Pointed at
+  `<out>/5644/repro` with no `<out>/5644`, it stops with "Unable to create output
+  directory" and exit code 0 — so `ciao.run`'s output check is the only thing that would
+  have caught it. The front end makes the directory itself. An *existing empty* directory
+  it accepts even with `clobber=no`, which is what makes that safe.
+* **`CALDBVER` is not updated by a reprocessing.** The reprocessed `5644` event list still
+  reads `CALDBVER = 4.9.2` after a run with CALDB 4.12.4 installed; `ASCDSVER` moves from
+  `10.9.1` to `CIAO 4.18.0` and `CREATOR` to `acis_process_events - CIAO 4.18.0`. So the
+  staleness diagnostic step 4 built is **not** evidence that an observation still needs
+  reprocessing once it has had one, and the record says so in as many words.
+* **No level 1, no reprocessing.** The archive route's download filter does not fetch the
+  level-1 event list, so a tree downloaded on one route and reduced on the other cannot
+  work. That raises `FileNotFoundError` naming both the directory and the fix. Quietly
+  falling back to the archive's level-2 file would answer a configuration error with the
+  wrong data.
+
+**Nothing is renamed**, for the reason the grating products are not: `chandra_repro`
+cross-references its outputs in headers this pipeline did not write. Its names carry the
+obsid, and `chandra_repro_path` — `<out>/<OBSID>/repro`, its own directory beside
+`event_cl` and `products` — carries it too.
+
+**The route passes the acceptance test on its own.** `5644` downloaded with the repro
+filter (67.5 MB of 220.9), reprocessed through `chandra_repro_front_end`, then taken
+through regions, flare screening, cleaning and `axbary` by the module — every step
+unchanged. The downstream steps cannot tell the routes apart: the same position
+(4100.38, 4131.82) on chip 7, the same 0.830″ radius, the orbit ephemeris read from the
+download. Searched exactly as the archive route was (Z²₁, 0.722–0.756 Hz, no `--fast`,
+`--oversample 8`, deorbited with `orbital_decay.par`):
+
+| | archive route | reprocessing route |
+|---|---|---|
+| events in the level-2 file | 283 023 | 283 026 |
+| peak Z²₁ | 59.32 | 59.25 |
+| period | 1.3453202 s | 1.3453202 s |
+| next-highest peak | 14.60 | 14.55 |
+
+Three more events and a Z²₁ lower by 0.07 is what re-running `acis_process_events` with a
+newer CIAO on the same telemetry should look like. `5644` is `GRADED`, so the reprocessing
+cannot redo the CTI correction or VFAINT cleaning and a near-identical answer is expected
+here; an observation in `FAINT` or `VFAINT` mode is where the two routes would first
+genuinely differ.
 
 *Commit:* `Add the chandra_repro route behind products="repro"`
 
