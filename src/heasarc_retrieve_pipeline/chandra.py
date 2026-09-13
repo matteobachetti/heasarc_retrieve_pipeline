@@ -1941,8 +1941,9 @@ class Observation:
         The level-2 event list. Every other path may be ``None``; this one may not, and an
         observation without it is not an ``Observation`` at all.
     aspect_solution, bad_pixel_file, mask_file, gti_file : str or None
-        Companion products. ``aspect_solution`` is ``None`` for an observation of several
-        parts, which has more than one: see :attr:`aspect_solutions`.
+        Companion products. All four are ``None`` for an observation of several parts,
+        where each part has its own in ``parts``: see :attr:`aspect_solutions` and
+        :func:`chandra_part_observation`.
     dead_time_file : str or None
         HRC only, and ``None`` for ACIS is normal rather than missing. ``None`` too for an
         observation of several parts, where each part's is in ``parts``.
@@ -1971,6 +1972,9 @@ class Observation:
         The pointings the observation was taken in, each with its own companion files --
         see :func:`chandra_observation_parts`. One for an ordinary observation; empty only
         for an ``Observation`` built by hand.
+    part : ObservationPart or None
+        Set when this ``Observation`` is one part of an observation taken in several, as
+        :func:`chandra_part_observation` makes it; the part's label then ends the stem.
     """
 
     obsid: str
@@ -1994,6 +1998,7 @@ class Observation:
     active_rows: Optional[tuple] = None
     sky_pixel_arcsec: Optional[float] = None
     parts: tuple = ()
+    part: Optional[ObservationPart] = None
 
     def __post_init__(self):
         if self.sky_pixel_arcsec is None:
@@ -2002,19 +2007,21 @@ class Observation:
     @property
     def stem(self):
         """What every output file of this observation is named from."""
-        return chandra_file_stem(self.obsid, self.detector, self.mode)
+        stem = chandra_file_stem(self.obsid, self.detector, self.mode)
+        return stem if self.part is None else f"{stem}_{chandra_part_label(self.part)}"
 
     @property
     def aspect_solutions(self):
         """
         Every aspect solution the merged event list was made with, in time order.
 
-        For an observation of several parts, each part's own, one after another -- ``433``
-        has five for three parts. Otherwise the one ``aspect_solution``, or nothing.
+        The one ``aspect_solution`` when there is one. Otherwise every part's own, one after
+        another -- ``433`` has five for three parts, three of them in its first -- which
+        is also what one part taken as its own observation holds.
         """
-        if len(self.parts) > 1:
-            return tuple(path for part in self.parts for path in part.aspect_solutions)
-        return () if self.aspect_solution is None else (self.aspect_solution,)
+        if self.aspect_solution is not None:
+            return (self.aspect_solution,)
+        return tuple(path for part in self.parts for path in part.aspect_solutions)
 
     @property
     def is_continuous_clocking(self):
@@ -2096,9 +2103,9 @@ def chandra_archive_front_end(obsid, config, rec=None):
         chips=tuple(chandra_chips(header)),
         event_list=events,
         aspect_solution=chandra_aspect_solution(obsid, config) if len(parts) <= 1 else None,
-        bad_pixel_file=chandra_bad_pixel_file(obsid, config),
-        mask_file=chandra_mask_file(obsid, config),
-        gti_file=chandra_gti_file(obsid, config),
+        bad_pixel_file=chandra_bad_pixel_file(obsid, config) if len(parts) <= 1 else None,
+        mask_file=chandra_mask_file(obsid, config) if len(parts) <= 1 else None,
+        gti_file=chandra_gti_file(obsid, config) if len(parts) <= 1 else None,
         dead_time_file=dtf_path,
         orbit_ephemeris=chandra_orbit_ephemeris(obsid, config) if len(parts) <= 1 else None,
         grating_spectrum=chandra_grating_spectrum(obsid, config),
@@ -3837,6 +3844,88 @@ class _CollectedRecord:
 
     def array(self, **arrays):
         pass
+
+
+def chandra_part_observation(observation, part, config, env=None, log_to=None):
+    """
+    One part of an observation, as an observation of its own.
+
+    Matteo's ruling of 2026-09-13, and the CXC's answer too: ``splitobs`` separates the
+    parts so that each "can then be processed as if they were separate observations". Here
+    that holds from the source region on. Each part has its own aspect solutions, mask,
+    bad-pixel list, good-time file and orbit ephemeris, and ``specextract`` takes one mask
+    file per observation, so a spectrum of the merged list would have to pick one part's.
+
+    The part's events are cut out of the merged event list by its own times, into
+    ``<stem>_obiNNN_evt2.fits``. **The cut's** ``TSTART`` **and** ``TSTOP`` **are then
+    rewritten to the part's.** ``dmcopy``'s time filter trims the good-time blocks, the
+    exposure and the events, and leaves those two at the merged list's; ``dmextract`` bins
+    a light curve over them, and on ``380``'s second part that was 15 447 bins of 200 s, 7
+    with any exposure. On ``1411``, 84 days apart, it would be 36 000.
+
+    The time resolution, and with it the mode in the stem, is the part's own, from its own
+    dead-time file: ``1411``'s second part is 5.18 ms, where the combination in the front
+    end's record is 4.93.
+
+    Parameters
+    ----------
+    observation : Observation
+        The whole observation, as the front end read it.
+    part : ObservationPart
+        One of its ``parts``.
+    config : dict
+        ``out_data_path`` is where the cut goes; ``hrc_veto_ratio_threshold`` is read.
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    Observation
+        With ``part`` set, ``parts`` holding that part alone, and the part's companion
+        files in the single fields -- except ``aspect_solution``, which stays ``None``
+        because a part can have several: :attr:`Observation.aspect_solutions` has them.
+    """
+    from . import ciao
+
+    header = fits.getheader(observation.event_list, 1)
+    dtf = None if part.dead_time_file is None else read_dead_time_factors(part.dead_time_file)
+    resolution = chandra_time_resolution(header, dtf, config)
+    one = dataclasses.replace(
+        observation,
+        mode=chandra_mode_label(header, fast_timing=resolution.fast_timing),
+        time_resolution=resolution,
+        aspect_solution=None,
+        bad_pixel_file=part.bad_pixel_file,
+        mask_file=part.mask_file,
+        gti_file=part.gti_file,
+        dead_time_file=part.dead_time_file,
+        orbit_ephemeris=part.orbit_ephemeris,
+        parts=(part,),
+        part=part,
+    )
+
+    output = os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{one.stem}_evt2.fits"
+    )
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    ciao.run(
+        "dmcopy",
+        produces=output,
+        env=env,
+        log_to=log_to,
+        infile=f"{observation.event_list}[time={part.tstart!r}:{part.tstop!r}]",
+        outfile=output,
+        clobber=True,
+    )
+    with fits.open(output, mode="update") as hdulist:
+        hdulist[1].header["TSTART"] = part.tstart
+        hdulist[1].header["TSTOP"] = part.tstop
+
+    get_logger().info(
+        f"{observation.obsid}: part {part.number} cut into {os.path.basename(output)}, "
+        f"time resolution {resolution.seconds} s"
+    )
+    return dataclasses.replace(one, event_list=output)
 
 
 def chandra_barycenter_parts(

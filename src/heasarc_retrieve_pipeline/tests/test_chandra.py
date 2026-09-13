@@ -856,6 +856,136 @@ class TestSplittingAnObservationIntoItsParts:
         assert values["parts"][0]["dead_time_file"] == "hrcf06298_000N006_dtf1.fits"
 
 
+@pytest.fixture
+def stub_dmcopy_by_time(monkeypatch):
+    """A CIAO whose ``dmcopy`` copies the file named before the filter, header and all."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "dmcopy":
+            with fits.open(kwargs["infile"].split("[")[0]) as hdulist:
+                hdulist.writeto(kwargs["outfile"], overwrite=True)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestTakingOnePartAsItsOwnObservation:
+    """
+    Matteo's ruling of 2026-09-13: each part of an observation is reduced as an observation
+    of its own. ``specextract`` takes one mask file per observation, and ``splitobs`` -- the
+    CXC's own answer -- hands each part to ``chandra_repro`` as if it were separate.
+    """
+
+    def _380(self, tmp_path):
+        config = a_timed_observation(tmp_path, "380", ACIS_380_TIMES)
+        return config, chandra.chandra_archive_front_end("380", config)
+
+    def test_the_front_end_reads_an_observation_in_parts_without_choosing_a_file(self, tmp_path):
+        _, observation = self._380(tmp_path)
+
+        assert len(observation.parts) == 2
+        assert observation.part is None
+        assert observation.bad_pixel_file is None
+        assert observation.mask_file is None
+        assert observation.gti_file is None
+        assert observation.orbit_ephemeris is None
+
+    def test_a_part_is_named_for_its_number(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert one.stem == observation.stem + "_obi002"
+        assert one.part == observation.parts[1]
+        assert one.parts == (observation.parts[1],)
+
+    def test_a_part_s_events_are_cut_from_the_merged_list_by_its_own_times(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        (dmcopy,) = [kwargs for name, kwargs in stub_dmcopy_by_time if name == "dmcopy"]
+        assert dmcopy["infile"] == (
+            f"{observation.event_list}[time=77203909.743536:77206498.381131]"
+        )
+        assert one.event_list == os.path.join(
+            chandra.chandra_pipeline_output_path("380", config), f"{one.stem}_evt2.fits"
+        )
+
+    def test_a_part_s_event_list_starts_and_stops_when_the_part_does(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        """
+        ``dmcopy``'s time filter trims the good-time blocks, ``EXPOSURE`` and the events,
+        and leaves ``TSTART`` and ``TSTOP`` at the merged list's. ``dmextract`` then bins the
+        flare curve over the header's range: on ``380``'s second part, 15 447 bins of 200 s,
+        7 of them with any exposure. Measured with CIAO on 2026-09-13.
+        """
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        header = fits.getheader(one.event_list, 1)
+        assert (header["TSTART"], header["TSTOP"]) == (77203909.743536, 77206498.381131)
+
+    def test_a_part_carries_its_own_companion_files(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert _names([one.bad_pixel_file, one.mask_file, one.gti_file, one.orbit_ephemeris]) == [
+            "acisf00380_002N006_bpix1.fits.gz",
+            "acisf00380_002N006_msk1.fits.gz",
+            "acisf00380_002N006_flt1.fits.gz",
+            "orbitf077025900N001_eph1.fits.gz",
+        ]
+        assert _names(one.aspect_solutions) == ["pcadf00380_002N001_asol1.fits.gz"]
+
+    def test_an_acis_part_reads_out_at_its_frame_time(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[0], config)
+
+        assert one.time_resolution.seconds == 3.24104
+        assert one.mode == observation.mode
+
+    def test_an_hrc_part_has_its_own_time_resolution_and_not_the_combined_one(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        """``1411``'s second part: 5.18 ms, where the two parts together answer 4.93."""
+        a_dead_time_file(tmp_path / "d000.fits", 425, 95)
+        a_dead_time_file(tmp_path / "d002.fits", 396, 93)
+        parts = (
+            chandra.ObservationPart(0, *_1411_PART_000, dead_time_file=str(tmp_path / "d000.fits")),
+            chandra.ObservationPart(2, *_1411_PART_002, dead_time_file=str(tmp_path / "d002.fits")),
+        )
+        observation = chandra.Observation(
+            obsid="1411",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=chandra.TimeResolution(4.934e-3, "hrc_trigger_rate", ""),
+            chips=(0,),
+            event_list=an_event_file(
+                tmp_path / "hrcf01411N006_evt2.fits", TSTART=5.7e7, TSTOP=6.5e7
+            ),
+            parts=parts,
+        )
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        one = chandra.chandra_part_observation(observation, parts[1], config)
+
+        assert one.time_resolution.seconds == pytest.approx(2.05 / 396)
+        assert one.time_resolution.fast_timing is False
+        assert one.mode == "imaging"
+        assert one.dead_time_file == str(tmp_path / "d002.fits")
+
+
 class TestWhichChipsWereReadOut:
     """
     ``DETNAM`` is a chip list, and the digits are chip identifiers.
