@@ -2388,6 +2388,13 @@ The nineteen fast-frame observations not already verified were reduced through `
 pile-up at most 3.1% (``6361``, on-axis). ``10025``, ``10026``, ``18062`` and ``18063``
 sit within the dither of their chip's edge and lose some counts to it.
 
+A targeted Z²₁ search of all nineteen, with a two-segment spin solution that follows Liu et al.
+2024, fixed beforehand, finds no pulsation. The best-placed observations limit the pulsed amplitude
+to 8.4% (``6097``) and 8.9% (``10027``), below the 10.6% seen in ``5644``. The false-alarm
+probabilities HENzsearch reports in its targeted mode are all below 0.38, in these and in the
+HRC observations. So they are not quoted as significances until that mode is calibrated on data
+without a signal. The per-observation table is in ``~/tmp/m82_acis/M82X2_ACIS_search_results.md``.
+
 Open questions
 ~~~~~~~~~~~~~~
 
