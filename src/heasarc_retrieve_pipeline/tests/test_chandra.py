@@ -987,6 +987,19 @@ class TestTakingOnePartAsItsOwnObservation:
         header = fits.getheader(one.event_list, 1)
         assert {key: header.get(key) for key in pointing} == pointing
 
+    def test_a_part_s_event_list_names_its_part(self, tmp_path, stub_dmcopy_by_time):
+        """
+        CIAO keeps a list of the obsids taken in parts, and ``380`` is on it: ``specextract``
+        refuses an event list of one without ``OBI_NUM`` -- "For multi-OBI datasets like
+        380 the obi argument must be set" -- and the merged list has none. Measured on the
+        real ``380`` through ``core`` on 2026-09-13, on both parts.
+        """
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert fits.getheader(one.event_list, 1)["OBI_NUM"] == 2
+
     def test_a_part_carries_its_own_companion_files(self, tmp_path, stub_dmcopy_by_time):
         config, observation = self._380(tmp_path)
 

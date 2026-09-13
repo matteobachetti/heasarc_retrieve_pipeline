@@ -4157,6 +4157,11 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
         hdulist[1].header["TSTOP"] = part.tstop
         for key, value in pointing.items():
             hdulist[1].header[key] = value
+        # CIAO keeps a list of the obsids taken in parts, and specextract refuses an event
+        # list of one that does not say which part it is: "For multi-OBI datasets like 380
+        # the obi argument must be set". The merged list cannot say. Measured on 380.
+        if part.number is not None:
+            hdulist[1].header["OBI_NUM"] = part.number
 
     get_logger().info(
         f"{observation.obsid}: part {part.number} cut into {os.path.basename(output)}, "

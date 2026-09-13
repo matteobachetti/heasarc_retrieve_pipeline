@@ -2019,7 +2019,18 @@ coarser is taken when they are not or a dead-time file is missing.
 the cut's ``TSTART`` and ``TSTOP`` are rewritten to the part's. ``dmcopy``'s time filter
 trims the good-time blocks, the exposure and the events but not those two keywords, and
 ``dmextract`` bins a light curve over them: on ``380``'s second part that was 15 447 bins of
-200 s, 7 with any exposure.
+200 s, 7 with any exposure. The cut is also given the part's own ``RA_PNT``, ``DEC_PNT`` and
+``ROLL_PNT``, read from its good-time, mask or bad-pixel file. The merged list has none
+where the parts pointed differently (``380`` was rolled 251.6 and 282.8 degrees, ``1411``
+60.3 and 147.3), and ``psfsize_srcs`` stops without them. Its ``OBI_NUM`` is set to the
+part's number too: CIAO keeps a list of the obsids taken in parts, and ``specextract``
+refuses an event list of one that does not say which part it holds ("For multi-OBI datasets
+like 380 the obi argument must be set"). The cut's ``PBKFILE`` is still the merged list's,
+which names one part's parameter-block file; no file of a part carries the right one.
+
+When checking that the parts were read out the same way, ``TIMEDEL`` is compared only
+between files of one kind. An HRC good-time file's ``TIMEDEL`` is its own sampling, 0.25625
+s on both of ``1411``'s parts, not the event list's 1.5625e-05 s.
 
 **On the reprocessing route** ``chandra_repro`` refuses an observation in parts, so
 ``splitobs`` separates them into ``<out>/<obsid>/split/<obsid>_NNN`` and ``chandra_repro``
