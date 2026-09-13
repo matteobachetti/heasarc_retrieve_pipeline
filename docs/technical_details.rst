@@ -2206,7 +2206,7 @@ What the reduction writes, for ``5644``::
     <OBSID>/event_cl/chandra05644_aciss_timed_cl.evt           screened events
     <OBSID>/event_cl/chandra05644_aciss_timed_chipimg.fits     source chip, for pile-up
     <OBSID>/event_cl/chandra05644_aciss_timed_pileup.fits      pileup_map's output
-    <OBSID>/event_cl/chandra05644_aciss_timed_cl_bary.evt      barycentred
+    <OBSID>/event_cl/chandra05644_aciss_timed_cl_bary.evt.gz   barycentred, gzipped
     <OBSID>/event_cl/chandra05644_aciss_timed_src_bary.evt     barycentred, source region
     <OBSID>/products/chandra05644_aciss_timed_src.pi           source spectrum
     <OBSID>/products/chandra05644_aciss_timed_src_bkg.pi       background spectrum
@@ -2265,6 +2265,71 @@ Two search settings matter, and both cost a real non-detection before they were 
   2.6 σ -- a non-detection of a signal that is really there at 6 σ. ``--oversample 16``
   recovers it; the exact search without ``--fast`` at ``--oversample 8`` agrees to better
   than 1%. The symptom is a peak frequency that wanders between runs that should agree.
+
+The acceptance run: every HRC observation of M82
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The module was accepted on a batch chosen to test timing, where Chandra is hard: all 16 HRC
+observations within 12 arcminutes of M82, 266 ks, run through
+``core.retrieve_and_process_data`` on 2026-09-12 and barycentred at M82 X-2. Two are HRC-S
+in ``S_TIMING`` (``8189``, ``8505``) and genuinely deliver 15.625 µs; fourteen are HRC-I
+and do not; all sixteen headers carry the same ``TIMEDEL``. Thirteen of them have the
+custom ``data_mode`` ``OBS20743``, which is why the mode is read from the dead-time file and
+not matched against known names.
+
+**15 of 16 reduced, and every timing criterion was met.** ``1411`` was refused because it
+was taken in two separate pointings (OBIs), 84 days apart.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - criterion
+     - result
+   * - the two ``S_TIMING`` observations at 15.625 µs, and no other
+     - ``8189`` and ``8505``, veto ratio 1.000; none of the rest on ``TIMEDEL`` alone
+   * - every other observation measured, with its own reason
+     - the thirteen HRC-I pointings: 3.13-3.66 ms, veto ratio 0.424-0.438, 273-319
+       triggers/s
+   * - every observation barycentred at the position asked for
+     - all 15, ``refframe=ICRS``, DE405 recorded
+   * - the numbers physical
+     - veto ratio near 1 only for ``S_TIMING``; trigger rates consistent across pointings
+       of the same field
+
+**Low source counts are astrophysical, not a fault**: 51 events in ``8189`` and 102 in
+``8505``. M82 X-2 is absent or faint in 2007 and in ``23469`` and ``26111``, and present in
+``23466`` at 0.21 arcsec from the position searched. M82 X-1's offset from its catalogue
+position is the same in ``8189`` and ``23466``, so the astrometry is sound.
+
+Four faults were found by the run and fixed:
+
+* **The catalogue returns OBSIDs as 32-bit integers** (``0949b46``).
+  ``core.observation_work_items`` stores them as strings, since every path downstream is
+  built from one.
+* **CIAO on ``PATH`` is not CIAO activated** (``518ed30``). ``psfsize_srcs`` stopped at
+  "Please set the $ASCDS_CALIB environment variable". ``ciao_environment`` now fills in the
+  variables CIAO's activation script derives from the installation alone -- ``ASCDS_CALIB``,
+  ``ASCDS_BIN``, ``ASCDS_LIB``, ``ASCDS_OTS``, ``ASCDS_CONTRIB`` and ``XPA_METHOD`` -- and
+  keeps an activated shell's own values.
+* **The sky pixel scale is read from the event list** (``b889b55``), from the ``TCDLT`` of
+  its ``x`` column: 0.492 arcsec for ACIS, **0.1318** for HRC. Drawn with ACIS's scale, every
+  HRC region was 3.7 times too small.
+* **The whole-field barycentred list is gzipped** (``d6d21e6``) once the source events have
+  been cut from it. Nothing reads it again, but another source in the field can still be cut
+  from it, and CIAO reads a gzipped event list directly. Level 1 is used: on ``8505``'s
+  319 MB list it gives 244 MB in 6 s, where level 6 gives 240 MB in 15 s. The file is written
+  under a temporary name and renamed, so an interrupted run leaves no truncated ``.gz``.
+
+**No pulsation was detected in any of them**, and none was expected to be: detection was
+never a pass criterion. The search used the settings above plus a prior spin solution
+fixed before looking (HENDRICS ``--known-freq 0.728 --known-fdot -5e-11
+--known-pepoch 56682``), over 0.728-0.77 Hz for 2007 and 0.70-0.73 Hz for 2020-21. The best
+single value, ``23463`` at a false-alarm probability of 0.5%, becomes about 6% after 13
+pointings. With 50-170 source events the 90% upper limits on the pulsed amplitude are
+36-100% or more, far above the 5-12% seen with ACIS, so these observations are not
+sensitive enough to rule the pulsation out. The per-observation table, commands and logs
+are kept outside the repository, in ``~/tmp/m82_hrc/M82X2_HRC_search_results.md``.
 
 Orchestration with Prefect
 --------------------------
