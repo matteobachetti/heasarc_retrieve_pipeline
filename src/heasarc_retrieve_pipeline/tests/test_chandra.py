@@ -2874,6 +2874,134 @@ class TestBarycentringWithAxbary:
         assert stub_axbary == []
 
 
+class TestBarycentringAnObservationInParts:
+    """
+    ``1411``'s two parts are 84 days apart, and each has its own orbit ephemeris. One
+    ``axbary`` over the merged list would correct the second part with an orbit file that
+    ends 84 days before its first event.
+    """
+
+    RA, DEC = 148.96267, 69.67931
+    REGIONS = chandra.ExtractionRegions(source="[sky=circle(1,2,3)]", background="")
+
+    def _observation(self, tmp_path, second_orbit="orbitf064281664N002_eph1.fits.gz"):
+        parts = (
+            chandra.ObservationPart(
+                0,
+                57471875.357874,
+                57509598.434235,
+                orbit_ephemeris=str(tmp_path / "orbitf057024064N002_eph1.fits.gz"),
+            ),
+            chandra.ObservationPart(
+                2,
+                64767109.146926,
+                64787079.222651,
+                orbit_ephemeris=None if second_orbit is None else str(tmp_path / second_orbit),
+            ),
+        )
+        return chandra.Observation(
+            obsid="1411",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=chandra.TimeResolution(4.9e-3, "hrc_trigger_rate", ""),
+            chips=(0,),
+            event_list=str(tmp_path / "hrcf01411N006_evt2.fits.gz"),
+            parts=parts,
+        )
+
+    def _reduce(self, tmp_path, observation=None, rec=None):
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        return chandra.chandra_barycenter_parts(
+            observation or self._observation(tmp_path),
+            config,
+            str(tmp_path / "chandra01411_hrci_imaging_cl.evt"),
+            self.REGIONS,
+            ra=self.RA,
+            dec=self.DEC,
+            rec=rec,
+        )
+
+    def test_each_part_is_cut_out_of_the_cleaned_list_by_its_own_times(self, tmp_path, stub_axbary):
+        self._reduce(tmp_path)
+
+        cuts = [kwargs["infile"] for name, kwargs in stub_axbary if name == "dmcopy"]
+        cleaned = str(tmp_path / "chandra01411_hrci_imaging_cl.evt")
+        assert cuts[0] == f"{cleaned}[time=57471875.357874:57509598.434235]"
+        assert f"{cleaned}[time=64767109.146926:64787079.222651]" in cuts
+
+    def test_each_part_is_barycentred_with_its_own_orbit_at_the_position_asked_for(
+        self, tmp_path, stub_axbary
+    ):
+        self._reduce(tmp_path)
+
+        axbary = [kwargs for name, kwargs in stub_axbary if name == "axbary"]
+        assert _names(call["orbitfile"] for call in axbary) == [
+            "orbitf057024064N002_eph1.fits.gz",
+            "orbitf064281664N002_eph1.fits.gz",
+        ]
+        assert _names(call["infile"] for call in axbary) == [
+            "chandra01411_hrci_imaging_obi000_cl.evt",
+            "chandra01411_hrci_imaging_obi002_cl.evt",
+        ]
+        assert all((call["ra"], call["dec"]) == (self.RA, self.DEC) for call in axbary)
+
+    def test_there_is_one_barycentred_source_list_per_part_and_no_merged_one(
+        self, tmp_path, stub_axbary
+    ):
+        found = self._reduce(tmp_path)
+
+        assert _names(found) == [
+            "chandra01411_hrci_imaging_obi000_src_bary.evt",
+            "chandra01411_hrci_imaging_obi002_src_bary.evt",
+        ]
+
+    def test_each_whole_field_list_is_compressed_and_the_split_copies_removed(
+        self, tmp_path, stub_axbary
+    ):
+        """The spacecraft-time split is a subset of the cleaned list, which is kept."""
+        found = self._reduce(tmp_path)
+
+        directory = pathlib.Path(found[0]).parent
+        assert sorted(path.name for path in directory.iterdir()) == [
+            "chandra01411_hrci_imaging_obi000_cl_bary.evt.gz",
+            "chandra01411_hrci_imaging_obi000_src_bary.evt",
+            "chandra01411_hrci_imaging_obi002_cl_bary.evt.gz",
+            "chandra01411_hrci_imaging_obi002_src_bary.evt",
+        ]
+
+    def test_the_record_holds_each_part_s_correction(self, tmp_path, stub_axbary):
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "1411", "barycenter") as rec:
+            self._reduce(tmp_path, rec=rec)
+
+        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
+        assert values["n_parts"] == 2
+        assert values["barycentered"] is True
+        first, second = values["parts"]
+        assert first["number"] == 0 and second["number"] == 2
+        assert first["barycentered_file"] == "chandra01411_hrci_imaging_obi000_cl_bary.evt.gz"
+        assert second["barycentered_source_file"] == "chandra01411_hrci_imaging_obi002_src_bary.evt"
+        assert second["orbit_ephemeris"] == "orbitf064281664N002_eph1.fits.gz"
+        assert first["timesys"] == "TDB"
+        assert (first["tstart"], first["tstop"]) == (57471875.357874, 57509598.434235)
+
+    def test_a_part_with_no_orbit_is_recorded_and_the_other_is_still_corrected(
+        self, tmp_path, stub_axbary
+    ):
+        directory = tmp_path / "diagnostics"
+
+        with record_step(str(directory), "1411", "barycenter") as rec:
+            found = self._reduce(tmp_path, self._observation(tmp_path, second_orbit=None), rec)
+
+        assert _names(found) == ["chandra01411_hrci_imaging_obi000_src_bary.evt"]
+        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
+        assert values["parts"][1]["barycentered"] is False
+        assert "orbit ephemeris" in values["parts"][1]["reason"]
+        assert not list(tmp_path.rglob("*_obi002_cl.evt"))
+
+
 class TestCompressingTheBarycentredList:
     """
     The whole-field barycentred list is read once, to cut the source out of it, and kept
@@ -4225,6 +4353,7 @@ def stub_every_step(monkeypatch):
         ("chandra_barycenter", "cl_bary.evt"),
         ("chandra_barycentered_source_events", "src_bary.evt"),
         ("chandra_compress_barycentered_events", "cl_bary.evt.gz"),
+        ("chandra_barycenter_parts", ["obi000_src_bary.evt", "obi002_src_bary.evt"]),
         ("chandra_calculate_spectra", None),
     ):
         monkeypatch.setattr(chandra, name, recording(name, returns))
@@ -4313,6 +4442,36 @@ class TestReducingAnObservation:
 
         environments = {id(kwargs["env"]) for name, _, kwargs in stub_every_step if "env" in kwargs}
         assert len(environments) == 1
+
+    def test_an_observation_in_parts_is_barycentred_part_by_part(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        observation = SimpleNamespace(
+            obsid="1411",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=SimpleNamespace(seconds=4.9e-3),
+            parts=("part 0", "part 2"),
+        )
+        monkeypatch.setattr(
+            chandra,
+            "chandra_archive_front_end",
+            lambda *a, **k: (
+                stub_every_step.append(("chandra_archive_front_end", a, k)) or observation
+            ),
+        )
+
+        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert self.steps(stub_every_step)[-3:] == [
+            "chandra_pileup",
+            "chandra_barycenter_parts",
+            "chandra_calculate_spectra",
+        ]
+        ((_, args, kwargs),) = [c for c in stub_every_step if c[0] == "chandra_barycenter_parts"]
+        assert args[2] == "cl.evt", "the cleaned list, not the raw one"
+        assert (kwargs["ra"], kwargs["dec"]) == (self.RA, self.DEC)
 
     def test_no_ephemeris_means_no_source_events_and_the_rest_still_runs(
         self, tmp_path, stub_every_step, monkeypatch

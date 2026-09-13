@@ -49,6 +49,7 @@ import gzip
 import os
 import re
 import shutil
+import dataclasses
 from dataclasses import dataclass
 from itertools import takewhile
 from typing import Optional
@@ -1946,7 +1947,8 @@ class Observation:
         HRC only, and ``None`` for ACIS is normal rather than missing. ``None`` too for an
         observation of several parts, where each part's is in ``parts``.
     orbit_ephemeris : str or None
-        What ``axbary`` barycentres with.
+        What ``axbary`` barycentres with. ``None`` for an observation of several parts,
+        each of which has its own in ``parts``.
     grating_spectrum : str or None
     grating_responses : tuple of str
         The archive's ready-made grating products, collected and never re-made.
@@ -2098,7 +2100,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         mask_file=chandra_mask_file(obsid, config),
         gti_file=chandra_gti_file(obsid, config),
         dead_time_file=dtf_path,
-        orbit_ephemeris=chandra_orbit_ephemeris(obsid, config),
+        orbit_ephemeris=chandra_orbit_ephemeris(obsid, config) if len(parts) <= 1 else None,
         grating_spectrum=chandra_grating_spectrum(obsid, config),
         grating_responses=tuple(chandra_grating_responses(obsid, config)),
         caldb_version=_keyword(header, "CALDBVER"),
@@ -3746,7 +3748,7 @@ def _source_coordinates(ra, dec):
 
 
 def chandra_barycentered_source_events(
-    observation, config, barycentered, regions, rec=None, env=None, log_to=None
+    observation, config, barycentered, regions, rec=None, env=None, log_to=None, part=None
 ):
     """
     Cut the source region out of the barycentred event list.
@@ -3771,6 +3773,9 @@ def chandra_barycentered_source_events(
         position it was made to and the file cut from it.
     env : dict, optional
     log_to : str, optional
+    part : ObservationPart, optional
+        For an observation of several parts, the one ``barycentered`` holds, whose label
+        goes into the name: ``<stem>_obi002_src_bary.evt``.
 
     Returns
     -------
@@ -3784,10 +3789,11 @@ def chandra_barycentered_source_events(
         rec.value(barycentered_source_file=None)
         return None
 
+    label = "" if part is None else f"_{chandra_part_label(part)}"
     output = barycentered_file_name(
         os.path.join(
             chandra_pipeline_output_path(observation.obsid, config),
-            f"{observation.stem}_src.evt",
+            f"{observation.stem}{label}_src.evt",
         )
     )
     os.makedirs(os.path.dirname(output), exist_ok=True)
@@ -3806,6 +3812,132 @@ def chandra_barycentered_source_events(
         f"{observation.obsid}: barycentred source events in {os.path.basename(output)}"
     )
     return output
+
+
+def chandra_part_label(part):
+    """
+    What names one part in a file name.
+
+    Examples
+    --------
+    >>> chandra_part_label(ObservationPart(2, 0.0, 1.0))
+    'obi002'
+    """
+    return f"obi{part.number:03d}"
+
+
+class _CollectedRecord:
+    """Stands in for a :class:`StepRecord` so that one part's values stay that part's."""
+
+    def __init__(self):
+        self.values = {}
+
+    def value(self, **values):
+        self.values.update(values)
+
+    def array(self, **arrays):
+        pass
+
+
+def chandra_barycenter_parts(
+    observation, config, events, regions, ra="NONE", dec="NONE", rec=None, env=None, log_to=None
+):
+    """
+    Barycentre an observation taken in several parts, one part at a time.
+
+    **One** ``axbary`` **over the merged list would be wrong**, not merely approximate: each
+    part has its own orbit ephemeris, and ``1411``'s two parts are 84 days apart, so any one
+    orbit file ends long before the other part's first event. So each part is cut out of
+    the cleaned list by its own time range, barycentred with its own orbit file at the
+    position asked for, and has the source cut out of it:
+
+        chandra01411_hrci_imaging_obi000_src_bary.evt
+        chandra01411_hrci_imaging_obi002_src_bary.evt
+
+    There is **no merged barycentred file**, which is Matteo's ruling of 2026-09-13: a gap of
+    84 days is not something a timing search should be handed without deciding to. Each
+    part's whole-field list is compressed, as for one part; the spacecraft-time cut it was
+    made from is removed, since it is a subset of the cleaned list, which is kept.
+
+    Each step is the one an ordinary observation runs -- :func:`chandra_barycenter`,
+    :func:`chandra_barycentered_source_events` and
+    :func:`chandra_compress_barycentered_events` -- so the ``TIMESYS`` check and the
+    handling of a missing orbit file are the same, part by part. A part with no orbit file
+    is recorded as not barycentred and the others still are.
+
+    Parameters
+    ----------
+    observation : Observation
+        With more than one of ``parts``.
+    config : dict
+    events : str
+        The cleaned event list, on spacecraft time.
+    regions : ExtractionRegions
+    ra, dec : float or str, optional
+    rec : StepRecord, optional
+        Gets ``n_parts``, ``barycentered`` (whether any part was) and ``parts``, one
+        dictionary per part with its times and everything its own correction recorded.
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    list of str
+        The barycentred source lists, one per part that could be corrected, in time order.
+    """
+    from . import ciao
+
+    rec = rec or no_record()
+    logger = get_logger()
+    output_directory = chandra_pipeline_output_path(observation.obsid, config)
+    os.makedirs(output_directory, exist_ok=True)
+
+    found, records = [], []
+    for part in observation.parts:
+        label = chandra_part_label(part)
+        split = os.path.join(output_directory, f"{observation.stem}_{label}_cl.evt")
+        ciao.run(
+            "dmcopy",
+            produces=split,
+            env=env,
+            log_to=log_to,
+            infile=f"{events}[time={part.tstart!r}:{part.tstop!r}]",
+            outfile=split,
+            clobber=True,
+        )
+
+        one = dataclasses.replace(observation, orbit_ephemeris=part.orbit_ephemeris, parts=(part,))
+        collected = _CollectedRecord()
+        barycentered = chandra_barycenter(
+            one, config, split, ra=ra, dec=dec, rec=collected, env=env, log_to=log_to
+        )
+        os.remove(split)
+        if barycentered is None:
+            logger.warning(f"{observation.obsid}: part {part.number} was not barycentred")
+        else:
+            found.append(
+                chandra_barycentered_source_events(
+                    one,
+                    config,
+                    barycentered,
+                    regions,
+                    rec=collected,
+                    env=env,
+                    log_to=log_to,
+                    part=part,
+                )
+            )
+            chandra_compress_barycentered_events(barycentered, rec=collected)
+        records.append(
+            dict(number=part.number, tstart=part.tstart, tstop=part.tstop, **collected.values)
+        )
+
+    rec.value(
+        n_parts=len(observation.parts),
+        barycentered=bool(found),
+        parts=records,
+    )
+    return found
 
 
 #: How hard :func:`chandra_compress_barycentered_events` compresses. Measured on obsid
@@ -4681,16 +4813,30 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
         )
 
     with record_step(diagnostics, obsid, "barycenter") as rec:
-        barycentered = chandra_barycenter(
-            observation,
-            config,
-            cleaned,
-            ra=ra,
-            dec=dec,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("axbary", obsid, config),
-        )
+        if len(getattr(observation, "parts", ())) > 1:
+            chandra_barycenter_parts(
+                observation,
+                config,
+                cleaned,
+                regions,
+                ra=ra,
+                dec=dec,
+                rec=rec,
+                env=env,
+                log_to=tool_log_file("axbary", obsid, config),
+            )
+            barycentered = None
+        else:
+            barycentered = chandra_barycenter(
+                observation,
+                config,
+                cleaned,
+                ra=ra,
+                dec=dec,
+                rec=rec,
+                env=env,
+                log_to=tool_log_file("axbary", obsid, config),
+            )
         if barycentered is not None:
             chandra_barycentered_source_events(
                 observation,
