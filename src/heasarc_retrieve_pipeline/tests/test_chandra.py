@@ -961,6 +961,32 @@ class TestTakingOnePartAsItsOwnObservation:
         header = fits.getheader(one.event_list, 1)
         assert (header["TSTART"], header["TSTOP"]) == (77203909.743536, 77206498.381131)
 
+    def test_a_part_s_event_list_says_where_that_part_pointed(self, tmp_path, stub_dmcopy_by_time):
+        """
+        The merged list has no ``RA_PNT``, ``DEC_PNT`` or ``ROLL_PNT``: ``380``'s parts were
+        rolled 251.6 and 282.8 degrees. Every file of a part has its own, and without them
+        ``psfsize_srcs`` stops with "Input keyword list is missing" -- measured on the real
+        ``380`` through ``core`` on 2026-09-13, on both parts.
+        """
+        pointing = {
+            "RA_PNT": 148.8495527153,
+            "DEC_PNT": 69.628018652338,
+            "ROLL_PNT": 282.83742905797,
+        }
+        times = dict(ACIS_380_TIMES)
+        for name in (
+            "secondary/acisf00380_002N006_flt1.fits.gz",
+            "secondary/acisf00380_002N006_msk1.fits.gz",
+        ):
+            times[name] = (*_380_PART_002[:2], dict(_380_CONFIGURATION, **pointing))
+        config = a_timed_observation(tmp_path, "380", times)
+        observation = chandra.chandra_archive_front_end("380", config)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        header = fits.getheader(one.event_list, 1)
+        assert {key: header.get(key) for key in pointing} == pointing
+
     def test_a_part_carries_its_own_companion_files(self, tmp_path, stub_dmcopy_by_time):
         config, observation = self._380(tmp_path)
 
@@ -1589,6 +1615,28 @@ class TestPartsMustBeTakenTheSameWay:
 
         with pytest.raises(ValueError, match="DETNAM"):
             chandra.chandra_check_part_configurations(header, parts)
+
+    def test_an_hrc_good_time_file_s_own_timedel_is_not_a_difference(self, tmp_path):
+        """
+        Measured on the real ``1411``: both parts' ``std_flt1`` say ``TIMEDEL`` 0.25625 s,
+        the sampling of the filter, while the event list says 1.5625e-05 s. The parts agree
+        with each other, and comparing either with the event list compares two quantities.
+        """
+        times = {
+            name: (
+                (*spec[:2], {"DETNAM": "HRC-I", "TIMEDEL": 0.2562500089407})
+                if "_flt1" in name
+                else spec
+            )
+            for name, spec in HRC_I_1411_TIMES.items()
+            if "_asol1" not in name
+        }
+        config = a_timed_observation(tmp_path, "1411", times)
+        header = fits.getheader(chandra.chandra_event_list("1411", config), 1)
+
+        chandra.chandra_check_part_configurations(
+            header, chandra.chandra_observation_parts("1411", config)
+        )
 
     def test_an_ordinary_observation_opens_nothing(self, tmp_path):
         """Its companions are empty placeholders, so opening one would raise."""

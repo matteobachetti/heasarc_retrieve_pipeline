@@ -1966,13 +1966,21 @@ def chandra_check_part_configurations(header, parts):
     if len(parts) < 2:
         return
 
-    rows = [("the event list", header)]
+    rows = [("the event list", header, True)]
     for part in parts:
         # A reprocessed part's own event list first: chandra_repro's flt2 repeats none of
         # the readout keywords, measured on 380.
         source = part.event_list or part.gti_file or part.mask_file
         if source is not None:
-            rows.append((f"part {part.number}", fits.getheader(source, 1)))
+            rows.append(
+                (f"part {part.number}", fits.getheader(source, 1), part.event_list is not None)
+            )
+
+    # A good-time file's TIMEDEL is its own sampling: 0.25625 s in both of 1411's HRC
+    # std_flt1 files against the event list's 1.5625e-05 s. Only ACIS's repeats the frame
+    # time. So it is compared between files of one kind -- the parts' good-time files with
+    # each other, or event lists with event lists.
+    every_part_has_events = all(events for _, _, events in rows[1:])
 
     for keyword in PART_CONFIGURATION_KEYWORDS:
         seen = {
@@ -1981,8 +1989,9 @@ def chandra_check_part_configurations(header, parts):
                 if keyword == "TIMEDEL"
                 else str(found[keyword]).strip().upper()
             )
-            for label, found in rows
+            for label, found, events in rows
             if found.get(keyword) is not None
+            and (keyword != "TIMEDEL" or events == every_part_has_events)
         }
         if len(set(seen.values())) > 1:
             raise ValueError(
@@ -4036,6 +4045,11 @@ def chandra_barycentered_source_events(
     return output
 
 
+#: Where a part pointed: absent from a merged event list whose parts pointed differently,
+#: and required by ``psfsize_srcs``.
+PART_POINTING_KEYWORDS = ("RA_PNT", "DEC_PNT", "ROLL_PNT")
+
+
 def chandra_part_label(part):
     """
     What names one part in a file name.
@@ -4130,9 +4144,19 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
         outfile=output,
         clobber=True,
     )
+    # The merged list has no pointing either, because the parts pointed differently -- on
+    # 380 rolled 251.6 and 282.8 degrees -- and psfsize_srcs stops without it. Every file
+    # of the part carries its own, so the first that has them gives them.
+    pointing = {}
+    for companion in (part.gti_file, part.mask_file, part.bad_pixel_file):
+        if companion is not None and not pointing:
+            found = fits.getheader(companion, 1)
+            pointing = {key: found[key] for key in PART_POINTING_KEYWORDS if key in found}
     with fits.open(output, mode="update") as hdulist:
         hdulist[1].header["TSTART"] = part.tstart
         hdulist[1].header["TSTOP"] = part.tstop
+        for key, value in pointing.items():
+            hdulist[1].header[key] = value
 
     get_logger().info(
         f"{observation.obsid}: part {part.number} cut into {os.path.basename(output)}, "
