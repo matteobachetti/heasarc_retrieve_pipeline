@@ -3004,134 +3004,6 @@ class TestBarycentringWithAxbary:
         assert stub_axbary == []
 
 
-class TestBarycentringAnObservationInParts:
-    """
-    ``1411``'s two parts are 84 days apart, and each has its own orbit ephemeris. One
-    ``axbary`` over the merged list would correct the second part with an orbit file that
-    ends 84 days before its first event.
-    """
-
-    RA, DEC = 148.96267, 69.67931
-    REGIONS = chandra.ExtractionRegions(source="[sky=circle(1,2,3)]", background="")
-
-    def _observation(self, tmp_path, second_orbit="orbitf064281664N002_eph1.fits.gz"):
-        parts = (
-            chandra.ObservationPart(
-                0,
-                57471875.357874,
-                57509598.434235,
-                orbit_ephemeris=str(tmp_path / "orbitf057024064N002_eph1.fits.gz"),
-            ),
-            chandra.ObservationPart(
-                2,
-                64767109.146926,
-                64787079.222651,
-                orbit_ephemeris=None if second_orbit is None else str(tmp_path / second_orbit),
-            ),
-        )
-        return chandra.Observation(
-            obsid="1411",
-            detector="hrci",
-            grating="NONE",
-            mode="imaging",
-            time_resolution=chandra.TimeResolution(4.9e-3, "hrc_trigger_rate", ""),
-            chips=(0,),
-            event_list=str(tmp_path / "hrcf01411N006_evt2.fits.gz"),
-            parts=parts,
-        )
-
-    def _reduce(self, tmp_path, observation=None, rec=None):
-        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
-        return chandra.chandra_barycenter_parts(
-            observation or self._observation(tmp_path),
-            config,
-            str(tmp_path / "chandra01411_hrci_imaging_cl.evt"),
-            self.REGIONS,
-            ra=self.RA,
-            dec=self.DEC,
-            rec=rec,
-        )
-
-    def test_each_part_is_cut_out_of_the_cleaned_list_by_its_own_times(self, tmp_path, stub_axbary):
-        self._reduce(tmp_path)
-
-        cuts = [kwargs["infile"] for name, kwargs in stub_axbary if name == "dmcopy"]
-        cleaned = str(tmp_path / "chandra01411_hrci_imaging_cl.evt")
-        assert cuts[0] == f"{cleaned}[time=57471875.357874:57509598.434235]"
-        assert f"{cleaned}[time=64767109.146926:64787079.222651]" in cuts
-
-    def test_each_part_is_barycentred_with_its_own_orbit_at_the_position_asked_for(
-        self, tmp_path, stub_axbary
-    ):
-        self._reduce(tmp_path)
-
-        axbary = [kwargs for name, kwargs in stub_axbary if name == "axbary"]
-        assert _names(call["orbitfile"] for call in axbary) == [
-            "orbitf057024064N002_eph1.fits.gz",
-            "orbitf064281664N002_eph1.fits.gz",
-        ]
-        assert _names(call["infile"] for call in axbary) == [
-            "chandra01411_hrci_imaging_obi000_cl.evt",
-            "chandra01411_hrci_imaging_obi002_cl.evt",
-        ]
-        assert all((call["ra"], call["dec"]) == (self.RA, self.DEC) for call in axbary)
-
-    def test_there_is_one_barycentred_source_list_per_part_and_no_merged_one(
-        self, tmp_path, stub_axbary
-    ):
-        found = self._reduce(tmp_path)
-
-        assert _names(found) == [
-            "chandra01411_hrci_imaging_obi000_src_bary.evt",
-            "chandra01411_hrci_imaging_obi002_src_bary.evt",
-        ]
-
-    def test_each_whole_field_list_is_compressed_and_the_split_copies_removed(
-        self, tmp_path, stub_axbary
-    ):
-        """The spacecraft-time split is a subset of the cleaned list, which is kept."""
-        found = self._reduce(tmp_path)
-
-        directory = pathlib.Path(found[0]).parent
-        assert sorted(path.name for path in directory.iterdir()) == [
-            "chandra01411_hrci_imaging_obi000_cl_bary.evt.gz",
-            "chandra01411_hrci_imaging_obi000_src_bary.evt",
-            "chandra01411_hrci_imaging_obi002_cl_bary.evt.gz",
-            "chandra01411_hrci_imaging_obi002_src_bary.evt",
-        ]
-
-    def test_the_record_holds_each_part_s_correction(self, tmp_path, stub_axbary):
-        directory = tmp_path / "diagnostics"
-
-        with record_step(str(directory), "1411", "barycenter") as rec:
-            self._reduce(tmp_path, rec=rec)
-
-        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
-        assert values["n_parts"] == 2
-        assert values["barycentered"] is True
-        first, second = values["parts"]
-        assert first["number"] == 0 and second["number"] == 2
-        assert first["barycentered_file"] == "chandra01411_hrci_imaging_obi000_cl_bary.evt.gz"
-        assert second["barycentered_source_file"] == "chandra01411_hrci_imaging_obi002_src_bary.evt"
-        assert second["orbit_ephemeris"] == "orbitf064281664N002_eph1.fits.gz"
-        assert first["timesys"] == "TDB"
-        assert (first["tstart"], first["tstop"]) == (57471875.357874, 57509598.434235)
-
-    def test_a_part_with_no_orbit_is_recorded_and_the_other_is_still_corrected(
-        self, tmp_path, stub_axbary
-    ):
-        directory = tmp_path / "diagnostics"
-
-        with record_step(str(directory), "1411", "barycenter") as rec:
-            found = self._reduce(tmp_path, self._observation(tmp_path, second_orbit=None), rec)
-
-        assert _names(found) == ["chandra01411_hrci_imaging_obi000_src_bary.evt"]
-        values = json.loads(next(directory.glob("*barycenter*.json")).read_text())["values"]
-        assert values["parts"][1]["barycentered"] is False
-        assert "orbit ephemeris" in values["parts"][1]["reason"]
-        assert not list(tmp_path.rglob("*_obi002_cl.evt"))
-
-
 class TestCompressingTheBarycentredList:
     """
     The whole-field barycentred list is read once, to cut the source out of it, and kept
@@ -3778,6 +3650,23 @@ class TestExtractingAnAcisSpectrum:
         assert call["asp"] == observation.aspect_solution
         assert call["mskfile"] == observation.mask_file
         assert call["badpixfile"] == observation.bad_pixel_file
+
+    def test_every_aspect_solution_of_a_part_is_handed_over(self, tmp_path, stub_specextract):
+        """
+        A part can have several -- ``433``'s first has three -- and ``specextract`` takes
+        "one or more aspect solution files" per observation, as a stack.
+        """
+        part = chandra.ObservationPart(
+            1, 1.0, 2.0, aspect_solutions=(str(tmp_path / "a.fits"), str(tmp_path / "b.fits"))
+        )
+        observation = self._observation(tmp_path, aspect_solution=None, parts=(part,), part=part)
+
+        chandra.chandra_calculate_spectra(
+            observation, self._config(tmp_path), str(tmp_path / "cl.evt"), self._regions()
+        )
+
+        call = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        assert call["asp"] == f"{tmp_path / 'a.fits'},{tmp_path / 'b.fits'}"
 
     def test_grouping_is_a_separate_call_and_not_specextracts(self, tmp_path, stub_specextract):
         """
@@ -4483,7 +4372,6 @@ def stub_every_step(monkeypatch):
         ("chandra_barycenter", "cl_bary.evt"),
         ("chandra_barycentered_source_events", "src_bary.evt"),
         ("chandra_compress_barycentered_events", "cl_bary.evt.gz"),
-        ("chandra_barycenter_parts", ["obi000_src_bary.evt", "obi002_src_bary.evt"]),
         ("chandra_calculate_spectra", None),
     ):
         monkeypatch.setattr(chandra, name, recording(name, returns))
@@ -4573,35 +4461,162 @@ class TestReducingAnObservation:
         environments = {id(kwargs["env"]) for name, _, kwargs in stub_every_step if "env" in kwargs}
         assert len(environments) == 1
 
-    def test_an_observation_in_parts_is_barycentred_part_by_part(
-        self, tmp_path, stub_every_step, monkeypatch
-    ):
-        observation = SimpleNamespace(
+    ONE_PART = [
+        "chandra_part_observation",
+        "chandra_source_regions",
+        "chandra_flare_lightcurve",
+        "chandra_flare_gti",
+        "chandra_clean_event_list",
+        "chandra_pileup",
+        "chandra_barycenter",
+        "chandra_barycentered_source_events",
+        "chandra_compress_barycentered_events",
+        "chandra_calculate_spectra",
+    ]
+
+    def _in_parts(self, calls, monkeypatch):
+        """``1411``'s shape: parts 0 and 2, each handed back as an observation of its own."""
+        parts = (SimpleNamespace(number=0), SimpleNamespace(number=2))
+        whole = SimpleNamespace(
             obsid="1411",
             detector="hrci",
             grating="NONE",
             mode="imaging",
             time_resolution=SimpleNamespace(seconds=4.9e-3),
-            parts=("part 0", "part 2"),
-        )
-        monkeypatch.setattr(
-            chandra,
-            "chandra_archive_front_end",
-            lambda *a, **k: (
-                stub_every_step.append(("chandra_archive_front_end", a, k)) or observation
-            ),
+            parts=parts,
         )
 
-        self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
+        def front_end(*args, **kwargs):
+            calls.append(("chandra_archive_front_end", args, kwargs))
+            return whole
 
-        assert self.steps(stub_every_step)[-3:] == [
-            "chandra_pileup",
-            "chandra_barycenter_parts",
-            "chandra_calculate_spectra",
+        def part_observation(observation, part, config, **kwargs):
+            calls.append(("chandra_part_observation", (observation, part, config), kwargs))
+            return SimpleNamespace(
+                obsid="1411",
+                detector="hrci",
+                grating="NONE",
+                mode="imaging",
+                time_resolution=SimpleNamespace(seconds=5.0e-3),
+                parts=(part,),
+                part=part,
+            )
+
+        monkeypatch.setattr(chandra, "chandra_archive_front_end", front_end)
+        monkeypatch.setattr(chandra, "chandra_part_observation", part_observation)
+        return whole
+
+    def _reduce_1411(self, tmp_path, config=None, **kwargs):
+        base = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+        return chandra.process_chandra_obsid.fn(
+            "1411", config=dict(base, **(config or {})), **kwargs
+        )
+
+    def test_each_part_is_reduced_in_turn_as_its_own_observation(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert self.steps(stub_every_step) == (
+            ["chandra_archive_front_end"] + self.ONE_PART + self.ONE_PART
+        )
+
+    def test_every_step_is_handed_the_part_and_not_the_whole(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        handed = [
+            args[0].part.number
+            for name, args, _ in stub_every_step
+            if name
+            in (
+                "chandra_source_regions",
+                "chandra_flare_gti",
+                "chandra_barycenter",
+                "chandra_calculate_spectra",
+            )
         ]
-        ((_, args, kwargs),) = [c for c in stub_every_step if c[0] == "chandra_barycenter_parts"]
-        assert args[2] == "cl.evt", "the cleaned list, not the raw one"
-        assert (kwargs["ra"], kwargs["dec"]) == (self.RA, self.DEC)
+        assert handed == [0, 0, 0, 0, 2, 2, 2, 2]
+
+    def test_every_record_of_a_part_carries_its_label(self, tmp_path, stub_every_step, monkeypatch):
+        """One heading per part on the report page, the way XMM has one per exposure."""
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        records = [json.loads(path.read_text()) for path in (tmp_path / "1411").rglob("*.json")]
+        keyed = {
+            (record["step"], record.get("key"))
+            for record in records
+            if record.get("step") not in (None, "chandra_front_end")
+        }
+        assert keyed == {
+            (step, key)
+            for step in (
+                "source_region",
+                "flare_filtering",
+                "clean_event_list",
+                "pileup_check",
+                "barycenter",
+                "calculate_spectra",
+            )
+            for key in ("obi000", "obi002")
+        }
+
+    def test_each_part_s_tools_log_to_files_of_its_own(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        logs = [kwargs["log_to"] for _, _, kwargs in stub_every_step if "log_to" in kwargs]
+        assert all("obi000" in log or "obi002" in log for log in logs)
+        assert len(set(logs)) == len(logs)
+
+    def test_a_part_that_fails_does_not_take_the_other_down(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        """XMM's rule for its exposures, measured on 0560590201: write the loss down, keep
+        what worked."""
+        self._in_parts(stub_every_step, monkeypatch)
+
+        def broken_for_part_0(observation, *args, **kwargs):
+            stub_every_step.append(("chandra_flare_lightcurve", (observation,) + args, kwargs))
+            if observation.part.number == 0:
+                raise RuntimeError("dmextract fell over")
+            return "curve.fits"
+
+        monkeypatch.setattr(chandra, "chandra_flare_lightcurve", broken_for_part_0)
+
+        assert self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC) is None
+
+        spectra = [
+            args[0].part.number
+            for name, args, _ in stub_every_step
+            if name == "chandra_calculate_spectra"
+        ]
+        assert spectra == [2]
+        record = next((tmp_path / "1411").rglob("*flare_filtering*obi000*.json")).read_text()
+        assert "failed" in record
+
+    def test_when_every_part_fails_the_observation_fails(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("dmextract fell over")
+
+        monkeypatch.setattr(chandra, "chandra_flare_lightcurve", broken)
+
+        with pytest.raises(RuntimeError, match="no part of 1411 .*dmextract fell over"):
+            self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
 
     def test_no_ephemeris_means_no_source_events_and_the_rest_still_runs(
         self, tmp_path, stub_every_step, monkeypatch

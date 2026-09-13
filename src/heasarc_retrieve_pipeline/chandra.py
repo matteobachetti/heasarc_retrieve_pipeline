@@ -3755,7 +3755,7 @@ def _source_coordinates(ra, dec):
 
 
 def chandra_barycentered_source_events(
-    observation, config, barycentered, regions, rec=None, env=None, log_to=None, part=None
+    observation, config, barycentered, regions, rec=None, env=None, log_to=None
 ):
     """
     Cut the source region out of the barycentred event list.
@@ -3780,9 +3780,6 @@ def chandra_barycentered_source_events(
         position it was made to and the file cut from it.
     env : dict, optional
     log_to : str, optional
-    part : ObservationPart, optional
-        For an observation of several parts, the one ``barycentered`` holds, whose label
-        goes into the name: ``<stem>_obi002_src_bary.evt``.
 
     Returns
     -------
@@ -3796,11 +3793,10 @@ def chandra_barycentered_source_events(
         rec.value(barycentered_source_file=None)
         return None
 
-    label = "" if part is None else f"_{chandra_part_label(part)}"
     output = barycentered_file_name(
         os.path.join(
             chandra_pipeline_output_path(observation.obsid, config),
-            f"{observation.stem}{label}_src.evt",
+            f"{observation.stem}_src.evt",
         )
     )
     os.makedirs(os.path.dirname(output), exist_ok=True)
@@ -3831,19 +3827,6 @@ def chandra_part_label(part):
     'obi002'
     """
     return f"obi{part.number:03d}"
-
-
-class _CollectedRecord:
-    """Stands in for a :class:`StepRecord` so that one part's values stay that part's."""
-
-    def __init__(self):
-        self.values = {}
-
-    def value(self, **values):
-        self.values.update(values)
-
-    def array(self, **arrays):
-        pass
 
 
 def chandra_part_observation(observation, part, config, env=None, log_to=None):
@@ -3926,107 +3909,6 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
         f"time resolution {resolution.seconds} s"
     )
     return dataclasses.replace(one, event_list=output)
-
-
-def chandra_barycenter_parts(
-    observation, config, events, regions, ra="NONE", dec="NONE", rec=None, env=None, log_to=None
-):
-    """
-    Barycentre an observation taken in several parts, one part at a time.
-
-    **One** ``axbary`` **over the merged list would be wrong**, not merely approximate: each
-    part has its own orbit ephemeris, and ``1411``'s two parts are 84 days apart, so any one
-    orbit file ends long before the other part's first event. So each part is cut out of
-    the cleaned list by its own time range, barycentred with its own orbit file at the
-    position asked for, and has the source cut out of it:
-
-        chandra01411_hrci_imaging_obi000_src_bary.evt
-        chandra01411_hrci_imaging_obi002_src_bary.evt
-
-    There is **no merged barycentred file**, which is Matteo's ruling of 2026-09-13: a gap of
-    84 days is not something a timing search should be handed without deciding to. Each
-    part's whole-field list is compressed, as for one part; the spacecraft-time cut it was
-    made from is removed, since it is a subset of the cleaned list, which is kept.
-
-    Each step is the one an ordinary observation runs -- :func:`chandra_barycenter`,
-    :func:`chandra_barycentered_source_events` and
-    :func:`chandra_compress_barycentered_events` -- so the ``TIMESYS`` check and the
-    handling of a missing orbit file are the same, part by part. A part with no orbit file
-    is recorded as not barycentred and the others still are.
-
-    Parameters
-    ----------
-    observation : Observation
-        With more than one of ``parts``.
-    config : dict
-    events : str
-        The cleaned event list, on spacecraft time.
-    regions : ExtractionRegions
-    ra, dec : float or str, optional
-    rec : StepRecord, optional
-        Gets ``n_parts``, ``barycentered`` (whether any part was) and ``parts``, one
-        dictionary per part with its times and everything its own correction recorded.
-    env : dict, optional
-    log_to : str, optional
-
-    Returns
-    -------
-    list of str
-        The barycentred source lists, one per part that could be corrected, in time order.
-    """
-    from . import ciao
-
-    rec = rec or no_record()
-    logger = get_logger()
-    output_directory = chandra_pipeline_output_path(observation.obsid, config)
-    os.makedirs(output_directory, exist_ok=True)
-
-    found, records = [], []
-    for part in observation.parts:
-        label = chandra_part_label(part)
-        split = os.path.join(output_directory, f"{observation.stem}_{label}_cl.evt")
-        ciao.run(
-            "dmcopy",
-            produces=split,
-            env=env,
-            log_to=log_to,
-            infile=f"{events}[time={part.tstart!r}:{part.tstop!r}]",
-            outfile=split,
-            clobber=True,
-        )
-
-        one = dataclasses.replace(observation, orbit_ephemeris=part.orbit_ephemeris, parts=(part,))
-        collected = _CollectedRecord()
-        barycentered = chandra_barycenter(
-            one, config, split, ra=ra, dec=dec, rec=collected, env=env, log_to=log_to
-        )
-        os.remove(split)
-        if barycentered is None:
-            logger.warning(f"{observation.obsid}: part {part.number} was not barycentred")
-        else:
-            found.append(
-                chandra_barycentered_source_events(
-                    one,
-                    config,
-                    barycentered,
-                    regions,
-                    rec=collected,
-                    env=env,
-                    log_to=log_to,
-                    part=part,
-                )
-            )
-            chandra_compress_barycentered_events(barycentered, rec=collected)
-        records.append(
-            dict(number=part.number, tstart=part.tstart, tstop=part.tstop, **collected.values)
-        )
-
-    rec.value(
-        n_parts=len(observation.parts),
-        barycentered=bool(found),
-        parts=records,
-    )
-    return found
 
 
 #: How hard :func:`chandra_compress_barycentered_events` compresses. Measured on obsid
@@ -4711,7 +4593,7 @@ def chandra_calculate_spectra(
         infile=cleaned + regions.source,
         outroot=root,
         bkgfile=cleaned + regions.background,
-        asp=observation.aspect_solution or "",
+        asp=",".join(observation.aspect_solutions),
         mskfile=observation.mask_file or "",
         badpixfile=observation.bad_pixel_file or "",
         bkgresp="yes",
@@ -4779,6 +4661,76 @@ NO_POSITION_REASON = (
 )
 
 
+def _chandra_reduce(obsid, observation, part, key, config, ra, dec, diagnostics, env):
+    """
+    Everything after the front end, for one observation or for one part of one.
+
+    ``part`` is ``None`` for an ordinary observation, whose records and tool logs keep the
+    names they always had. For a part, the observation is first cut down to it by
+    :func:`chandra_part_observation`, and every record is keyed and every tool log suffixed
+    with its label, ``obi000``, so that the parts cannot overwrite each other.
+    """
+    suffix = f"_{key}" if key else ""
+
+    def log(tool):
+        return tool_log_file(f"{tool}{suffix}", obsid, config)
+
+    with record_step(diagnostics, obsid, "source_region", key=key) as rec:
+        rec.value(ra=ra, dec=dec)
+        if part is not None:
+            rec.value(part=part.number)
+            observation = chandra_part_observation(
+                observation, part, config, env=env, log_to=log("dmcopy_part")
+            )
+        position, regions = chandra_source_regions(
+            observation, config, ra, dec, rec=rec, env=env, log_to=log("psfsize_srcs")
+        )
+
+    with record_step(diagnostics, obsid, "flare_filtering", key=key) as rec:
+        lightcurve = chandra_flare_lightcurve(
+            observation, position, regions, config, env=env, log_to=log("dmextract")
+        )
+        gti = chandra_flare_gti(observation, config, lightcurve, rec=rec)
+
+    with record_step(diagnostics, obsid, "clean_event_list", key=key) as rec:
+        cleaned = chandra_clean_event_list(
+            observation, config, gti, rec=rec, env=env, log_to=log("dmcopy")
+        )
+
+    with record_step(diagnostics, obsid, "pileup_check", key=key) as rec:
+        chandra_pileup(
+            observation,
+            config,
+            cleaned,
+            position,
+            regions,
+            rec=rec,
+            env=env,
+            log_to=log("pileup_map"),
+        )
+
+    with record_step(diagnostics, obsid, "barycenter", key=key) as rec:
+        barycentered = chandra_barycenter(
+            observation, config, cleaned, ra=ra, dec=dec, rec=rec, env=env, log_to=log("axbary")
+        )
+        if barycentered is not None:
+            chandra_barycentered_source_events(
+                observation,
+                config,
+                barycentered,
+                regions,
+                rec=rec,
+                env=env,
+                log_to=log("dmcopy_src_bary"),
+            )
+            chandra_compress_barycentered_events(barycentered, rec=rec)
+
+    with record_step(diagnostics, obsid, "calculate_spectra", key=key) as rec:
+        chandra_calculate_spectra(
+            observation, config, cleaned, regions, rec=rec, env=env, log_to=log("specextract")
+        )
+
+
 @flow(flow_run_name="chandra_{obsid}")
 def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     """
@@ -4796,6 +4748,12 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
 
     Like XMM, and unlike NuSTAR, ``ra`` and ``dec`` are used as given and never
     overridden -- see :func:`chandra_source_position`.
+
+    **An observation taken in several parts is reduced one part at a time**, each as an
+    observation of its own from the source region on -- see
+    :func:`chandra_part_observation`. Every record is keyed by the part's label and every
+    output named with it. As XMM does with its exposures, a part that fails is recorded and
+    the others are still reduced; only when every part fails does the observation.
 
     Parameters
     ----------
@@ -4856,97 +4814,33 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
 
     env = ciao.ciao_environment(obsid, config)
 
-    with record_step(diagnostics, obsid, "source_region") as rec:
-        rec.value(ra=ra, dec=dec)
-        position, regions = chandra_source_regions(
-            observation,
-            config,
-            ra,
-            dec,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("psfsize_srcs", obsid, config),
-        )
-
-    with record_step(diagnostics, obsid, "flare_filtering") as rec:
-        lightcurve = chandra_flare_lightcurve(
-            observation,
-            position,
-            regions,
-            config,
-            env=env,
-            log_to=tool_log_file("dmextract", obsid, config),
-        )
-        gti = chandra_flare_gti(observation, config, lightcurve, rec=rec)
-
-    with record_step(diagnostics, obsid, "clean_event_list") as rec:
-        cleaned = chandra_clean_event_list(
-            observation,
-            config,
-            gti,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("dmcopy", obsid, config),
-        )
-
-    with record_step(diagnostics, obsid, "pileup_check") as rec:
-        chandra_pileup(
-            observation,
-            config,
-            cleaned,
-            position,
-            regions,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("pileup_map", obsid, config),
-        )
-
-    with record_step(diagnostics, obsid, "barycenter") as rec:
-        if len(getattr(observation, "parts", ())) > 1:
-            chandra_barycenter_parts(
-                observation,
-                config,
-                cleaned,
-                regions,
-                ra=ra,
-                dec=dec,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file("axbary", obsid, config),
+    parts = getattr(observation, "parts", ())
+    units = [(chandra_part_label(part), part) for part in parts] if len(parts) > 1 else [("", None)]
+    failed = {}
+    for key, part in units:
+        try:
+            _chandra_reduce(obsid, observation, part, key, config, ra, dec, diagnostics, env)
+        except Exception as error:
+            if part is None:
+                raise
+            # XMM's rule for its exposures: the step that failed has recorded why under this
+            # part's key, and the parts that worked are kept.
+            failed[key] = error
+            logger.error(
+                f"{obsid}: part {part.number} could not be reduced and is left out of this "
+                f"observation's products: {type(error).__name__}: {error}"
             )
-            barycentered = None
-        else:
-            barycentered = chandra_barycenter(
-                observation,
-                config,
-                cleaned,
-                ra=ra,
-                dec=dec,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file("axbary", obsid, config),
-            )
-        if barycentered is not None:
-            chandra_barycentered_source_events(
-                observation,
-                config,
-                barycentered,
-                regions,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file("dmcopy_src_bary", obsid, config),
-            )
-            chandra_compress_barycentered_events(barycentered, rec=rec)
 
-    with record_step(diagnostics, obsid, "calculate_spectra") as rec:
-        chandra_calculate_spectra(
-            observation,
-            config,
-            cleaned,
-            regions,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("specextract", obsid, config),
+    if failed and len(failed) == len(units):
+        last = list(failed.values())[-1]
+        raise RuntimeError(
+            f"no part of {obsid} could be reduced; the last failure was "
+            f"{type(last).__name__}: {last}"
+        ) from last
+    if failed:
+        logger.warning(
+            f"{obsid}: reduced {len(units) - len(failed)} of {len(units)} parts. "
+            f"{', '.join(sorted(failed))} failed; the diagnostics say why."
         )
 
     logger.info(f"Finished processing Chandra observation {obsid}")
