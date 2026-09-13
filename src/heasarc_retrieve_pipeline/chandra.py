@@ -1037,6 +1037,265 @@ def chandra_grating_responses(obsid, config):
     return sorted(found)
 
 
+@dataclass(frozen=True)
+class ObservationPart:
+    """
+    One pointing of an observation, and the files that belong to it alone.
+
+    Some Chandra observations were taken in several separate pointings under one obsid --
+    ``1411`` is two, 84 days apart. Chandra calls each an OBI, an observation interval.
+    The archive merges their events into one level-2 list and ships everything else once
+    per part, and each part has to be reduced with its own: its own dead time, its own
+    aspect, its own orbit. An ordinary observation is simply one part.
+
+    Attributes
+    ----------
+    number : int or None
+        The part number as the archive writes it, ``2`` for ``hrcf01411_002N006_dtf1``.
+        Numbers can skip and need not start at zero -- ``433`` is parts 1, 3 and 4.
+        ``None`` only when nothing downloaded carries one.
+    tstart, tstop : float or None
+        The span of the part's own files, in spacecraft seconds. For an observation of one
+        part, the event list's.
+    dead_time_file : str or None
+        HRC only.
+    aspect_solutions : tuple of str
+        Every aspect solution of this part. Usually one; ``433``'s first part has three.
+    orbit_ephemeris, bad_pixel_file, mask_file, gti_file : str or None
+    """
+
+    number: Optional[int]
+    tstart: Optional[float]
+    tstop: Optional[float]
+    dead_time_file: Optional[str] = None
+    aspect_solutions: tuple = ()
+    orbit_ephemeris: Optional[str] = None
+    bad_pixel_file: Optional[str] = None
+    mask_file: Optional[str] = None
+    gti_file: Optional[str] = None
+
+
+#: The families a part is made of: ``(field, archive patterns, repro pattern)``, searched
+#: the way the single-file getters above search them. The bad-pixel list is looked for in
+#: both directories, because ACIS files it under ``primary/`` and HRC under ``secondary/``.
+_PART_FAMILIES = (
+    ("dead_time_file", (os.path.join("primary", "*_dtf1.fits"),), None),
+    ("aspect_solutions", (os.path.join("primary", "*_asol1.fits"),), "pcadf*_asol1.fits"),
+    ("orbit_ephemeris", (os.path.join("primary", "orbitf*_eph1.fits"),), None),
+    (
+        "bad_pixel_file",
+        (os.path.join("primary", "*_bpix1.fits"), os.path.join("secondary", "*_bpix1.fits")),
+        "*_repro_bpix1.fits",
+    ),
+    ("mask_file", (os.path.join("secondary", "*_msk1.fits"),), "*_msk1.fits"),
+    ("gti_file", (os.path.join("secondary", "*_flt1.fits"),), "*_repro_flt2.fits"),
+)
+
+#: Read only for the time it spans: every part has one, on both instruments.
+_PART_FIELD_OF_VIEW = os.path.join("primary", "*_fov1.fits")
+
+#: ``hrcf01411_002N006_dtf1`` and ``pcadf01411_002N001_asol1`` both name part 2. The
+#: time-named ``pcadf071323369N004_asol1`` and ``orbitf057024064N002_eph1`` name none.
+_PART_NUMBER_RE = re.compile(r"^[a-z]+f\d+_(\d{3})N\d{3}_")
+
+#: The processing version, ``N006``, which is what two copies of one file differ by.
+_VERSION_RE = re.compile(r"N\d{3}(?=_)")
+
+
+def _part_number(path):
+    """The part number in an archive name, or ``None`` when the name carries none."""
+    found = _PART_NUMBER_RE.match(os.path.basename(path))
+    return None if found is None else int(found.group(1))
+
+
+def _family_files(obsid, config, archive_patterns, repro):
+    """Every file of one family, from the first directory that holds any."""
+    for pattern in archive_patterns:
+        found = _archive_products(obsid, config, pattern, repro)
+        if found:
+            return found
+    return []
+
+
+def _refuse_two_versions(obsid, files):
+    """
+    Raise when one file is present twice, under two processing versions or compressions.
+
+    Parts legitimately differ in version -- ``108`` ships ``_000N006`` beside
+    ``_001N005`` -- so only two copies of the *same* file are refused: the same name once
+    the version and the ``.gz`` are taken off.
+    """
+    copies = {}
+    for path in files:
+        name = os.path.basename(path)
+        name = name[: -len(".gz")] if name.endswith(".gz") else name
+        copies.setdefault(_VERSION_RE.sub("N", name), []).append(path)
+    for paths in copies.values():
+        if len(paths) > 1:
+            raise ValueError(
+                f"observation {obsid} has {len(paths)} versions of one file, and one of "
+                f"them would be reduced in silence: {sorted(os.path.basename(p) for p in paths)}"
+            )
+
+
+def _time_keywords(path):
+    """``(TSTART, TSTOP, OBI_NUM)`` from a file's first extension; ``OBI_NUM`` may be None."""
+    header = fits.getheader(path, 1)
+    obi = header.get("OBI_NUM")
+    return float(header["TSTART"]), float(header["TSTOP"]), None if obi is None else int(obi)
+
+
+def _overlaps(first, second):
+    """Whether two ``(start, stop)`` spans share any time. Touching is not sharing."""
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _at_most_one(obsid, number, field, paths):
+    """The single file of a family in one part, ``None``, or an error naming them all."""
+    if len(paths) > 1:
+        what = "orbit ephemeris" if field == "orbit_ephemeris" else field.replace("_", " ")
+        raise ValueError(
+            f"part {number} of observation {obsid} has {len(paths)} {what} files, and "
+            f"choosing one would be a guess: {sorted(os.path.basename(p) for p in paths)}"
+        )
+    return paths[0] if paths else None
+
+
+def chandra_observation_parts(obsid, config):
+    """
+    Split an observation's companion files into its parts.
+
+    **Files that carry a part number are paired by it**; files that do not are paired by
+    the time they cover. That second rule is not optional: orbit files are named by start
+    time on every observation, and so are the aspect solutions of the oldest ones --
+    ``433`` has five ``pcadf<time>N004_asol1`` files for three parts. Where a time-paired
+    file's header has ``OBI_NUM``, it must agree with the part the time put it in.
+
+    **An observation of one part opens nothing new.** Every file belongs to that part, and
+    its span is the event list's own ``TSTART`` and ``TSTOP``. This is the path every
+    ordinary observation takes, and the companions' headers are never read on it.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``. ``products`` chooses where to look, as it does
+        for the single-file getters.
+
+    Returns
+    -------
+    tuple of ObservationPart
+        In part-number order. One, for an ordinary observation.
+
+    Raises
+    ------
+    ValueError
+        If one file of one part is present in two versions; if a part has two orbit files,
+        bad-pixel lists, masks, good-time files or dead-time files; or if a time-paired
+        file's ``OBI_NUM`` names a different part from the one its time falls in.
+    """
+    obsid = chandra_obsid(obsid)
+    families = {
+        field: _family_files(obsid, config, archive, repro)
+        for field, archive, repro in _PART_FAMILIES
+    }
+    fields_of_view = _archive_products(obsid, config, _PART_FIELD_OF_VIEW)
+    for files in (*families.values(), fields_of_view):
+        _refuse_two_versions(obsid, files)
+
+    numbered = {}
+    for files in (*families.values(), fields_of_view):
+        for path in files:
+            if _part_number(path) is not None:
+                numbered.setdefault(_part_number(path), []).append(path)
+
+    if len(numbered) <= 1:
+        number = next(iter(numbered), None)
+        events = chandra_event_list(obsid, config)
+        tstart = tstop = None
+        if events is not None:
+            header = fits.getheader(events, 1)
+            tstart, tstop = header.get("TSTART"), header.get("TSTOP")
+        fields = {
+            field: (
+                tuple(files)
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, number, field, files)
+            )
+            for field, files in families.items()
+        }
+        return (
+            ObservationPart(
+                number=number,
+                tstart=None if tstart is None else float(tstart),
+                tstop=None if tstop is None else float(tstop),
+                **fields,
+            ),
+        )
+
+    spans = {}
+    for number, paths in numbered.items():
+        times = [_time_keywords(path) for path in paths]
+        spans[number] = (min(t[0] for t in times), max(t[1] for t in times))
+
+    unnumbered = {
+        path: _time_keywords(path)
+        for files in families.values()
+        for path in files
+        if _part_number(path) is None
+    }
+    paired = set()
+    parts = []
+    for number in sorted(numbered):
+        fields = {}
+        for field, files in families.items():
+            mine = [path for path in files if _part_number(path) == number]
+            for path in files:
+                if path not in unnumbered or not _overlaps(unnumbered[path][:2], spans[number]):
+                    continue
+                header_part = unnumbered[path][2]
+                if header_part is not None and header_part != number:
+                    raise ValueError(
+                        f"{os.path.basename(path)} falls in the time of part {number} of "
+                        f"observation {obsid}, and its OBI_NUM says part {header_part}"
+                    )
+                mine.append(path)
+                paired.add(path)
+            fields[field] = (
+                tuple(sorted(mine))
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, number, field, mine)
+            )
+        parts.append(ObservationPart(number, *spans[number], **fields))
+
+    for path in sorted(set(unnumbered) - paired):
+        get_logger().warning(
+            f"{obsid}: {os.path.basename(path)} covers the time of none of the "
+            f"{len(parts)} parts, so no part uses it"
+        )
+    return tuple(parts)
+
+
+def _part_summary(part):
+    """One part as the diagnostics record carries it: numbers and file names, not paths."""
+
+    def name(path):
+        return None if path is None else os.path.basename(path)
+
+    return dict(
+        number=part.number,
+        tstart=part.tstart,
+        tstop=part.tstop,
+        dead_time_file=name(part.dead_time_file),
+        aspect_solutions=[os.path.basename(path) for path in part.aspect_solutions],
+        orbit_ephemeris=name(part.orbit_ephemeris),
+        bad_pixel_file=name(part.bad_pixel_file),
+        mask_file=name(part.mask_file),
+        gti_file=name(part.gti_file),
+    )
+
+
 #: ``READMODE`` as the header spells it, against the label an output file carries.
 ACIS_READ_MODES = {"TIMED": "timed", "CONTINUOUS": "cc"}
 
@@ -1460,6 +1719,10 @@ class Observation:
     sky_pixel_arcsec : float or None
         What one sky pixel is on the sky, as the event list declares it: 0.492 arcseconds
         for ACIS and 0.1318 for HRC. Left ``None``, it is filled in from ``detector``.
+    parts : tuple of ObservationPart
+        The pointings the observation was taken in, each with its own companion files --
+        see :func:`chandra_observation_parts`. One for an ordinary observation; empty only
+        for an ``Observation`` built by hand.
     """
 
     obsid: str
@@ -1482,6 +1745,7 @@ class Observation:
     data_mode: Optional[str] = None
     active_rows: Optional[tuple] = None
     sky_pixel_arcsec: Optional[float] = None
+    parts: tuple = ()
 
     def __post_init__(self):
         if self.sky_pixel_arcsec is None:
@@ -1558,6 +1822,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
     with fits.open(events) as hdulist:
         header = hdulist[1].header
 
+    parts = chandra_observation_parts(obsid, config)
     dtf_path = chandra_dead_time_file(obsid, config)
     dtf = read_dead_time_factors(dtf_path) if dtf_path is not None else None
     resolution = chandra_time_resolution(header, dtf, config)
@@ -1583,6 +1848,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         data_mode=_keyword(header, "DATAMODE"),
         active_rows=_active_rows(header),
         sky_pixel_arcsec=chandra_sky_pixel_arcsec(header),
+        parts=parts,
     )
 
     if rec is not None:
@@ -1605,6 +1871,8 @@ def chandra_archive_front_end(obsid, config, rec=None):
             has_dead_time_file=dtf_path is not None,
             n_grating_responses=len(observation.grating_responses),
             sky_pixel_arcsec=observation.sky_pixel_arcsec,
+            n_parts=len(parts),
+            parts=[_part_summary(part) for part in parts],
         )
 
     return observation

@@ -630,6 +630,232 @@ class TestFindingTheProductsOfAnObservation:
             chandra.chandra_event_list("6298", config)
 
 
+# ``1411``: HRC-I on M82, taken in two parts 84 days apart under one obsid. Listed from the
+# S3 mirror on 2026-09-13, with every time read off the real file headers the same day.
+# The archive merges the parts into one level-2 event list and ships every other product
+# once per part, with the part number -- ``000``, ``002`` -- in the name.
+_1411_PART_000 = (57471875.357874, 57509598.434235)
+_1411_PART_002 = (64767109.146926, 64787079.222651)
+HRC_I_1411_TIMES = {
+    "primary/hrcf01411N006_evt2.fits.gz": (57471875.357874, 64787079.222651),
+    "primary/hrcf01411_000N006_dtf1.fits.gz": _1411_PART_000,
+    "primary/hrcf01411_000N006_fov1.fits.gz": _1411_PART_000,
+    "primary/hrcf01411_002N006_dtf1.fits.gz": _1411_PART_002,
+    "primary/hrcf01411_002N006_fov1.fits.gz": _1411_PART_002,
+    "primary/orbitf057024064N002_eph1.fits.gz": (57024064.184, 58838464.184),
+    "primary/orbitf064281664N002_eph1.fits.gz": (64281664.184, 66096064.184),
+    "primary/pcadf01411_000N001_asol1.fits.gz": (57472330.71414, 57508816.871706, {"OBI_NUM": 0}),
+    "primary/pcadf01411_002N001_asol1.fits.gz": (64768580.278229, 64786525.210131, {"OBI_NUM": 2}),
+    "secondary/hrcf01411_000N006_bpix1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_000N006_msk1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_000N006_std_flt1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_002N006_bpix1.fits.gz": _1411_PART_002,
+    "secondary/hrcf01411_002N006_msk1.fits.gz": _1411_PART_002,
+    "secondary/hrcf01411_002N006_std_flt1.fits.gz": _1411_PART_002,
+}
+
+# ``433``: ACIS-S with HETG, in three parts. The names are real, listed on 2026-09-13; the
+# times are invented, in the right order, because the observation was not downloaded. It is
+# the case that breaks pairing by name: the parts are numbered 001, 003 and 004, and its
+# five aspect solutions carry a start time where the part number would be.
+_433_PART_001 = (71323000.0, 71450000.0)
+_433_PART_003 = (76842000.0, 76900000.0)
+_433_PART_004 = (83242000.0, 83300000.0)
+ACIS_433_TIMES = {
+    "primary/acisf00433N008_evt2.fits.gz": (71323000.0, 83300000.0),
+    "primary/acisf00433_001N005_bpix1.fits.gz": _433_PART_001,
+    "primary/acisf00433_001N005_fov1.fits.gz": _433_PART_001,
+    "primary/acisf00433_003N006_bpix1.fits.gz": _433_PART_003,
+    "primary/acisf00433_003N006_fov1.fits.gz": _433_PART_003,
+    "primary/acisf00433_004N004_bpix1.fits.gz": _433_PART_004,
+    "primary/acisf00433_004N004_fov1.fits.gz": _433_PART_004,
+    "primary/orbitf070977900N001_eph1.fits.gz": (70977900.0, 72792300.0),
+    "primary/orbitf076766700N001_eph1.fits.gz": (76766700.0, 78581100.0),
+    "primary/orbitf082987500N001_eph1.fits.gz": (82987500.0, 84801900.0),
+    "primary/pcadf071323369N004_asol1.fits.gz": (71323369.0, 71391700.0, {"OBI_NUM": 1}),
+    "primary/pcadf071391777N004_asol1.fits.gz": (71391777.0, 71419600.0, {"OBI_NUM": 1}),
+    "primary/pcadf071419624N004_asol1.fits.gz": (71419624.0, 71449000.0, {"OBI_NUM": 1}),
+    "primary/pcadf076842088N006_asol1.fits.gz": (76842088.0, 76899000.0, {"OBI_NUM": 3}),
+    "primary/pcadf083242295N004_asol1.fits.gz": (83242295.0, 83299000.0, {"OBI_NUM": 4}),
+    "secondary/acisf00433_001N005_flt1.fits.gz": _433_PART_001,
+    "secondary/acisf00433_001N005_msk1.fits.gz": _433_PART_001,
+    "secondary/acisf00433_003N006_flt1.fits.gz": _433_PART_003,
+    "secondary/acisf00433_003N006_msk1.fits.gz": _433_PART_003,
+    "secondary/acisf00433_004N004_flt1.fits.gz": _433_PART_004,
+    "secondary/acisf00433_004N004_msk1.fits.gz": _433_PART_004,
+}
+
+
+def a_timed_observation(tmp_path, obsid, times):
+    """
+    A download whose every file carries the ``TSTART`` and ``TSTOP`` a real one would.
+
+    ``times`` maps each archive name to ``(tstart, tstop)``, or to ``(tstart, tstop,
+    header)`` for extra keywords. Pairing the parts of an observation by time reads these,
+    so the empty placeholders of :func:`a_downloaded_observation` will not do.
+    """
+    config = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+    for name, spec in times.items():
+        tstart, tstop, extra = (tuple(spec) + ({},))[:3]
+        path = tmp_path / chandra.chandra_obsid(obsid) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if "_evt2." in name:
+            an_event_file(path, TSTART=tstart, TSTOP=tstop, **extra)
+            continue
+        hdu = fits.BinTableHDU.from_columns([fits.Column("TIME", "1D", array=[tstart])])
+        for key, value in dict(TSTART=tstart, TSTOP=tstop, **extra).items():
+            hdu.header[key] = value
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return config
+
+
+def _names(paths):
+    return [os.path.basename(path) for path in paths]
+
+
+class TestSplittingAnObservationIntoItsParts:
+    """
+    Some Chandra observations were taken in several separate pointings under one obsid.
+    Chandra calls each an OBI; this module calls it a *part*. The archive merges the parts'
+    events into one level-2 list and ships the rest -- dead time, aspect, orbit, bad
+    pixels, mask, good times -- once per part, and each part has to be reduced with its
+    own.
+    """
+
+    def parts(self, tmp_path, obsid, times):
+        return chandra.chandra_observation_parts(obsid, a_timed_observation(tmp_path, obsid, times))
+
+    def test_an_ordinary_observation_is_one_part_and_opens_nothing_new(self, tmp_path):
+        """
+        No second code path: a single-pointing observation is one part. Its companions are
+        empty placeholders here, so the test also proves that none of them is opened --
+        the part's time range is the event list's own.
+        """
+        config = an_archive_observation(tmp_path, "6298", TSTART=235397500.0, TSTOP=235420000.0)
+
+        (part,) = chandra.chandra_observation_parts("6298", config)
+
+        assert part.number == 0
+        assert (part.tstart, part.tstop) == (235397500.0, 235420000.0)
+        assert os.path.basename(part.dead_time_file) == "hrcf06298_000N006_dtf1.fits"
+        assert _names(part.aspect_solutions) == ["pcadf06298_000N001_asol1.fits.gz"]
+        assert os.path.basename(part.orbit_ephemeris) == "orbitf235397100N001_eph1.fits.gz"
+        assert os.path.basename(part.bad_pixel_file) == "hrcf06298_000N006_bpix1.fits.gz"
+        assert os.path.basename(part.mask_file) == "hrcf06298_000N006_msk1.fits.gz"
+        assert os.path.basename(part.gti_file) == "hrcf06298_000N006_std_flt1.fits.gz"
+
+    def test_obsid_1411_is_two_parts_each_with_its_own_files(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert (first.number, second.number) == (0, 2)
+        assert os.path.basename(first.dead_time_file) == "hrcf01411_000N006_dtf1.fits.gz"
+        assert os.path.basename(second.dead_time_file) == "hrcf01411_002N006_dtf1.fits.gz"
+        assert _names(second.aspect_solutions) == ["pcadf01411_002N001_asol1.fits.gz"]
+        assert os.path.basename(second.bad_pixel_file) == "hrcf01411_002N006_bpix1.fits.gz"
+        assert os.path.basename(second.mask_file) == "hrcf01411_002N006_msk1.fits.gz"
+        assert os.path.basename(second.gti_file) == "hrcf01411_002N006_std_flt1.fits.gz"
+
+    def test_an_orbit_file_carries_no_part_number_and_is_paired_by_time(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert os.path.basename(first.orbit_ephemeris) == "orbitf057024064N002_eph1.fits.gz"
+        assert os.path.basename(second.orbit_ephemeris) == "orbitf064281664N002_eph1.fits.gz"
+
+    def test_each_part_spans_its_own_files_and_the_gap_is_84_days(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert (first.tstart, first.tstop) == pytest.approx(_1411_PART_000)
+        assert (second.tstart, second.tstop) == pytest.approx(_1411_PART_002)
+        assert (second.tstart - first.tstop) / 86400 == pytest.approx(84.0, abs=0.1)
+
+    def test_part_numbers_can_skip_and_aspect_solutions_are_paired_by_time(self, tmp_path):
+        """Obsid 433: parts 001, 003 and 004, and five aspect solutions named by time."""
+        first, second, third = self.parts(tmp_path, "433", ACIS_433_TIMES)
+
+        assert (first.number, second.number, third.number) == (1, 3, 4)
+        assert _names(first.aspect_solutions) == [
+            "pcadf071323369N004_asol1.fits.gz",
+            "pcadf071391777N004_asol1.fits.gz",
+            "pcadf071419624N004_asol1.fits.gz",
+        ]
+        assert _names(second.aspect_solutions) == ["pcadf076842088N006_asol1.fits.gz"]
+        assert _names(third.aspect_solutions) == ["pcadf083242295N004_asol1.fits.gz"]
+        assert os.path.basename(third.orbit_ephemeris) == "orbitf082987500N001_eph1.fits.gz"
+
+    def test_an_aspect_solution_whose_header_names_another_part_is_an_error(self, tmp_path):
+        """The time says one part and ``OBI_NUM`` says another: neither is believed."""
+        times = dict(ACIS_433_TIMES)
+        times["primary/pcadf076842088N006_asol1.fits.gz"] = (76842088.0, 76899000.0, {"OBI_NUM": 4})
+
+        with pytest.raises(ValueError, match="OBI_NUM"):
+            self.parts(tmp_path, "433", times)
+
+    def test_parts_may_come_from_different_processing_versions(self, tmp_path):
+        """Obsid 108 really ships ``_000N006`` beside ``_001N005``. That is not a conflict."""
+        times = {
+            name.replace("_002N006_", "_002N005_"): spec for name, spec in HRC_I_1411_TIMES.items()
+        }
+
+        first, second = self.parts(tmp_path, "1411", times)
+
+        assert os.path.basename(second.dead_time_file) == "hrcf01411_002N005_dtf1.fits.gz"
+
+    def test_two_versions_of_one_part_are_an_error(self, tmp_path):
+        times = dict(HRC_I_1411_TIMES)
+        times["primary/hrcf01411_000N005_dtf1.fits.gz"] = _1411_PART_000
+
+        with pytest.raises(ValueError, match="hrcf01411_000N005_dtf1.*hrcf01411_000N006_dtf1"):
+            self.parts(tmp_path, "1411", times)
+
+    def test_two_versions_of_one_time_named_aspect_solution_are_an_error(self, tmp_path):
+        times = dict(ACIS_433_TIMES)
+        times["primary/pcadf071323369N005_asol1.fits.gz"] = (71323369.0, 71391700.0, {"OBI_NUM": 1})
+
+        with pytest.raises(ValueError, match="pcadf071323369N00"):
+            self.parts(tmp_path, "433", times)
+
+    def test_a_part_no_orbit_file_covers_has_none(self, tmp_path):
+        """Recorded rather than raised, as it is for an ordinary observation."""
+        times = dict(HRC_I_1411_TIMES)
+        del times["primary/orbitf064281664N002_eph1.fits.gz"]
+
+        first, second = self.parts(tmp_path, "1411", times)
+
+        assert first.orbit_ephemeris is not None
+        assert second.orbit_ephemeris is None
+
+    def test_a_part_two_orbit_files_cover_is_an_error(self, tmp_path):
+        """``axbary`` takes one orbit file, so choosing between two would be a guess."""
+        times = dict(HRC_I_1411_TIMES)
+        times["primary/orbitf057400000N002_eph1.fits.gz"] = (57400000.0, 59214400.0)
+
+        with pytest.raises(ValueError, match="orbit"):
+            self.parts(tmp_path, "1411", times)
+
+    def test_the_reprocessing_route_s_unnumbered_products_belong_to_the_one_part(self, tmp_path):
+        """``chandra_repro`` names its bad pixels and good times without a part number."""
+        config = a_reprocessed_observation(tmp_path)
+
+        (part,) = chandra.chandra_observation_parts("5644", config)
+
+        assert os.path.basename(part.bad_pixel_file) == "acisf05644_repro_bpix1.fits"
+        assert os.path.basename(part.gti_file) == "acisf05644_repro_flt2.fits"
+
+    def test_the_front_end_records_every_part(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298", TSTART=1.0e8, TSTOP=1.1e8)
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            found = chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert len(found.parts) == 1
+        assert values["n_parts"] == 1
+        assert values["parts"][0]["number"] == 0
+        assert values["parts"][0]["tstart"] == pytest.approx(1.0e8)
+        assert values["parts"][0]["dead_time_file"] == "hrcf06298_000N006_dtf1.fits"
+
+
 class TestWhichChipsWereReadOut:
     """
     ``DETNAM`` is a chip list, and the digits are chip identifiers.
