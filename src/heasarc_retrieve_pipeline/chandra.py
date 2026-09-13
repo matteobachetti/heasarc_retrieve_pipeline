@@ -17,8 +17,8 @@ reduced: the level-2 products under ``primary/`` are what CIAO would produce, so
 them is the default route and ``chandra_repro`` is available through
 ``config["products"] = "repro"``.
 
-The full design, and every archive measurement this module rests on, is in
-``docs/chandra_integration_plan.md``.
+The design, and the archive measurements this module rests on, are in the *Chandra / ACIS
+and HRC* section of ``docs/technical_details.rst``.
 
 The archive layout
 ------------------
@@ -86,7 +86,7 @@ from .utils import (
 #: ``cc_source_halfwidth_pix`` and ``cc_background_pix`` are Continuous Clocking's, where
 #: there is no circle to draw and the regions are strips of ``chipx``. They are a
 #: starting guess and are flagged as one: CC mode is 1.7% of the archive, none of it has
-#: been run through this module yet, and open item 6 of the plan is exactly this.
+#: been run through this module yet; it is an open question in ``docs/technical_details.rst``.
 #:
 #: ``bkg_crowding_sectors``, ``bkg_crowding_ratio`` and ``bkg_crowding_probability`` decide
 #: when the background ring is reported as holding another source; see
@@ -417,7 +417,7 @@ def chandra_file_stem(obsid, detector, mode):
 
     ``mode`` is taken rather than worked out. For HRC the honest mode is not in the header
     at all -- it follows from the dead-time file's veto ratio -- so the caller settles it
-    and hands it here. See ``docs/chandra_integration_plan.md``.
+    and hands it here. See ``docs/technical_details.rst``.
 
     Parameters
     ----------
@@ -2363,7 +2363,7 @@ def chandra_extraction_regions(
                 f"circles on the sky. Source and background overlap along the collapsed "
                 f"axis and cannot be separated by position, so the background strips "
                 f"carry some of the source. These widths have not been tested on real "
-                f"data -- see open item 6 of the Chandra plan."
+                f"data -- see Open questions in docs/technical_details.rst."
             ),
         )
 
@@ -3284,7 +3284,7 @@ def chandra_clean_event_list(observation, config, gti, rec=None, env=None, log_t
 #: ``hdaxbary``'s only ones are ``xtescorbit``, ``nicerscorbit`` and ``swiftscorbit`` --
 #: and on a real Chandra event list with its own orbit file it dies with "no bracketing
 #: sample found", with the orbit file demonstrably not at fault. Measured 2026-09-12; see
-#: ``docs/chandra_integration_plan.md``.
+#: ``docs/technical_details.rst``.
 BARYCENTRE_REFFRAME = "ICRS"
 
 #: What ``TIMESYS`` must read after a successful correction.

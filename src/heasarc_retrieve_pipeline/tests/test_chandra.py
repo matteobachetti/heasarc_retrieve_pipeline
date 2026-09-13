@@ -8,7 +8,7 @@ Python and tested here.
 
 The file names are real. All three observation directories were listed in full from the
 public S3 mirror of the HEASARC archive on 2026-09-12, and the three observations are the
-ones ``docs/chandra_integration_plan.md`` measured: they span HRC-I, HRC-S in its
+ones measured while the module was designed: they span HRC-I, HRC-S in its
 fast-timing mode, and ACIS-S behind a transmission grating.
 """
 

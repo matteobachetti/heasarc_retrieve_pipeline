@@ -49,7 +49,6 @@ exclude_patterns = [
     ".DS_Store",
     "completion_model_plan.md",
     "xmm_integration_plan.md",
-    "chandra_integration_plan.md",
 ]
 
 # The suffix(es) of source filenames.

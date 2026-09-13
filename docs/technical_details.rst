@@ -1996,7 +1996,8 @@ plain-English reason, all of which are recorded. No CIAO is involved.
    * - configuration
      - what the data support
    * - ACIS Timed Exposure
-     - ``TIMEDEL``, the frame time: 3.2 s full frame, but **0.44 s** on ``5644``'s subarray
+     - ``TIMEDEL``, the frame time: 3.14 or 3.24 s at full frame, but **0.44 s** or
+       **0.54 s** on the single-chip subarrays M82 was observed with
    * - ACIS Continuous Clocking
      - 2.85 ms, with one spatial dimension gone
    * - HRC with on-board vetoing
@@ -2345,6 +2346,65 @@ pointings. With 50-170 source events the 90% upper limits on the pulsed amplitud
 36-100% or more, far above the 5-12% seen with ACIS, so these observations are not
 sensitive enough to rule the pulsation out. The per-observation table, commands and logs
 are kept outside the repository, in ``~/tmp/m82_hrc/M82X2_HRC_search_results.md``.
+
+Fast-frame ACIS observations of M82
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A 1.37 s spin can be searched only where the frame time samples it, and the catalogue cannot
+say where: ``data_mode`` does not decode to a frame time (``TE_006AC`` is 0.44 s,
+``TE_0085E`` is 3.14 s). So ``TIMEDEL`` is read from each event list, whose first 400 kB,
+gzipped, already hold the header. Of the 43 archived ACIS observations within 12 arcmin of
+M82 on 2026-09-13 (nine more are catalogued and not yet observed):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 62 20
+
+   * - frame time
+     - observations
+     - samples per cycle
+   * - 0.44104 s
+     - 8, ACIS-S on one chip: ``5644``, ``6097``, ``6361``, ``8190``, ``10025``, ``10026``,
+       ``10027``, ``17578``
+     - 3.1
+   * - 0.54104 s
+     - 13, ACIS-I on one chip, 2015-16: ``17678`` and ``18062``-``18073``
+     - 2.5
+   * - 3.14104 or 3.24104 s
+     - the other 22, among them the long ``10542``, ``10543`` and ``10544`` (315 ks)
+     - 0.4
+
+What decides it is the Nyquist frequency, ``1/(2 TIMEDEL)``, against a spin frequency of
+0.72-0.75 Hz: 1.13 Hz at 0.44 s and 0.92 Hz at 0.54 s, but 0.16 Hz at full frame. A frame
+also averages the signal over its length, multiplying a sinusoid's amplitude by
+``sin(πfT)/(πfT)``: 0.83 at 0.44 s, 0.77 at 0.54 s, 0.11 at 3.14 s. Scaled from ``5644``'s
+Z²₁ = 59, the three long full-frame observations, with four times its counts, would give
+Z²₁ of about 5, which is noise, so they were not searched. A first rule of
+``TIMEDEL < 0.5 s`` stood in for three samples per cycle and would have dropped the 0.54 s
+observations for no reason.
+
+The nineteen fast-frame observations not already verified were reduced through ``core`` on
+2026-09-13: all 19 at their header frame time, all barycentred at M82 X-2 with DE405, and
+pile-up at most 3.1% (``6361``, on-axis). ``10025``, ``10026``, ``18062`` and ``18063``
+sit within the dither of their chip's edge and lose some counts to it.
+
+Open questions
+~~~~~~~~~~~~~~
+
+* **The ``S_TIMING`` threshold.** ``hrc_veto_ratio_threshold = 0.99`` was chosen from two
+  observations, at 1.000 and 0.296; the fifteen M82 HRC observations since fall well clear
+  of it (1.000, and 0.424-0.438). Its distribution across the ~1 669 HRC-S observations is
+  unmeasured.
+* **The catalogue's ``data_mode`` as a cross-check** on the inferred HRC mode would need
+  ``core`` to hand the catalogue row to the reduction. Not done, because the dead-time ratio
+  makes it unnecessary; worth doing only if that inference proves unreliable.
+* **How long ``chandra_repro`` takes**, which decides whether the reprocessing route is
+  usable in a batch, is unmeasured.
+* **ACIS frame times across the archive.** Only M82's 43 have been read. The share of fast
+  frames among the 22 953 Timed Exposure observations needs one header read each; do not
+  quote one until it is measured.
+* **Continuous Clocking.** Its ``chipx`` strips are a starting guess, never run on real
+  data.
 
 Orchestration with Prefect
 --------------------------
