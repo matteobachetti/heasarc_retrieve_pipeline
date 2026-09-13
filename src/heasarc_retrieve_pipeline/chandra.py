@@ -87,6 +87,10 @@ from .utils import (
 #: there is no circle to draw and the regions are strips of ``chipx``. They are a
 #: starting guess and are flagged as one: CC mode is 1.7% of the archive, none of it has
 #: been run through this module yet, and open item 6 of the plan is exactly this.
+#:
+#: ``bkg_crowding_sectors``, ``bkg_crowding_ratio`` and ``bkg_crowding_probability`` decide
+#: when the background ring is reported as holding another source; see
+#: :func:`background_ring_crowding`. They warn and never change a region.
 DEFAULT_CONFIG = {
     "out_data_path": "./",
     "input_data_path": "./",
@@ -97,6 +101,9 @@ DEFAULT_CONFIG = {
     "src_radius_arcsec": None,
     "bkg_inner_factor": 1.5,
     "bkg_outer_factor": 3.0,
+    "bkg_crowding_sectors": 12,
+    "bkg_crowding_ratio": 3.0,
+    "bkg_crowding_probability": 1.35e-3,
     "flare_sigma": 3.0,
     "flare_bin_seconds": 200.0,
     "flare_energy_ev": (500, 7000),
@@ -2474,6 +2481,245 @@ def chandra_source_regions(observation, config, ra, dec, rec=None, env=None, log
     return position, regions
 
 
+@dataclass(frozen=True)
+class RingCrowding:
+    """
+    Whether the background ring holds another source, and what it does to the background.
+
+    Attributes
+    ----------
+    sector_counts : tuple of int
+        Events in each wedge of the ring, anticlockwise in sky pixels from the ``+x`` axis.
+    brightest_sector : int
+        Which wedge holds the most.
+    brightest_over_median : float
+        Its counts over the median wedge's, the median floored at one count.
+    chance_probability : float
+        How likely a wedge this bright is from sky alone, charged for every wedge.
+    crowded : bool
+        Whether both of the above cross their thresholds.
+    source_counts : int
+        Events in the source circle.
+    background_share, background_share_without_brightest : float or None
+        The background that would be subtracted, scaled by area, as a fraction of the source
+        counts: from the whole ring, and with the brightest wedge left out. ``None`` with no
+        source counts.
+    reason : str
+        Plain English, for the report page.
+    """
+
+    sector_counts: tuple
+    brightest_sector: int
+    brightest_over_median: float
+    chance_probability: float
+    crowded: bool
+    source_counts: int
+    background_share: Optional[float]
+    background_share_without_brightest: Optional[float]
+    reason: str
+
+
+def _poisson_at_least(k, mean):
+    """
+    The probability of ``k`` or more counts when ``mean`` are expected.
+
+    Summed term by term in the direction the terms shrink, from the logarithm of the first,
+    so that it neither underflows at tens of thousands of counts nor needs scipy, which is
+    not a dependency of the reduction.
+
+    >>> round(_poisson_at_least(4, 1.0), 4)
+    0.019
+    >>> _poisson_at_least(0, 5.0)
+    1.0
+    """
+    import math
+
+    if k <= 0:
+        return 1.0
+    if mean <= 0:
+        return 0.0
+
+    def log_term(i):
+        return -mean + i * math.log(mean) - math.lgamma(i + 1)
+
+    if k > mean:
+        term = total = math.exp(log_term(k))
+        i = k
+        while term > total * 1e-15:
+            i += 1
+            term *= mean / i
+            total += term
+        return min(total, 1.0)
+
+    i = k - 1
+    term = total = math.exp(log_term(i))
+    while i > 0 and term > total * 1e-15:
+        term *= i / mean
+        i -= 1
+        total += term
+    return max(0.0, 1.0 - total)
+
+
+def background_ring_crowding(x, y, position, regions, pixel_arcsec, config):
+    """
+    Whether another source sits in the background ring.
+
+    The annulus is a sample of the sky only when nothing else bright is in it, and in a
+    crowded field that fails without any sign in the spectrum files. Around M82 X-2, M82 X-1
+    puts 75 768 counts into one of twelve wedges of obsid ``8190``'s ring, and the background
+    subtracted is 74% of the source counts; 17% with that wedge left out.
+
+    The ring is cut into ``bkg_crowding_sectors`` wedges around the source. Sky fills them
+    evenly; a second source fills one, or a few neighbouring ones. The ring is called
+    crowded when the brightest wedge is both **unlikely by chance** -- a Poisson probability
+    below ``bkg_crowding_probability`` around the median wedge, charged for every wedge -- and
+    **more than ``bkg_crowding_ratio`` times the median**. The probability alone flags a
+    small, harmless excess on a well-exposed ring; the ratio alone flags four counts against
+    one. The median is floored at one count for the same reason.
+
+    Nothing is corrected: this measures and reports.
+
+    Parameters
+    ----------
+    x, y : numpy.ndarray
+        Sky coordinates of the events, in pixels.
+    position : SourcePosition
+        Only ``x`` and ``y`` are read.
+    regions : ExtractionRegions
+    pixel_arcsec : float
+        The observation's sky pixel scale.
+    config : dict
+        ``bkg_crowding_sectors``, ``bkg_crowding_ratio``, ``bkg_crowding_probability``.
+
+    Returns
+    -------
+    RingCrowding or None
+        ``None`` where there is no ring: Continuous Clocking's regions are strips.
+    """
+    if regions.radius_arcsec is None or regions.background_outer_arcsec is None:
+        return None
+
+    n_sectors = int(config["bkg_crowding_sectors"])
+    radius = regions.radius_arcsec / pixel_arcsec
+    inner = regions.background_inner_arcsec / pixel_arcsec
+    outer = regions.background_outer_arcsec / pixel_arcsec
+
+    dx = np.asarray(x, dtype=float) - position.x
+    dy = np.asarray(y, dtype=float) - position.y
+    distance = np.hypot(dx, dy)
+    source_counts = int(np.count_nonzero(distance < radius))
+    in_ring = (distance >= inner) & (distance < outer)
+    angle = np.degrees(np.arctan2(dy[in_ring], dx[in_ring])) % 360.0
+    sectors = np.bincount(
+        np.minimum((angle * n_sectors / 360.0).astype(int), n_sectors - 1), minlength=n_sectors
+    )
+
+    total = int(sectors.sum())
+    brightest = int(np.argmax(sectors))
+    peak = int(sectors[brightest])
+    median = max(float(np.median(sectors)), 1.0)
+    ratio = peak / median
+    single = _poisson_at_least(peak, median)
+    chance = float(-np.expm1(n_sectors * np.log1p(-min(single, 1.0 - 1e-16))))
+    crowded = bool(
+        chance < config["bkg_crowding_probability"] and ratio > config["bkg_crowding_ratio"]
+    )
+
+    area = radius**2 / (outer**2 - inner**2)
+    if source_counts:
+        share = total * area / source_counts
+        share_without = (total - peak) * n_sectors / (n_sectors - 1) * area / source_counts
+    else:
+        share = share_without = None
+
+    def percent(value):
+        return "an undefined share" if value is None else f"{value:.0%}"
+
+    if crowded:
+        reason = (
+            f"One of the {n_sectors} wedges of the background ring holds {peak} counts, "
+            f"{ratio:.1f} times brighter than the median wedge ({median:g}): another source "
+            f"is in the ring. The background subtracted is {percent(share)} of the source "
+            f"counts, and would be {percent(share_without)} without that wedge. Nothing "
+            "has been corrected; look at the field before fitting."
+        )
+    else:
+        reason = (
+            f"The background ring looks like sky: its brightest of {n_sectors} wedges holds "
+            f"{peak} counts against a median of {median:g}."
+        )
+
+    return RingCrowding(
+        sector_counts=tuple(int(count) for count in sectors),
+        brightest_sector=brightest,
+        brightest_over_median=float(ratio),
+        chance_probability=chance,
+        crowded=crowded,
+        source_counts=source_counts,
+        background_share=share,
+        background_share_without_brightest=share_without,
+        reason=reason,
+    )
+
+
+def chandra_background_ring_check(observation, config, events, position, regions, rec=None):
+    """
+    Check the background ring of the cleaned event list for another source, and record it.
+
+    Run on the cleaned list because the regions step comes before any event is read. A
+    crowded ring is a warning and never a failure: the timing analysis uses the source
+    events alone, and the spectrum is still worth having once the reader knows.
+
+    Parameters
+    ----------
+    observation : Observation
+        ``obsid`` and ``sky_pixel_arcsec`` are read.
+    config : dict
+    events : str
+        The cleaned event list.
+    position : SourcePosition
+    regions : ExtractionRegions
+    rec : StepRecord, optional
+
+    Returns
+    -------
+    RingCrowding or None
+    """
+    rec = rec or no_record()
+    logger = get_logger()
+
+    if regions.radius_arcsec is None:
+        rec.value(
+            background_ring_checked=False,
+            background_ring_reason="Continuous Clocking has strips, not a ring, to check.",
+        )
+        return None
+
+    with fits.open(events, memmap=True) as hdulist:
+        data = hdulist["EVENTS"].data
+        x = np.asarray(data["x"], dtype=float)
+        y = np.asarray(data["y"], dtype=float)
+
+    result = background_ring_crowding(x, y, position, regions, observation.sky_pixel_arcsec, config)
+    rec.value(
+        background_ring_checked=True,
+        background_ring_crowded=result.crowded,
+        background_ring_sector_counts=list(result.sector_counts),
+        background_ring_brightest_sector=result.brightest_sector,
+        background_ring_brightest_over_median=result.brightest_over_median,
+        background_ring_chance_probability=result.chance_probability,
+        background_ring_source_counts=result.source_counts,
+        background_ring_share=result.background_share,
+        background_ring_share_without_brightest=result.background_share_without_brightest,
+        background_ring_reason=result.reason,
+    )
+    if result.crowded:
+        logger.warning(f"{observation.obsid}: {result.reason}")
+    else:
+        logger.info(f"{observation.obsid}: {result.reason}")
+    return result
+
+
 #: Where ``dmextract opt=ltc1`` puts the light curve.
 CHANDRA_LIGHTCURVE_EXTENSION = "LIGHTCURVE"
 
@@ -4134,6 +4380,7 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
             env=env,
             log_to=tool_log_file("dmcopy", obsid, config),
         )
+        chandra_background_ring_check(observation, config, cleaned, position, regions, rec=rec)
 
     with record_step(diagnostics, obsid, "pileup_check") as rec:
         chandra_pileup(

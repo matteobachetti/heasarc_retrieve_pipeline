@@ -1666,6 +1666,160 @@ class TestWorkingOutWhereToExtract:
         assert "off axis" in written["values"]["reason"]
 
 
+class TestIsTheBackgroundRingCrowded:
+    """
+    The annulus is a sample of the sky only if nothing else bright is in it. Around M82 X-2
+    it is not: measured on the cleaned lists of 2026-09-12, M82 X-1 puts 75 768 counts into
+    one of twelve wedges of ``8190``'s ring, and the background subtracted there is 74% of
+    the source counts. The ring is split into wedges around the source; a second source
+    shows as one wedge far brighter than the rest.
+
+    Geometry throughout: a 2-pixel source circle, a 3-6 pixel ring, at 0.492 arcsec per
+    pixel, so the ring's area is 27/4 times the circle's.
+    """
+
+    PIXEL = 0.492
+
+    def _geometry(self, continuous_clocking=False):
+        position = SimpleNamespace(x=4100.0, y=4100.0)
+        if continuous_clocking:
+            return position, chandra.ExtractionRegions(
+                source="[chipx=1:2]", background="[chipx=5:9]"
+            )
+        return position, chandra.ExtractionRegions(
+            source="[sky=circle(4100,4100,2)]",
+            background="[sky=annulus(4100,4100,3,6)]",
+            radius_arcsec=2 * self.PIXEL,
+            background_inner_arcsec=3 * self.PIXEL,
+            background_outer_arcsec=6 * self.PIXEL,
+        )
+
+    @staticmethod
+    def _uniform_ring(rng, n):
+        radius = np.sqrt(rng.uniform(9, 36, n))
+        angle = rng.uniform(0, 2 * np.pi, n)
+        return 4100 + radius * np.cos(angle), 4100 + radius * np.sin(angle)
+
+    @staticmethod
+    def _in_wedges(counts):
+        """``counts[k]`` events at radius 4.5, in the middle of wedge ``k``."""
+        angle = np.radians(np.repeat(15 + 30 * np.arange(len(counts)), counts))
+        return 4100 + 4.5 * np.cos(angle), 4100 + 4.5 * np.sin(angle)
+
+    def _check(self, x, y, continuous_clocking=False, **config):
+        position, regions = self._geometry(continuous_clocking)
+        return chandra.background_ring_crowding(
+            np.asarray(x, float),
+            np.asarray(y, float),
+            position,
+            regions,
+            self.PIXEL,
+            dict(chandra.DEFAULT_CONFIG, **config),
+        )
+
+    def test_a_uniform_ring_is_not_crowded(self):
+        x, y = self._uniform_ring(np.random.default_rng(1), 2400)
+
+        result = self._check(x, y)
+
+        assert not result.crowded
+        assert len(result.sector_counts) == 12
+        assert sum(result.sector_counts) == 2400
+
+    def test_a_second_source_in_one_wedge_is_flagged(self):
+        rng = np.random.default_rng(2)
+        x, y = self._uniform_ring(rng, 2400)
+        angle = np.radians(rng.normal(105, 3, 800))
+        x = np.concatenate([x, 4100 + 4.5 * np.cos(angle)])
+        y = np.concatenate([y, 4100 + 4.5 * np.sin(angle)])
+
+        result = self._check(x, y)
+
+        assert result.crowded
+        assert result.brightest_sector == 3
+        assert "brighter" in result.reason
+
+    def test_a_significant_but_small_excess_is_not_flagged(self):
+        """1400 counts in a wedge that expects 1000 is no chance fluctuation, but it is
+        not a second source outshining the sky either, and it moves the background by
+        a few per cent."""
+        rng = np.random.default_rng(3)
+        x, y = self._uniform_ring(rng, 12000)
+        wx, wy = self._in_wedges([400] + [0] * 11)
+
+        result = self._check(np.concatenate([x, wx]), np.concatenate([y, wy]))
+
+        assert result.brightest_over_median > 1.2
+        assert result.chance_probability < 1e-6
+        assert not result.crowded
+
+    def test_a_fourfold_excess_on_a_handful_of_counts_is_not_flagged(self):
+        x, y = self._in_wedges([4] + [1] * 11)
+
+        result = self._check(x, y)
+
+        assert result.brightest_over_median == pytest.approx(4.0)
+        assert not result.crowded
+
+    def test_the_background_share_with_and_without_the_brightest_wedge(self):
+        wx, wy = self._in_wedges([230] + [10] * 11)
+        x = np.concatenate([wx, np.full(100, 4100.0)])
+        y = np.concatenate([wy, np.full(100, 4100.0)])
+
+        result = self._check(x, y)
+
+        assert result.crowded
+        assert result.source_counts == 100
+        assert result.background_share == pytest.approx(340 * 4 / 27 / 100)
+        assert result.background_share_without_brightest == pytest.approx(
+            110 * 12 / 11 * 4 / 27 / 100
+        )
+
+    def test_the_thresholds_are_configurable(self):
+        wx, wy = self._in_wedges([230] + [10] * 11)
+
+        assert not self._check(wx, wy, bkg_crowding_ratio=30.0).crowded
+
+    def test_continuous_clocking_has_no_ring_to_check(self):
+        assert self._check([4100.0], [4100.0], continuous_clocking=True) is None
+
+    def test_the_step_records_the_wedges_and_warns(self, tmp_path, caplog):
+        wx, wy = self._in_wedges([230] + [10] * 11)
+        events = tmp_path / "cl.evt"
+        fits.HDUList(
+            [
+                fits.PrimaryHDU(),
+                fits.BinTableHDU.from_columns(
+                    [
+                        fits.Column(name="x", format="E", array=np.concatenate([wx, [4100.0]])),
+                        fits.Column(name="y", format="E", array=np.concatenate([wy, [4100.0]])),
+                    ],
+                    name="EVENTS",
+                ),
+            ]
+        ).writeto(events)
+        observation = SimpleNamespace(obsid="8190", sky_pixel_arcsec=self.PIXEL)
+        position, regions = self._geometry()
+        directory = tmp_path / "diagnostics"
+
+        with caplog.at_level("WARNING"):
+            with record_step(str(directory), "8190", "clean_event_list") as rec:
+                chandra.chandra_background_ring_check(
+                    observation,
+                    dict(chandra.DEFAULT_CONFIG),
+                    str(events),
+                    position,
+                    regions,
+                    rec=rec,
+                )
+
+        values = json.loads(next(directory.glob("*clean_event_list*.json")).read_text())["values"]
+        assert values["background_ring_crowded"] is True
+        assert values["background_ring_sector_counts"][0] == 230
+        assert values["background_ring_source_counts"] == 1
+        assert "8190" in caplog.text and "background" in caplog.text
+
+
 class TestHowCloseTheSourceIsToAnEdge:
     """
     Our own check, and the reason it is ours is a bug in ``psfsize_srcs``. It bounds a
@@ -3727,6 +3881,7 @@ def stub_every_step(monkeypatch):
         ("chandra_flare_lightcurve", "curve.fits"),
         ("chandra_flare_gti", np.array([[0.0, 1.0]])),
         ("chandra_clean_event_list", "cl.evt"),
+        ("chandra_background_ring_check", None),
         ("chandra_pileup", None),
         ("chandra_barycenter", "cl_bary.evt"),
         ("chandra_barycentered_source_events", "src_bary.evt"),
@@ -3764,6 +3919,7 @@ class TestReducingAnObservation:
             "chandra_flare_lightcurve",
             "chandra_flare_gti",
             "chandra_clean_event_list",
+            "chandra_background_ring_check",
             "chandra_pileup",
             "chandra_barycenter",
             "chandra_barycentered_source_events",
@@ -3803,7 +3959,11 @@ class TestReducingAnObservation:
     def test_every_later_step_reads_the_cleaned_list(self, tmp_path, stub_every_step):
         self.reduce(tmp_path, ra=self.RA, dec=self.DEC)
 
-        for name in ("chandra_pileup", "chandra_calculate_spectra"):
+        for name in (
+            "chandra_background_ring_check",
+            "chandra_pileup",
+            "chandra_calculate_spectra",
+        ):
             ((_, args, _),) = [c for c in stub_every_step if c[0] == name]
             assert args[2] == "cl.evt", name
 

@@ -2040,12 +2040,26 @@ ACIS subarray it computes the top of the window as ``NROWS - 1 - edge`` instead 
 reports the clearance in chip pixels from ``FIRSTROW`` and ``NROWS`` instead: 47.95 on
 ``5644``, and 27.22 on ``8190``, which is genuinely inside the 32-pixel dither.
 
-In a crowded field the annulus is not necessarily background. Around M82 X-2 it contains
-M82 X-1, with 85 706 counts against the source circle's 10 577; scaled by the ratio of the
-areas that is about 940 counts subtracted from a 10 577-count source -- not ruinous, but a
-second bright source subtracted as though it were sky. **Nothing in the reduction detects
-this**, and nothing in a spectrum file would show it, so look at the field before fitting
-a crowded one.
+In a crowded field the annulus is not necessarily background, and around M82 X-2 it never
+is: M82 X-1 is 4.6 arcsec away. Measured on 2026-09-13 on all 35 cleaned lists on disk, the
+background scaled to the source circle is 6.3% and 6.6% of the source counts on the on-axis
+``5644`` and ``6361``, whose rings end at 2.5 arcsec, but **28-515%** on the seventeen
+off-axis ACIS observations and 34-186% on HRC. One wedge of twelve typically holds 5 to 112
+times the median wedge, and leaving that wedge out does not cure it, because X-1's point
+spread function spills into its neighbours. Nothing in a spectrum file shows any of this.
+
+``chandra_background_ring_check`` therefore measures the ring on the cleaned list. It cuts
+the ring into ``bkg_crowding_sectors`` (12) wedges around the source and calls it crowded
+when the brightest wedge is both **unlikely from sky alone** -- a Poisson probability around
+the median wedge, charged for every wedge, below ``bkg_crowding_probability`` (1.35e-3) --
+and **more than** ``bkg_crowding_ratio`` (3) **times the median**. Either condition alone
+misfires: the probability flags a harmless excess of a few per cent on a well-exposed ring,
+and the ratio flags four counts against one. The wedge counts and the background share, with
+and without the brightest wedge, go into the ``clean_event_list`` record, with a warning in
+the log. All 35 M82 observations are flagged; the check has not yet been run on a real
+isolated source. **Nothing is corrected**: the regions do not change, and the timing
+analysis, which uses the source events alone, is unaffected. Look at the field before
+fitting a crowded one.
 
 Flare screening
 ~~~~~~~~~~~~~~~
@@ -2176,7 +2190,8 @@ the HTML page:
    * - ``flare_filtering``
      - The background curve and the good time intervals.
    * - ``clean_event_list``
-     - ``dmcopy`` with those intervals; the whole field, not the source region.
+     - ``dmcopy`` with those intervals; the whole field, not the source region. Then the
+       background ring is checked for another source.
    * - ``pileup_check``
      - ACIS Timed Exposure only.
    * - ``barycenter``
