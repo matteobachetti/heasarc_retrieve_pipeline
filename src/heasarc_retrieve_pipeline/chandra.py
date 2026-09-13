@@ -1940,7 +1940,8 @@ class Observation:
         The level-2 event list. Every other path may be ``None``; this one may not, and an
         observation without it is not an ``Observation`` at all.
     aspect_solution, bad_pixel_file, mask_file, gti_file : str or None
-        Companion products.
+        Companion products. ``aspect_solution`` is ``None`` for an observation of several
+        parts, which has more than one: see :attr:`aspect_solutions`.
     dead_time_file : str or None
         HRC only, and ``None`` for ACIS is normal rather than missing. ``None`` too for an
         observation of several parts, where each part's is in ``parts``.
@@ -2000,6 +2001,18 @@ class Observation:
     def stem(self):
         """What every output file of this observation is named from."""
         return chandra_file_stem(self.obsid, self.detector, self.mode)
+
+    @property
+    def aspect_solutions(self):
+        """
+        Every aspect solution the merged event list was made with, in time order.
+
+        For an observation of several parts, each part's own, one after another -- ``433``
+        has five for three parts. Otherwise the one ``aspect_solution``, or nothing.
+        """
+        if len(self.parts) > 1:
+            return tuple(path for part in self.parts for path in part.aspect_solutions)
+        return () if self.aspect_solution is None else (self.aspect_solution,)
 
     @property
     def is_continuous_clocking(self):
@@ -2080,7 +2093,7 @@ def chandra_archive_front_end(obsid, config, rec=None):
         time_resolution=resolution,
         chips=tuple(chandra_chips(header)),
         event_list=events,
-        aspect_solution=chandra_aspect_solution(obsid, config),
+        aspect_solution=chandra_aspect_solution(obsid, config) if len(parts) <= 1 else None,
         bad_pixel_file=chandra_bad_pixel_file(obsid, config),
         mask_file=chandra_mask_file(obsid, config),
         gti_file=chandra_gti_file(obsid, config),
@@ -2532,8 +2545,14 @@ def chandra_source_position(observation, ra, dec, env=None, log_to=None):
     Parameters
     ----------
     observation : Observation
-        Its ``event_list`` sets the coordinate frame, and its ``aspect_solution`` refines
+        Its ``event_list`` sets the coordinate frame, and its ``aspect_solutions`` refine
         it. An observation with no aspect solution still converts, off the header alone.
+        One taken in several parts passes every part's, as a CIAO stack -- ``dmcoords``
+        accepts ``asolfile="a,b"`` -- because one sky position has to come out for the
+        whole merged event list. An event list that carries the averaged aspect keywords
+        ``DY_AVG``, ``DZ_AVG`` and ``DTH_AVG``, as ``1411``'s does, is converted with those
+        and ``dmcoords`` ignores the files; they are passed all the same, so the answer
+        does not depend on which kind of event list the archive happened to write.
     ra, dec : float
         Source position in degrees.
     env : dict, optional
@@ -2553,8 +2572,8 @@ def chandra_source_position(observation, ra, dec, env=None, log_to=None):
     parameters = dict(
         infile=observation.event_list, option="cel", ra=float(ra), dec=float(dec), celfmt="deg"
     )
-    if observation.aspect_solution is not None:
-        parameters["asolfile"] = observation.aspect_solution
+    if observation.aspect_solutions:
+        parameters["asolfile"] = ",".join(observation.aspect_solutions)
 
     ciao.run("dmcoords", produces=[], env=env, log_to=log_to, **parameters)
     answer = ciao.run(

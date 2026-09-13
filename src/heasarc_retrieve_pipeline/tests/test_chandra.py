@@ -2050,6 +2050,56 @@ class TestWorkingOutWhereToExtract:
         dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
         assert "asolfile" not in dmcoords[2]
 
+    def _in_parts(self, tmp_path):
+        """``1411``'s shape: part 0 with one aspect solution, part 2 with two."""
+        parts = (
+            chandra.ObservationPart(
+                0, 57471875.4, 57509598.4, aspect_solutions=(str(tmp_path / "a0.fits"),)
+            ),
+            chandra.ObservationPart(
+                2,
+                64767109.1,
+                64787079.2,
+                aspect_solutions=(str(tmp_path / "a2.fits"), str(tmp_path / "b2.fits")),
+            ),
+        )
+        observation = self._an_observation(tmp_path)
+        return chandra.Observation(
+            **{**observation.__dict__, "aspect_solution": None, "parts": parts}
+        )
+
+    def test_every_part_s_aspect_solution_is_stacked_for_dmcoords(self, tmp_path, stub_ciao_tasks):
+        """
+        One sky position has to come out for the whole merged event list, so ``dmcoords``
+        is given the aspect solutions of every part, as a CIAO stack, in time order.
+        """
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        chandra.chandra_source_regions(self._in_parts(tmp_path), config, 148.96, 69.68)
+
+        dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
+        assert dmcoords[2]["asolfile"] == ",".join(
+            str(tmp_path / name) for name in ("a0.fits", "a2.fits", "b2.fits")
+        )
+
+    def test_the_aspect_solutions_of_an_observation_in_parts_are_all_of_them(self, tmp_path):
+        assert _names(self._in_parts(tmp_path).aspect_solutions) == [
+            "a0.fits",
+            "a2.fits",
+            "b2.fits",
+        ]
+
+    def test_the_aspect_solutions_of_an_ordinary_observation_are_its_one(self, tmp_path):
+        observation = self._an_observation(tmp_path)
+
+        assert observation.aspect_solutions == (observation.aspect_solution,)
+
+    def test_no_aspect_solution_is_no_aspect_solutions(self, tmp_path):
+        observation = self._an_observation(tmp_path)
+        observation = chandra.Observation(**{**observation.__dict__, "aspect_solution": None})
+
+        assert observation.aspect_solutions == ()
+
     def test_by_default_the_radius_is_measured_rather_than_assumed(self, tmp_path, stub_ciao_tasks):
         config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
 
