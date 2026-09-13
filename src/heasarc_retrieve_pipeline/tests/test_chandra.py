@@ -4887,6 +4887,7 @@ class TestReducingAnObservation:
         "chandra_flare_lightcurve",
         "chandra_flare_gti",
         "chandra_clean_event_list",
+        "chandra_background_ring_check",
         "chandra_pileup",
         "chandra_barycenter",
         "chandra_barycentered_source_events",

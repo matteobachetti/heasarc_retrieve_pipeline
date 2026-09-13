@@ -5201,6 +5201,7 @@ def _chandra_reduce(obsid, observation, part, key, config, ra, dec, diagnostics,
         cleaned = chandra_clean_event_list(
             observation, config, gti, rec=rec, env=env, log_to=log("dmcopy")
         )
+        chandra_background_ring_check(observation, config, cleaned, position, regions, rec=rec)
 
     with record_step(diagnostics, obsid, "pileup_check", key=key) as rec:
         chandra_pileup(
@@ -5319,73 +5320,6 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
 
     env = ciao.ciao_environment(obsid, config)
 
-    with record_step(diagnostics, obsid, "source_region") as rec:
-        rec.value(ra=ra, dec=dec)
-        position, regions = chandra_source_regions(
-            observation,
-            config,
-            ra,
-            dec,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("psfsize_srcs", obsid, config),
-        )
-
-    with record_step(diagnostics, obsid, "flare_filtering") as rec:
-        lightcurve = chandra_flare_lightcurve(
-            observation,
-            position,
-            regions,
-            config,
-            env=env,
-            log_to=tool_log_file("dmextract", obsid, config),
-        )
-        gti = chandra_flare_gti(observation, config, lightcurve, rec=rec)
-
-    with record_step(diagnostics, obsid, "clean_event_list") as rec:
-        cleaned = chandra_clean_event_list(
-            observation,
-            config,
-            gti,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("dmcopy", obsid, config),
-        )
-        chandra_background_ring_check(observation, config, cleaned, position, regions, rec=rec)
-
-    with record_step(diagnostics, obsid, "pileup_check") as rec:
-        chandra_pileup(
-            observation,
-            config,
-            cleaned,
-            position,
-            regions,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("pileup_map", obsid, config),
-        )
-
-    with record_step(diagnostics, obsid, "barycenter") as rec:
-        barycentered = chandra_barycenter(
-            observation,
-            config,
-            cleaned,
-            ra=ra,
-            dec=dec,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("axbary", obsid, config),
-        )
-        if barycentered is not None:
-            chandra_barycentered_source_events(
-                observation,
-                config,
-                barycentered,
-                regions,
-                rec=rec,
-                env=env,
-                log_to=tool_log_file("dmcopy_src_bary", obsid, config),
-            )
     parts = getattr(observation, "parts", ())
     units = [(chandra_part_label(part), part) for part in parts] if len(parts) > 1 else [("", None)]
     failed = {}
