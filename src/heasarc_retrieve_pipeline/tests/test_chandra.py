@@ -893,6 +893,34 @@ class TestTakingOnePartAsItsOwnObservation:
         assert observation.gti_file is None
         assert observation.orbit_ephemeris is None
 
+    def test_the_front_end_warns_that_the_observation_is_in_parts(self, tmp_path):
+        """
+        Loudly, and in words: how many parts, when each was taken, how far apart, and
+        what its products are called. ``380``'s parts are 35.6 days apart.
+        """
+        config = a_timed_observation(tmp_path, "380", ACIS_380_TIMES)
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "380", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("380", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        (warning,) = values["warnings"]
+        assert "2 parts" in warning
+        assert "35.6 days apart" in warning
+        assert "2000-05-07" in warning and "2000-06-12" in warning
+        assert "_obi001" in warning and "_obi002" in warning
+
+    def test_an_ordinary_observation_warns_of_nothing(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298")
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert values["warnings"] == []
+
     def test_a_part_is_named_for_its_number(self, tmp_path, stub_dmcopy_by_time):
         config, observation = self._380(tmp_path)
 

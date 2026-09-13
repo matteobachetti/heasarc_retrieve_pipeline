@@ -56,6 +56,7 @@ from typing import Optional
 
 import numpy as np
 from astropy.io import fits
+from astropy.time import Time
 
 from prefect import flow
 
@@ -1278,6 +1279,65 @@ def chandra_observation_parts(obsid, config):
     return tuple(parts)
 
 
+#: Chandra's mission reference, 1998-01-01 in TT, for an event list that does not say.
+CHANDRA_MJDREF = 50814.0
+
+
+def chandra_parts_warning(obsid, stem, parts, mjdref=CHANDRA_MJDREF):
+    """
+    What the log, the record and the report page say about an observation in parts.
+
+    In words, because it changes how everything else about the observation is read: how
+    many parts there are, when each was taken, how far apart, and what each part's products
+    are called.
+
+    Parameters
+    ----------
+    obsid : str
+    stem : str
+        The observation's stem, which each part's label is added to.
+    parts : sequence of ObservationPart
+    mjdref : float, optional
+        What the parts' times count from, as the event list's ``MJDREF`` gives it.
+
+    Returns
+    -------
+    str or None
+        ``None`` for an observation of one part.
+
+    Examples
+    --------
+    >>> parts = (ObservationPart(1, 74117285.6, 74123990.7), ObservationPart(2, 77203909.7, 77206498.4))
+    >>> print(chandra_parts_warning("380", "chandra00380_acisi_timed", parts))
+    ... # doctest: +NORMALIZE_WHITESPACE
+    380 was taken in 2 parts, 35.6 days apart: part 1 on 2000-05-07 to 2000-05-07, whose
+    products are named chandra00380_acisi_timed_obi001; part 2 on 2000-06-12 to 2000-06-12,
+    whose products are named chandra00380_acisi_timed_obi002. Each part is reduced as an
+    observation of its own and nothing is merged across the gap, so a timing search over
+    more than one part has to be chosen, not inherited.
+    """
+    if len(parts) < 2:
+        return None
+
+    def date(met):
+        return Time(mjdref + met / 86400.0, format="mjd", scale="tt").utc.iso[:10]
+
+    gaps = [
+        f"{(later.tstart - earlier.tstop) / 86400.0:.1f}"
+        for earlier, later in zip(parts, parts[1:])
+    ]
+    each = "; ".join(
+        f"part {part.number} on {date(part.tstart)} to {date(part.tstop)}, whose products "
+        f"are named {stem}_{chandra_part_label(part)}"
+        for part in parts
+    )
+    return (
+        f"{obsid} was taken in {len(parts)} parts, {' and '.join(gaps)} days apart: {each}. "
+        "Each part is reduced as an observation of its own and nothing is merged across the "
+        "gap, so a timing search over more than one part has to be chosen, not inherited."
+    )
+
+
 def _part_summary(part):
     """One part as the diagnostics record carries it: numbers and file names, not paths."""
 
@@ -2118,8 +2178,15 @@ def chandra_archive_front_end(obsid, config, rec=None):
         parts=parts,
     )
 
+    warning = chandra_parts_warning(
+        obsid, observation.stem, parts, float(header.get("MJDREF", CHANDRA_MJDREF))
+    )
+    if warning is not None:
+        get_logger().warning(warning)
+
     if rec is not None:
         rec.value(
+            warnings=[] if warning is None else [warning],
             detector=observation.detector,
             grating=observation.grating,
             mode=observation.mode,

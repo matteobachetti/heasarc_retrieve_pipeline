@@ -472,6 +472,38 @@ class TestWhatTheFiguresContain:
         assert fig.layout.template.layout.plot_bgcolor is None
 
 
+class TestWarningsAStepRaises:
+    """
+    Some things about an observation must not be found three tables down. A step that
+    records ``warnings`` has them shown before anything else on the page -- the first use
+    being a Chandra observation taken in several parts, weeks apart.
+    """
+
+    def with_a_warning(self, tmp_path):
+        a_full_observation(tmp_path)
+        with record_step(observation(tmp_path), OBSID, "chandra_front_end") as rec:
+            rec.value(warnings=["taken in 2 parts, 35.6 days apart"])
+        return report.write_observation_page(OBSID, str(tmp_path))
+
+    def test_the_warning_is_on_the_page(self, tmp_path):
+        path = self.with_a_warning(tmp_path)
+
+        (note,) = soup(path).find_all("p", class_="warning")
+        assert "35.6 days apart" in note.get_text()
+
+    def test_it_comes_before_the_steps(self, tmp_path):
+        page = open(self.with_a_warning(tmp_path)).read()
+
+        assert page.index('class="warning"') < page.index("<h2>Steps</h2>")
+
+    def test_a_reduction_without_warnings_shows_none(self, tmp_path):
+        a_full_observation(tmp_path)
+
+        path = report.write_observation_page(OBSID, str(tmp_path))
+
+        assert soup(path).find_all("p", class_="warning") == []
+
+
 class TestAFigureFromAnEarlierRun:
     """
     A rerun that skips every step still draws them, from what the first run measured.

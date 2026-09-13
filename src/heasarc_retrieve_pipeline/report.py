@@ -122,6 +122,7 @@ tr + tr td, tr + tr th { border-top: 1px solid #eee; }
           color: #fff; font-size: 0.8rem; }
 .empty { color: #888; font-style: italic; }
 .earlier { color: #8a6d3b; font-size: 0.85rem; margin: 0.2rem 0 0 0; }
+.warning { background: #fff8e6; border-left: 3px solid #e9c46a; padding: 0.5rem 0.8rem; }
 .error { font-family: ui-monospace, monospace; font-size: 0.8rem; white-space: pre-wrap;
          background: #fdf1ee; border-left: 3px solid #e76f51; padding: 0.5rem 0.8rem; }
 footer { margin-top: 3rem; color: #888; font-size: 0.8rem; }
@@ -984,6 +985,15 @@ def _step_rows(records):
     return rows
 
 
+def _warnings(records):
+    """Every ``warnings`` value any step recorded, in the order the steps ran."""
+    return [
+        warning
+        for record in records
+        for warning in (record.get("values") or {}).get("warnings") or []
+    ]
+
+
 def _step_table(records):
     """The step table, with the status column rendered as a coloured pill."""
     if not records:
@@ -1022,6 +1032,9 @@ def observation_body(summary, directory):
     parts = [
         f"<h1>{html.escape(str(obsid))}</h1>",
         f'<p class="subtitle">{html.escape(str(title))} &mdash; {_badge(summary["outcome"])}</p>',
+        # Before everything else, because what a step warns of changes how the rest of
+        # the page should be read -- a Chandra observation in parts weeks apart, first.
+        *(f'<p class="warning">{html.escape(str(warning))}</p>' for warning in _warnings(records)),
         "<h2>Observation</h2>",
         _table(_parameter_rows(summary)),
         "<h2>Steps</h2>",
