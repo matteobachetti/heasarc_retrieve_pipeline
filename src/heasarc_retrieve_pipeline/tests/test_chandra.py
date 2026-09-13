@@ -630,6 +630,429 @@ class TestFindingTheProductsOfAnObservation:
             chandra.chandra_event_list("6298", config)
 
 
+# ``1411``: HRC-I on M82, taken in two parts 84 days apart under one obsid. Listed from the
+# S3 mirror on 2026-09-13, with every time read off the real file headers the same day.
+# The archive merges the parts into one level-2 event list and ships every other product
+# once per part, with the part number -- ``000``, ``002`` -- in the name.
+_1411_PART_000 = (57471875.357874, 57509598.434235)
+_1411_PART_002 = (64767109.146926, 64787079.222651)
+HRC_I_1411_TIMES = {
+    "primary/hrcf01411N006_evt2.fits.gz": (57471875.357874, 64787079.222651),
+    "primary/hrcf01411_000N006_dtf1.fits.gz": _1411_PART_000,
+    "primary/hrcf01411_000N006_fov1.fits.gz": _1411_PART_000,
+    "primary/hrcf01411_002N006_dtf1.fits.gz": _1411_PART_002,
+    "primary/hrcf01411_002N006_fov1.fits.gz": _1411_PART_002,
+    "primary/orbitf057024064N002_eph1.fits.gz": (57024064.184, 58838464.184),
+    "primary/orbitf064281664N002_eph1.fits.gz": (64281664.184, 66096064.184),
+    "primary/pcadf01411_000N001_asol1.fits.gz": (57472330.71414, 57508816.871706, {"OBI_NUM": 0}),
+    "primary/pcadf01411_002N001_asol1.fits.gz": (64768580.278229, 64786525.210131, {"OBI_NUM": 2}),
+    "secondary/hrcf01411_000N006_bpix1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_000N006_msk1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_000N006_std_flt1.fits.gz": _1411_PART_000,
+    "secondary/hrcf01411_002N006_bpix1.fits.gz": _1411_PART_002,
+    "secondary/hrcf01411_002N006_msk1.fits.gz": _1411_PART_002,
+    "secondary/hrcf01411_002N006_std_flt1.fits.gz": _1411_PART_002,
+}
+
+# ``433``: ACIS-S with HETG, in three parts. The names are real, listed on 2026-09-13; the
+# times are invented, in the right order, because the observation was not downloaded. It is
+# the case that breaks pairing by name: the parts are numbered 001, 003 and 004, and its
+# five aspect solutions carry a start time where the part number would be.
+_433_PART_001 = (71323000.0, 71450000.0)
+_433_PART_003 = (76842000.0, 76900000.0)
+_433_PART_004 = (83242000.0, 83300000.0)
+ACIS_433_TIMES = {
+    "primary/acisf00433N008_evt2.fits.gz": (71323000.0, 83300000.0),
+    "primary/acisf00433_001N005_bpix1.fits.gz": _433_PART_001,
+    "primary/acisf00433_001N005_fov1.fits.gz": _433_PART_001,
+    "primary/acisf00433_003N006_bpix1.fits.gz": _433_PART_003,
+    "primary/acisf00433_003N006_fov1.fits.gz": _433_PART_003,
+    "primary/acisf00433_004N004_bpix1.fits.gz": _433_PART_004,
+    "primary/acisf00433_004N004_fov1.fits.gz": _433_PART_004,
+    "primary/orbitf070977900N001_eph1.fits.gz": (70977900.0, 72792300.0),
+    "primary/orbitf076766700N001_eph1.fits.gz": (76766700.0, 78581100.0),
+    "primary/orbitf082987500N001_eph1.fits.gz": (82987500.0, 84801900.0),
+    "primary/pcadf071323369N004_asol1.fits.gz": (71323369.0, 71391700.0, {"OBI_NUM": 1}),
+    "primary/pcadf071391777N004_asol1.fits.gz": (71391777.0, 71419600.0, {"OBI_NUM": 1}),
+    "primary/pcadf071419624N004_asol1.fits.gz": (71419624.0, 71449000.0, {"OBI_NUM": 1}),
+    "primary/pcadf076842088N006_asol1.fits.gz": (76842088.0, 76899000.0, {"OBI_NUM": 3}),
+    "primary/pcadf083242295N004_asol1.fits.gz": (83242295.0, 83299000.0, {"OBI_NUM": 4}),
+    "secondary/acisf00433_001N005_flt1.fits.gz": _433_PART_001,
+    "secondary/acisf00433_001N005_msk1.fits.gz": _433_PART_001,
+    "secondary/acisf00433_003N006_flt1.fits.gz": _433_PART_003,
+    "secondary/acisf00433_003N006_msk1.fits.gz": _433_PART_003,
+    "secondary/acisf00433_004N004_flt1.fits.gz": _433_PART_004,
+    "secondary/acisf00433_004N004_msk1.fits.gz": _433_PART_004,
+}
+
+
+def a_timed_observation(tmp_path, obsid, times):
+    """
+    A download whose every file carries the ``TSTART`` and ``TSTOP`` a real one would.
+
+    ``times`` maps each archive name to ``(tstart, tstop)``, or to ``(tstart, tstop,
+    header)`` for extra keywords. Pairing the parts of an observation by time reads these,
+    so the empty placeholders of :func:`a_downloaded_observation` will not do.
+    """
+    config = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+    for name, spec in times.items():
+        tstart, tstop, extra = (tuple(spec) + ({},))[:3]
+        path = tmp_path / chandra.chandra_obsid(obsid) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if "_evt2." in name:
+            an_event_file(path, TSTART=tstart, TSTOP=tstop, **extra)
+            continue
+        hdu = fits.BinTableHDU.from_columns([fits.Column("TIME", "1D", array=[tstart])])
+        for key, value in dict(TSTART=tstart, TSTOP=tstop, **extra).items():
+            hdu.header[key] = value
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+    return config
+
+
+def _names(paths):
+    return [os.path.basename(path) for path in paths]
+
+
+class TestSplittingAnObservationIntoItsParts:
+    """
+    Some Chandra observations were taken in several separate pointings under one obsid.
+    Chandra calls each an OBI; this module calls it a *part*. The archive merges the parts'
+    events into one level-2 list and ships the rest -- dead time, aspect, orbit, bad
+    pixels, mask, good times -- once per part, and each part has to be reduced with its
+    own.
+    """
+
+    def parts(self, tmp_path, obsid, times):
+        return chandra.chandra_observation_parts(obsid, a_timed_observation(tmp_path, obsid, times))
+
+    def test_an_ordinary_observation_is_one_part_and_opens_nothing_new(self, tmp_path):
+        """
+        No second code path: a single-pointing observation is one part. Its companions are
+        empty placeholders here, so the test also proves that none of them is opened --
+        the part's time range is the event list's own.
+        """
+        config = an_archive_observation(tmp_path, "6298", TSTART=235397500.0, TSTOP=235420000.0)
+
+        (part,) = chandra.chandra_observation_parts("6298", config)
+
+        assert part.number == 0
+        assert (part.tstart, part.tstop) == (235397500.0, 235420000.0)
+        assert os.path.basename(part.dead_time_file) == "hrcf06298_000N006_dtf1.fits"
+        assert _names(part.aspect_solutions) == ["pcadf06298_000N001_asol1.fits.gz"]
+        assert os.path.basename(part.orbit_ephemeris) == "orbitf235397100N001_eph1.fits.gz"
+        assert os.path.basename(part.bad_pixel_file) == "hrcf06298_000N006_bpix1.fits.gz"
+        assert os.path.basename(part.mask_file) == "hrcf06298_000N006_msk1.fits.gz"
+        assert os.path.basename(part.gti_file) == "hrcf06298_000N006_std_flt1.fits.gz"
+
+    def test_obsid_1411_is_two_parts_each_with_its_own_files(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert (first.number, second.number) == (0, 2)
+        assert os.path.basename(first.dead_time_file) == "hrcf01411_000N006_dtf1.fits.gz"
+        assert os.path.basename(second.dead_time_file) == "hrcf01411_002N006_dtf1.fits.gz"
+        assert _names(second.aspect_solutions) == ["pcadf01411_002N001_asol1.fits.gz"]
+        assert os.path.basename(second.bad_pixel_file) == "hrcf01411_002N006_bpix1.fits.gz"
+        assert os.path.basename(second.mask_file) == "hrcf01411_002N006_msk1.fits.gz"
+        assert os.path.basename(second.gti_file) == "hrcf01411_002N006_std_flt1.fits.gz"
+
+    def test_an_orbit_file_carries_no_part_number_and_is_paired_by_time(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert os.path.basename(first.orbit_ephemeris) == "orbitf057024064N002_eph1.fits.gz"
+        assert os.path.basename(second.orbit_ephemeris) == "orbitf064281664N002_eph1.fits.gz"
+
+    def test_each_part_spans_its_own_files_and_the_gap_is_84_days(self, tmp_path):
+        first, second = self.parts(tmp_path, "1411", HRC_I_1411_TIMES)
+
+        assert (first.tstart, first.tstop) == pytest.approx(_1411_PART_000)
+        assert (second.tstart, second.tstop) == pytest.approx(_1411_PART_002)
+        assert (second.tstart - first.tstop) / 86400 == pytest.approx(84.0, abs=0.1)
+
+    def test_part_numbers_can_skip_and_aspect_solutions_are_paired_by_time(self, tmp_path):
+        """Obsid 433: parts 001, 003 and 004, and five aspect solutions named by time."""
+        first, second, third = self.parts(tmp_path, "433", ACIS_433_TIMES)
+
+        assert (first.number, second.number, third.number) == (1, 3, 4)
+        assert _names(first.aspect_solutions) == [
+            "pcadf071323369N004_asol1.fits.gz",
+            "pcadf071391777N004_asol1.fits.gz",
+            "pcadf071419624N004_asol1.fits.gz",
+        ]
+        assert _names(second.aspect_solutions) == ["pcadf076842088N006_asol1.fits.gz"]
+        assert _names(third.aspect_solutions) == ["pcadf083242295N004_asol1.fits.gz"]
+        assert os.path.basename(third.orbit_ephemeris) == "orbitf082987500N001_eph1.fits.gz"
+
+    def test_an_aspect_solution_whose_header_names_another_part_is_an_error(self, tmp_path):
+        """The time says one part and ``OBI_NUM`` says another: neither is believed."""
+        times = dict(ACIS_433_TIMES)
+        times["primary/pcadf076842088N006_asol1.fits.gz"] = (76842088.0, 76899000.0, {"OBI_NUM": 4})
+
+        with pytest.raises(ValueError, match="OBI_NUM"):
+            self.parts(tmp_path, "433", times)
+
+    def test_parts_may_come_from_different_processing_versions(self, tmp_path):
+        """Obsid 108 really ships ``_000N006`` beside ``_001N005``. That is not a conflict."""
+        times = {
+            name.replace("_002N006_", "_002N005_"): spec for name, spec in HRC_I_1411_TIMES.items()
+        }
+
+        first, second = self.parts(tmp_path, "1411", times)
+
+        assert os.path.basename(second.dead_time_file) == "hrcf01411_002N005_dtf1.fits.gz"
+
+    def test_two_versions_of_one_part_are_an_error(self, tmp_path):
+        times = dict(HRC_I_1411_TIMES)
+        times["primary/hrcf01411_000N005_dtf1.fits.gz"] = _1411_PART_000
+
+        with pytest.raises(ValueError, match="hrcf01411_000N005_dtf1.*hrcf01411_000N006_dtf1"):
+            self.parts(tmp_path, "1411", times)
+
+    def test_two_versions_of_one_time_named_aspect_solution_are_an_error(self, tmp_path):
+        times = dict(ACIS_433_TIMES)
+        times["primary/pcadf071323369N005_asol1.fits.gz"] = (71323369.0, 71391700.0, {"OBI_NUM": 1})
+
+        with pytest.raises(ValueError, match="pcadf071323369N00"):
+            self.parts(tmp_path, "433", times)
+
+    def test_a_part_no_orbit_file_covers_has_none(self, tmp_path):
+        """Recorded rather than raised, as it is for an ordinary observation."""
+        times = dict(HRC_I_1411_TIMES)
+        del times["primary/orbitf064281664N002_eph1.fits.gz"]
+
+        first, second = self.parts(tmp_path, "1411", times)
+
+        assert first.orbit_ephemeris is not None
+        assert second.orbit_ephemeris is None
+
+    def test_a_part_two_orbit_files_cover_is_an_error(self, tmp_path):
+        """``axbary`` takes one orbit file, so choosing between two would be a guess."""
+        times = dict(HRC_I_1411_TIMES)
+        times["primary/orbitf057400000N002_eph1.fits.gz"] = (57400000.0, 59214400.0)
+
+        with pytest.raises(ValueError, match="orbit"):
+            self.parts(tmp_path, "1411", times)
+
+    def test_the_reprocessing_route_s_unnumbered_products_belong_to_the_one_part(self, tmp_path):
+        """``chandra_repro`` names its bad pixels and good times without a part number."""
+        config = a_reprocessed_observation(tmp_path)
+
+        (part,) = chandra.chandra_observation_parts("5644", config)
+
+        assert os.path.basename(part.bad_pixel_file) == "acisf05644_repro_bpix1.fits"
+        assert os.path.basename(part.gti_file) == "acisf05644_repro_flt2.fits"
+
+    def test_the_front_end_records_every_part(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298", TSTART=1.0e8, TSTOP=1.1e8)
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            found = chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert len(found.parts) == 1
+        assert values["n_parts"] == 1
+        assert values["parts"][0]["number"] == 0
+        assert values["parts"][0]["tstart"] == pytest.approx(1.0e8)
+        assert values["parts"][0]["dead_time_file"] == "hrcf06298_000N006_dtf1.fits"
+
+
+@pytest.fixture
+def stub_dmcopy_by_time(monkeypatch):
+    """A CIAO whose ``dmcopy`` copies the file named before the filter, header and all."""
+    calls = []
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "dmcopy":
+            with fits.open(kwargs["infile"].split("[")[0]) as hdulist:
+                hdulist.writeto(kwargs["outfile"], overwrite=True)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return calls
+
+
+class TestTakingOnePartAsItsOwnObservation:
+    """
+    Matteo's ruling of 2026-09-13: each part of an observation is reduced as an observation
+    of its own. ``specextract`` takes one mask file per observation, and ``splitobs`` -- the
+    CXC's own answer -- hands each part to ``chandra_repro`` as if it were separate.
+    """
+
+    def _380(self, tmp_path):
+        config = a_timed_observation(tmp_path, "380", ACIS_380_TIMES)
+        return config, chandra.chandra_archive_front_end("380", config)
+
+    def test_the_front_end_reads_an_observation_in_parts_without_choosing_a_file(self, tmp_path):
+        _, observation = self._380(tmp_path)
+
+        assert len(observation.parts) == 2
+        assert observation.part is None
+        assert observation.bad_pixel_file is None
+        assert observation.mask_file is None
+        assert observation.gti_file is None
+        assert observation.orbit_ephemeris is None
+
+    def test_the_front_end_warns_that_the_observation_is_in_parts(self, tmp_path):
+        """
+        Loudly, and in words: how many parts, when each was taken, how far apart, and
+        what its products are called. ``380``'s parts are 35.6 days apart.
+        """
+        config = a_timed_observation(tmp_path, "380", ACIS_380_TIMES)
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "380", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("380", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        (warning,) = values["warnings"]
+        assert "2 parts" in warning
+        assert "35.6 days apart" in warning
+        assert "2000-05-07" in warning and "2000-06-12" in warning
+        assert "_obi001" in warning and "_obi002" in warning
+
+    def test_an_ordinary_observation_warns_of_nothing(self, tmp_path):
+        config = an_archive_observation(tmp_path, "6298")
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert values["warnings"] == []
+
+    def test_a_part_is_named_for_its_number(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert one.stem == observation.stem + "_obi002"
+        assert one.part == observation.parts[1]
+        assert one.parts == (observation.parts[1],)
+
+    def test_a_part_s_events_are_cut_from_the_merged_list_by_its_own_times(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        (dmcopy,) = [kwargs for name, kwargs in stub_dmcopy_by_time if name == "dmcopy"]
+        assert dmcopy["infile"] == (
+            f"{observation.event_list}[time=77203909.743536:77206498.381131]"
+        )
+        assert one.event_list == os.path.join(
+            chandra.chandra_pipeline_output_path("380", config), f"{one.stem}_evt2.fits"
+        )
+
+    def test_a_part_s_event_list_starts_and_stops_when_the_part_does(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        """
+        ``dmcopy``'s time filter trims the good-time blocks, ``EXPOSURE`` and the events,
+        and leaves ``TSTART`` and ``TSTOP`` at the merged list's. ``dmextract`` then bins the
+        flare curve over the header's range: on ``380``'s second part, 15 447 bins of 200 s,
+        7 of them with any exposure. Measured with CIAO on 2026-09-13.
+        """
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        header = fits.getheader(one.event_list, 1)
+        assert (header["TSTART"], header["TSTOP"]) == (77203909.743536, 77206498.381131)
+
+    def test_a_part_s_event_list_says_where_that_part_pointed(self, tmp_path, stub_dmcopy_by_time):
+        """
+        The merged list has no ``RA_PNT``, ``DEC_PNT`` or ``ROLL_PNT``: ``380``'s parts were
+        rolled 251.6 and 282.8 degrees. Every file of a part has its own, and without them
+        ``psfsize_srcs`` stops with "Input keyword list is missing" -- measured on the real
+        ``380`` through ``core`` on 2026-09-13, on both parts.
+        """
+        pointing = {
+            "RA_PNT": 148.8495527153,
+            "DEC_PNT": 69.628018652338,
+            "ROLL_PNT": 282.83742905797,
+        }
+        times = dict(ACIS_380_TIMES)
+        for name in (
+            "secondary/acisf00380_002N006_flt1.fits.gz",
+            "secondary/acisf00380_002N006_msk1.fits.gz",
+        ):
+            times[name] = (*_380_PART_002[:2], dict(_380_CONFIGURATION, **pointing))
+        config = a_timed_observation(tmp_path, "380", times)
+        observation = chandra.chandra_archive_front_end("380", config)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        header = fits.getheader(one.event_list, 1)
+        assert {key: header.get(key) for key in pointing} == pointing
+
+    def test_a_part_s_event_list_names_its_part(self, tmp_path, stub_dmcopy_by_time):
+        """
+        CIAO keeps a list of the obsids taken in parts, and ``380`` is on it: ``specextract``
+        refuses an event list of one without ``OBI_NUM`` -- "For multi-OBI datasets like
+        380 the obi argument must be set" -- and the merged list has none. Measured on the
+        real ``380`` through ``core`` on 2026-09-13, on both parts.
+        """
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert fits.getheader(one.event_list, 1)["OBI_NUM"] == 2
+
+    def test_a_part_carries_its_own_companion_files(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert _names([one.bad_pixel_file, one.mask_file, one.gti_file, one.orbit_ephemeris]) == [
+            "acisf00380_002N006_bpix1.fits.gz",
+            "acisf00380_002N006_msk1.fits.gz",
+            "acisf00380_002N006_flt1.fits.gz",
+            "orbitf077025900N001_eph1.fits.gz",
+        ]
+        assert _names(one.aspect_solutions) == ["pcadf00380_002N001_asol1.fits.gz"]
+
+    def test_an_acis_part_reads_out_at_its_frame_time(self, tmp_path, stub_dmcopy_by_time):
+        config, observation = self._380(tmp_path)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[0], config)
+
+        assert one.time_resolution.seconds == 3.24104
+        assert one.mode == observation.mode
+
+    def test_an_hrc_part_has_its_own_time_resolution_and_not_the_combined_one(
+        self, tmp_path, stub_dmcopy_by_time
+    ):
+        """``1411``'s second part: 5.18 ms, where the two parts together answer 4.93."""
+        a_dead_time_file(tmp_path / "d000.fits", 425, 95)
+        a_dead_time_file(tmp_path / "d002.fits", 396, 93)
+        parts = (
+            chandra.ObservationPart(0, *_1411_PART_000, dead_time_file=str(tmp_path / "d000.fits")),
+            chandra.ObservationPart(2, *_1411_PART_002, dead_time_file=str(tmp_path / "d002.fits")),
+        )
+        observation = chandra.Observation(
+            obsid="1411",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=chandra.TimeResolution(4.934e-3, "hrc_trigger_rate", ""),
+            chips=(0,),
+            event_list=an_event_file(
+                tmp_path / "hrcf01411N006_evt2.fits", TSTART=5.7e7, TSTOP=6.5e7
+            ),
+            parts=parts,
+        )
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        one = chandra.chandra_part_observation(observation, parts[1], config)
+
+        assert one.time_resolution.seconds == pytest.approx(2.05 / 396)
+        assert one.time_resolution.fast_timing is False
+        assert one.mode == "imaging"
+        assert one.dead_time_file == str(tmp_path / "d002.fits")
+
+
 class TestWhichChipsWereReadOut:
     """
     ``DETNAM`` is a chip list, and the digits are chip identifiers.
@@ -996,6 +1419,246 @@ class TestReadingTheDeadTimeFile:
 
         with pytest.raises(ValueError, match="no triggers"):
             chandra.read_dead_time_factors(path)
+
+
+# ``1411``'s two dead-time files, measured on 2026-09-13: medians of 425 triggers and 95
+# telemetered events per 2.05 s sample in part 000, 396 and 93 in part 002. Both heavily
+# vetoed, at slightly different rates. The exposures are each part's good time.
+_1411_DTF_000 = chandra.DeadTimeFactors(95 / 425, 425 / 2.05, 2.05, 15233, 17737)
+_1411_DTF_002 = chandra.DeadTimeFactors(93 / 396, 396 / 2.05, 2.05, 7405, 8690)
+_1411_GOOD_TIME = (36275.00755862892, 17722.250644013286)
+
+# ``380``: M82 on ACIS-I, in two parts about 36 days apart. Names, times and keywords read
+# off the real files on 2026-09-13. Each part's good-time, mask and field-of-view files
+# repeat the readout configuration, which is what lets the parts be compared.
+_380_CONFIGURATION = {
+    "READMODE": "TIMED",
+    "DATAMODE": "VFAINT",
+    "TIMEDEL": 3.24104,
+    "DETNAM": "ACIS-012367",
+}
+_380_PART_001 = (74117285.617538, 74123990.655284, _380_CONFIGURATION)
+_380_PART_002 = (77203909.743536, 77206498.381131, _380_CONFIGURATION)
+ACIS_380_TIMES = {
+    "primary/acisf00380N007_evt2.fits.gz": (
+        74117285.617538,
+        77206498.381131,
+        dict(_380_CONFIGURATION, INSTRUME="ACIS", SIM_Z=-233.58743446083),
+    ),
+    "primary/acisf00380_001N005_bpix1.fits.gz": _380_PART_001,
+    "primary/acisf00380_001N005_fov1.fits.gz": _380_PART_001,
+    "primary/acisf00380_002N006_bpix1.fits.gz": _380_PART_002,
+    "primary/acisf00380_002N006_fov1.fits.gz": _380_PART_002,
+    "primary/orbitf073742700N001_eph1.fits.gz": (73742700.184, 75427200.184),
+    "primary/orbitf077025900N001_eph1.fits.gz": (77025900.184, 78710400.184),
+    "primary/pcadf00380_001N001_asol1.fits.gz": (74117601.31755, 74122686.855236, {"OBI_NUM": 1}),
+    "primary/pcadf00380_002N001_asol1.fits.gz": (77204795.087318, 77206184.21862, {"OBI_NUM": 2}),
+    "secondary/acisf00380_001N005_flt1.fits.gz": _380_PART_001,
+    "secondary/acisf00380_001N005_msk1.fits.gz": _380_PART_001,
+    "secondary/acisf00380_002N006_flt1.fits.gz": _380_PART_002,
+    "secondary/acisf00380_002N006_msk1.fits.gz": _380_PART_002,
+}
+
+_HRC_HEADER = {"INSTRUME": "HRC", "DETNAM": "HRC-I", "TIMEDEL": 1.5625e-05}
+
+
+class TestTimeResolutionOverSeveralParts:
+    """
+    A multi-part observation gets one time resolution, one mode label and one file stem,
+    so its parts' evidence has to be combined -- and combined so that no part is claimed
+    to be better than it is.
+    """
+
+    def test_one_part_is_exactly_the_answer_for_an_ordinary_observation(self):
+        """No second code path: a single part changes nothing, and reads no exposure."""
+        dtf = chandra.DeadTimeFactors(0.2964, 228.78, 2.05, 2392, 2769)
+
+        combined = chandra.chandra_parts_time_resolution(_HRC_HEADER, [(0, dtf, None)])
+
+        assert combined == chandra.chandra_time_resolution(_HRC_HEADER, dtf)
+
+    def test_1411_combines_its_two_vetoed_parts_weighted_by_exposure(self):
+        evidence = [
+            (0, _1411_DTF_000, _1411_GOOD_TIME[0]),
+            (2, _1411_DTF_002, _1411_GOOD_TIME[1]),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.veto_ratio == pytest.approx(0.22724, rel=1e-3)
+        assert found.trigger_rate_hz == pytest.approx(202.68, rel=1e-3)
+        assert found.seconds == pytest.approx(4.934e-3, rel=1e-3)
+        assert found.fast_timing is False
+        assert "weighted by exposure" in found.reason
+
+    def test_every_part_s_own_answer_is_kept_beside_the_combination(self):
+        evidence = [
+            (0, _1411_DTF_000, _1411_GOOD_TIME[0]),
+            (2, _1411_DTF_002, _1411_GOOD_TIME[1]),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert [part["number"] for part in found.parts] == [0, 2]
+        assert found.parts[0]["seconds"] == pytest.approx(4.8235e-3, rel=1e-3)
+        assert found.parts[1]["seconds"] == pytest.approx(5.1768e-3, rel=1e-3)
+        assert found.parts[1]["exposure_s"] == pytest.approx(17722.25)
+
+    def test_parts_on_opposite_sides_of_the_threshold_take_the_coarser_resolution(self):
+        """
+        The trap an average walks into: 500 ks unvetoed and 1 ks vetoed average to a veto
+        ratio of 0.9986, above the threshold, which would claim 15.625 us for events of
+        which some are only good to 5 ms.
+        """
+        unvetoed = chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100)
+        vetoed = chandra.DeadTimeFactors(0.3, 200.0, 2.05, 100, 100)
+        evidence = [(0, unvetoed, 500_000.0), (1, vetoed, 1_000.0)]
+        naive = chandra.combine_dead_time_factors([unvetoed, vetoed], [500_000.0, 1_000.0])
+        assert chandra.chandra_time_resolution(_HRC_HEADER, naive).fast_timing is True
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(5.0e-3)
+        assert found.fast_timing is False
+        assert found.basis == "hrc_parts_disagree"
+        assert "coarser" in found.reason
+
+    def test_two_unvetoed_parts_keep_the_header_s_resolution(self):
+        evidence = [
+            (0, chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100), 10_000.0),
+            (1, chandra.DeadTimeFactors(0.995, 62.0, 2.05, 100, 100), 20_000.0),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(1.5625e-05)
+        assert found.fast_timing is True
+
+    def test_a_part_without_its_dead_time_file_cannot_be_called_unvetoed(self):
+        """That part falls back on the documented 4 ms, and the coarser answer stands."""
+        evidence = [
+            (0, chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100), 10_000.0),
+            (1, None, 1.0),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(chandra.HRC_DOCUMENTED_RESOLUTION)
+        assert found.fast_timing is False
+
+    def test_acis_parts_share_the_frame_time_they_were_checked_to_share(self):
+        header = {"INSTRUME": "ACIS", "READMODE": "TIMED", "TIMEDEL": 3.24104}
+
+        found = chandra.chandra_parts_time_resolution(
+            header, [(1, None, 3813.0), (2, None, 1184.0)]
+        )
+
+        assert found.seconds == pytest.approx(3.24104)
+        assert "2 parts" in found.reason
+
+    def test_equal_weights_stand_in_when_no_exposure_is_known(self):
+        combined = chandra.combine_dead_time_factors([_1411_DTF_000, _1411_DTF_002], [None, None])
+
+        assert combined.veto_ratio == pytest.approx((95 / 425 + 93 / 396) / 2)
+
+    def test_a_part_s_exposure_is_its_good_time(self, tmp_path):
+        gti = chandra.write_gti_file(
+            tmp_path / "flt1.fits", np.array([[57472541.4797728, 57508816.48733143]])
+        )
+        part = chandra.ObservationPart(0, 57471875.357874, 57509598.434235, gti_file=gti)
+
+        assert chandra.chandra_part_exposure(part) == pytest.approx(_1411_GOOD_TIME[0])
+
+    def test_without_good_times_a_part_s_exposure_is_its_span(self):
+        part = chandra.ObservationPart(0, 100.0, 350.0)
+
+        assert chandra.chandra_part_exposure(part) == pytest.approx(250.0)
+
+    def test_the_front_end_records_what_each_part_answered(self, tmp_path):
+        """Empty for one part: there is nothing combined to show."""
+        config = an_archive_observation(tmp_path, "6298")
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert values["time_resolution_parts"] == []
+        assert values["has_dead_time_file"] is True
+
+
+class TestPartsMustBeTakenTheSameWay:
+    def parts_of(self, tmp_path, times):
+        config = a_timed_observation(tmp_path, "380", times)
+        header = fits.getheader(chandra.chandra_event_list("380", config), 1)
+        return header, chandra.chandra_observation_parts("380", config)
+
+    def test_380_s_two_parts_were_read_out_identically(self, tmp_path):
+        header, parts = self.parts_of(tmp_path, ACIS_380_TIMES)
+
+        chandra.chandra_check_part_configurations(header, parts)
+
+    @pytest.mark.parametrize(
+        "keyword, value",
+        [("READMODE", "CONTINUOUS"), ("TIMEDEL", 0.44104), ("DETNAM", "ACIS-7")],
+    )
+    def test_a_part_read_out_differently_is_refused(self, tmp_path, keyword, value):
+        """Mode, frame time and chips: one resolution and one stem cannot describe both."""
+        different = (*_380_PART_002[:2], dict(_380_CONFIGURATION, **{keyword: value}))
+        times = dict(ACIS_380_TIMES)
+        times["secondary/acisf00380_002N006_flt1.fits.gz"] = different
+        header, parts = self.parts_of(tmp_path, times)
+
+        with pytest.raises(ValueError, match=f"{keyword}.*part 2"):
+            chandra.chandra_check_part_configurations(header, parts)
+
+    def test_hrc_parts_on_different_detectors_are_refused(self, tmp_path):
+        times = {
+            name: (*spec[:2], {"DETNAM": "HRC-I"}) if "_evt2." not in name else spec
+            for name, spec in HRC_I_1411_TIMES.items()
+            if "_asol1" not in name
+        }
+        times["secondary/hrcf01411_002N006_std_flt1.fits.gz"] = (
+            *_1411_PART_002,
+            {"DETNAM": "HRC-S"},
+        )
+        config = a_timed_observation(tmp_path, "1411", times)
+        header = fits.getheader(chandra.chandra_event_list("1411", config), 1)
+        parts = chandra.chandra_observation_parts("1411", config)
+
+        with pytest.raises(ValueError, match="DETNAM"):
+            chandra.chandra_check_part_configurations(header, parts)
+
+    def test_an_hrc_good_time_file_s_own_timedel_is_not_a_difference(self, tmp_path):
+        """
+        Measured on the real ``1411``: both parts' ``std_flt1`` say ``TIMEDEL`` 0.25625 s,
+        the sampling of the filter, while the event list says 1.5625e-05 s. The parts agree
+        with each other, and comparing either with the event list compares two quantities.
+        """
+        times = {
+            name: (
+                (*spec[:2], {"DETNAM": "HRC-I", "TIMEDEL": 0.2562500089407})
+                if "_flt1" in name
+                else spec
+            )
+            for name, spec in HRC_I_1411_TIMES.items()
+            if "_asol1" not in name
+        }
+        config = a_timed_observation(tmp_path, "1411", times)
+        header = fits.getheader(chandra.chandra_event_list("1411", config), 1)
+
+        chandra.chandra_check_part_configurations(
+            header, chandra.chandra_observation_parts("1411", config)
+        )
+
+    def test_an_ordinary_observation_opens_nothing(self, tmp_path):
+        """Its companions are empty placeholders, so opening one would raise."""
+        config = an_archive_observation(tmp_path, "6298")
+        header = fits.getheader(chandra.chandra_event_list("6298", config), 1)
+
+        chandra.chandra_check_part_configurations(
+            header, chandra.chandra_observation_parts("6298", config)
+        )
 
 
 def an_event_file(path, sky_pixel_deg=None, **keywords):
@@ -1605,6 +2268,56 @@ class TestWorkingOutWhereToExtract:
 
         dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
         assert "asolfile" not in dmcoords[2]
+
+    def _in_parts(self, tmp_path):
+        """``1411``'s shape: part 0 with one aspect solution, part 2 with two."""
+        parts = (
+            chandra.ObservationPart(
+                0, 57471875.4, 57509598.4, aspect_solutions=(str(tmp_path / "a0.fits"),)
+            ),
+            chandra.ObservationPart(
+                2,
+                64767109.1,
+                64787079.2,
+                aspect_solutions=(str(tmp_path / "a2.fits"), str(tmp_path / "b2.fits")),
+            ),
+        )
+        observation = self._an_observation(tmp_path)
+        return chandra.Observation(
+            **{**observation.__dict__, "aspect_solution": None, "parts": parts}
+        )
+
+    def test_every_part_s_aspect_solution_is_stacked_for_dmcoords(self, tmp_path, stub_ciao_tasks):
+        """
+        One sky position has to come out for the whole merged event list, so ``dmcoords``
+        is given the aspect solutions of every part, as a CIAO stack, in time order.
+        """
+        config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+
+        chandra.chandra_source_regions(self._in_parts(tmp_path), config, 148.96, 69.68)
+
+        dmcoords = [call for call in stub_ciao_tasks if call[0] == "dmcoords"][0]
+        assert dmcoords[2]["asolfile"] == ",".join(
+            str(tmp_path / name) for name in ("a0.fits", "a2.fits", "b2.fits")
+        )
+
+    def test_the_aspect_solutions_of_an_observation_in_parts_are_all_of_them(self, tmp_path):
+        assert _names(self._in_parts(tmp_path).aspect_solutions) == [
+            "a0.fits",
+            "a2.fits",
+            "b2.fits",
+        ]
+
+    def test_the_aspect_solutions_of_an_ordinary_observation_are_its_one(self, tmp_path):
+        observation = self._an_observation(tmp_path)
+
+        assert observation.aspect_solutions == (observation.aspect_solution,)
+
+    def test_no_aspect_solution_is_no_aspect_solutions(self, tmp_path):
+        observation = self._an_observation(tmp_path)
+        observation = chandra.Observation(**{**observation.__dict__, "aspect_solution": None})
+
+        assert observation.aspect_solutions == ()
 
     def test_by_default_the_radius_is_measured_rather_than_assumed(self, tmp_path, stub_ciao_tasks):
         config = dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
@@ -3181,6 +3894,23 @@ class TestExtractingAnAcisSpectrum:
         assert call["mskfile"] == observation.mask_file
         assert call["badpixfile"] == observation.bad_pixel_file
 
+    def test_every_aspect_solution_of_a_part_is_handed_over(self, tmp_path, stub_specextract):
+        """
+        A part can have several -- ``433``'s first has three -- and ``specextract`` takes
+        "one or more aspect solution files" per observation, as a stack.
+        """
+        part = chandra.ObservationPart(
+            1, 1.0, 2.0, aspect_solutions=(str(tmp_path / "a.fits"), str(tmp_path / "b.fits"))
+        )
+        observation = self._observation(tmp_path, aspect_solution=None, parts=(part,), part=part)
+
+        chandra.chandra_calculate_spectra(
+            observation, self._config(tmp_path), str(tmp_path / "cl.evt"), self._regions()
+        )
+
+        call = [one for one in stub_specextract if one[0] == "specextract"][0][1]
+        assert call["asp"] == f"{tmp_path / 'a.fits'},{tmp_path / 'b.fits'}"
+
     def test_grouping_is_a_separate_call_and_not_specextracts(self, tmp_path, stub_specextract):
         """
         ``specextract``'s own ``grouptype``/``binspec`` did nothing at all in CIAO 4.18.0
@@ -3672,6 +4402,177 @@ class TestReprocessingAnObservation:
         assert values["ascds_version"] == "CIAO 4.18.0"
 
 
+#: ``380``'s download under the reprocessing route's filter: level 1 as well, one per part.
+ACIS_380_LEVEL1 = dict(
+    ACIS_380_TIMES,
+    **{
+        "secondary/acisf00380_001N005_evt1.fits.gz": (*_380_PART_001[:2], {"OBI_NUM": 1}),
+        "secondary/acisf00380_002N006_evt1.fits.gz": (*_380_PART_002[:2], {"OBI_NUM": 2}),
+    },
+)
+
+_380_SPANS = {1: _380_PART_001[:2], 2: _380_PART_002[:2]}
+
+
+def a_timed_file(path, tstart, tstop, **keywords):
+    """A one-row table whose first extension carries the times and ``keywords``."""
+    hdu = fits.BinTableHDU.from_columns([fits.Column("TIME", "1D", array=[tstart])])
+    for key, value in dict(TSTART=tstart, TSTOP=tstop, **keywords).items():
+        hdu.header[key] = value
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+@pytest.fixture
+def stub_splitobs_and_repro(monkeypatch):
+    """
+    A ``splitobs`` and a ``chandra_repro`` that leave what the real ones left on ``380``.
+
+    Measured on 2026-09-13: ``splitobs`` makes ``<outroot>_001`` and ``<outroot>_002``, and
+    ``chandra_repro`` on each writes ``acisf00380_repro_evt2.fits`` -- the same name in
+    both -- spanning that part alone, beside its own flt2, bpix1, mask and aspect solution.
+    ``skip`` names parts either task should quietly leave out.
+    """
+    calls = []
+    skip = {"splitobs": set(), "chandra_repro": set()}
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "splitobs":
+            for number in _380_SPANS:
+                if number not in skip["splitobs"]:
+                    os.makedirs(f"{kwargs['outroot']}_{number:03d}", exist_ok=True)
+        elif name == "chandra_repro":
+            number = int(kwargs["indir"][-3:])
+            if number in skip["chandra_repro"]:
+                return SimpleNamespace(stdout="")
+            tstart, tstop = _380_SPANS[number]
+            outdir = pathlib.Path(kwargs["outdir"])
+            outdir.mkdir(parents=True, exist_ok=True)
+            an_event_file(
+                outdir / "acisf00380_repro_evt2.fits",
+                TSTART=tstart,
+                TSTOP=tstop,
+                OBI_NUM=number,
+                INSTRUME="ACIS",
+                SIM_Z=-233.58743446083,
+                ASCDSVER="CIAO 4.18.0",
+                **_380_CONFIGURATION,
+            )
+            for written in (
+                "acisf00380_repro_flt2.fits",
+                "acisf00380_repro_bpix1.fits",
+                f"acisf00380_{number:03d}N005_msk1.fits",
+                f"pcadf00380_{number:03d}N001_asol1.fits",
+            ):
+                a_timed_file(outdir / written, tstart, tstop, **_380_CONFIGURATION)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return SimpleNamespace(calls=calls, skip=skip)
+
+
+class TestReprocessingAnObservationInParts:
+    """
+    ``chandra_repro`` refuses an observation in parts: the CXC says to separate them with
+    ``splitobs`` first, and then reprocess each as if it were an observation of its own.
+    Matteo's ruling of 2026-09-13, measured on ``380`` the same day.
+    """
+
+    def _380(self, tmp_path):
+        config = a_timed_observation(tmp_path, "380", ACIS_380_LEVEL1)
+        config["products"] = "repro"
+        return config
+
+    def test_splitobs_runs_first_and_chandra_repro_once_per_part(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        config = self._380(tmp_path)
+
+        chandra.chandra_repro_front_end("380", config, env={})
+
+        calls = stub_splitobs_and_repro.calls
+        assert [name for name, _ in calls] == ["splitobs", "chandra_repro", "chandra_repro"]
+        outroot = os.path.join(config["out_data_path"], "380", "split", "380")
+        assert calls[0][1]["indir"] == chandra.chandra_archive_path("380", config)
+        assert calls[0][1]["outroot"] == outroot
+        assert calls[1][1]["indir"] == outroot + "_001"
+        assert calls[1][1]["outdir"] == chandra.chandra_repro_path("380", config) + "_obi001"
+        assert calls[2][1]["indir"] == outroot + "_002"
+        assert calls[2][1]["outdir"] == chandra.chandra_repro_path("380", config) + "_obi002"
+        assert all(kwargs["set_ardlib"] == "no" for _, kwargs in calls[1:])
+
+    def test_each_part_reads_its_own_reprocessed_products(self, tmp_path, stub_splitobs_and_repro):
+        config = self._380(tmp_path)
+
+        observation = chandra.chandra_repro_front_end("380", config, env={})
+
+        first, second = observation.parts
+        mine = chandra.chandra_repro_path("380", config) + "_obi002"
+        assert second.event_list == os.path.join(mine, "acisf00380_repro_evt2.fits")
+        assert second.gti_file == os.path.join(mine, "acisf00380_repro_flt2.fits")
+        assert second.bad_pixel_file == os.path.join(mine, "acisf00380_repro_bpix1.fits")
+        assert second.mask_file == os.path.join(mine, "acisf00380_002N005_msk1.fits")
+        assert second.aspect_solutions == (os.path.join(mine, "pcadf00380_002N001_asol1.fits"),)
+        assert os.path.dirname(first.event_list).endswith("repro_obi001")
+
+    def test_orbit_files_still_come_from_the_download_paired_by_time(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        """``chandra_repro`` copies no orbit file, on one part or on several."""
+        config = self._380(tmp_path)
+
+        first, second = chandra.chandra_repro_front_end("380", config, env={}).parts
+
+        assert os.path.basename(first.orbit_ephemeris) == "orbitf073742700N001_eph1.fits.gz"
+        assert os.path.basename(second.orbit_ephemeris) == "orbitf077025900N001_eph1.fits.gz"
+
+    def test_a_part_splitobs_left_out_is_an_error(self, tmp_path, stub_splitobs_and_repro):
+        """Measured: with ``ASCDS_CALIB`` unset, ``splitobs`` makes nothing and says little."""
+        config = self._380(tmp_path)
+        stub_splitobs_and_repro.skip["splitobs"].add(2)
+
+        with pytest.raises(RuntimeError, match="splitobs.*part 2"):
+            chandra.chandra_repro_front_end("380", config, env={})
+
+    def test_a_part_chandra_repro_did_not_reprocess_is_an_error(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        """Measured: ``chandra_repro`` pointed at a missing directory returns 0."""
+        config = self._380(tmp_path)
+        stub_splitobs_and_repro.skip["chandra_repro"].add(2)
+
+        with pytest.raises(RuntimeError, match="wrote no.*repro_obi002"):
+            chandra.chandra_repro_front_end("380", config, env={})
+
+    def test_a_reprocessed_part_is_not_cut_again(self, tmp_path, stub_splitobs_and_repro):
+        """Its event list already spans that part alone; a second copy would only cost disk."""
+        config = self._380(tmp_path)
+        observation = chandra.chandra_repro_front_end("380", config, env={})
+        before = len(stub_splitobs_and_repro.calls)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert stub_splitobs_and_repro.calls[before:] == []
+        assert one.event_list == observation.parts[1].event_list
+        assert one.stem.endswith("_obi002")
+
+    def test_the_reprocessed_header_is_the_one_read(self, tmp_path, stub_splitobs_and_repro):
+        """The archive's merged list still says the CIAO that made it, not the one that ran."""
+        config = self._380(tmp_path)
+        directory = tmp_path / "records"
+
+        with record_step(str(directory), "380", "chandra_repro") as rec:
+            chandra.chandra_repro_front_end("380", config, rec=rec, env={})
+
+        values = json.loads(next(directory.glob("*repro*.json")).read_text())["values"]
+        assert values["ascds_version"] == "CIAO 4.18.0"
+        assert values["repro_directories"] == [
+            chandra.chandra_repro_path("380", config) + "_obi001",
+            chandra.chandra_repro_path("380", config) + "_obi002",
+        ]
+        assert "repro_obi002/acisf00380_repro_evt2.fits" in values["reprocessed_products"]
+
+
 class TestTheConfiguration:
     """
     The defaults have to survive a caller who names only the paths, which is exactly what
@@ -3979,6 +4880,163 @@ class TestReducingAnObservation:
 
         environments = {id(kwargs["env"]) for name, _, kwargs in stub_every_step if "env" in kwargs}
         assert len(environments) == 1
+
+    ONE_PART = [
+        "chandra_part_observation",
+        "chandra_source_regions",
+        "chandra_flare_lightcurve",
+        "chandra_flare_gti",
+        "chandra_clean_event_list",
+        "chandra_pileup",
+        "chandra_barycenter",
+        "chandra_barycentered_source_events",
+        "chandra_compress_barycentered_events",
+        "chandra_calculate_spectra",
+    ]
+
+    def _in_parts(self, calls, monkeypatch):
+        """``1411``'s shape: parts 0 and 2, each handed back as an observation of its own."""
+        parts = (SimpleNamespace(number=0), SimpleNamespace(number=2))
+        whole = SimpleNamespace(
+            obsid="1411",
+            detector="hrci",
+            grating="NONE",
+            mode="imaging",
+            time_resolution=SimpleNamespace(seconds=4.9e-3),
+            parts=parts,
+        )
+
+        def front_end(*args, **kwargs):
+            calls.append(("chandra_archive_front_end", args, kwargs))
+            return whole
+
+        def part_observation(observation, part, config, **kwargs):
+            calls.append(("chandra_part_observation", (observation, part, config), kwargs))
+            return SimpleNamespace(
+                obsid="1411",
+                detector="hrci",
+                grating="NONE",
+                mode="imaging",
+                time_resolution=SimpleNamespace(seconds=5.0e-3),
+                parts=(part,),
+                part=part,
+            )
+
+        monkeypatch.setattr(chandra, "chandra_archive_front_end", front_end)
+        monkeypatch.setattr(chandra, "chandra_part_observation", part_observation)
+        return whole
+
+    def _reduce_1411(self, tmp_path, config=None, **kwargs):
+        base = {"input_data_path": str(tmp_path), "out_data_path": str(tmp_path)}
+        return chandra.process_chandra_obsid.fn(
+            "1411", config=dict(base, **(config or {})), **kwargs
+        )
+
+    def test_each_part_is_reduced_in_turn_as_its_own_observation(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        assert self.steps(stub_every_step) == (
+            ["chandra_archive_front_end"] + self.ONE_PART + self.ONE_PART
+        )
+
+    def test_every_step_is_handed_the_part_and_not_the_whole(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        handed = [
+            args[0].part.number
+            for name, args, _ in stub_every_step
+            if name
+            in (
+                "chandra_source_regions",
+                "chandra_flare_gti",
+                "chandra_barycenter",
+                "chandra_calculate_spectra",
+            )
+        ]
+        assert handed == [0, 0, 0, 0, 2, 2, 2, 2]
+
+    def test_every_record_of_a_part_carries_its_label(self, tmp_path, stub_every_step, monkeypatch):
+        """One heading per part on the report page, the way XMM has one per exposure."""
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        records = [json.loads(path.read_text()) for path in (tmp_path / "1411").rglob("*.json")]
+        keyed = {
+            (record["step"], record.get("key"))
+            for record in records
+            if record.get("step") not in (None, "chandra_front_end")
+        }
+        assert keyed == {
+            (step, key)
+            for step in (
+                "source_region",
+                "flare_filtering",
+                "clean_event_list",
+                "pileup_check",
+                "barycenter",
+                "calculate_spectra",
+            )
+            for key in ("obi000", "obi002")
+        }
+
+    def test_each_part_s_tools_log_to_files_of_its_own(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
+
+        logs = [kwargs["log_to"] for _, _, kwargs in stub_every_step if "log_to" in kwargs]
+        assert all("obi000" in log or "obi002" in log for log in logs)
+        assert len(set(logs)) == len(logs)
+
+    def test_a_part_that_fails_does_not_take_the_other_down(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        """XMM's rule for its exposures, measured on 0560590201: write the loss down, keep
+        what worked."""
+        self._in_parts(stub_every_step, monkeypatch)
+
+        def broken_for_part_0(observation, *args, **kwargs):
+            stub_every_step.append(("chandra_flare_lightcurve", (observation,) + args, kwargs))
+            if observation.part.number == 0:
+                raise RuntimeError("dmextract fell over")
+            return "curve.fits"
+
+        monkeypatch.setattr(chandra, "chandra_flare_lightcurve", broken_for_part_0)
+
+        assert self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC) is None
+
+        spectra = [
+            args[0].part.number
+            for name, args, _ in stub_every_step
+            if name == "chandra_calculate_spectra"
+        ]
+        assert spectra == [2]
+        record = next((tmp_path / "1411").rglob("*flare_filtering*obi000*.json")).read_text()
+        assert "failed" in record
+
+    def test_when_every_part_fails_the_observation_fails(
+        self, tmp_path, stub_every_step, monkeypatch
+    ):
+        self._in_parts(stub_every_step, monkeypatch)
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("dmextract fell over")
+
+        monkeypatch.setattr(chandra, "chandra_flare_lightcurve", broken)
+
+        with pytest.raises(RuntimeError, match="no part of 1411 .*dmextract fell over"):
+            self._reduce_1411(tmp_path, ra=self.RA, dec=self.DEC)
 
     def test_no_ephemeris_means_no_source_events_and_the_rest_still_runs(
         self, tmp_path, stub_every_step, monkeypatch

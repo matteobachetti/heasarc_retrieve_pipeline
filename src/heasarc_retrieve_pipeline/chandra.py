@@ -49,12 +49,14 @@ import gzip
 import os
 import re
 import shutil
+import dataclasses
 from dataclasses import dataclass
 from itertools import takewhile
 from typing import Optional
 
 import numpy as np
 from astropy.io import fits
+from astropy.time import Time
 
 from prefect import flow
 
@@ -681,6 +683,30 @@ def chandra_repro_path(obsid, config):
     return os.path.join(chandra_base_output_path(obsid, config), "repro")
 
 
+def chandra_part_repro_path(obsid, config, number):
+    """
+    Where ``chandra_repro`` writes one part of an observation taken in parts.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    number : int
+        The part number, as :class:`ObservationPart` has it.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/repro_obiNNN``, beside :func:`chandra_repro_path` and
+        named the way :func:`chandra_part_label` names the part's products. A directory
+        per part is not tidiness: the task names its products without a part number, so
+        two parts in one directory would overwrite each other.
+    """
+    return f"{chandra_repro_path(obsid, config)}_obi{int(number):03d}"
+
+
 def _glob_both_ways(root, pattern):
     """
     Every file under one root matching a glob, sorted, gzipped or not.
@@ -1044,6 +1070,362 @@ def chandra_grating_responses(obsid, config):
     return sorted(found)
 
 
+@dataclass(frozen=True)
+class ObservationPart:
+    """
+    One pointing of an observation, and the files that belong to it alone.
+
+    Some Chandra observations were taken in several separate pointings under one obsid --
+    ``1411`` is two, 84 days apart. Chandra calls each an OBI, an observation interval.
+    The archive merges their events into one level-2 list and ships everything else once
+    per part, and each part has to be reduced with its own: its own dead time, its own
+    aspect, its own orbit. An ordinary observation is simply one part.
+
+    Attributes
+    ----------
+    number : int or None
+        The part number as the archive writes it, ``2`` for ``hrcf01411_002N006_dtf1``.
+        Numbers can skip and need not start at zero -- ``433`` is parts 1, 3 and 4.
+        ``None`` only when nothing downloaded carries one.
+    tstart, tstop : float or None
+        The span of the part's own files, in spacecraft seconds. For an observation of one
+        part, the event list's.
+    dead_time_file : str or None
+        HRC only.
+    aspect_solutions : tuple of str
+        Every aspect solution of this part. Usually one; ``433``'s first part has three.
+    orbit_ephemeris, bad_pixel_file, mask_file, gti_file : str or None
+    event_list : str or None
+        The part's own level-2 event list, which only the reprocessing route has:
+        ``chandra_repro`` run on each part in turn. ``None`` means the part's events are
+        still inside the archive's merged list.
+    """
+
+    number: Optional[int]
+    tstart: Optional[float]
+    tstop: Optional[float]
+    dead_time_file: Optional[str] = None
+    aspect_solutions: tuple = ()
+    orbit_ephemeris: Optional[str] = None
+    bad_pixel_file: Optional[str] = None
+    mask_file: Optional[str] = None
+    gti_file: Optional[str] = None
+    event_list: Optional[str] = None
+
+
+#: The families a part is made of: ``(field, archive patterns, repro pattern)``, searched
+#: the way the single-file getters above search them. The bad-pixel list is looked for in
+#: both directories, because ACIS files it under ``primary/`` and HRC under ``secondary/``.
+_PART_FAMILIES = (
+    ("dead_time_file", (os.path.join("primary", "*_dtf1.fits"),), None),
+    ("aspect_solutions", (os.path.join("primary", "*_asol1.fits"),), "pcadf*_asol1.fits"),
+    ("orbit_ephemeris", (os.path.join("primary", "orbitf*_eph1.fits"),), None),
+    (
+        "bad_pixel_file",
+        (os.path.join("primary", "*_bpix1.fits"), os.path.join("secondary", "*_bpix1.fits")),
+        "*_repro_bpix1.fits",
+    ),
+    ("mask_file", (os.path.join("secondary", "*_msk1.fits"),), "*_msk1.fits"),
+    ("gti_file", (os.path.join("secondary", "*_flt1.fits"),), "*_repro_flt2.fits"),
+)
+
+#: Read only for the time it spans: every part has one, on both instruments.
+_PART_FIELD_OF_VIEW = os.path.join("primary", "*_fov1.fits")
+
+#: ``hrcf01411_002N006_dtf1`` and ``pcadf01411_002N001_asol1`` both name part 2. The
+#: time-named ``pcadf071323369N004_asol1`` and ``orbitf057024064N002_eph1`` name none.
+_PART_NUMBER_RE = re.compile(r"^[a-z]+f\d+_(\d{3})N\d{3}_")
+
+#: The processing version, ``N006``, which is what two copies of one file differ by.
+_VERSION_RE = re.compile(r"N\d{3}(?=_)")
+
+
+def _part_number(path):
+    """The part number in an archive name, or ``None`` when the name carries none."""
+    found = _PART_NUMBER_RE.match(os.path.basename(path))
+    return None if found is None else int(found.group(1))
+
+
+def _family_files(obsid, config, archive_patterns, repro):
+    """Every file of one family, from the first directory that holds any."""
+    for pattern in archive_patterns:
+        found = _archive_products(obsid, config, pattern, repro)
+        if found:
+            return found
+    return []
+
+
+def _refuse_two_versions(obsid, files):
+    """
+    Raise when one file is present twice, under two processing versions or compressions.
+
+    Parts legitimately differ in version -- ``108`` ships ``_000N006`` beside
+    ``_001N005`` -- so only two copies of the *same* file are refused: the same name once
+    the version and the ``.gz`` are taken off.
+    """
+    copies = {}
+    for path in files:
+        name = os.path.basename(path)
+        name = name[: -len(".gz")] if name.endswith(".gz") else name
+        copies.setdefault(_VERSION_RE.sub("N", name), []).append(path)
+    for paths in copies.values():
+        if len(paths) > 1:
+            raise ValueError(
+                f"observation {obsid} has {len(paths)} versions of one file, and one of "
+                f"them would be reduced in silence: {sorted(os.path.basename(p) for p in paths)}"
+            )
+
+
+def _time_keywords(path):
+    """``(TSTART, TSTOP, OBI_NUM)`` from a file's first extension; ``OBI_NUM`` may be None."""
+    header = fits.getheader(path, 1)
+    obi = header.get("OBI_NUM")
+    return float(header["TSTART"]), float(header["TSTOP"]), None if obi is None else int(obi)
+
+
+def _overlaps(first, second):
+    """Whether two ``(start, stop)`` spans share any time. Touching is not sharing."""
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _at_most_one(obsid, number, field, paths):
+    """The single file of a family in one part, ``None``, or an error naming them all."""
+    if len(paths) > 1:
+        what = "orbit ephemeris" if field == "orbit_ephemeris" else field.replace("_", " ")
+        raise ValueError(
+            f"part {number} of observation {obsid} has {len(paths)} {what} files, and "
+            f"choosing one would be a guess: {sorted(os.path.basename(p) for p in paths)}"
+        )
+    return paths[0] if paths else None
+
+
+def _reprocessed_part(obsid, config, part):
+    """
+    One part, with what ``chandra_repro`` wrote for it in place of the archive's files.
+
+    Run part by part, the task gives every part a directory of its own, and the names in
+    it carry no part number -- ``acisf00380_repro_evt2.fits`` in both of ``380``'s -- so
+    the directory is what says which part a file belongs to. What the task does not write,
+    the orbit ephemeris and the dead-time file, stays the download's, paired by time.
+    """
+    directory = chandra_part_repro_path(obsid, config, part.number)
+    events = _glob_both_ways(directory, REPRO_EVENT_LIST_PATTERN)
+    if not events:
+        raise FileNotFoundError(
+            f"{obsid}: products='repro' was asked for and part {part.number} has no "
+            f"reprocessed event list in {directory}"
+        )
+    found = {"event_list": _at_most_one(obsid, part.number, "event_list", events)}
+    for field, _, repro in _PART_FAMILIES:
+        files = [] if repro is None else _glob_both_ways(directory, repro)
+        if files:
+            found[field] = (
+                tuple(files)
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, part.number, field, files)
+            )
+    return dataclasses.replace(part, **found)
+
+
+def chandra_observation_parts(obsid, config):
+    """
+    Split an observation's companion files into its parts.
+
+    **Files that carry a part number are paired by it**; files that do not are paired by
+    the time they cover. That second rule is not optional: orbit files are named by start
+    time on every observation, and so are the aspect solutions of the oldest ones --
+    ``433`` has five ``pcadf<time>N004_asol1`` files for three parts. Where a time-paired
+    file's header has ``OBI_NUM``, it must agree with the part the time put it in.
+
+    **An observation of one part opens nothing new.** Every file belongs to that part, and
+    its span is the event list's own ``TSTART`` and ``TSTOP``. This is the path every
+    ordinary observation takes, and the companions' headers are never read on it.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``. ``products`` chooses where to look, as it does
+        for the single-file getters.
+
+    Returns
+    -------
+    tuple of ObservationPart
+        In part-number order. One, for an ordinary observation.
+
+    Raises
+    ------
+    ValueError
+        If one file of one part is present in two versions; if a part has two orbit files,
+        bad-pixel lists, masks, good-time files or dead-time files; or if a time-paired
+        file's ``OBI_NUM`` names a different part from the one its time falls in.
+    """
+    obsid = chandra_obsid(obsid)
+    families = {
+        field: _family_files(obsid, config, archive, repro)
+        for field, archive, repro in _PART_FAMILIES
+    }
+    fields_of_view = _archive_products(obsid, config, _PART_FIELD_OF_VIEW)
+    for files in (*families.values(), fields_of_view):
+        _refuse_two_versions(obsid, files)
+
+    numbered = {}
+    for files in (*families.values(), fields_of_view):
+        for path in files:
+            if _part_number(path) is not None:
+                numbered.setdefault(_part_number(path), []).append(path)
+
+    if len(numbered) <= 1:
+        number = next(iter(numbered), None)
+        events = chandra_event_list(obsid, config)
+        tstart = tstop = None
+        if events is not None:
+            header = fits.getheader(events, 1)
+            tstart, tstop = header.get("TSTART"), header.get("TSTOP")
+        fields = {
+            field: (
+                tuple(files)
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, number, field, files)
+            )
+            for field, files in families.items()
+        }
+        return (
+            ObservationPart(
+                number=number,
+                tstart=None if tstart is None else float(tstart),
+                tstop=None if tstop is None else float(tstop),
+                **fields,
+            ),
+        )
+
+    spans = {}
+    for number, paths in numbered.items():
+        times = [_time_keywords(path) for path in paths]
+        spans[number] = (min(t[0] for t in times), max(t[1] for t in times))
+
+    unnumbered = {
+        path: _time_keywords(path)
+        for files in families.values()
+        for path in files
+        if _part_number(path) is None
+    }
+    paired = set()
+    parts = []
+    for number in sorted(numbered):
+        fields = {}
+        for field, files in families.items():
+            mine = [path for path in files if _part_number(path) == number]
+            for path in files:
+                if path not in unnumbered or not _overlaps(unnumbered[path][:2], spans[number]):
+                    continue
+                header_part = unnumbered[path][2]
+                if header_part is not None and header_part != number:
+                    raise ValueError(
+                        f"{os.path.basename(path)} falls in the time of part {number} of "
+                        f"observation {obsid}, and its OBI_NUM says part {header_part}"
+                    )
+                mine.append(path)
+                paired.add(path)
+            fields[field] = (
+                tuple(sorted(mine))
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, number, field, mine)
+            )
+        parts.append(ObservationPart(number, *spans[number], **fields))
+
+    for path in sorted(set(unnumbered) - paired):
+        get_logger().warning(
+            f"{obsid}: {os.path.basename(path)} covers the time of none of the "
+            f"{len(parts)} parts, so no part uses it"
+        )
+
+    # The pairing above ran on the download, which the reprocessing route still has; each
+    # part then takes what chandra_repro remade for it. See chandra_repro_front_end.
+    if config.get("products", DEFAULT_CONFIG["products"]) == "repro":
+        parts = [_reprocessed_part(obsid, config, part) for part in parts]
+    return tuple(parts)
+
+
+#: Chandra's mission reference, 1998-01-01 in TT, for an event list that does not say.
+CHANDRA_MJDREF = 50814.0
+
+
+def chandra_parts_warning(obsid, stem, parts, mjdref=CHANDRA_MJDREF):
+    """
+    What the log, the record and the report page say about an observation in parts.
+
+    In words, because it changes how everything else about the observation is read: how
+    many parts there are, when each was taken, how far apart, and what each part's products
+    are called.
+
+    Parameters
+    ----------
+    obsid : str
+    stem : str
+        The observation's stem, which each part's label is added to.
+    parts : sequence of ObservationPart
+    mjdref : float, optional
+        What the parts' times count from, as the event list's ``MJDREF`` gives it.
+
+    Returns
+    -------
+    str or None
+        ``None`` for an observation of one part.
+
+    Examples
+    --------
+    >>> parts = (ObservationPart(1, 74117285.6, 74123990.7), ObservationPart(2, 77203909.7, 77206498.4))
+    >>> print(chandra_parts_warning("380", "chandra00380_acisi_timed", parts))
+    ... # doctest: +NORMALIZE_WHITESPACE
+    380 was taken in 2 parts, 35.6 days apart: part 1 on 2000-05-07 to 2000-05-07, whose
+    products are named chandra00380_acisi_timed_obi001; part 2 on 2000-06-12 to 2000-06-12,
+    whose products are named chandra00380_acisi_timed_obi002. Each part is reduced as an
+    observation of its own and nothing is merged across the gap, so a timing search over
+    more than one part has to be chosen, not inherited.
+    """
+    if len(parts) < 2:
+        return None
+
+    def date(met):
+        return Time(mjdref + met / 86400.0, format="mjd", scale="tt").utc.iso[:10]
+
+    gaps = [
+        f"{(later.tstart - earlier.tstop) / 86400.0:.1f}"
+        for earlier, later in zip(parts, parts[1:])
+    ]
+    each = "; ".join(
+        f"part {part.number} on {date(part.tstart)} to {date(part.tstop)}, whose products "
+        f"are named {stem}_{chandra_part_label(part)}"
+        for part in parts
+    )
+    return (
+        f"{obsid} was taken in {len(parts)} parts, {' and '.join(gaps)} days apart: {each}. "
+        "Each part is reduced as an observation of its own and nothing is merged across the "
+        "gap, so a timing search over more than one part has to be chosen, not inherited."
+    )
+
+
+def _part_summary(part):
+    """One part as the diagnostics record carries it: numbers and file names, not paths."""
+
+    def name(path):
+        return None if path is None else os.path.basename(path)
+
+    return dict(
+        number=part.number,
+        tstart=part.tstart,
+        tstop=part.tstop,
+        dead_time_file=name(part.dead_time_file),
+        aspect_solutions=[os.path.basename(path) for path in part.aspect_solutions],
+        orbit_ephemeris=name(part.orbit_ephemeris),
+        bad_pixel_file=name(part.bad_pixel_file),
+        mask_file=name(part.mask_file),
+        gti_file=name(part.gti_file),
+    )
+
+
 #: ``READMODE`` as the header spells it, against the label an output file carries.
 ACIS_READ_MODES = {"TIMED": "timed", "CONTINUOUS": "cc"}
 
@@ -1170,6 +1552,10 @@ class TimeResolution:
     veto_ratio, trigger_rate_hz : float or None
         Carried through from :class:`DeadTimeFactors` when there was one, so the record
         shows the evidence and not only the conclusion.
+    parts : tuple of dict
+        For an observation taken in several parts, each part's own answer -- ``number``,
+        ``seconds``, ``basis``, ``fast_timing``, ``veto_ratio``, ``trigger_rate_hz`` and
+        ``exposure_s`` -- so the record shows what was combined. Empty for one part.
     """
 
     seconds: float
@@ -1178,6 +1564,7 @@ class TimeResolution:
     fast_timing: Optional[bool] = None
     veto_ratio: Optional[float] = None
     trigger_rate_hz: Optional[float] = None
+    parts: tuple = ()
 
 
 def read_dead_time_factors(path):
@@ -1372,6 +1759,256 @@ def chandra_time_resolution(header, dtf=None, config=None):
     raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
 
 
+def combine_dead_time_factors(factors, exposures):
+    """
+    Several parts' dead-time evidence as one, each part weighted by its exposure.
+
+    Parameters
+    ----------
+    factors : sequence of DeadTimeFactors
+    exposures : sequence of float or None
+        Seconds of good time per part. Where any is unknown, or they sum to nothing, every
+        part weighs the same.
+
+    Returns
+    -------
+    DeadTimeFactors
+        The veto ratio, trigger rate and sample interval are weighted means; the row counts
+        are totals.
+
+    Examples
+    --------
+    >>> one = DeadTimeFactors(0.2, 200.0, 2.05, 10, 10)
+    >>> two = DeadTimeFactors(0.3, 100.0, 2.05, 10, 12)
+    >>> round(combine_dead_time_factors([one, two], [3000.0, 1000.0]).veto_ratio, 3)
+    0.225
+    """
+    weights = np.array([np.nan if one is None else float(one) for one in exposures])
+    if not np.all(np.isfinite(weights)) or weights.sum() <= 0:
+        weights = np.ones(len(factors))
+
+    def mean(values):
+        return float(np.average(np.asarray(values, dtype=float), weights=weights))
+
+    return DeadTimeFactors(
+        veto_ratio=mean([one.veto_ratio for one in factors]),
+        trigger_rate_hz=mean([one.trigger_rate_hz for one in factors]),
+        sample_interval=mean([one.sample_interval for one in factors]),
+        n_good_rows=sum(one.n_good_rows for one in factors),
+        n_rows=sum(one.n_rows for one in factors),
+    )
+
+
+def chandra_parts_time_resolution(header, evidence, config=None):
+    """
+    One time resolution for an observation taken in several parts.
+
+    Every part is first answered on its own, by :func:`chandra_time_resolution`, and the
+    answers are kept. Then:
+
+    * **ACIS** -- the parts were checked to share their readout by
+      :func:`chandra_check_part_configurations`, so they share one answer.
+    * **HRC, every part on the same side of the veto threshold** -- the dead-time evidence
+      is combined, weighted by each part's exposure, and answered once. On obsid ``1411``
+      that is a veto ratio of 0.227 and 4.93 ms, between its parts' 4.82 and 5.18 ms.
+    * **HRC, parts on opposite sides**, or a part with no dead-time file beside one with
+      -- the coarser answer. An average here is a trap: 500 ks unvetoed and 1 ks vetoed
+      average above the threshold and would claim 15.625 us for events of which some are
+      good to 5 ms.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        The merged event list's header, as for :func:`chandra_time_resolution`.
+    evidence : sequence of tuple
+        ``(part number, DeadTimeFactors or None, exposure in seconds or None)``, one per
+        part. See :func:`chandra_part_exposure`.
+    config : dict, optional
+        Only ``hrc_veto_ratio_threshold`` is read.
+
+    Returns
+    -------
+    TimeResolution
+        For one part, exactly what :func:`chandra_time_resolution` returns, and nothing
+        about exposure is needed.
+    """
+    evidence = list(evidence)
+    if len(evidence) == 1:
+        return chandra_time_resolution(header, evidence[0][1], config)
+
+    answers = [chandra_time_resolution(header, dtf, config) for _, dtf, _ in evidence]
+    parts = tuple(
+        dict(
+            number=number,
+            seconds=answer.seconds,
+            basis=answer.basis,
+            fast_timing=answer.fast_timing,
+            veto_ratio=answer.veto_ratio,
+            trigger_rate_hz=answer.trigger_rate_hz,
+            exposure_s=exposure,
+        )
+        for (number, _, exposure), answer in zip(evidence, answers)
+    )
+    count = len(evidence)
+    by_part = "; ".join(f"part {part['number']}: {part['seconds'] * 1e3:.3g} ms" for part in parts)
+
+    def answered(answer, reason, **changes):
+        fields = dict(
+            seconds=answer.seconds,
+            basis=answer.basis,
+            fast_timing=answer.fast_timing,
+            veto_ratio=answer.veto_ratio,
+            trigger_rate_hz=answer.trigger_rate_hz,
+        )
+        fields.update(changes)
+        return TimeResolution(reason=reason, parts=parts, **fields)
+
+    if str(header.get("INSTRUME", "")).strip().upper() != "HRC":
+        return answered(
+            answers[0],
+            f"All {count} parts were read out the same way, so they share one answer. "
+            f"{answers[0].reason}",
+        )
+
+    dtfs = [dtf for _, dtf, _ in evidence]
+    if all(dtf is None for dtf in dtfs):
+        return answered(
+            answers[0], f"None of the {count} parts has a dead-time file. {answers[0].reason}"
+        )
+
+    if any(dtf is None for dtf in dtfs) or len({one.fast_timing for one in answers}) > 1:
+        coarsest = max(answers, key=lambda answer: answer.seconds)
+        known = [(dtf, exposure) for _, dtf, exposure in evidence if dtf is not None]
+        return answered(
+            coarsest,
+            f"The {count} parts of this observation do not agree on whether on-board "
+            f"vetoing took place ({by_part}), so the coarser resolution, "
+            f"part {parts[answers.index(coarsest)]['number']}'s "
+            f"{coarsest.seconds * 1e3:.3g} ms, is the one that holds for the observation as "
+            "a whole. An average would claim a resolution some of its events do not have.",
+            basis="hrc_parts_disagree",
+            fast_timing=False,
+            veto_ratio=combine_dead_time_factors(*zip(*known)).veto_ratio,
+        )
+
+    combined = chandra_time_resolution(
+        header,
+        combine_dead_time_factors(dtfs, [exposure for _, _, exposure in evidence]),
+        config,
+    )
+    return answered(
+        combined,
+        f"Combined over {count} parts, weighted by exposure ({by_part}). {combined.reason}",
+    )
+
+
+def chandra_part_exposure(part):
+    """
+    How much good time one part holds, which is what its evidence is weighted by.
+
+    Parameters
+    ----------
+    part : ObservationPart
+
+    Returns
+    -------
+    float or None
+        The part's own good-time intervals, summed; failing those, the span its files
+        cover; failing that, ``None``, which :func:`combine_dead_time_factors` reads as
+        "weigh every part the same".
+    """
+    if part.gti_file is not None:
+        gti = read_observation_gti(part.gti_file)
+        if gti is not None and len(gti):
+            return float(np.sum(gti[:, 1] - gti[:, 0]))
+    if part.tstart is not None and part.tstop is not None:
+        return float(part.tstop - part.tstart)
+    return None
+
+
+def _time_resolution_evidence(parts):
+    """``(number, dead-time factors, exposure)`` per part; exposure only when there are several."""
+    several = len(parts) > 1
+    return [
+        (
+            part.number,
+            None if part.dead_time_file is None else read_dead_time_factors(part.dead_time_file),
+            chandra_part_exposure(part) if several else None,
+        )
+        for part in parts
+    ]
+
+
+#: What every part of an observation must share for one time resolution and one file stem
+#: to describe them all: the readout mode, the frame time, and the chips -- or, for HRC,
+#: the detector.
+PART_CONFIGURATION_KEYWORDS = ("READMODE", "TIMEDEL", "DETNAM")
+
+
+def chandra_check_part_configurations(header, parts):
+    """
+    Refuse an observation whose parts were not taken the same way.
+
+    Each part's good-time file repeats the readout keywords -- measured on obsid ``380``,
+    whose mask and field-of-view files do too -- and they are compared with each other and
+    with the merged event list. ``FIRSTROW`` is deliberately not among them: the mask file
+    uses that name for something else, 3 against the event list's 1 on ``380``, and a
+    subarray already shows in ``TIMEDEL``.
+
+    An observation of one part is not checked, and nothing is opened.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        The merged event list's header.
+    parts : sequence of ObservationPart
+
+    Raises
+    ------
+    ValueError
+        If any of :data:`PART_CONFIGURATION_KEYWORDS` differs anywhere. One time resolution
+        and one file stem cannot describe both, and reducing them as one would be wrong in
+        silence.
+    """
+    if len(parts) < 2:
+        return
+
+    rows = [("the event list", header, True)]
+    for part in parts:
+        # A reprocessed part's own event list first: chandra_repro's flt2 repeats none of
+        # the readout keywords, measured on 380.
+        source = part.event_list or part.gti_file or part.mask_file
+        if source is not None:
+            rows.append(
+                (f"part {part.number}", fits.getheader(source, 1), part.event_list is not None)
+            )
+
+    # A good-time file's TIMEDEL is its own sampling: 0.25625 s in both of 1411's HRC
+    # std_flt1 files against the event list's 1.5625e-05 s. Only ACIS's repeats the frame
+    # time. So it is compared between files of one kind -- the parts' good-time files with
+    # each other, or event lists with event lists.
+    every_part_has_events = all(events for _, _, events in rows[1:])
+
+    for keyword in PART_CONFIGURATION_KEYWORDS:
+        seen = {
+            label: (
+                round(float(found[keyword]), 9)
+                if keyword == "TIMEDEL"
+                else str(found[keyword]).strip().upper()
+            )
+            for label, found, events in rows
+            if found.get(keyword) is not None
+            and (keyword != "TIMEDEL" or events == every_part_has_events)
+        }
+        if len(set(seen.values())) > 1:
+            raise ValueError(
+                f"the parts of this observation were not taken the same way: {keyword} is "
+                + ", ".join(f"{value} in {label}" for label, value in seen.items())
+                + ". One time resolution and one file stem cannot describe them, so the "
+                "observation is refused rather than reduced as if it were one."
+            )
+
+
 #: The CALDB current on the CXC's conda channel on 2026-09-12.
 #:
 #: Used only to say how stale an archive product's calibration is. It is a diagnostic and
@@ -1444,11 +2081,15 @@ class Observation:
         The level-2 event list. Every other path may be ``None``; this one may not, and an
         observation without it is not an ``Observation`` at all.
     aspect_solution, bad_pixel_file, mask_file, gti_file : str or None
-        Companion products.
+        Companion products. All four are ``None`` for an observation of several parts,
+        where each part has its own in ``parts``: see :attr:`aspect_solutions` and
+        :func:`chandra_part_observation`.
     dead_time_file : str or None
-        HRC only, and ``None`` for ACIS is normal rather than missing.
+        HRC only, and ``None`` for ACIS is normal rather than missing. ``None`` too for an
+        observation of several parts, where each part's is in ``parts``.
     orbit_ephemeris : str or None
-        What ``axbary`` barycentres with.
+        What ``axbary`` barycentres with. ``None`` for an observation of several parts,
+        each of which has its own in ``parts``.
     grating_spectrum : str or None
     grating_responses : tuple of str
         The archive's ready-made grating products, collected and never re-made.
@@ -1467,6 +2108,13 @@ class Observation:
     sky_pixel_arcsec : float or None
         What one sky pixel is on the sky, as the event list declares it: 0.492 arcseconds
         for ACIS and 0.1318 for HRC. Left ``None``, it is filled in from ``detector``.
+    parts : tuple of ObservationPart
+        The pointings the observation was taken in, each with its own companion files --
+        see :func:`chandra_observation_parts`. One for an ordinary observation; empty only
+        for an ``Observation`` built by hand.
+    part : ObservationPart or None
+        Set when this ``Observation`` is one part of an observation taken in several, as
+        :func:`chandra_part_observation` makes it; the part's label then ends the stem.
     """
 
     obsid: str
@@ -1489,6 +2137,8 @@ class Observation:
     data_mode: Optional[str] = None
     active_rows: Optional[tuple] = None
     sky_pixel_arcsec: Optional[float] = None
+    parts: tuple = ()
+    part: Optional[ObservationPart] = None
 
     def __post_init__(self):
         if self.sky_pixel_arcsec is None:
@@ -1497,7 +2147,21 @@ class Observation:
     @property
     def stem(self):
         """What every output file of this observation is named from."""
-        return chandra_file_stem(self.obsid, self.detector, self.mode)
+        stem = chandra_file_stem(self.obsid, self.detector, self.mode)
+        return stem if self.part is None else f"{stem}_{chandra_part_label(self.part)}"
+
+    @property
+    def aspect_solutions(self):
+        """
+        Every aspect solution the merged event list was made with, in time order.
+
+        The one ``aspect_solution`` when there is one. Otherwise every part's own, one after
+        another -- ``433`` has five for three parts, three of them in its first -- which
+        is also what one part taken as its own observation holds.
+        """
+        if self.aspect_solution is not None:
+            return (self.aspect_solution,)
+        return tuple(path for part in self.parts for path in part.aspect_solutions)
 
     @property
     def is_continuous_clocking(self):
@@ -1562,12 +2226,15 @@ def chandra_archive_front_end(obsid, config, rec=None):
     if events is None:
         return None
 
-    with fits.open(events) as hdulist:
+    parts = chandra_observation_parts(obsid, config)
+    # Reprocessed part by part, the archive's merged list is still there, and still names
+    # the CIAO that made it rather than the one that ran; the first part's own list does not.
+    with fits.open(parts[0].event_list or events) as hdulist:
         header = hdulist[1].header
 
-    dtf_path = chandra_dead_time_file(obsid, config)
-    dtf = read_dead_time_factors(dtf_path) if dtf_path is not None else None
-    resolution = chandra_time_resolution(header, dtf, config)
+    chandra_check_part_configurations(header, parts)
+    resolution = chandra_parts_time_resolution(header, _time_resolution_evidence(parts), config)
+    dtf_path = parts[0].dead_time_file if len(parts) == 1 else None
 
     observation = Observation(
         obsid=obsid,
@@ -1577,12 +2244,12 @@ def chandra_archive_front_end(obsid, config, rec=None):
         time_resolution=resolution,
         chips=tuple(chandra_chips(header)),
         event_list=events,
-        aspect_solution=chandra_aspect_solution(obsid, config),
-        bad_pixel_file=chandra_bad_pixel_file(obsid, config),
-        mask_file=chandra_mask_file(obsid, config),
-        gti_file=chandra_gti_file(obsid, config),
+        aspect_solution=chandra_aspect_solution(obsid, config) if len(parts) <= 1 else None,
+        bad_pixel_file=chandra_bad_pixel_file(obsid, config) if len(parts) <= 1 else None,
+        mask_file=chandra_mask_file(obsid, config) if len(parts) <= 1 else None,
+        gti_file=chandra_gti_file(obsid, config) if len(parts) <= 1 else None,
         dead_time_file=dtf_path,
-        orbit_ephemeris=chandra_orbit_ephemeris(obsid, config),
+        orbit_ephemeris=chandra_orbit_ephemeris(obsid, config) if len(parts) <= 1 else None,
         grating_spectrum=chandra_grating_spectrum(obsid, config),
         grating_responses=tuple(chandra_grating_responses(obsid, config)),
         caldb_version=_keyword(header, "CALDBVER"),
@@ -1590,10 +2257,18 @@ def chandra_archive_front_end(obsid, config, rec=None):
         data_mode=_keyword(header, "DATAMODE"),
         active_rows=_active_rows(header),
         sky_pixel_arcsec=chandra_sky_pixel_arcsec(header),
+        parts=parts,
     )
+
+    warning = chandra_parts_warning(
+        obsid, observation.stem, parts, float(header.get("MJDREF", CHANDRA_MJDREF))
+    )
+    if warning is not None:
+        get_logger().warning(warning)
 
     if rec is not None:
         rec.value(
+            warnings=[] if warning is None else [warning],
             detector=observation.detector,
             grating=observation.grating,
             mode=observation.mode,
@@ -1604,14 +2279,17 @@ def chandra_archive_front_end(obsid, config, rec=None):
             time_resolution_reason=resolution.reason,
             hrc_veto_ratio=resolution.veto_ratio,
             hrc_trigger_rate_hz=resolution.trigger_rate_hz,
+            time_resolution_parts=list(resolution.parts),
             caldb_version=observation.caldb_version,
             caldb_current=CURRENT_CALDB_VERSION,
             caldb_is_stale=observation.caldb_is_stale,
             ascds_version=observation.ascds_version,
             data_mode=observation.data_mode,
-            has_dead_time_file=dtf_path is not None,
+            has_dead_time_file=all(part.dead_time_file is not None for part in parts),
             n_grating_responses=len(observation.grating_responses),
             sky_pixel_arcsec=observation.sky_pixel_arcsec,
+            n_parts=len(parts),
+            parts=[_part_summary(part) for part in parts],
         )
 
     return observation
@@ -1646,6 +2324,65 @@ def chandra_archive_front_end(obsid, config, rec=None):
 REPRO_EVENT_LIST_PATTERN = "*_repro_evt2.fits"
 
 
+def _chandra_repro_in_parts(obsid, config, level1, env, log_to):
+    """
+    ``splitobs``, then ``chandra_repro`` once per part; the reprocessing directories.
+
+    ``chandra_repro`` refuses an observation in parts, and its help page says to separate
+    them with ``splitobs`` first. That writes ``<outroot>_NNN`` per part, named by the
+    level-1 lists' ``OBI_NUM``, which is the number in their file names too.
+
+    Both return 0 on failure, so both are checked. Measured on ``380`` on 2026-09-13:
+    with ``ASCDS_CALIB`` unset, ``splitobs`` cannot read a header, says only that the
+    observation "is neither interleaved nor multiobi", and makes nothing; ``chandra_repro``
+    pointed at the missing directory then exits 0 as well.
+    """
+    from . import ciao
+
+    numbers = [_part_number(path) for path in level1]
+    if None in numbers:
+        raise ValueError(
+            f"{obsid}: a level-1 event list without a part number in its name, so splitobs's "
+            f"directories cannot be told apart: {[os.path.basename(p) for p in level1]}"
+        )
+
+    outroot = os.path.join(chandra_base_output_path(obsid, config), "split", obsid)
+    os.makedirs(os.path.dirname(outroot), exist_ok=True)
+    ciao.run(
+        "splitobs",
+        produces=[],  # one directory per part, checked below
+        indir=chandra_archive_path(obsid, config),
+        outroot=outroot,
+        clobber="yes",
+        env=env,
+        log_to=log_to,
+    )
+
+    outdirs = []
+    for number in sorted(set(numbers)):
+        split = f"{outroot}_{number:03d}"
+        if not os.path.isdir(split):
+            raise RuntimeError(
+                f"{obsid}: splitobs returned cleanly and wrote nothing for part {number} "
+                f"into {split}. It fails this way when it cannot read the headers, as with "
+                "ASCDS_CALIB unset."
+            )
+        outdir = chandra_part_repro_path(obsid, config, number)
+        os.makedirs(outdir, exist_ok=True)
+        ciao.run(
+            "chandra_repro",
+            produces=[],  # the event list is checked by the caller
+            indir=split,
+            outdir=outdir,
+            set_ardlib="no",
+            clobber="yes",
+            env=env,
+            log_to=log_to,
+        )
+        outdirs.append(outdir)
+    return outdirs
+
+
 def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     """
     Re-run the archive's pipeline with ``chandra_repro``, then read what it wrote.
@@ -1666,6 +2403,12 @@ def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     theirs: the task cross-references them in headers this pipeline did not write. Its
     names carry the obsid already, and :func:`chandra_repro_path` puts them in a directory
     that carries it too.
+
+    **An observation taken in parts is split first.** Several level-1 event lists mean
+    several parts, and ``chandra_repro`` does not accept those: ``splitobs`` separates
+    them, and ``chandra_repro`` runs on each into :func:`chandra_part_repro_path`. Each
+    part is then read from its own directory (see :func:`chandra_observation_parts`), with
+    the orbit ephemeris and dead-time file still the download's, paired by time.
 
     Parameters
     ----------
@@ -1709,43 +2452,64 @@ def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     if not os.path.isdir(indir) or not os.listdir(indir):
         return None
 
-    if chandra_level1_event_list(obsid, config) is None:
+    level1 = _archive_products(obsid, config, os.path.join("secondary", "*_evt1.fits"))
+    if not level1:
         raise FileNotFoundError(
             f"{obsid}: products='repro' was asked for and no level-1 event list was "
             f"downloaded to {indir}. The archive route's download filter does not fetch "
             f"one; re-download with products='repro' set."
         )
+    _refuse_two_versions(obsid, level1)
+    env = env if env is not None else ciao.ciao_environment(obsid, config)
 
-    # chandra_repro creates the last component of outdir and refuses to create any above
-    # it, so it is made here. An existing empty directory it accepts even with clobber=no.
-    os.makedirs(outdir, exist_ok=True)
-
-    ciao.run(
-        "chandra_repro",
-        produces=[],  # the names are chandra_repro's own; the event list is checked below
-        indir=indir,
-        outdir=outdir,
-        set_ardlib="no",
-        clobber="yes",
-        env=env if env is not None else ciao.ciao_environment(obsid, config),
-        log_to=log_to,
-    )
-
-    reprocessed = _glob_both_ways(outdir, REPRO_EVENT_LIST_PATTERN)
-    if not reprocessed:
-        raise RuntimeError(
-            f"{obsid}: chandra_repro returned cleanly and wrote no {REPRO_EVENT_LIST_PATTERN} "
-            f"into {outdir}. A zero return code proves nothing; see ciao.run."
+    if len(level1) > 1:
+        outdirs = _chandra_repro_in_parts(obsid, config, level1, env, log_to)
+    else:
+        # chandra_repro creates the last component of outdir and refuses to create any
+        # above it, so it is made here. An existing empty directory it accepts even with
+        # clobber=no.
+        os.makedirs(outdir, exist_ok=True)
+        ciao.run(
+            "chandra_repro",
+            produces=[],  # the names are chandra_repro's own; the event list is checked below
+            indir=indir,
+            outdir=outdir,
+            set_ardlib="no",
+            clobber="yes",
+            env=env,
+            log_to=log_to,
         )
+        outdirs = [outdir]
+
+    for directory in outdirs:
+        if not _glob_both_ways(directory, REPRO_EVENT_LIST_PATTERN):
+            raise RuntimeError(
+                f"{obsid}: chandra_repro returned cleanly and wrote no "
+                f"{REPRO_EVENT_LIST_PATTERN} into {directory}. A zero return code proves "
+                "nothing; see ciao.run."
+            )
 
     observation = chandra_archive_front_end(obsid, config, rec=rec)
 
     if rec is not None:
+        several = len(outdirs) > 1
         rec.value(
-            repro_directory=outdir,
-            repro_event_list=observation.event_list if observation else None,
+            repro_directory=None if several else outdir,
+            repro_event_list=None if several or not observation else observation.event_list,
+            repro_directories=outdirs,
+            repro_event_lists=(
+                [part.event_list for part in observation.parts] if several and observation else []
+            ),
+            # Relative to the observation's directory when there are several: every part's
+            # products have the same names.
             reprocessed_products=sorted(
-                os.path.basename(path) for path in _glob_both_ways(outdir, "*_repro_*.fits")
+                (
+                    os.path.relpath(path, os.path.dirname(directory))
+                    if several
+                    else os.path.basename(path)
+                )
+                for directory in outdirs
+                for path in _glob_both_ways(directory, "*_repro_*.fits")
             ),
             # chandra_repro leaves CALDBVER at the value the archive's file carried -- on
             # 5644 it still read 4.9.2 after a run with CALDB 4.12.4 installed -- so on this
@@ -2025,8 +2789,14 @@ def chandra_source_position(observation, ra, dec, env=None, log_to=None):
     Parameters
     ----------
     observation : Observation
-        Its ``event_list`` sets the coordinate frame, and its ``aspect_solution`` refines
+        Its ``event_list`` sets the coordinate frame, and its ``aspect_solutions`` refine
         it. An observation with no aspect solution still converts, off the header alone.
+        One taken in several parts passes every part's, as a CIAO stack -- ``dmcoords``
+        accepts ``asolfile="a,b"`` -- because one sky position has to come out for the
+        whole merged event list. An event list that carries the averaged aspect keywords
+        ``DY_AVG``, ``DZ_AVG`` and ``DTH_AVG``, as ``1411``'s does, is converted with those
+        and ``dmcoords`` ignores the files; they are passed all the same, so the answer
+        does not depend on which kind of event list the archive happened to write.
     ra, dec : float
         Source position in degrees.
     env : dict, optional
@@ -2046,8 +2816,8 @@ def chandra_source_position(observation, ra, dec, env=None, log_to=None):
     parameters = dict(
         infile=observation.event_list, option="cel", ra=float(ra), dec=float(dec), celfmt="deg"
     )
-    if observation.aspect_solution is not None:
-        parameters["asolfile"] = observation.aspect_solution
+    if observation.aspect_solutions:
+        parameters["asolfile"] = ",".join(observation.aspect_solutions)
 
     ciao.run("dmcoords", produces=[], env=env, log_to=log_to, **parameters)
     answer = ciao.run(
@@ -3521,6 +4291,131 @@ def chandra_barycentered_source_events(
     return output
 
 
+#: Where a part pointed: absent from a merged event list whose parts pointed differently,
+#: and required by ``psfsize_srcs``.
+PART_POINTING_KEYWORDS = ("RA_PNT", "DEC_PNT", "ROLL_PNT")
+
+
+def chandra_part_label(part):
+    """
+    What names one part in a file name.
+
+    Examples
+    --------
+    >>> chandra_part_label(ObservationPart(2, 0.0, 1.0))
+    'obi002'
+    """
+    return f"obi{part.number:03d}"
+
+
+def chandra_part_observation(observation, part, config, env=None, log_to=None):
+    """
+    One part of an observation, as an observation of its own.
+
+    Matteo's ruling of 2026-09-13, and the CXC's answer too: ``splitobs`` separates the
+    parts so that each "can then be processed as if they were separate observations". Here
+    that holds from the source region on. Each part has its own aspect solutions, mask,
+    bad-pixel list, good-time file and orbit ephemeris, and ``specextract`` takes one mask
+    file per observation, so a spectrum of the merged list would have to pick one part's.
+
+    The part's events are cut out of the merged event list by its own times, into
+    ``<stem>_obiNNN_evt2.fits``. **The cut's** ``TSTART`` **and** ``TSTOP`` **are then
+    rewritten to the part's.** ``dmcopy``'s time filter trims the good-time blocks, the
+    exposure and the events, and leaves those two at the merged list's; ``dmextract`` bins
+    a light curve over them, and on ``380``'s second part that was 15 447 bins of 200 s, 7
+    with any exposure. On ``1411``, 84 days apart, it would be 36 000.
+
+    The time resolution, and with it the mode in the stem, is the part's own, from its own
+    dead-time file: ``1411``'s second part is 5.18 ms, where the combination in the front
+    end's record is 4.93.
+
+    **A part the reprocessing route already made is not cut.** ``chandra_repro`` run on
+    each part leaves an event list spanning that part alone, ``TSTART`` and ``TSTOP``
+    included (measured on ``380``), and it is used as it is.
+
+    Parameters
+    ----------
+    observation : Observation
+        The whole observation, as the front end read it.
+    part : ObservationPart
+        One of its ``parts``.
+    config : dict
+        ``out_data_path`` is where the cut goes; ``hrc_veto_ratio_threshold`` is read.
+    env : dict, optional
+    log_to : str, optional
+
+    Returns
+    -------
+    Observation
+        With ``part`` set, ``parts`` holding that part alone, and the part's companion
+        files in the single fields -- except ``aspect_solution``, which stays ``None``
+        because a part can have several: :attr:`Observation.aspect_solutions` has them.
+    """
+    from . import ciao
+
+    header = fits.getheader(part.event_list or observation.event_list, 1)
+    dtf = None if part.dead_time_file is None else read_dead_time_factors(part.dead_time_file)
+    resolution = chandra_time_resolution(header, dtf, config)
+    one = dataclasses.replace(
+        observation,
+        mode=chandra_mode_label(header, fast_timing=resolution.fast_timing),
+        time_resolution=resolution,
+        aspect_solution=None,
+        bad_pixel_file=part.bad_pixel_file,
+        mask_file=part.mask_file,
+        gti_file=part.gti_file,
+        dead_time_file=part.dead_time_file,
+        orbit_ephemeris=part.orbit_ephemeris,
+        parts=(part,),
+        part=part,
+    )
+
+    if part.event_list is not None:
+        get_logger().info(
+            f"{observation.obsid}: part {part.number} was reprocessed on its own into "
+            f"{part.event_list}, time resolution {resolution.seconds} s"
+        )
+        return dataclasses.replace(one, event_list=part.event_list)
+
+    output = os.path.join(
+        chandra_pipeline_output_path(observation.obsid, config), f"{one.stem}_evt2.fits"
+    )
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    ciao.run(
+        "dmcopy",
+        produces=output,
+        env=env,
+        log_to=log_to,
+        infile=f"{observation.event_list}[time={part.tstart!r}:{part.tstop!r}]",
+        outfile=output,
+        clobber=True,
+    )
+    # The merged list has no pointing either, because the parts pointed differently -- on
+    # 380 rolled 251.6 and 282.8 degrees -- and psfsize_srcs stops without it. Every file
+    # of the part carries its own, so the first that has them gives them.
+    pointing = {}
+    for companion in (part.gti_file, part.mask_file, part.bad_pixel_file):
+        if companion is not None and not pointing:
+            found = fits.getheader(companion, 1)
+            pointing = {key: found[key] for key in PART_POINTING_KEYWORDS if key in found}
+    with fits.open(output, mode="update") as hdulist:
+        hdulist[1].header["TSTART"] = part.tstart
+        hdulist[1].header["TSTOP"] = part.tstop
+        for key, value in pointing.items():
+            hdulist[1].header[key] = value
+        # CIAO keeps a list of the obsids taken in parts, and specextract refuses an event
+        # list of one that does not say which part it is: "For multi-OBI datasets like 380
+        # the obi argument must be set". The merged list cannot say. Measured on 380.
+        if part.number is not None:
+            hdulist[1].header["OBI_NUM"] = part.number
+
+    get_logger().info(
+        f"{observation.obsid}: part {part.number} cut into {os.path.basename(output)}, "
+        f"time resolution {resolution.seconds} s"
+    )
+    return dataclasses.replace(one, event_list=output)
+
+
 #: How hard :func:`chandra_compress_barycentered_events` compresses. Measured on obsid
 #: ``8505``'s 319 MB list: level 1 leaves 244 MB in 6 s, level 6 leaves 240 MB in 15 s.
 #: HRC event lists are mostly incompressible numbers, so the extra effort buys nothing.
@@ -4203,7 +5098,7 @@ def chandra_calculate_spectra(
         infile=cleaned + regions.source,
         outroot=root,
         bkgfile=cleaned + regions.background,
-        asp=observation.aspect_solution or "",
+        asp=",".join(observation.aspect_solutions),
         mskfile=observation.mask_file or "",
         badpixfile=observation.bad_pixel_file or "",
         bkgresp="yes",
@@ -4271,6 +5166,76 @@ NO_POSITION_REASON = (
 )
 
 
+def _chandra_reduce(obsid, observation, part, key, config, ra, dec, diagnostics, env):
+    """
+    Everything after the front end, for one observation or for one part of one.
+
+    ``part`` is ``None`` for an ordinary observation, whose records and tool logs keep the
+    names they always had. For a part, the observation is first cut down to it by
+    :func:`chandra_part_observation`, and every record is keyed and every tool log suffixed
+    with its label, ``obi000``, so that the parts cannot overwrite each other.
+    """
+    suffix = f"_{key}" if key else ""
+
+    def log(tool):
+        return tool_log_file(f"{tool}{suffix}", obsid, config)
+
+    with record_step(diagnostics, obsid, "source_region", key=key) as rec:
+        rec.value(ra=ra, dec=dec)
+        if part is not None:
+            rec.value(part=part.number)
+            observation = chandra_part_observation(
+                observation, part, config, env=env, log_to=log("dmcopy_part")
+            )
+        position, regions = chandra_source_regions(
+            observation, config, ra, dec, rec=rec, env=env, log_to=log("psfsize_srcs")
+        )
+
+    with record_step(diagnostics, obsid, "flare_filtering", key=key) as rec:
+        lightcurve = chandra_flare_lightcurve(
+            observation, position, regions, config, env=env, log_to=log("dmextract")
+        )
+        gti = chandra_flare_gti(observation, config, lightcurve, rec=rec)
+
+    with record_step(diagnostics, obsid, "clean_event_list", key=key) as rec:
+        cleaned = chandra_clean_event_list(
+            observation, config, gti, rec=rec, env=env, log_to=log("dmcopy")
+        )
+
+    with record_step(diagnostics, obsid, "pileup_check", key=key) as rec:
+        chandra_pileup(
+            observation,
+            config,
+            cleaned,
+            position,
+            regions,
+            rec=rec,
+            env=env,
+            log_to=log("pileup_map"),
+        )
+
+    with record_step(diagnostics, obsid, "barycenter", key=key) as rec:
+        barycentered = chandra_barycenter(
+            observation, config, cleaned, ra=ra, dec=dec, rec=rec, env=env, log_to=log("axbary")
+        )
+        if barycentered is not None:
+            chandra_barycentered_source_events(
+                observation,
+                config,
+                barycentered,
+                regions,
+                rec=rec,
+                env=env,
+                log_to=log("dmcopy_src_bary"),
+            )
+            chandra_compress_barycentered_events(barycentered, rec=rec)
+
+    with record_step(diagnostics, obsid, "calculate_spectra", key=key) as rec:
+        chandra_calculate_spectra(
+            observation, config, cleaned, regions, rec=rec, env=env, log_to=log("specextract")
+        )
+
+
 @flow(flow_run_name="chandra_{obsid}")
 def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
     """
@@ -4288,6 +5253,12 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
 
     Like XMM, and unlike NuSTAR, ``ra`` and ``dec`` are used as given and never
     overridden -- see :func:`chandra_source_position`.
+
+    **An observation taken in several parts is reduced one part at a time**, each as an
+    observation of its own from the source region on -- see
+    :func:`chandra_part_observation`. Every record is keyed by the part's label and every
+    output named with it. As XMM does with its exposures, a part that fails is recorded and
+    the others are still reduced; only when every part fails does the observation.
 
     Parameters
     ----------
@@ -4415,17 +5386,33 @@ def process_chandra_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None)
                 env=env,
                 log_to=tool_log_file("dmcopy_src_bary", obsid, config),
             )
-            chandra_compress_barycentered_events(barycentered, rec=rec)
+    parts = getattr(observation, "parts", ())
+    units = [(chandra_part_label(part), part) for part in parts] if len(parts) > 1 else [("", None)]
+    failed = {}
+    for key, part in units:
+        try:
+            _chandra_reduce(obsid, observation, part, key, config, ra, dec, diagnostics, env)
+        except Exception as error:
+            if part is None:
+                raise
+            # XMM's rule for its exposures: the step that failed has recorded why under this
+            # part's key, and the parts that worked are kept.
+            failed[key] = error
+            logger.error(
+                f"{obsid}: part {part.number} could not be reduced and is left out of this "
+                f"observation's products: {type(error).__name__}: {error}"
+            )
 
-    with record_step(diagnostics, obsid, "calculate_spectra") as rec:
-        chandra_calculate_spectra(
-            observation,
-            config,
-            cleaned,
-            regions,
-            rec=rec,
-            env=env,
-            log_to=tool_log_file("specextract", obsid, config),
+    if failed and len(failed) == len(units):
+        last = list(failed.values())[-1]
+        raise RuntimeError(
+            f"no part of {obsid} could be reduced; the last failure was "
+            f"{type(last).__name__}: {last}"
+        ) from last
+    if failed:
+        logger.warning(
+            f"{obsid}: reduced {len(units) - len(failed)} of {len(units)} parts. "
+            f"{', '.join(sorted(failed))} failed; the diagnostics say why."
         )
 
     logger.info(f"Finished processing Chandra observation {obsid}")

@@ -1982,6 +1982,76 @@ XMM's are: the files leave the tree that gives them context. The OBSID is padded
 the catalogue returns it as an integer while the archive's own names are padded
 (``acisf05644``); the download *directory* is unpadded, which the path helpers handle.
 
+An observation taken in parts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some observations were taken in several separate pointings under one obsid. Chandra calls
+each an OBI, an observation interval; the code calls it a *part*. ``1411`` (HRC-I) is two
+parts 84 days apart, ``380`` (ACIS-I) two parts 35.6 days apart. The archive merges the
+parts' events into one level-2 list and ships everything else once per part: dead time,
+aspect, orbit, bad pixels, mask, good times.
+
+**Each part is reduced as an observation of its own** from the source region on, with
+``_obiNNN`` added to its names (``chandra00380_acisi_timed_obi002``). Nothing is merged
+across the gap: no combined barycentred list and no combined spectrum, because
+``specextract`` takes one mask file per observation. This is also what the CXC's
+``splitobs`` is for.
+
+Pairing the files with the parts (``chandra_observation_parts``):
+
+* Files whose names carry a part number (``hrcf01411_002N006_dtf1``) are paired by it.
+  Numbers can skip and need not start at zero: ``433`` is parts 1, 3 and 4.
+* Files named by time are paired by the time they cover. Every orbit ephemeris is one, and
+  so are the oldest aspect solutions (``433`` has five for three parts). Where such a file
+  has ``OBI_NUM``, it must agree with the part its time falls in.
+* Parts may come from different processing versions (``108``); two versions of one file
+  within one part are refused.
+* Parts whose ``READMODE``, ``TIMEDEL`` or ``DETNAM`` differ are refused: one stem and one
+  time resolution cannot describe them.
+
+**The time resolution in the front end's record is combined over the parts**, and each
+part is then reduced at its own. For ACIS the parts agree by construction. For HRC the
+per-part answers from the dead-time files are weighted by exposure when they are on the
+same side of the veto threshold (``1411``: 4.82 and 5.18 ms, recorded as 4.93), and the
+coarser is taken when they are not or a dead-time file is missing.
+
+**On the archive route** a part's events are cut out of the merged list by its times, and
+the cut's ``TSTART`` and ``TSTOP`` are rewritten to the part's. ``dmcopy``'s time filter
+trims the good-time blocks, the exposure and the events but not those two keywords, and
+``dmextract`` bins a light curve over them: on ``380``'s second part that was 15 447 bins of
+200 s, 7 with any exposure. The cut is also given the part's own ``RA_PNT``, ``DEC_PNT`` and
+``ROLL_PNT``, read from its good-time, mask or bad-pixel file. The merged list has none
+where the parts pointed differently (``380`` was rolled 251.6 and 282.8 degrees, ``1411``
+60.3 and 147.3), and ``psfsize_srcs`` stops without them. Its ``OBI_NUM`` is set to the
+part's number too: CIAO keeps a list of the obsids taken in parts, and ``specextract``
+refuses an event list of one that does not say which part it holds ("For multi-OBI datasets
+like 380 the obi argument must be set"). The cut's ``PBKFILE`` is still the merged list's,
+which names one part's parameter-block file; no file of a part carries the right one.
+
+When checking that the parts were read out the same way, ``TIMEDEL`` is compared only
+between files of one kind. An HRC good-time file's ``TIMEDEL`` is its own sampling, 0.25625
+s on both of ``1411``'s parts, not the event list's 1.5625e-05 s.
+
+**On the reprocessing route** ``chandra_repro`` refuses an observation in parts, so
+``splitobs`` separates them into ``<out>/<obsid>/split/<obsid>_NNN`` and ``chandra_repro``
+runs once per part into ``<out>/<obsid>/repro_obiNNN``, since its product names carry no
+part number and two parts would overwrite each other in one directory. The result spans that part alone, ``TSTART``, ``TSTOP`` and ``OBI_NUM`` included, and is used
+without a cut. The orbit ephemeris and HRC dead-time file are not copied by either task and
+still come from the download, paired by time. Both tasks return 0 when they fail: with
+``ASCDS_CALIB`` unset, ``splitobs`` cannot read a header, says only that the observation
+"is neither interleaved nor multiobi", and makes nothing. Each part's directory and event
+list are therefore checked.
+
+**A failing part does not fail the others**, the rule XMM applies to its exposures: the
+failure is logged and recorded, the remaining parts are reduced, and only when every part
+fails does the observation raise. This is the exception to "one failing step fails the
+observation" above.
+
+**The split is announced**, in the log, in the front end's record under ``warnings``, and
+at the top of the observation's report page: how many parts, when each was taken, how far
+apart, and what its products are called. A timing search over more than one part has to be
+chosen deliberately.
+
 The time resolution the data can support
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
