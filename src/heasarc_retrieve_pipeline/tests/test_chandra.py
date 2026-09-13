@@ -1224,6 +1224,224 @@ class TestReadingTheDeadTimeFile:
             chandra.read_dead_time_factors(path)
 
 
+# ``1411``'s two dead-time files, measured on 2026-09-13: medians of 425 triggers and 95
+# telemetered events per 2.05 s sample in part 000, 396 and 93 in part 002. Both heavily
+# vetoed, at slightly different rates. The exposures are each part's good time.
+_1411_DTF_000 = chandra.DeadTimeFactors(95 / 425, 425 / 2.05, 2.05, 15233, 17737)
+_1411_DTF_002 = chandra.DeadTimeFactors(93 / 396, 396 / 2.05, 2.05, 7405, 8690)
+_1411_GOOD_TIME = (36275.00755862892, 17722.250644013286)
+
+# ``380``: M82 on ACIS-I, in two parts about 36 days apart. Names, times and keywords read
+# off the real files on 2026-09-13. Each part's good-time, mask and field-of-view files
+# repeat the readout configuration, which is what lets the parts be compared.
+_380_CONFIGURATION = {
+    "READMODE": "TIMED",
+    "DATAMODE": "VFAINT",
+    "TIMEDEL": 3.24104,
+    "DETNAM": "ACIS-012367",
+}
+_380_PART_001 = (74117285.617538, 74123990.655284, _380_CONFIGURATION)
+_380_PART_002 = (77203909.743536, 77206498.381131, _380_CONFIGURATION)
+ACIS_380_TIMES = {
+    "primary/acisf00380N007_evt2.fits.gz": (
+        74117285.617538,
+        77206498.381131,
+        dict(_380_CONFIGURATION, INSTRUME="ACIS", SIM_Z=-233.58743446083),
+    ),
+    "primary/acisf00380_001N005_bpix1.fits.gz": _380_PART_001,
+    "primary/acisf00380_001N005_fov1.fits.gz": _380_PART_001,
+    "primary/acisf00380_002N006_bpix1.fits.gz": _380_PART_002,
+    "primary/acisf00380_002N006_fov1.fits.gz": _380_PART_002,
+    "primary/orbitf073742700N001_eph1.fits.gz": (73742700.184, 75427200.184),
+    "primary/orbitf077025900N001_eph1.fits.gz": (77025900.184, 78710400.184),
+    "primary/pcadf00380_001N001_asol1.fits.gz": (74117601.31755, 74122686.855236, {"OBI_NUM": 1}),
+    "primary/pcadf00380_002N001_asol1.fits.gz": (77204795.087318, 77206184.21862, {"OBI_NUM": 2}),
+    "secondary/acisf00380_001N005_flt1.fits.gz": _380_PART_001,
+    "secondary/acisf00380_001N005_msk1.fits.gz": _380_PART_001,
+    "secondary/acisf00380_002N006_flt1.fits.gz": _380_PART_002,
+    "secondary/acisf00380_002N006_msk1.fits.gz": _380_PART_002,
+}
+
+_HRC_HEADER = {"INSTRUME": "HRC", "DETNAM": "HRC-I", "TIMEDEL": 1.5625e-05}
+
+
+class TestTimeResolutionOverSeveralParts:
+    """
+    A multi-part observation gets one time resolution, one mode label and one file stem,
+    so its parts' evidence has to be combined -- and combined so that no part is claimed
+    to be better than it is.
+    """
+
+    def test_one_part_is_exactly_the_answer_for_an_ordinary_observation(self):
+        """No second code path: a single part changes nothing, and reads no exposure."""
+        dtf = chandra.DeadTimeFactors(0.2964, 228.78, 2.05, 2392, 2769)
+
+        combined = chandra.chandra_parts_time_resolution(_HRC_HEADER, [(0, dtf, None)])
+
+        assert combined == chandra.chandra_time_resolution(_HRC_HEADER, dtf)
+
+    def test_1411_combines_its_two_vetoed_parts_weighted_by_exposure(self):
+        evidence = [
+            (0, _1411_DTF_000, _1411_GOOD_TIME[0]),
+            (2, _1411_DTF_002, _1411_GOOD_TIME[1]),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.veto_ratio == pytest.approx(0.22724, rel=1e-3)
+        assert found.trigger_rate_hz == pytest.approx(202.68, rel=1e-3)
+        assert found.seconds == pytest.approx(4.934e-3, rel=1e-3)
+        assert found.fast_timing is False
+        assert "weighted by exposure" in found.reason
+
+    def test_every_part_s_own_answer_is_kept_beside_the_combination(self):
+        evidence = [
+            (0, _1411_DTF_000, _1411_GOOD_TIME[0]),
+            (2, _1411_DTF_002, _1411_GOOD_TIME[1]),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert [part["number"] for part in found.parts] == [0, 2]
+        assert found.parts[0]["seconds"] == pytest.approx(4.8235e-3, rel=1e-3)
+        assert found.parts[1]["seconds"] == pytest.approx(5.1768e-3, rel=1e-3)
+        assert found.parts[1]["exposure_s"] == pytest.approx(17722.25)
+
+    def test_parts_on_opposite_sides_of_the_threshold_take_the_coarser_resolution(self):
+        """
+        The trap an average walks into: 500 ks unvetoed and 1 ks vetoed average to a veto
+        ratio of 0.9986, above the threshold, which would claim 15.625 us for events of
+        which some are only good to 5 ms.
+        """
+        unvetoed = chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100)
+        vetoed = chandra.DeadTimeFactors(0.3, 200.0, 2.05, 100, 100)
+        evidence = [(0, unvetoed, 500_000.0), (1, vetoed, 1_000.0)]
+        naive = chandra.combine_dead_time_factors([unvetoed, vetoed], [500_000.0, 1_000.0])
+        assert chandra.chandra_time_resolution(_HRC_HEADER, naive).fast_timing is True
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(5.0e-3)
+        assert found.fast_timing is False
+        assert found.basis == "hrc_parts_disagree"
+        assert "coarser" in found.reason
+
+    def test_two_unvetoed_parts_keep_the_header_s_resolution(self):
+        evidence = [
+            (0, chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100), 10_000.0),
+            (1, chandra.DeadTimeFactors(0.995, 62.0, 2.05, 100, 100), 20_000.0),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(1.5625e-05)
+        assert found.fast_timing is True
+
+    def test_a_part_without_its_dead_time_file_cannot_be_called_unvetoed(self):
+        """That part falls back on the documented 4 ms, and the coarser answer stands."""
+        evidence = [
+            (0, chandra.DeadTimeFactors(1.0, 60.0, 2.05, 100, 100), 10_000.0),
+            (1, None, 1.0),
+        ]
+
+        found = chandra.chandra_parts_time_resolution(_HRC_HEADER, evidence)
+
+        assert found.seconds == pytest.approx(chandra.HRC_DOCUMENTED_RESOLUTION)
+        assert found.fast_timing is False
+
+    def test_acis_parts_share_the_frame_time_they_were_checked_to_share(self):
+        header = {"INSTRUME": "ACIS", "READMODE": "TIMED", "TIMEDEL": 3.24104}
+
+        found = chandra.chandra_parts_time_resolution(
+            header, [(1, None, 3813.0), (2, None, 1184.0)]
+        )
+
+        assert found.seconds == pytest.approx(3.24104)
+        assert "2 parts" in found.reason
+
+    def test_equal_weights_stand_in_when_no_exposure_is_known(self):
+        combined = chandra.combine_dead_time_factors([_1411_DTF_000, _1411_DTF_002], [None, None])
+
+        assert combined.veto_ratio == pytest.approx((95 / 425 + 93 / 396) / 2)
+
+    def test_a_part_s_exposure_is_its_good_time(self, tmp_path):
+        gti = chandra.write_gti_file(
+            tmp_path / "flt1.fits", np.array([[57472541.4797728, 57508816.48733143]])
+        )
+        part = chandra.ObservationPart(0, 57471875.357874, 57509598.434235, gti_file=gti)
+
+        assert chandra.chandra_part_exposure(part) == pytest.approx(_1411_GOOD_TIME[0])
+
+    def test_without_good_times_a_part_s_exposure_is_its_span(self):
+        part = chandra.ObservationPart(0, 100.0, 350.0)
+
+        assert chandra.chandra_part_exposure(part) == pytest.approx(250.0)
+
+    def test_the_front_end_records_what_each_part_answered(self, tmp_path):
+        """Empty for one part: there is nothing combined to show."""
+        config = an_archive_observation(tmp_path, "6298")
+        directory = tmp_path / "diag"
+
+        with record_step(str(directory), "6298", "chandra_front_end") as rec:
+            chandra.chandra_archive_front_end("6298", config, rec=rec)
+
+        values = json.loads((directory / "chandra_front_end.json").read_text())["values"]
+        assert values["time_resolution_parts"] == []
+        assert values["has_dead_time_file"] is True
+
+
+class TestPartsMustBeTakenTheSameWay:
+    def parts_of(self, tmp_path, times):
+        config = a_timed_observation(tmp_path, "380", times)
+        header = fits.getheader(chandra.chandra_event_list("380", config), 1)
+        return header, chandra.chandra_observation_parts("380", config)
+
+    def test_380_s_two_parts_were_read_out_identically(self, tmp_path):
+        header, parts = self.parts_of(tmp_path, ACIS_380_TIMES)
+
+        chandra.chandra_check_part_configurations(header, parts)
+
+    @pytest.mark.parametrize(
+        "keyword, value",
+        [("READMODE", "CONTINUOUS"), ("TIMEDEL", 0.44104), ("DETNAM", "ACIS-7")],
+    )
+    def test_a_part_read_out_differently_is_refused(self, tmp_path, keyword, value):
+        """Mode, frame time and chips: one resolution and one stem cannot describe both."""
+        different = (*_380_PART_002[:2], dict(_380_CONFIGURATION, **{keyword: value}))
+        times = dict(ACIS_380_TIMES)
+        times["secondary/acisf00380_002N006_flt1.fits.gz"] = different
+        header, parts = self.parts_of(tmp_path, times)
+
+        with pytest.raises(ValueError, match=f"{keyword}.*part 2"):
+            chandra.chandra_check_part_configurations(header, parts)
+
+    def test_hrc_parts_on_different_detectors_are_refused(self, tmp_path):
+        times = {
+            name: (*spec[:2], {"DETNAM": "HRC-I"}) if "_evt2." not in name else spec
+            for name, spec in HRC_I_1411_TIMES.items()
+            if "_asol1" not in name
+        }
+        times["secondary/hrcf01411_002N006_std_flt1.fits.gz"] = (
+            *_1411_PART_002,
+            {"DETNAM": "HRC-S"},
+        )
+        config = a_timed_observation(tmp_path, "1411", times)
+        header = fits.getheader(chandra.chandra_event_list("1411", config), 1)
+        parts = chandra.chandra_observation_parts("1411", config)
+
+        with pytest.raises(ValueError, match="DETNAM"):
+            chandra.chandra_check_part_configurations(header, parts)
+
+    def test_an_ordinary_observation_opens_nothing(self, tmp_path):
+        """Its companions are empty placeholders, so opening one would raise."""
+        config = an_archive_observation(tmp_path, "6298")
+        header = fits.getheader(chandra.chandra_event_list("6298", config), 1)
+
+        chandra.chandra_check_part_configurations(
+            header, chandra.chandra_observation_parts("6298", config)
+        )
+
+
 def an_event_file(path, sky_pixel_deg=None, **keywords):
     """
     A level-2 event list carrying the header keywords the front end reads.

@@ -1422,6 +1422,10 @@ class TimeResolution:
     veto_ratio, trigger_rate_hz : float or None
         Carried through from :class:`DeadTimeFactors` when there was one, so the record
         shows the evidence and not only the conclusion.
+    parts : tuple of dict
+        For an observation taken in several parts, each part's own answer -- ``number``,
+        ``seconds``, ``basis``, ``fast_timing``, ``veto_ratio``, ``trigger_rate_hz`` and
+        ``exposure_s`` -- so the record shows what was combined. Empty for one part.
     """
 
     seconds: float
@@ -1430,6 +1434,7 @@ class TimeResolution:
     fast_timing: Optional[bool] = None
     veto_ratio: Optional[float] = None
     trigger_rate_hz: Optional[float] = None
+    parts: tuple = ()
 
 
 def read_dead_time_factors(path):
@@ -1624,6 +1629,245 @@ def chandra_time_resolution(header, dtf=None, config=None):
     raise ValueError(f"READMODE {read_mode!r} is neither TIMED nor CONTINUOUS")
 
 
+def combine_dead_time_factors(factors, exposures):
+    """
+    Several parts' dead-time evidence as one, each part weighted by its exposure.
+
+    Parameters
+    ----------
+    factors : sequence of DeadTimeFactors
+    exposures : sequence of float or None
+        Seconds of good time per part. Where any is unknown, or they sum to nothing, every
+        part weighs the same.
+
+    Returns
+    -------
+    DeadTimeFactors
+        The veto ratio, trigger rate and sample interval are weighted means; the row counts
+        are totals.
+
+    Examples
+    --------
+    >>> one = DeadTimeFactors(0.2, 200.0, 2.05, 10, 10)
+    >>> two = DeadTimeFactors(0.3, 100.0, 2.05, 10, 12)
+    >>> round(combine_dead_time_factors([one, two], [3000.0, 1000.0]).veto_ratio, 3)
+    0.225
+    """
+    weights = np.array([np.nan if one is None else float(one) for one in exposures])
+    if not np.all(np.isfinite(weights)) or weights.sum() <= 0:
+        weights = np.ones(len(factors))
+
+    def mean(values):
+        return float(np.average(np.asarray(values, dtype=float), weights=weights))
+
+    return DeadTimeFactors(
+        veto_ratio=mean([one.veto_ratio for one in factors]),
+        trigger_rate_hz=mean([one.trigger_rate_hz for one in factors]),
+        sample_interval=mean([one.sample_interval for one in factors]),
+        n_good_rows=sum(one.n_good_rows for one in factors),
+        n_rows=sum(one.n_rows for one in factors),
+    )
+
+
+def chandra_parts_time_resolution(header, evidence, config=None):
+    """
+    One time resolution for an observation taken in several parts.
+
+    Every part is first answered on its own, by :func:`chandra_time_resolution`, and the
+    answers are kept. Then:
+
+    * **ACIS** -- the parts were checked to share their readout by
+      :func:`chandra_check_part_configurations`, so they share one answer.
+    * **HRC, every part on the same side of the veto threshold** -- the dead-time evidence
+      is combined, weighted by each part's exposure, and answered once. On obsid ``1411``
+      that is a veto ratio of 0.227 and 4.93 ms, between its parts' 4.82 and 5.18 ms.
+    * **HRC, parts on opposite sides**, or a part with no dead-time file beside one with
+      -- the coarser answer. An average here is a trap: 500 ks unvetoed and 1 ks vetoed
+      average above the threshold and would claim 15.625 us for events of which some are
+      good to 5 ms.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        The merged event list's header, as for :func:`chandra_time_resolution`.
+    evidence : sequence of tuple
+        ``(part number, DeadTimeFactors or None, exposure in seconds or None)``, one per
+        part. See :func:`chandra_part_exposure`.
+    config : dict, optional
+        Only ``hrc_veto_ratio_threshold`` is read.
+
+    Returns
+    -------
+    TimeResolution
+        For one part, exactly what :func:`chandra_time_resolution` returns, and nothing
+        about exposure is needed.
+    """
+    evidence = list(evidence)
+    if len(evidence) == 1:
+        return chandra_time_resolution(header, evidence[0][1], config)
+
+    answers = [chandra_time_resolution(header, dtf, config) for _, dtf, _ in evidence]
+    parts = tuple(
+        dict(
+            number=number,
+            seconds=answer.seconds,
+            basis=answer.basis,
+            fast_timing=answer.fast_timing,
+            veto_ratio=answer.veto_ratio,
+            trigger_rate_hz=answer.trigger_rate_hz,
+            exposure_s=exposure,
+        )
+        for (number, _, exposure), answer in zip(evidence, answers)
+    )
+    count = len(evidence)
+    by_part = "; ".join(f"part {part['number']}: {part['seconds'] * 1e3:.3g} ms" for part in parts)
+
+    def answered(answer, reason, **changes):
+        fields = dict(
+            seconds=answer.seconds,
+            basis=answer.basis,
+            fast_timing=answer.fast_timing,
+            veto_ratio=answer.veto_ratio,
+            trigger_rate_hz=answer.trigger_rate_hz,
+        )
+        fields.update(changes)
+        return TimeResolution(reason=reason, parts=parts, **fields)
+
+    if str(header.get("INSTRUME", "")).strip().upper() != "HRC":
+        return answered(
+            answers[0],
+            f"All {count} parts were read out the same way, so they share one answer. "
+            f"{answers[0].reason}",
+        )
+
+    dtfs = [dtf for _, dtf, _ in evidence]
+    if all(dtf is None for dtf in dtfs):
+        return answered(
+            answers[0], f"None of the {count} parts has a dead-time file. {answers[0].reason}"
+        )
+
+    if any(dtf is None for dtf in dtfs) or len({one.fast_timing for one in answers}) > 1:
+        coarsest = max(answers, key=lambda answer: answer.seconds)
+        known = [(dtf, exposure) for _, dtf, exposure in evidence if dtf is not None]
+        return answered(
+            coarsest,
+            f"The {count} parts of this observation do not agree on whether on-board "
+            f"vetoing took place ({by_part}), so the coarser resolution, "
+            f"part {parts[answers.index(coarsest)]['number']}'s "
+            f"{coarsest.seconds * 1e3:.3g} ms, is the one that holds for the observation as "
+            "a whole. An average would claim a resolution some of its events do not have.",
+            basis="hrc_parts_disagree",
+            fast_timing=False,
+            veto_ratio=combine_dead_time_factors(*zip(*known)).veto_ratio,
+        )
+
+    combined = chandra_time_resolution(
+        header,
+        combine_dead_time_factors(dtfs, [exposure for _, _, exposure in evidence]),
+        config,
+    )
+    return answered(
+        combined,
+        f"Combined over {count} parts, weighted by exposure ({by_part}). {combined.reason}",
+    )
+
+
+def chandra_part_exposure(part):
+    """
+    How much good time one part holds, which is what its evidence is weighted by.
+
+    Parameters
+    ----------
+    part : ObservationPart
+
+    Returns
+    -------
+    float or None
+        The part's own good-time intervals, summed; failing those, the span its files
+        cover; failing that, ``None``, which :func:`combine_dead_time_factors` reads as
+        "weigh every part the same".
+    """
+    if part.gti_file is not None:
+        gti = read_observation_gti(part.gti_file)
+        if gti is not None and len(gti):
+            return float(np.sum(gti[:, 1] - gti[:, 0]))
+    if part.tstart is not None and part.tstop is not None:
+        return float(part.tstop - part.tstart)
+    return None
+
+
+def _time_resolution_evidence(parts):
+    """``(number, dead-time factors, exposure)`` per part; exposure only when there are several."""
+    several = len(parts) > 1
+    return [
+        (
+            part.number,
+            None if part.dead_time_file is None else read_dead_time_factors(part.dead_time_file),
+            chandra_part_exposure(part) if several else None,
+        )
+        for part in parts
+    ]
+
+
+#: What every part of an observation must share for one time resolution and one file stem
+#: to describe them all: the readout mode, the frame time, and the chips -- or, for HRC,
+#: the detector.
+PART_CONFIGURATION_KEYWORDS = ("READMODE", "TIMEDEL", "DETNAM")
+
+
+def chandra_check_part_configurations(header, parts):
+    """
+    Refuse an observation whose parts were not taken the same way.
+
+    Each part's good-time file repeats the readout keywords -- measured on obsid ``380``,
+    whose mask and field-of-view files do too -- and they are compared with each other and
+    with the merged event list. ``FIRSTROW`` is deliberately not among them: the mask file
+    uses that name for something else, 3 against the event list's 1 on ``380``, and a
+    subarray already shows in ``TIMEDEL``.
+
+    An observation of one part is not checked, and nothing is opened.
+
+    Parameters
+    ----------
+    header : dict or astropy.io.fits.Header
+        The merged event list's header.
+    parts : sequence of ObservationPart
+
+    Raises
+    ------
+    ValueError
+        If any of :data:`PART_CONFIGURATION_KEYWORDS` differs anywhere. One time resolution
+        and one file stem cannot describe both, and reducing them as one would be wrong in
+        silence.
+    """
+    if len(parts) < 2:
+        return
+
+    rows = [("the event list", header)]
+    for part in parts:
+        source = part.gti_file or part.mask_file
+        if source is not None:
+            rows.append((f"part {part.number}", fits.getheader(source, 1)))
+
+    for keyword in PART_CONFIGURATION_KEYWORDS:
+        seen = {
+            label: (
+                round(float(found[keyword]), 9)
+                if keyword == "TIMEDEL"
+                else str(found[keyword]).strip().upper()
+            )
+            for label, found in rows
+            if found.get(keyword) is not None
+        }
+        if len(set(seen.values())) > 1:
+            raise ValueError(
+                f"the parts of this observation were not taken the same way: {keyword} is "
+                + ", ".join(f"{value} in {label}" for label, value in seen.items())
+                + ". One time resolution and one file stem cannot describe them, so the "
+                "observation is refused rather than reduced as if it were one."
+            )
+
+
 #: The CALDB current on the CXC's conda channel on 2026-09-12.
 #:
 #: Used only to say how stale an archive product's calibration is. It is a diagnostic and
@@ -1698,7 +1942,8 @@ class Observation:
     aspect_solution, bad_pixel_file, mask_file, gti_file : str or None
         Companion products.
     dead_time_file : str or None
-        HRC only, and ``None`` for ACIS is normal rather than missing.
+        HRC only, and ``None`` for ACIS is normal rather than missing. ``None`` too for an
+        observation of several parts, where each part's is in ``parts``.
     orbit_ephemeris : str or None
         What ``axbary`` barycentres with.
     grating_spectrum : str or None
@@ -1823,9 +2068,9 @@ def chandra_archive_front_end(obsid, config, rec=None):
         header = hdulist[1].header
 
     parts = chandra_observation_parts(obsid, config)
-    dtf_path = chandra_dead_time_file(obsid, config)
-    dtf = read_dead_time_factors(dtf_path) if dtf_path is not None else None
-    resolution = chandra_time_resolution(header, dtf, config)
+    chandra_check_part_configurations(header, parts)
+    resolution = chandra_parts_time_resolution(header, _time_resolution_evidence(parts), config)
+    dtf_path = parts[0].dead_time_file if len(parts) == 1 else None
 
     observation = Observation(
         obsid=obsid,
@@ -1863,12 +2108,13 @@ def chandra_archive_front_end(obsid, config, rec=None):
             time_resolution_reason=resolution.reason,
             hrc_veto_ratio=resolution.veto_ratio,
             hrc_trigger_rate_hz=resolution.trigger_rate_hz,
+            time_resolution_parts=list(resolution.parts),
             caldb_version=observation.caldb_version,
             caldb_current=CURRENT_CALDB_VERSION,
             caldb_is_stale=observation.caldb_is_stale,
             ascds_version=observation.ascds_version,
             data_mode=observation.data_mode,
-            has_dead_time_file=dtf_path is not None,
+            has_dead_time_file=all(part.dead_time_file is not None for part in parts),
             n_grating_responses=len(observation.grating_responses),
             sky_pixel_arcsec=observation.sky_pixel_arcsec,
             n_parts=len(parts),
