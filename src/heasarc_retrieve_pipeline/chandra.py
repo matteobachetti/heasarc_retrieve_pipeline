@@ -676,6 +676,30 @@ def chandra_repro_path(obsid, config):
     return os.path.join(chandra_base_output_path(obsid, config), "repro")
 
 
+def chandra_part_repro_path(obsid, config, number):
+    """
+    Where ``chandra_repro`` writes one part of an observation taken in parts.
+
+    Parameters
+    ----------
+    obsid : int or str
+        Observation identifier.
+    config : dict
+        Must contain ``out_data_path``.
+    number : int
+        The part number, as :class:`ObservationPart` has it.
+
+    Returns
+    -------
+    str
+        ``<out_data_path>/<OBSID>/repro_obiNNN``, beside :func:`chandra_repro_path` and
+        named the way :func:`chandra_part_label` names the part's products. A directory
+        per part is not tidiness: the task names its products without a part number, so
+        two parts in one directory would overwrite each other.
+    """
+    return f"{chandra_repro_path(obsid, config)}_obi{int(number):03d}"
+
+
 def _glob_both_ways(root, pattern):
     """
     Every file under one root matching a glob, sorted, gzipped or not.
@@ -1064,6 +1088,10 @@ class ObservationPart:
     aspect_solutions : tuple of str
         Every aspect solution of this part. Usually one; ``433``'s first part has three.
     orbit_ephemeris, bad_pixel_file, mask_file, gti_file : str or None
+    event_list : str or None
+        The part's own level-2 event list, which only the reprocessing route has:
+        ``chandra_repro`` run on each part in turn. ``None`` means the part's events are
+        still inside the archive's merged list.
     """
 
     number: Optional[int]
@@ -1075,6 +1103,7 @@ class ObservationPart:
     bad_pixel_file: Optional[str] = None
     mask_file: Optional[str] = None
     gti_file: Optional[str] = None
+    event_list: Optional[str] = None
 
 
 #: The families a part is made of: ``(field, archive patterns, repro pattern)``, searched
@@ -1161,6 +1190,34 @@ def _at_most_one(obsid, number, field, paths):
             f"choosing one would be a guess: {sorted(os.path.basename(p) for p in paths)}"
         )
     return paths[0] if paths else None
+
+
+def _reprocessed_part(obsid, config, part):
+    """
+    One part, with what ``chandra_repro`` wrote for it in place of the archive's files.
+
+    Run part by part, the task gives every part a directory of its own, and the names in
+    it carry no part number -- ``acisf00380_repro_evt2.fits`` in both of ``380``'s -- so
+    the directory is what says which part a file belongs to. What the task does not write,
+    the orbit ephemeris and the dead-time file, stays the download's, paired by time.
+    """
+    directory = chandra_part_repro_path(obsid, config, part.number)
+    events = _glob_both_ways(directory, REPRO_EVENT_LIST_PATTERN)
+    if not events:
+        raise FileNotFoundError(
+            f"{obsid}: products='repro' was asked for and part {part.number} has no "
+            f"reprocessed event list in {directory}"
+        )
+    found = {"event_list": _at_most_one(obsid, part.number, "event_list", events)}
+    for field, _, repro in _PART_FAMILIES:
+        files = [] if repro is None else _glob_both_ways(directory, repro)
+        if files:
+            found[field] = (
+                tuple(files)
+                if field == "aspect_solutions"
+                else _at_most_one(obsid, part.number, field, files)
+            )
+    return dataclasses.replace(part, **found)
 
 
 def chandra_observation_parts(obsid, config):
@@ -1276,6 +1333,11 @@ def chandra_observation_parts(obsid, config):
             f"{obsid}: {os.path.basename(path)} covers the time of none of the "
             f"{len(parts)} parts, so no part uses it"
         )
+
+    # The pairing above ran on the download, which the reprocessing route still has; each
+    # part then takes what chandra_repro remade for it. See chandra_repro_front_end.
+    if config.get("products", DEFAULT_CONFIG["products"]) == "repro":
+        parts = [_reprocessed_part(obsid, config, part) for part in parts]
     return tuple(parts)
 
 
@@ -1906,7 +1968,9 @@ def chandra_check_part_configurations(header, parts):
 
     rows = [("the event list", header)]
     for part in parts:
-        source = part.gti_file or part.mask_file
+        # A reprocessed part's own event list first: chandra_repro's flt2 repeats none of
+        # the readout keywords, measured on 380.
+        source = part.event_list or part.gti_file or part.mask_file
         if source is not None:
             rows.append((f"part {part.number}", fits.getheader(source, 1)))
 
@@ -2146,10 +2210,12 @@ def chandra_archive_front_end(obsid, config, rec=None):
     if events is None:
         return None
 
-    with fits.open(events) as hdulist:
+    parts = chandra_observation_parts(obsid, config)
+    # Reprocessed part by part, the archive's merged list is still there, and still names
+    # the CIAO that made it rather than the one that ran; the first part's own list does not.
+    with fits.open(parts[0].event_list or events) as hdulist:
         header = hdulist[1].header
 
-    parts = chandra_observation_parts(obsid, config)
     chandra_check_part_configurations(header, parts)
     resolution = chandra_parts_time_resolution(header, _time_resolution_evidence(parts), config)
     dtf_path = parts[0].dead_time_file if len(parts) == 1 else None
@@ -2242,6 +2308,65 @@ def chandra_archive_front_end(obsid, config, rec=None):
 REPRO_EVENT_LIST_PATTERN = "*_repro_evt2.fits"
 
 
+def _chandra_repro_in_parts(obsid, config, level1, env, log_to):
+    """
+    ``splitobs``, then ``chandra_repro`` once per part; the reprocessing directories.
+
+    ``chandra_repro`` refuses an observation in parts, and its help page says to separate
+    them with ``splitobs`` first. That writes ``<outroot>_NNN`` per part, named by the
+    level-1 lists' ``OBI_NUM``, which is the number in their file names too.
+
+    Both return 0 on failure, so both are checked. Measured on ``380`` on 2026-09-13:
+    with ``ASCDS_CALIB`` unset, ``splitobs`` cannot read a header, says only that the
+    observation "is neither interleaved nor multiobi", and makes nothing; ``chandra_repro``
+    pointed at the missing directory then exits 0 as well.
+    """
+    from . import ciao
+
+    numbers = [_part_number(path) for path in level1]
+    if None in numbers:
+        raise ValueError(
+            f"{obsid}: a level-1 event list without a part number in its name, so splitobs's "
+            f"directories cannot be told apart: {[os.path.basename(p) for p in level1]}"
+        )
+
+    outroot = os.path.join(chandra_base_output_path(obsid, config), "split", obsid)
+    os.makedirs(os.path.dirname(outroot), exist_ok=True)
+    ciao.run(
+        "splitobs",
+        produces=[],  # one directory per part, checked below
+        indir=chandra_archive_path(obsid, config),
+        outroot=outroot,
+        clobber="yes",
+        env=env,
+        log_to=log_to,
+    )
+
+    outdirs = []
+    for number in sorted(set(numbers)):
+        split = f"{outroot}_{number:03d}"
+        if not os.path.isdir(split):
+            raise RuntimeError(
+                f"{obsid}: splitobs returned cleanly and wrote nothing for part {number} "
+                f"into {split}. It fails this way when it cannot read the headers, as with "
+                "ASCDS_CALIB unset."
+            )
+        outdir = chandra_part_repro_path(obsid, config, number)
+        os.makedirs(outdir, exist_ok=True)
+        ciao.run(
+            "chandra_repro",
+            produces=[],  # the event list is checked by the caller
+            indir=split,
+            outdir=outdir,
+            set_ardlib="no",
+            clobber="yes",
+            env=env,
+            log_to=log_to,
+        )
+        outdirs.append(outdir)
+    return outdirs
+
+
 def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     """
     Re-run the archive's pipeline with ``chandra_repro``, then read what it wrote.
@@ -2262,6 +2387,12 @@ def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     theirs: the task cross-references them in headers this pipeline did not write. Its
     names carry the obsid already, and :func:`chandra_repro_path` puts them in a directory
     that carries it too.
+
+    **An observation taken in parts is split first.** Several level-1 event lists mean
+    several parts, and ``chandra_repro`` does not accept those: ``splitobs`` separates
+    them, and ``chandra_repro`` runs on each into :func:`chandra_part_repro_path`. Each
+    part is then read from its own directory (see :func:`chandra_observation_parts`), with
+    the orbit ephemeris and dead-time file still the download's, paired by time.
 
     Parameters
     ----------
@@ -2305,43 +2436,64 @@ def chandra_repro_front_end(obsid, config, rec=None, env=None, log_to=None):
     if not os.path.isdir(indir) or not os.listdir(indir):
         return None
 
-    if chandra_level1_event_list(obsid, config) is None:
+    level1 = _archive_products(obsid, config, os.path.join("secondary", "*_evt1.fits"))
+    if not level1:
         raise FileNotFoundError(
             f"{obsid}: products='repro' was asked for and no level-1 event list was "
             f"downloaded to {indir}. The archive route's download filter does not fetch "
             f"one; re-download with products='repro' set."
         )
+    _refuse_two_versions(obsid, level1)
+    env = env if env is not None else ciao.ciao_environment(obsid, config)
 
-    # chandra_repro creates the last component of outdir and refuses to create any above
-    # it, so it is made here. An existing empty directory it accepts even with clobber=no.
-    os.makedirs(outdir, exist_ok=True)
-
-    ciao.run(
-        "chandra_repro",
-        produces=[],  # the names are chandra_repro's own; the event list is checked below
-        indir=indir,
-        outdir=outdir,
-        set_ardlib="no",
-        clobber="yes",
-        env=env if env is not None else ciao.ciao_environment(obsid, config),
-        log_to=log_to,
-    )
-
-    reprocessed = _glob_both_ways(outdir, REPRO_EVENT_LIST_PATTERN)
-    if not reprocessed:
-        raise RuntimeError(
-            f"{obsid}: chandra_repro returned cleanly and wrote no {REPRO_EVENT_LIST_PATTERN} "
-            f"into {outdir}. A zero return code proves nothing; see ciao.run."
+    if len(level1) > 1:
+        outdirs = _chandra_repro_in_parts(obsid, config, level1, env, log_to)
+    else:
+        # chandra_repro creates the last component of outdir and refuses to create any
+        # above it, so it is made here. An existing empty directory it accepts even with
+        # clobber=no.
+        os.makedirs(outdir, exist_ok=True)
+        ciao.run(
+            "chandra_repro",
+            produces=[],  # the names are chandra_repro's own; the event list is checked below
+            indir=indir,
+            outdir=outdir,
+            set_ardlib="no",
+            clobber="yes",
+            env=env,
+            log_to=log_to,
         )
+        outdirs = [outdir]
+
+    for directory in outdirs:
+        if not _glob_both_ways(directory, REPRO_EVENT_LIST_PATTERN):
+            raise RuntimeError(
+                f"{obsid}: chandra_repro returned cleanly and wrote no "
+                f"{REPRO_EVENT_LIST_PATTERN} into {directory}. A zero return code proves "
+                "nothing; see ciao.run."
+            )
 
     observation = chandra_archive_front_end(obsid, config, rec=rec)
 
     if rec is not None:
+        several = len(outdirs) > 1
         rec.value(
-            repro_directory=outdir,
-            repro_event_list=observation.event_list if observation else None,
+            repro_directory=None if several else outdir,
+            repro_event_list=None if several or not observation else observation.event_list,
+            repro_directories=outdirs,
+            repro_event_lists=(
+                [part.event_list for part in observation.parts] if several and observation else []
+            ),
+            # Relative to the observation's directory when there are several: every part's
+            # products have the same names.
             reprocessed_products=sorted(
-                os.path.basename(path) for path in _glob_both_ways(outdir, "*_repro_*.fits")
+                (
+                    os.path.relpath(path, os.path.dirname(directory))
+                    if several
+                    else os.path.basename(path)
+                )
+                for directory in outdirs
+                for path in _glob_both_ways(directory, "*_repro_*.fits")
             ),
             # chandra_repro leaves CALDBVER at the value the archive's file carried -- on
             # 5644 it still read 4.9.2 after a run with CALDB 4.12.4 installed -- so on this
@@ -3917,6 +4069,10 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
     dead-time file: ``1411``'s second part is 5.18 ms, where the combination in the front
     end's record is 4.93.
 
+    **A part the reprocessing route already made is not cut.** ``chandra_repro`` run on
+    each part leaves an event list spanning that part alone, ``TSTART`` and ``TSTOP``
+    included (measured on ``380``), and it is used as it is.
+
     Parameters
     ----------
     observation : Observation
@@ -3937,7 +4093,7 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
     """
     from . import ciao
 
-    header = fits.getheader(observation.event_list, 1)
+    header = fits.getheader(part.event_list or observation.event_list, 1)
     dtf = None if part.dead_time_file is None else read_dead_time_factors(part.dead_time_file)
     resolution = chandra_time_resolution(header, dtf, config)
     one = dataclasses.replace(
@@ -3953,6 +4109,13 @@ def chandra_part_observation(observation, part, config, env=None, log_to=None):
         parts=(part,),
         part=part,
     )
+
+    if part.event_list is not None:
+        get_logger().info(
+            f"{observation.obsid}: part {part.number} was reprocessed on its own into "
+            f"{part.event_list}, time resolution {resolution.seconds} s"
+        )
+        return dataclasses.replace(one, event_list=part.event_list)
 
     output = os.path.join(
         chandra_pipeline_output_path(observation.obsid, config), f"{one.stem}_evt2.fits"

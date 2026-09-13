@@ -4187,6 +4187,177 @@ class TestReprocessingAnObservation:
         assert values["ascds_version"] == "CIAO 4.18.0"
 
 
+#: ``380``'s download under the reprocessing route's filter: level 1 as well, one per part.
+ACIS_380_LEVEL1 = dict(
+    ACIS_380_TIMES,
+    **{
+        "secondary/acisf00380_001N005_evt1.fits.gz": (*_380_PART_001[:2], {"OBI_NUM": 1}),
+        "secondary/acisf00380_002N006_evt1.fits.gz": (*_380_PART_002[:2], {"OBI_NUM": 2}),
+    },
+)
+
+_380_SPANS = {1: _380_PART_001[:2], 2: _380_PART_002[:2]}
+
+
+def a_timed_file(path, tstart, tstop, **keywords):
+    """A one-row table whose first extension carries the times and ``keywords``."""
+    hdu = fits.BinTableHDU.from_columns([fits.Column("TIME", "1D", array=[tstart])])
+    for key, value in dict(TSTART=tstart, TSTOP=tstop, **keywords).items():
+        hdu.header[key] = value
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+
+@pytest.fixture
+def stub_splitobs_and_repro(monkeypatch):
+    """
+    A ``splitobs`` and a ``chandra_repro`` that leave what the real ones left on ``380``.
+
+    Measured on 2026-09-13: ``splitobs`` makes ``<outroot>_001`` and ``<outroot>_002``, and
+    ``chandra_repro`` on each writes ``acisf00380_repro_evt2.fits`` -- the same name in
+    both -- spanning that part alone, beside its own flt2, bpix1, mask and aspect solution.
+    ``skip`` names parts either task should quietly leave out.
+    """
+    calls = []
+    skip = {"splitobs": set(), "chandra_repro": set()}
+
+    def fake_run(name, *, produces, args=(), capture=False, **kwargs):
+        calls.append((name, kwargs))
+        if name == "splitobs":
+            for number in _380_SPANS:
+                if number not in skip["splitobs"]:
+                    os.makedirs(f"{kwargs['outroot']}_{number:03d}", exist_ok=True)
+        elif name == "chandra_repro":
+            number = int(kwargs["indir"][-3:])
+            if number in skip["chandra_repro"]:
+                return SimpleNamespace(stdout="")
+            tstart, tstop = _380_SPANS[number]
+            outdir = pathlib.Path(kwargs["outdir"])
+            outdir.mkdir(parents=True, exist_ok=True)
+            an_event_file(
+                outdir / "acisf00380_repro_evt2.fits",
+                TSTART=tstart,
+                TSTOP=tstop,
+                OBI_NUM=number,
+                INSTRUME="ACIS",
+                SIM_Z=-233.58743446083,
+                ASCDSVER="CIAO 4.18.0",
+                **_380_CONFIGURATION,
+            )
+            for written in (
+                "acisf00380_repro_flt2.fits",
+                "acisf00380_repro_bpix1.fits",
+                f"acisf00380_{number:03d}N005_msk1.fits",
+                f"pcadf00380_{number:03d}N001_asol1.fits",
+            ):
+                a_timed_file(outdir / written, tstart, tstop, **_380_CONFIGURATION)
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(ciao, "run", fake_run)
+    return SimpleNamespace(calls=calls, skip=skip)
+
+
+class TestReprocessingAnObservationInParts:
+    """
+    ``chandra_repro`` refuses an observation in parts: the CXC says to separate them with
+    ``splitobs`` first, and then reprocess each as if it were an observation of its own.
+    Matteo's ruling of 2026-09-13, measured on ``380`` the same day.
+    """
+
+    def _380(self, tmp_path):
+        config = a_timed_observation(tmp_path, "380", ACIS_380_LEVEL1)
+        config["products"] = "repro"
+        return config
+
+    def test_splitobs_runs_first_and_chandra_repro_once_per_part(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        config = self._380(tmp_path)
+
+        chandra.chandra_repro_front_end("380", config, env={})
+
+        calls = stub_splitobs_and_repro.calls
+        assert [name for name, _ in calls] == ["splitobs", "chandra_repro", "chandra_repro"]
+        outroot = os.path.join(config["out_data_path"], "380", "split", "380")
+        assert calls[0][1]["indir"] == chandra.chandra_archive_path("380", config)
+        assert calls[0][1]["outroot"] == outroot
+        assert calls[1][1]["indir"] == outroot + "_001"
+        assert calls[1][1]["outdir"] == chandra.chandra_repro_path("380", config) + "_obi001"
+        assert calls[2][1]["indir"] == outroot + "_002"
+        assert calls[2][1]["outdir"] == chandra.chandra_repro_path("380", config) + "_obi002"
+        assert all(kwargs["set_ardlib"] == "no" for _, kwargs in calls[1:])
+
+    def test_each_part_reads_its_own_reprocessed_products(self, tmp_path, stub_splitobs_and_repro):
+        config = self._380(tmp_path)
+
+        observation = chandra.chandra_repro_front_end("380", config, env={})
+
+        first, second = observation.parts
+        mine = chandra.chandra_repro_path("380", config) + "_obi002"
+        assert second.event_list == os.path.join(mine, "acisf00380_repro_evt2.fits")
+        assert second.gti_file == os.path.join(mine, "acisf00380_repro_flt2.fits")
+        assert second.bad_pixel_file == os.path.join(mine, "acisf00380_repro_bpix1.fits")
+        assert second.mask_file == os.path.join(mine, "acisf00380_002N005_msk1.fits")
+        assert second.aspect_solutions == (os.path.join(mine, "pcadf00380_002N001_asol1.fits"),)
+        assert os.path.dirname(first.event_list).endswith("repro_obi001")
+
+    def test_orbit_files_still_come_from_the_download_paired_by_time(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        """``chandra_repro`` copies no orbit file, on one part or on several."""
+        config = self._380(tmp_path)
+
+        first, second = chandra.chandra_repro_front_end("380", config, env={}).parts
+
+        assert os.path.basename(first.orbit_ephemeris) == "orbitf073742700N001_eph1.fits.gz"
+        assert os.path.basename(second.orbit_ephemeris) == "orbitf077025900N001_eph1.fits.gz"
+
+    def test_a_part_splitobs_left_out_is_an_error(self, tmp_path, stub_splitobs_and_repro):
+        """Measured: with ``ASCDS_CALIB`` unset, ``splitobs`` makes nothing and says little."""
+        config = self._380(tmp_path)
+        stub_splitobs_and_repro.skip["splitobs"].add(2)
+
+        with pytest.raises(RuntimeError, match="splitobs.*part 2"):
+            chandra.chandra_repro_front_end("380", config, env={})
+
+    def test_a_part_chandra_repro_did_not_reprocess_is_an_error(
+        self, tmp_path, stub_splitobs_and_repro
+    ):
+        """Measured: ``chandra_repro`` pointed at a missing directory returns 0."""
+        config = self._380(tmp_path)
+        stub_splitobs_and_repro.skip["chandra_repro"].add(2)
+
+        with pytest.raises(RuntimeError, match="wrote no.*repro_obi002"):
+            chandra.chandra_repro_front_end("380", config, env={})
+
+    def test_a_reprocessed_part_is_not_cut_again(self, tmp_path, stub_splitobs_and_repro):
+        """Its event list already spans that part alone; a second copy would only cost disk."""
+        config = self._380(tmp_path)
+        observation = chandra.chandra_repro_front_end("380", config, env={})
+        before = len(stub_splitobs_and_repro.calls)
+
+        one = chandra.chandra_part_observation(observation, observation.parts[1], config)
+
+        assert stub_splitobs_and_repro.calls[before:] == []
+        assert one.event_list == observation.parts[1].event_list
+        assert one.stem.endswith("_obi002")
+
+    def test_the_reprocessed_header_is_the_one_read(self, tmp_path, stub_splitobs_and_repro):
+        """The archive's merged list still says the CIAO that made it, not the one that ran."""
+        config = self._380(tmp_path)
+        directory = tmp_path / "records"
+
+        with record_step(str(directory), "380", "chandra_repro") as rec:
+            chandra.chandra_repro_front_end("380", config, rec=rec, env={})
+
+        values = json.loads(next(directory.glob("*repro*.json")).read_text())["values"]
+        assert values["ascds_version"] == "CIAO 4.18.0"
+        assert values["repro_directories"] == [
+            chandra.chandra_repro_path("380", config) + "_obi001",
+            chandra.chandra_repro_path("380", config) + "_obi002",
+        ]
+        assert "repro_obi002/acisf00380_repro_evt2.fits" in values["reprocessed_products"]
+
+
 class TestTheConfiguration:
     """
     The defaults have to survive a caller who names only the paths, which is exactly what
