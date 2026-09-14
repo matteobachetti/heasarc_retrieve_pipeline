@@ -333,14 +333,16 @@ class TestOneFailureDoesNotStopTheRest:
             for i in range(n)
         ]
 
-    def run(self, monkeypatch, tmp_path, failing, no_science=()):
+    def run(self, monkeypatch, tmp_path, failing, no_science=(), **kwargs):
         """Run the flow with the download and the reduction stubbed out."""
         processed = []
+        self.configs = {}
 
         def stub_download(url, outdir, test_str=".", test=False):
             return []
 
         def stub_processing(obsid, config=None, ra=None, dec=None, flags=None):
+            self.configs[obsid] = config
             if obsid in failing:
                 raise ValueError(f"{obsid} is no good")
             if obsid in no_science:
@@ -358,8 +360,18 @@ class TestOneFailureDoesNotStopTheRest:
             mission="nustar",
             pfiles_root=str(tmp_path / ".pfiles"),
             work_root=str(tmp_path / ".workers"),
+            **kwargs,
         )
         return failed, processed
+
+    def test_the_caller_config_reaches_every_observation(self, tmp_path, monkeypatch):
+        self.run(monkeypatch, tmp_path, failing=set(), config={"cameras": ["pn"]})
+
+        assert {obsid: c["cameras"] for obsid, c in self.configs.items()} == {
+            "obs0": ["pn"],
+            "obs1": ["pn"],
+            "obs2": ["pn"],
+        }
 
     def test_every_observation_gets_a_manifest_even_the_failing_one(self, tmp_path, monkeypatch):
         self.run(monkeypatch, tmp_path, failing={"obs1"})
@@ -518,8 +530,10 @@ class TestTheFlowUsesAShortWorkspace:
                 work_root,
                 flags=None,
                 test=False,
+                config=None,
             ):
                 seen["outdir"] = outdir
+                seen["config"] = config
                 seen["pfiles_root"] = pfiles_root
                 seen["work_root"] = work_root
                 # A worker writes its results through the name it was given.
@@ -594,6 +608,14 @@ class TestTheFlowUsesAShortWorkspace:
         assert not os.path.exists(seen["pfiles_root"])
         assert not os.path.exists(seen["work_root"])
         assert (outdir / "a_result.txt").is_file()
+
+    def test_the_caller_config_reaches_the_workers(self, tmp_path, monkeypatch):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        seen = self.run(monkeypatch, outdir, config={"cameras": ["pn"]})
+
+        assert seen["config"] == {"cameras": ["pn"]}
 
 
 class TestTheFlowRefusesNamesHeasoftCannotHandle:

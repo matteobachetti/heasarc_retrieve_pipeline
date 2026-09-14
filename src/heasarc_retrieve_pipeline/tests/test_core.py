@@ -975,6 +975,38 @@ class TestTheResolvedConfigReachesTheRun:
 
         assert seen["download"]["re_include"] == "odf"
 
+    def test_the_caller_config_reaches_the_mission(self, tmp_path, monkeypatch):
+        """``retrieve_and_process_data(config=...)`` is how a batch asks, for instance, for
+        XMM's pn camera alone. The two paths stay the run's own: a worker writes where the
+        flow put it, whatever the caller's dictionary says."""
+        self.a_run_that_records_what_it_saw(monkeypatch)
+        given = []
+        monkeypatch.setitem(
+            core.MISSION_CONFIG,
+            "fictional",
+            dict(
+                MISSION_CONFIG["nustar"],
+                resolve_config=lambda config, url: given.append(config) or config,
+            ),
+        )
+
+        core.download_and_process_observation.fn(
+            "0153950401",
+            "https://example.invalid/0153950401",
+            83.0,
+            22.0,
+            str(tmp_path),
+            "fictional",
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            config={"cameras": ["pn"], "out_data_path": "/somewhere/else"},
+            test=True,
+        )
+
+        assert given[0]["cameras"] == ["pn"]
+        assert given[0]["out_data_path"] == str(tmp_path)
+        assert given[0]["input_data_path"] == str(tmp_path)
+
 
 class TestTheDownloadFilterReachesTheDownload:
     """The wiring, from ``MISSION_CONFIG`` down to the call that fetches the files."""

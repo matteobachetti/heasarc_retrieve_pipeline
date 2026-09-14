@@ -1696,6 +1696,7 @@ def download_and_process_observation(
     flags=None,
     test=False,
     pgp_passphrase=None,
+    config=None,
 ):
     """
     Download one observation and reduce it, in this process alone.
@@ -1728,11 +1729,17 @@ def download_and_process_observation(
         If True, fake the download and do not process.
     pgp_passphrase : str, optional
         PGP passphrase for decryption, if this is encrypted data.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
     """
     prepare_worker(pfiles_root, work_root)
 
+    # The caller's settings with the run's own paths over them: a worker writes where the
+    # flow put it, whatever the dictionary says.
     config = absolute_config(
-        dict(input_data_path=outdir, out_data_path=outdir),
+        dict(config or {}, input_data_path=outdir, out_data_path=outdir),
         MISSION_CONFIG[mission]["default_config"],
     )
 
@@ -1835,7 +1842,9 @@ def write_page(obsid, outdir):
 
 
 @flow(flow_run_name="process_{mission}_observations")
-def process_observations(items, outdir, mission, pfiles_root, work_root, flags=None, test=False):
+def process_observations(
+    items, outdir, mission, pfiles_root, work_root, flags=None, test=False, config=None
+):
     """
     Reduce every observation, one process each.
 
@@ -1861,6 +1870,10 @@ def process_observations(items, outdir, mission, pfiles_root, work_root, flags=N
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
         If True, fake the downloads and process nothing.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
 
     Returns
     -------
@@ -1900,6 +1913,7 @@ def process_observations(items, outdir, mission, pfiles_root, work_root, flags=N
             work_root=work_root,
             flags=flags,
             test=test,
+            config=config,
         )
         if "pgp_passphrase" in item:
             kwargs["pgp_passphrase"] = item["pgp_passphrase"]
@@ -2008,6 +2022,7 @@ def retrieve_and_process_data(
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
+    config: typing.Union[dict, None] = None,
 ):
     """
     Download and reduce every observation in a catalogue table.
@@ -2060,6 +2075,10 @@ def retrieve_and_process_data(
     pgp_keys_file : str or None, optional
         Path to PGP keys file for encrypted data. If ``None``, defaults to
         ``~/.heasarc_retrieve_pgp_keys``. File format: ``mission obsid passphrase``.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
 
     Returns
     -------
@@ -2130,6 +2149,7 @@ def retrieve_and_process_data(
             work_root=workspace.work,
             flags=flags,
             test=test,
+            config=config,
         )
 
     return result_table
