@@ -1880,6 +1880,62 @@ to 0.1 ms.
 An observation whose ODF is missing reduces completely but is not barycentred; the step
 records ``barycentered: false`` with a reason rather than failing the run.
 
+Pulsation search of M82 X-2 in pn
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All 16 observations with EPIC data within 12 arcmin of M82 were reduced on 2026-09-14 through
+``core.retrieve_and_process_data(..., config={"cameras": ["pn"]})`` and barycentred at M82 X-2
+with DE430. pn frames every 73 ms (full window) or 48 ms (large window); MOS cannot sample the
+spin (see *What an exposure is*). Each pn exposure was searched with the same targeted Z²₁
+settings as Chandra -- the two-segment spin solution, ``orbital_decay.par``,
+``HENzsearch --fast --oversample 4``, ``p_value_best`` -- in two energy bands fixed beforehand,
+3-8 keV and 0.2-12 keV (HENDRICS reads XMM ``PI`` as eV).
+
+Both of Liu et al. 2024's XMM detections are recovered at 3-8 keV, within one frequency bin
+(``1/T``) of their frequency:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 30 30
+
+   * -
+     - ``0112290201`` (2001)
+     - ``0657801701`` (2011)
+   * - Liu et al. 2024
+     - 0.755017 Hz, 4.0 σ, 5 ± 1%
+     - 0.731409 Hz, 5.0 σ, 8 ± 2%
+   * - found
+     - +10.7 µHz, 3.4 σ, 4.7 ± 0.9%
+     - +2.4 µHz, 5.2 σ, 8.6 ± 1.6%
+   * - one frequency bin
+     - 36.6 µHz
+     - 49.1 µHz
+
+The 2011 frequency proves little, because the spin solution was anchored on that observation;
+its significance does. In 0.2-12 keV the other sources in the circle dilute the pulse: 2011
+falls to 3.5 σ and 2001 vanishes.
+
+**The frequency derivative is held at zero in short exposures,** with
+``--fdotmin 0 --fdotmax 0``, whenever ``1/T² > 2e-10`` Hz/s (``T = TSTOP - TSTART``). Only
+``0206080101`` (103 ks) searches it freely. This rule was adopted *after* 2001 failed the
+recovery test with a free derivative: ``--fast`` then ranked a noise point 112 µHz away, on
+the ridge that a free derivative opens in the frequency-derivative plane (Z²₁ 38.6), above the
+true peak at zero derivative (28.9). The orbit was ruled out as the cause, because Liu's
+orbital solution differs from ours by 403 s in 2001 and gives the same peak. The rule is
+physical: the residual spin derivative (below 1e-10 Hz/s) is smaller than one grid step
+(``1/T²``, 1-3e-9 Hz/s) in every other exposure. The Chandra searches below still search the
+derivative freely, and are to be rerun with the same rule; until then the two sets are not
+computed the same way.
+
+No new detection among the other 14 exposures. The smallest ``p_value_best`` is 0.42%
+(``0560590101``, 3-8 keV, 13.7 mHz above the prediction), about 11% across the 28 searches.
+Thirteen of the fourteen limit the 3-8 keV pulsed amplitude to 4.0-8.3%, below the 8.6% seen
+in 2011; ``0657800101``, three weeks before that detection and with 2.5 times its events, gives
+below 5.5%, so the pulse comes and goes. Every amplitude is a fraction of all the events in the
+30 arcsec circle, which always holds M82 X-1, about 5 arcsec from X-2, and the galaxy's
+diffuse emission: X-2's own pulsed fraction is higher. The per-exposure table, commands and
+logs are kept outside the repository, in ``~/tmp/m82_xmm/M82X2_XMM_search_results.md``.
+
 Chandra / ACIS and HRC
 ----------------------
 
