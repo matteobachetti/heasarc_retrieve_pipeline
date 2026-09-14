@@ -1929,11 +1929,23 @@ computed the same way.
 
 No new detection among the other 14 exposures. The smallest ``p_value_best`` is 0.42%
 (``0560590101``, 3-8 keV, 13.7 mHz above the prediction), about 11% across the 28 searches.
-Thirteen of the fourteen limit the 3-8 keV pulsed amplitude to 4.0-8.3%, below the 8.6% seen
-in 2011; ``0657800101``, three weeks before that detection and with 2.5 times its events, gives
-below 5.5%, so the pulse comes and goes. Every amplitude is a fraction of all the events in the
-30 arcsec circle, which always holds M82 X-1, about 5 arcsec from X-2, and the galaxy's
-diffuse emission: X-2's own pulsed fraction is higher. The per-exposure table, commands and
+Every amplitude is a fraction of all the events in the 30 arcsec circle, which always holds
+M82 X-1, about 5 arcsec from X-2, and the galaxy's diffuse emission. A falling pulsed fraction
+can therefore mean a weaker pulse or more unpulsed light. The **pulsed count rate** tells them
+apart, because unpulsed light adds no pulsed counts. It is HENDRICS' ``pulse_amp`` -- ``a`` in
+``λ(1 + a sin φ)``, the pulsed fraction of a sinusoid -- times the circle's mean rate in the
+searched band, over the summed good time intervals. Limits are taken at the highest Z²₁
+anywhere in the periodogram, not in the candidate table, which misses the tallest peak in 5 of
+the 32 searches. That makes them valid at any frequency in the band.
+
+In 3-8 keV the 2011 detection pulses at 107 ± 20 mcts/s. Three weeks before and after, the
+90% limits are 46 and 56 mcts/s, while the circle's total 3-8 keV rate was *lower* than during
+the detection (0.85 and 0.55 counts/s, against 1.25). X-1 did not hide the pulse: it faded. All
+14 other exposures fall below 107 mcts/s, and ten below 68. X-1 matters for sensitivity
+instead, because a pulsed-rate limit grows as the square root of the counts:
+``0560590101``, the brightest circle at 2.2 counts/s, barely reaches the 2011 level. The 2001
+pulse is about half as strong (56 ± 11 mcts/s), and only ``0206080101`` (below 30) is
+clearly beneath it. The per-exposure table, commands and
 logs are kept outside the repository, in ``~/tmp/m82_xmm/M82X2_XMM_search_results.md``.
 
 Chandra / ACIS and HRC
