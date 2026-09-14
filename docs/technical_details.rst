@@ -2394,7 +2394,9 @@ custom ``data_mode`` ``OBS20743``, which is why the mode is read from the dead-t
 not matched against known names.
 
 **15 of 16 reduced, and every timing criterion was met.** ``1411`` was refused because it
-was taken in two separate pointings (OBIs), 84 days apart.
+was taken in two separate pointings (OBIs), 84 days apart. Once observations in parts were
+supported it was reduced too, on 2026-09-14: each part barycentred at M82 X-2 with its own
+orbit file, 4.82 and 5.18 ms measured (4.93 ms recorded), 822 and 16 source events.
 
 .. list-table::
    :header-rows: 1
@@ -2440,10 +2442,13 @@ Four faults were found by the run and fixed:
 **No pulsation was detected in any of them**, and none was expected to be: detection was
 never a pass criterion. The search used the settings above plus a prior spin solution
 fixed before looking (HENDRICS ``--known-freq 0.728 --known-fdot -5e-11
---known-pepoch 56682``), over 0.728-0.77 Hz for 2007 and 0.70-0.73 Hz for 2020-21. The best
-single value, ``23463`` at a false-alarm probability of 0.5%, becomes about 6% after 13
-pointings. With 50-170 source events the 90% upper limits on the pulsed amplitude are
-36-100% or more, far above the 5-12% seen with ACIS, so these observations are not
+--known-pepoch 56682``), over 0.728-0.77 Hz for 2007 and 0.70-0.73 Hz for 2020-21. It was
+rerun with the two-segment solution and then with the calibrated false-alarm probability
+described under *Fast-frame ACIS observations of M82*, adding both parts of ``1411``
+(0.728-0.77 Hz). The smallest is then 3.4% (``23463``, a peak 9 mHz from the prediction),
+about 40% across the fifteen searches. With 8-172 source events the 90% upper limits on the
+pulsed amplitude are 29% or more. ``1411``'s first part, 822 events, gives 19.9% at the
+predicted frequency. All are above the 5-12% seen with ACIS, so these observations are not
 sensitive enough to rule the pulsation out. The per-observation table, commands and logs
 are kept outside the repository, in ``~/tmp/m82_hrc/M82X2_HRC_search_results.md``.
 
@@ -2489,11 +2494,17 @@ pile-up at most 3.1% (``6361``, on-axis). ``10025``, ``10026``, ``18062`` and ``
 sit within the dither of their chip's edge and lose some counts to it.
 
 A targeted Z²₁ search of all nineteen, with a two-segment spin solution that follows Liu et al.
-2024, fixed beforehand, finds no pulsation. The best-placed observations limit the pulsed amplitude
-to 8.4% (``6097``) and 8.9% (``10027``), below the 10.6% seen in ``5644``. The false-alarm
-probabilities HENzsearch reports in its targeted mode are all below 0.38, in these and in the
-HRC observations. So they are not quoted as significances until that mode is calibrated on data
-without a signal. The per-observation table is in ``~/tmp/m82_acis/M82X2_ACIS_search_results.md``.
+2024, fixed beforehand, finds no pulsation. The first run reported false-alarm probabilities
+all below 0.38, five of them below 1%: a targeted search did not pay for picking its best
+candidate. HENDRICS now charges for it (``p_value_best``, calibrated by simulation), and in the
+rerun, with ``--oversample 4`` (the same grid, now counted per 1/T), the smallest is 1.9%
+(``18066``, a peak 2.5 mHz from the prediction), about 30% across the nineteen.
+
+The strongest peak of ``6097``'s band limits the pulsed amplitude to 8.3%, below the 10.6% seen
+in ``5644``. Lower limits elsewhere (6.8% in ``18063``) are computed at a candidate within a
+frequency bin of the prediction. The solution misses the frequencies measured in ``5644`` and
+``8190`` by 0.6-0.75 mHz, so those limits hold only for a pulse at the predicted frequency. The
+per-observation table is in ``~/tmp/m82_acis/M82X2_ACIS_search_results.md``.
 
 Open questions
 ~~~~~~~~~~~~~~
