@@ -74,6 +74,9 @@ DEFAULT_CONFIG = dict(
     input_data_path="./",
     products="pps",
     sas_ccfpath=None,
+    # The EPIC cameras to reduce, by name. All three unless the caller narrows it -- see
+    # :func:`xmm_selected_exposures`.
+    cameras=("pn", "mos1", "mos2"),
     src_radius_arcsec=30.0,
     bkg_inner_factor=1.5,
     bkg_outer_factor=3.0,
@@ -553,6 +556,12 @@ def xmm_config(config):
         A new dictionary. Neither the caller's nor :data:`DEFAULT_CONFIG` is modified, and
         the two path entries are absolute.
 
+    Raises
+    ------
+    ValueError
+        If ``cameras`` is empty, a bare string, or names something that is not an EPIC
+        camera. A typo there would otherwise be a reduction that quietly finds nothing.
+
     Examples
     --------
     >>> xmm_config({"products": "odf"})["src_radius_arcsec"]
@@ -565,6 +574,13 @@ def xmm_config(config):
     # adjust it for the whole process.
     merged = copy.deepcopy(DEFAULT_CONFIG)
     merged.update(copy.deepcopy(config or {}))
+
+    cameras = merged["cameras"]
+    known = set(EPIC_INSTRUMENTS.values())
+    if isinstance(cameras, str) or not cameras or not set(cameras) <= known:
+        raise ValueError(
+            f"cameras must be a non-empty list drawn from {sorted(known)}; got {cameras!r}"
+        )
     return absolute_config(merged, DEFAULT_CONFIG)
 
 
@@ -3368,6 +3384,41 @@ def xmm_barycentered_source_events(
     return output
 
 
+def xmm_selected_exposures(exposures, config):
+    """
+    Keep only the exposures of the cameras ``config["cameras"]`` names.
+
+    Both routes list everything the observation holds and narrow it here, so the listing
+    stays a faithful account of the data and the choice is made in one place. On the ODF
+    route ``epproc`` and ``emproc`` still both run: the saving is the per-exposure
+    reduction -- screening, regions, pile-up, barycentring, spectra -- not the telemetry
+    processing.
+
+    Parameters
+    ----------
+    exposures : list of Exposure
+        What the observation holds, in the order the front end listed it.
+    config : dict
+        A complete configuration, from :func:`xmm_config`.
+
+    Returns
+    -------
+    list of Exposure
+        The same exposures in the same order, less those of other cameras. Empty when the
+        observation holds none of the cameras asked for.
+    """
+    wanted = set(config["cameras"])
+    kept = [exposure for exposure in exposures if exposure.instrument in wanted]
+    left_out = [exposure for exposure in exposures if exposure.instrument not in wanted]
+    if left_out:
+        get_logger().info(
+            "Not reducing "
+            + ", ".join(f"{e.instrument} {e.expid} {e.mode}" for e in left_out)
+            + f": cameras is {sorted(wanted)}"
+        )
+    return kept
+
+
 def xmm_pps_front_end(obsid, config):
     """
     Everything the PPS route does before the per-exposure loop.
@@ -3388,7 +3439,9 @@ def xmm_pps_front_end(obsid, config):
     """
     from . import sas
 
-    exposures = xmm_with_submodes(xmm_exposures_from_pps(obsid, config))
+    exposures = xmm_with_submodes(
+        xmm_selected_exposures(xmm_exposures_from_pps(obsid, config), config)
+    )
     if not exposures:
         return [], None, None
 
@@ -3464,7 +3517,7 @@ def xmm_odf_front_end(obsid, config):
         obsid, config, env=env, log_to=lambda task: tool_log_file(task, obsid, config)
     )
 
-    exposures = xmm_exposures_from_odf(obsid, config)
+    exposures = xmm_selected_exposures(xmm_exposures_from_odf(obsid, config), config)
     if not exposures:
         return [], env, summary
 

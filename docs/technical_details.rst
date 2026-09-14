@@ -1729,6 +1729,15 @@ MOS ``FastUncompressed`` reads its central CCD in timing and its outer six in im
 PPS writes both under one exposure identifier. Keyed on camera and exposure alone, one of
 the two would be dropped in silence.
 
+``config["cameras"]`` restricts the reduction to some cameras, all three by default. Both
+routes list every exposure the observation holds and ``xmm_selected_exposures`` narrows the
+list, logging what it leaves out. The reason is timing: a search for M82 X-2's 1.37 s spin
+needs pn alone, because MOS reads out every 0.9 s (``PrimePartialW3``) or 2.6 s (full
+window), too slowly to sample it. On the ODF route ``emproc`` still runs; what is saved is
+the per-exposure reduction. An empty list, a bare string or an unknown name is refused by
+``xmm_config``: a typo there would otherwise be a reduction that finds nothing to do, and
+an observation holding none of the cameras asked for is reported as ``NO_SCIENCE_DATA``.
+
 The calibration index is built, not downloaded
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

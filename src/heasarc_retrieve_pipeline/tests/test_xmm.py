@@ -1034,6 +1034,61 @@ class TestChoosingTheRoute:
         assert kept == NO_PPS_ARCHIVE
 
 
+class TestChoosingTheCameras:
+    """
+    ``config["cameras"]`` restricts a reduction to some of the EPIC cameras. The case that
+    asked for it is a pulsation search at 1.37 s: MOS reads out every 0.9 or 2.6 s, too
+    slowly to sample the spin, so reducing it costs disk and time for nothing.
+    """
+
+    def exposures(self, tmp_path, names=HER_X_1_PPS):
+        config = a_downloaded_observation(tmp_path, "0153950401", names)
+        return xmm.xmm_exposures_from_pps("0153950401", config)
+
+    def test_every_camera_is_reduced_by_default(self, tmp_path):
+        exposures = self.exposures(tmp_path)
+
+        kept = xmm.xmm_selected_exposures(exposures, xmm.xmm_config(None))
+
+        assert kept == exposures
+
+    def test_the_default_names_all_three_cameras(self):
+        assert tuple(xmm.xmm_config(None)["cameras"]) == ("pn", "mos1", "mos2")
+
+    def test_only_the_cameras_asked_for_are_kept(self, tmp_path):
+        exposures = self.exposures(tmp_path)
+
+        kept = xmm.xmm_selected_exposures(exposures, xmm.xmm_config({"cameras": ["pn"]}))
+
+        assert [(e.instrument, e.expid, e.mode) for e in kept] == [("pn", "S003", xmm.TIMING)]
+
+    def test_both_modes_of_a_kept_camera_survive(self, tmp_path):
+        exposures = self.exposures(tmp_path)
+
+        kept = xmm.xmm_selected_exposures(exposures, xmm.xmm_config({"cameras": ["mos1"]}))
+
+        assert {e.mode for e in kept} == {xmm.IMAGING, xmm.TIMING}
+
+    def test_an_observation_without_the_camera_asked_for_keeps_nothing(self, tmp_path):
+        exposures = self.exposures(tmp_path, [n for n in HER_X_1_PPS if "PNS003" not in n])
+
+        assert xmm.xmm_selected_exposures(exposures, xmm.xmm_config({"cameras": ["pn"]})) == []
+
+    def test_an_unknown_camera_is_refused(self):
+        """A typo must not become a reduction that quietly finds nothing to do."""
+        with pytest.raises(ValueError, match="pm"):
+            xmm.xmm_config({"cameras": ["pm"]})
+
+    def test_a_bare_string_is_refused(self):
+        """``"pn"`` iterates as ``"p", "n"``; asking for a list is clearer than guessing."""
+        with pytest.raises(ValueError):
+            xmm.xmm_config({"cameras": "pn"})
+
+    def test_no_camera_at_all_is_refused(self):
+        with pytest.raises(ValueError):
+            xmm.xmm_config({"cameras": []})
+
+
 class TestTheConfiguration:
     """
     The mission defaults have to survive a caller who only names the paths, which is
