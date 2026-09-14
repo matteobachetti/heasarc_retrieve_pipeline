@@ -2529,6 +2529,18 @@ predicted frequency. All are above the 5-12% seen with ACIS, so these observatio
 sensitive enough to rule the pulsation out. The per-observation table, commands and logs
 are kept outside the repository, in ``~/tmp/m82_hrc/M82X2_HRC_search_results.md``.
 
+**Rerun 2026-09-14 with the fdot rule from the XMM pn survey** (see *Pulsation search of
+M82 X-2 in pn*): fdot fixed at 0 when ``1/T² > 2e-10`` Hz/s for an event file's own
+exposure, free otherwise. Fourteen of the fifteen searchable event files meet the fixed
+case; only ``8505`` (85 ks) keeps a free fdot, and its best candidate lands on
+``fdot = -1.2e-9`` Hz/s, off the two-segment solution -- the same free-fdot noise-ridge
+effect seen in XMM's 2001 observation. The XMM survey also splits 2-8 keV from the full
+band; HRC's event lists carry no calibrated ``ENERGY`` column, only a raw ``PI`` channel
+with no established keV mapping, so that split is not attempted here and HRC keeps one
+unfiltered search per file, as before. Still no detection: smallest false-alarm
+probability 11%, none below 1%; the tightest limit is unchanged, ``1411``'s first part at
+19.9%. Table in the same results file, under *Rerun 2026-09-14*.
+
 Fast-frame ACIS observations of M82
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2582,6 +2594,18 @@ in ``5644``. Lower limits elsewhere (6.8% in ``18063``) are computed at a candid
 frequency bin of the prediction. The solution misses the frequencies measured in ``5644`` and
 ``8190`` by 0.6-0.75 mHz, so those limits hold only for a pulse at the predicted frequency. The
 per-observation table is in ``~/tmp/m82_acis/M82X2_ACIS_search_results.md``.
+
+**Rerun 2026-09-14 to match the XMM pn survey's criteria** (Matteo): fdot fixed at 0 when
+``1/T² > 2e-10`` Hz/s for an event file's own exposure, free otherwise, and two energy
+bands, 2-8 keV and 0.2-12 keV. All nineteen observations have ``T`` between 11.7 and
+60 ks, so the rule fixes fdot at 0 everywhere. Unlike XMM's PI, ACIS's ``ENERGY`` column
+is genuinely calibrated (eV, converted to keV from the column's own unit), so the 2-8 keV
+cut needs no workaround. Still no detection in either band: smallest false-alarm
+probability 2.3% (``18073``, full band), none below 1%. The tightest limits stay under
+5644's 10.6% -- ``6097`` at 7.1% (full band) / 8.5% (2-8 keV), ``10027`` at 8.3% / 12.1%
+-- though both candidates sit away from the exact prediction, so the limits hold at the
+frequency found, not necessarily the predicted one. Table in the same results file, under
+*Rerun 2026-09-14*.
 
 Open questions
 ~~~~~~~~~~~~~~
