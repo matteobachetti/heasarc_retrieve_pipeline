@@ -2127,8 +2127,38 @@ and **more than** ``bkg_crowding_ratio`` (3) **times the median**. Either condit
 misfires: the probability flags a harmless excess of a few per cent on a well-exposed ring,
 and the ratio flags four counts against one. The wedge counts and the background share, with
 and without the brightest wedge, go into the ``clean_event_list`` record, with a warning in
-the log. All 35 M82 observations are flagged; the check has not yet been run on a real
-isolated source. **Nothing is corrected**: the regions do not change, and the timing
+the log. All 35 M82 observations are flagged. Two isolated sources, reduced through ``core``
+on 2026-09-13/14, are not:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 14 14 14 14 14
+
+   * - observation
+     - source counts
+     - source radius
+     - brightest / median
+     - chance probability
+     - background share
+   * - ``741``, PSR J0437-4715
+     - 6 761
+     - 2.6 arcsec
+     - 25 / 12.5 = 2.0
+     - 1.4e-2
+     - 0.4%
+   * - ``731``, RBS 1223
+     - 7 069
+     - 6.6 arcsec
+     - 38 / 15 = 2.5
+     - 5.6e-6
+     - 0.4%
+
+``731`` shows why both conditions are needed: its brightest wedge is far too bright to be
+chance, yet only 2.5 times the median, and on the probability alone it would be flagged.
+Reduced first at the position the name resolver returns for "RBS 1223", 6.9 arcsec from the
+source, ``731`` *was* flagged, and rightly: the source itself lay in the ring, 341 counts in
+one wedge and 22 times the median, while the source circle held 19 events. So a misplaced
+source region shows up here too. **Nothing is corrected**: the regions do not change, and the timing
 analysis, which uses the source events alone, is unaffected. Look at the field before
 fitting a crowded one.
 
