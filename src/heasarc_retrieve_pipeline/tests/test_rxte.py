@@ -10,6 +10,7 @@ import os
 import re
 
 import numpy as np
+import pytest
 from astropy.io import fits
 from astropy.table import Table
 
@@ -18,6 +19,10 @@ from heasarc_retrieve_pipeline.rxte import (
     rxte_base_output_path,
     rxte_download_filter,
     find_rxte_inputs,
+    join_rxte_events,
+    observation_windows,
+    pca_gain_epoch,
+    pcus_with_propane_veto,
     process_rxte_obsid,
     rxte_pcu_gtis,
     rxte_screened_events,
@@ -743,3 +748,205 @@ class TestTheFlowDefaults:
 
         assert process_rxte_obsid.fn("94123-01-19-00") is None
         assert seen["config"]["out_data_path"] == str(tmp_path)
+
+
+class TestGainEpochs:
+    def test_the_five_epochs_are_bounded_by_the_four_gain_changes(self):
+        """
+        Epoch numbers, not dates, are what an energy calibration is keyed on. The M82
+        archive falls in two: the 1997 pointings in 3, everything from 2004 on in 5.
+        """
+        assert pca_gain_epoch(50170.0) == 2  # 1996-03, between the first two changes
+        assert pca_gain_epoch(50482.0) == 3  # 1997-02, the 20303 pointings
+        assert pca_gain_epoch(53000.0) == 5  # 2004-01, the 90121 pointings
+        assert pca_gain_epoch(55195.0) == 5  # 2009-12, the last 94123 pointing
+
+    def test_a_date_on_an_edge_belongs_to_the_later_epoch(self):
+        """A gain change starts an epoch, it does not end one."""
+        assert pca_gain_epoch(51676.0) == 4  # 2000-05-12, the day before
+        assert pca_gain_epoch(51677.0) == 5  # 2000-05-13, the change itself
+
+
+class TestJoiningPointings:
+    def write_reduced(self, path, times, pcus, anodes, tstart, stop=None):
+        """A reduced pointing: absolute times, a GTI, and the mission keywords."""
+        stop = stop if stop is not None else max(times) + 10.0
+        n = len(times)
+        table = Table(
+            {
+                "TIME": np.asarray(times, dtype=float),
+                "PCUID": np.asarray(pcus, dtype=np.uint8),
+                "ANODEID": np.asarray(anodes, dtype=np.uint8),
+                "PHA": np.full(n, 50, dtype=np.uint8),
+            }
+        )
+        events = fits.BinTableHDU(table, name="XTE_SE")
+        for key, value in [
+            ("TELESCOP", "XTE"),
+            ("INSTRUME", "PCA"),
+            ("MJDREFI", 49353),
+            ("MJDREFF", 0.000696574074),
+            ("TIMESYS", "TDB"),
+            ("TIMEUNIT", "s"),
+            ("TIMEZERO", 0.0),
+            ("TEVTB2", "(M[1]{1},S[Zero]{5},E[VPR]{1},D[0:4]{3},E[0:63]{6},C[0:255]{8})"),
+            ("TSTART", float(tstart)),
+            ("TSTOP", float(stop)),
+            ("EXPOSURE", float(stop - tstart)),
+            ("ONTIME", float(stop - tstart)),
+        ]:
+            events.header[key] = value
+        gti = fits.BinTableHDU(
+            Table([[float(tstart)], [float(stop)]], names=("START", "STOP")), name="GTI"
+        )
+        fits.HDUList([fits.PrimaryHDU(), events, gti]).writeto(path, overwrite=True)
+        return str(path)
+
+    def two_pointings(self, tmp_path):
+        first = self.write_reduced(
+            tmp_path / "a.evt", [10.0, 20.0], [2, 2], [10, 20], tstart=0.0, stop=100.0
+        )
+        second = self.write_reduced(
+            tmp_path / "b.evt", [5010.0], [3], [11], tstart=5000.0, stop=5100.0
+        )
+        return first, second
+
+    def test_the_events_are_concatenated_in_time_order(self, tmp_path):
+        """Fusing days is the whole point: one event list, one GTI list, sorted."""
+        first, second = self.two_pointings(tmp_path)
+        out = tmp_path / "joined.evt"
+
+        join_rxte_events([second, first], str(out), layers=None)
+
+        with fits.open(out) as hdul:
+            assert hdul["XTE_SE"].data["TIME"].tolist() == [10.0, 20.0, 5010.0]
+
+    def test_the_gap_between_pointings_stays_a_gap(self, tmp_path):
+        """The days between two pointings are not good time, and the exposure is the sum
+        of the intervals rather than the span."""
+        first, second = self.two_pointings(tmp_path)
+        out = tmp_path / "joined.evt"
+
+        join_rxte_events([first, second], str(out), layers=None)
+
+        with fits.open(out) as hdul:
+            gti = hdul["GTI"].data
+            assert gti["START"].tolist() == [0.0, 5000.0]
+            assert hdul["XTE_SE"].header["EXPOSURE"] == 200.0
+            assert hdul["XTE_SE"].header["TSTOP"] == 5100.0
+
+    def test_the_top_layer_is_the_default_selection(self, tmp_path):
+        """
+        ANODEID 10 and 11 are the two halves of the top layer, which sees the source with
+        the least background; 20/21 and 30/31 are the layers below it.
+        """
+        first, second = self.two_pointings(tmp_path)
+        out = tmp_path / "joined.evt"
+
+        join_rxte_events([first, second], str(out))
+
+        with fits.open(out) as hdul:
+            assert hdul["XTE_SE"].data["ANODEID"].tolist() == [10, 11]
+            assert hdul["XTE_SE"].header["LAYERS"] == "1"
+
+    def test_a_pcu_selection_is_applied_across_the_pointings(self, tmp_path):
+        """Which PCUs are worth keeping can be decided at merge time, not only at
+        reduction time, because the reduced files keep PCUID."""
+        first, second = self.two_pointings(tmp_path)
+        out = tmp_path / "joined.evt"
+
+        join_rxte_events([first, second], str(out), pcus=(2,), layers=None)
+
+        with fits.open(out) as hdul:
+            assert set(hdul["XTE_SE"].data["PCUID"].tolist()) == {2}
+
+    def test_joining_across_a_gain_epoch_is_refused(self, tmp_path):
+        """
+        PHA means a different energy either side of a gain change, and the merged file can
+        carry only one epoch, so stingray would calibrate half the events wrongly. The M82
+        archive has 1997 in epoch 3 and everything else in epoch 5, seven years apart, so
+        a real fusion window never needs this -- but the failure has to be loud.
+        """
+        early = self.write_reduced(
+            tmp_path / "early.evt", [10.0], [2], [10], tstart=0.0, stop=100.0
+        )
+        # 2004-01-01 in mission elapsed time: epoch 5 against epoch 1 for a time near zero.
+        late = self.write_reduced(
+            tmp_path / "late.evt", [3.15e8], [2], [10], tstart=3.15e8, stop=3.15e8 + 100
+        )
+
+        with pytest.raises(ValueError, match="gain epoch"):
+            join_rxte_events([early, late], str(tmp_path / "joined.evt"), layers=None)
+
+    def test_the_bit_layout_survives_the_join(self, tmp_path):
+        """
+        TEVTB2 fills its header card exactly, and writing it warns that a comment would be
+        truncated. The warning is silenced, so the value has to be checked instead: without
+        it stingray cannot turn PHA into keV.
+        """
+        first, second = self.two_pointings(tmp_path)
+        out = tmp_path / "joined.evt"
+
+        join_rxte_events([first, second], str(out), layers=None)
+
+        with fits.open(out) as hdul:
+            assert hdul["XTE_SE"].header["TEVTB2"] == (
+                "(M[1]{1},S[Zero]{5},E[VPR]{1},D[0:4]{3},E[0:63]{6},C[0:255]{8})"
+            )
+
+    def test_a_window_with_no_surviving_events_writes_nothing(self, tmp_path):
+        """A selection that keeps nothing is reported, not written as an empty file."""
+        first, second = self.two_pointings(tmp_path)
+
+        assert join_rxte_events([first, second], str(tmp_path / "j.evt"), pcus=(4,)) is None
+
+
+class TestBuildingWindows:
+    def test_pointings_are_grouped_up_to_the_span(self):
+        """
+        Fusing days buys sensitivity only while the frequency model stays good over the
+        span, so the span is the knob. Three pointings a day apart group in pairs under a
+        two-day limit.
+        """
+        day = 86400.0
+        starts = [0.0, day, 2 * day, 3 * day]
+
+        groups = observation_windows(starts, [s + 1000.0 for s in starts], max_span=2 * day)
+
+        assert groups == [[0, 1], [2, 3]]
+
+    def test_a_long_gap_can_break_a_window(self):
+        """Two pointings inside the span but a month apart are not one coherent stretch."""
+        starts = [0.0, 100.0, 30 * 86400.0]
+
+        groups = observation_windows(
+            starts, [s + 100.0 for s in starts], max_span=365 * 86400.0, max_gap=86400.0
+        )
+
+        assert groups == [[0, 1], [2]]
+
+    def test_one_pointing_is_a_window_of_its_own(self):
+        assert observation_windows([0.0], [100.0], max_span=86400.0) == [[0]]
+
+    def test_the_pointings_do_not_have_to_arrive_sorted(self):
+        """The reduced files come off a directory listing, which is sorted by name."""
+        groups = observation_windows([100.0, 0.0], [200.0, 50.0], max_span=1000.0)
+
+        assert groups == [[1, 0]]
+
+
+class TestThePropaneVeto:
+    def test_all_five_units_have_their_veto_at_the_start(self):
+        """Before 2000 there is no reason to leave a unit out, and the 1997 M82 pointings
+        are the only ones that gain from it: PCU3 and PCU4 were off for all of them."""
+        assert pcus_with_propane_veto(50482.0) == (0, 1, 2, 3, 4)
+
+    def test_pcu0_is_dropped_after_its_veto_layer_is_lost(self):
+        """The propane layer vetoes charged particles; without it the top xenon layer of
+        PCU0 collects a background a faint source cannot be found under."""
+        assert pcus_with_propane_veto(51676.0) == (0, 1, 2, 3, 4)  # 2000-05-12
+        assert pcus_with_propane_veto(51677.0) == (1, 2, 3, 4)  # 2000-05-13
+
+    def test_pcu1_goes_the_same_way_six_years_later(self):
+        assert pcus_with_propane_veto(54094.0) == (1, 2, 3, 4)  # 2006-12-25
+        assert pcus_with_propane_veto(54095.0) == (2, 3, 4)  # 2006-12-26

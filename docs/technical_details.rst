@@ -1743,11 +1743,21 @@ Run over the 863 downloaded M82 pointings, the screened exposure per unit is:
      - 475.1 ks
      - 436.4 ks
 
-PCU2 is the workhorse and is the only unit on for most of the archive. PCU0 lost its
-propane veto layer in 2000 and carries about 65% more background than the others, so the
-M82 search drops it, at a cost of 562 ks of unit-time; PCUs 2, 3 and 4 together give
-1808 ks.
+PCU2 is the workhorse and is the only unit on for most of the archive.
 
+Which units to keep is a question with a date in it. Each PCU has a propane layer in front
+of its xenon that vetoes charged particles; PCU0 lost its window on 2000-05-12 and PCU1 on
+2006-12-25, and from then on their top xenon layer collects several times the particle
+background of the others. The usual advice is to drop those units outright, which is right
+after those dates and wasteful before them: ``pcus_with_propane_veto(mjd)`` returns the
+units that still had their veto. For M82 this is not a detail. The 30 pointings of 1997
+were taken with **only PCU1 and PCU2 switched on** -- PCU3 and PCU4 have ``PCU3_ON = 0``
+for every sample of those filter files -- so putting PCU0 back gives that block three
+units instead of two, half again the collecting area, for 85 ks of exposure.
+
+Reducing with all five units and choosing later raised the barycentred good time from
+903.2 ks to 912.9 ks and the top-layer events in the merged windows from 31.28 to 32.43
+million.
 
 Reduction
 ~~~~~~~~~
@@ -1811,6 +1821,87 @@ inside the ``GTI`` extension by construction, since that extension is the union 
 units; the per-unit extensions are there so that an exposure, and therefore an upper limit
 on a pulsed fraction, can be computed properly.
 
+
+Fusing days
+~~~~~~~~~~~
+
+An RXTE pointing on M82 is short: a median of 880 s, and 15 ks at the very best. A
+coherent search of one of them has no sensitivity at all to a 0.73 Hz pulsar at the flux of
+X-2. The pointings have to be fused, and ``join_rxte_events`` is the step that does it.
+
+It concatenates reduced pointings into one event list, **unions** their good time
+intervals -- so the days between two pointings stay a gap, and ``EXPOSURE`` is the good
+time summed over the intervals rather than the span -- and applies two selections that the
+reduction deliberately left open:
+
+``pcus``
+    Which units to keep, normally ``pcus_with_propane_veto`` of the window's date.
+
+``layers``
+    Which xenon layers to keep, through ``LAYER_ANODES``: ``ANODEID`` 10 and 11 are the
+    left and right halves of the top layer, 20/21 and 30/31 the two below it. The top
+    layer is the default. It holds 52% of the archive's events and much the best ratio of
+    a faint source's 2-10 keV counts to background.
+
+``observation_windows(starts, stops, max_span, max_gap=None)`` decides what goes together.
+It grows a window greedily from the earliest pointing not yet in one and closes it as soon
+as adding the next would take it past ``max_span``. The span is the knob that matters: it
+is how far the frequency model has to hold, and the trial count of a coherent search grows
+with it. For the 847 reduced M82 pointings:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 14 18 18 18
+
+   * - Max span
+     - Windows
+     - Median exposure
+     - Largest window
+     - Windows over 10 ks
+   * - 1 day
+     - 812
+     - 0.9 ks
+     - 20.5 ks
+     - 2
+   * - 3 days
+     - 422
+     - 1.7 ks
+     - 22.3 ks
+     - 3
+   * - 10 days
+     - 160
+     - 4.3 ks
+     - 24.7 ks
+     - 23
+   * - 30 days
+     - 63
+     - 11.6 ks
+     - 40.0 ks
+     - 53
+
+A window may never cross a **gain epoch**. The PCA high voltage was retuned on 1996-03-21,
+1996-04-15, 1999-03-22 and 2000-05-13, and the same ``PHA`` means a different energy either
+side of each; ``pca_gain_epoch(mjd)`` gives the number, 1 to 5. A merged file carries a
+single epoch and a single ``TEVTB2``, and stingray calibrates from them, so joining across
+an epoch would silently mislabel the energies of half the events. ``join_rxte_events``
+refuses. In practice this costs nothing: the M82 archive has 30 pointings in epoch 3 (1997)
+and 817 in epoch 5 (2004 onwards), seven years apart, and all 847 share one ``TEVTB2``.
+
+.. note::
+
+   Summing the pointings' ``EXPOSURE`` keywords gives 1.6 s more than the merged windows do,
+   over 912.9 ks. That is not a rounding error: consecutive pointings occasionally share a
+   second of good time at their boundary, and the union counts it once, which is correct.
+
+.. note::
+
+   After barycentring, the sum of a pointing's intervals differs from its ``EXPOSURE``
+   keyword by up to 0.43 s, median -1.1 ms, never more than a second. This is physical and
+   is left alone. ``barycorr`` shifts the start and the stop of an interval by the light
+   travel time to the barycentre *at each of those two instants*, and the Earth moves 30
+   km/s between them, so an interval a few kiloseconds long is stretched or squeezed by a
+   few tenths of a second -- 4 x 10\ :sup:`-4` of the exposure. The interval boundaries are
+   the trustworthy numbers; the keyword is the one computed before the correction.
 
 XMM-Newton / EPIC
 -----------------

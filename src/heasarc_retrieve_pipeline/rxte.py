@@ -1,16 +1,24 @@
 """
-RXTE/PCA reduction: a pure-astropy re-implementation of the standard screening.
+RXTE/PCA reduction and day fusion: a pure-astropy re-implementation of the screening.
 
-Unlike the NuSTAR and NICER modules, this one uses no HEASOFT at all except for the
-barycentre correction. It reads the standard filter file, builds one good time interval
-list *per PCU* from the standard screening conditions, and applies them to the GoodXenon
-event files with numpy masking.
+Unlike the NuSTAR and NICER modules, the reduction here uses no HEASOFT at all except for
+the barycentre correction. It reads the standard filter file, builds one good time
+interval list *per PCU* from the standard screening conditions, and applies them to the
+GoodXenon event files with numpy masking.
 
-The entry point is process_rxte_obsid. It screens every GoodXenon file of a pointing
-against its own unit's intervals, merges them into a single event list with absolute
-times, and barycentres it at the position being searched. The output keeps PCUID,
-ANODEID and PHA, so the choice of units and xenon layers can still be made
-afterwards and stingray can calibrate the energies from TEVTB2.
+Two stages, in this order:
+
+``process_rxte_obsid``
+    One pointing. Screens every GoodXenon file against its own unit's intervals, merges
+    them into a single event list with absolute times, and barycentres it at the position
+    being searched. The output keeps ``PCUID``, ``ANODEID`` and ``PHA``, so the choice of
+    units and xenon layers can still be made afterwards and stingray can calibrate the
+    energies from ``TEVTB2``.
+
+``join_rxte_events``
+    Several pointings. RXTE observations of a faint source are short and scattered, and
+    fusing the pointings of a few days is what makes a coherent pulsation search possible
+    at all. The good time intervals are unioned, so the time between pointings stays a gap.
 
 Only event-mode data can be processed; pointings that ran only binned modes are skipped
 with a warning. The products are a first look, not calibrated spectra: the number of
@@ -558,3 +566,252 @@ def process_rxte_obsid(obsid: str, config=None, flags=None, ra: float = None, de
 
     barycentred = barycenter_file(screened, orbit_file, ra=ra, dec=dec, overwrite=True)
     logger.info(f"RXTE processing complete: {barycentred}")
+    return barycentred
+
+
+#: Modified Julian Dates of the four PCA gain changes, each of which starts a new epoch.
+#:
+#: The high voltage was retuned on 1996-03-21, 1996-04-15, 1999-03-22 and 2000-05-13, and
+#: the same pulse height means a different energy either side of each. Epoch 5 runs from
+#: the last of them to the end of the mission.
+GAIN_EPOCH_EDGES = (50163.0, 50188.0, 51259.0, 51677.0)
+
+#: Which anode identifiers make up each xenon layer. The two per layer are the left and
+#: right halves of the same volume; the layer number is what matters.
+#:
+#: Layer 1 is the top one, nearest the window. It sees the largest fraction of a faint
+#: source's 2-10 keV counts against the smallest background, so it is the default
+#: selection for a source like M82 X-2 that is far below the background.
+LAYER_ANODES = {1: (10, 11), 2: (20, 21), 3: (30, 31)}
+
+#: The layers kept when joining pointings, unless told otherwise.
+DEFAULT_LAYERS = (1,)
+
+
+def pca_gain_epoch(mjd):
+    """
+    The PCA gain epoch a date falls in, 1 to 5.
+
+    Parameters
+    ----------
+    mjd : float
+        Modified Julian Date. A date on a gain change belongs to the epoch it starts.
+
+    Returns
+    -------
+    int
+        The epoch number, as the PCA calibration uses it.
+    """
+    return 1 + int(np.searchsorted(GAIN_EPOCH_EDGES, float(mjd), side="right"))
+
+
+def _mjd_of(header, met):
+    """A mission elapsed time turned into an MJD with the file's own reference."""
+    return float(header.get("MJDREFI", 0)) + float(header.get("MJDREFF", 0.0)) + met / 86400.0
+
+
+def join_rxte_events(files, outfile, pcus=None, layers=DEFAULT_LAYERS, extra_header=None):
+    """
+    Fuse several reduced pointings into one event list, to be searched as a whole.
+
+    RXTE pointings on M82 are short -- a median of about a kilosecond -- and a coherent
+    search over one of them has no sensitivity to a 0.73 Hz pulsar at the flux of X-2.
+    Joining the pointings of a few days multiplies the exposure while the frequency drift
+    stays inside one Fourier bin, which is the only way this search can work at all.
+
+    The inputs must be barycentred and must share a gain epoch: the merged file carries a
+    single ``TEVTB2`` and a single epoch, and stingray turns ``PHA`` into keV from them,
+    so mixing epochs would silently mislabel the energies of half the events.
+
+    Parameters
+    ----------
+    files : list of str
+        Reduced pointings, as :func:`process_rxte_obsid` writes them. Order does not
+        matter; the output is sorted by time.
+    outfile : str
+        Where to write.
+    pcus : sequence of int, optional
+        Keep only these units. ``None`` keeps whatever each pointing was screened for.
+    layers : sequence of int, optional
+        Keep only these xenon layers, by :data:`LAYER_ANODES`. Defaults to the top layer;
+        ``None`` keeps all three.
+    extra_header : dict, optional
+        Keywords to add to the event extension.
+
+    Returns
+    -------
+    str or None
+        ``outfile``, or ``None`` if the selection kept no events, in which case no file is
+        written.
+
+    Raises
+    ------
+    ValueError
+        If the pointings span more than one gain epoch, or disagree on ``TEVTB2``.
+
+    Notes
+    -----
+    The good time intervals are the union of the inputs', so the time between two
+    pointings stays a gap: ``EXPOSURE`` is the good time summed over the intervals and
+    never the span from the first event to the last.
+    """
+    anodes = None
+    if layers is not None:
+        anodes = np.array([a for layer in layers for a in LAYER_ANODES[layer]])
+
+    chunks, intervals, headers, epochs, formats = [], [], [], set(), set()
+    for path in sorted(files):
+        with fits.open(path) as hdul:
+            hdu = hdul["XTE_SE"]
+            header = hdu.header
+            data = hdu.data
+            epochs.add(pca_gain_epoch(_mjd_of(header, float(header["TSTART"]))))
+            if "TEVTB2" in header:
+                formats.add(header["TEVTB2"].strip())
+            headers.append(header)
+            for extension in hdul:
+                if extension.name == "GTI":
+                    intervals.append(
+                        np.column_stack(
+                            [
+                                np.asarray(extension.data["START"], dtype=float),
+                                np.asarray(extension.data["STOP"], dtype=float),
+                            ]
+                        )
+                    )
+            times = np.asarray(data["TIME"], dtype=float) + float(header.get("TIMEZERO", 0.0))
+            pcuid = np.asarray(data["PCUID"])
+            anodeid = np.asarray(data["ANODEID"])
+            keep = np.ones(times.size, dtype=bool)
+            if pcus is not None:
+                keep &= np.isin(pcuid, np.asarray(pcus))
+            if anodes is not None:
+                keep &= np.isin(anodeid, anodes)
+            if keep.any():
+                chunks.append(
+                    (times[keep], pcuid[keep], anodeid[keep], np.asarray(data["PHA"])[keep])
+                )
+
+    if len(epochs) > 1:
+        raise ValueError(
+            f"these pointings span gain epochs {sorted(epochs)}; PHA means a different "
+            "energy in each, so they cannot share one calibrated event list"
+        )
+    if len(formats) > 1:
+        raise ValueError(f"these pointings disagree on TEVTB2: {sorted(formats)}")
+    if not chunks:
+        return None
+
+    times, pcuid, anodeid, pha = (np.concatenate(c) for c in zip(*chunks))
+    order = np.argsort(times, kind="stable")
+    union = merge_intervals(np.concatenate(intervals + [np.zeros((0, 2))]))
+
+    events = fits.BinTableHDU(
+        Table(
+            [times[order], pcuid[order], anodeid[order], pha[order]],
+            names=("TIME", "PCUID", "ANODEID", "PHA"),
+        ),
+        name="XTE_SE",
+    )
+    _copy_keywords(events.header, headers[0], [k for k in KEPT_KEYWORDS if k != "OBS_ID"])
+    events.header["TIMEZERO"] = (0.0, "absolute times: TIMEZERO is already in TIME")
+    events.header["TSTART"] = (float(union[0][0]), "start of the first good time interval")
+    events.header["TSTOP"] = (float(union[-1][1]), "end of the last good time interval")
+    exposure = float((union[:, 1] - union[:, 0]).sum())
+    events.header["ONTIME"] = (exposure, "good time summed over the pointings")
+    events.header["EXPOSURE"] = (exposure, "good time summed over the pointings; no deadtime")
+    events.header["GAINEPOC"] = (sorted(epochs)[0], "PCA gain epoch, one for the whole file")
+    events.header["NPOINT"] = (len(headers), "pointings joined")
+    kept_pcus = sorted(set(int(p) for p in pcuid))
+    events.header["PCUS"] = (",".join(str(p) for p in kept_pcus), "PCUs present")
+    events.header["LAYERS"] = (
+        ",".join(str(layer) for layer in layers) if layers is not None else "1,2,3",
+        "xenon layers kept",
+    )
+    for keyword, value in (extra_header or {}).items():
+        events.header[keyword] = value
+    for obsid in [h["OBS_ID"] for h in headers if "OBS_ID" in h]:
+        events.header["HISTORY"] = f"joined {obsid}"
+
+    _write([fits.PrimaryHDU(), events, _gti_hdu(union, "GTI", events.header)], outfile)
+    return outfile
+
+
+def observation_windows(starts, stops, max_span, max_gap=None):
+    """
+    Group pointings into the stretches that can be searched coherently together.
+
+    A window is grown greedily from the earliest pointing not yet in one, and closed as
+    soon as adding the next would take it past ``max_span``. The span is the knob that
+    matters: it is how far the frequency model has to hold, and the number of trials in a
+    blind search grows with it.
+
+    Parameters
+    ----------
+    starts, stops : sequence of float
+        Start and stop times of each pointing, in the same units as ``max_span``. They
+        need not arrive sorted; the groups come back in time order and so do their members.
+    max_span : float
+        Longest window, from the start of its first pointing to the stop of its last.
+    max_gap : float, optional
+        Close a window rather than bridge a gap longer than this. ``None`` bridges any gap
+        that fits inside ``max_span``.
+
+    Returns
+    -------
+    list of list of int
+        Indices into ``starts``, one list per window.
+    """
+    starts = np.asarray(starts, dtype=float)
+    stops = np.asarray(stops, dtype=float)
+    order = np.argsort(starts, kind="stable")
+
+    groups, current = [], []
+    window_start = last_stop = None
+    for index in order:
+        if current and (
+            stops[index] - window_start > max_span
+            or (max_gap is not None and starts[index] - last_stop > max_gap)
+        ):
+            groups.append(current)
+            current = []
+        if not current:
+            window_start = starts[index]
+        current.append(int(index))
+        last_stop = max(last_stop, stops[index]) if current[:-1] else stops[index]
+    if current:
+        groups.append(current)
+    return groups
+
+
+#: When each PCU lost its propane veto layer, as a Modified Julian Date.
+#:
+#: The propane layer sits in front of the xenon and vetoes charged particles. PCU0 lost
+#: its window on 2000-05-12 and PCU1 on 2006-12-25, and from then on their top xenon layer
+#: collects a particle background several times the others'. The units keep working, and
+#: for a bright source they are still worth using -- for a source far below the background,
+#: like M82 X-2, they are not.
+PROPANE_LOST = {0: 51676.0, 1: 54094.0}
+
+
+def pcus_with_propane_veto(mjd):
+    """
+    The PCUs that still had their propane veto layer on a given date.
+
+    The usual advice to drop PCU0 (and later PCU1) outright costs real exposure early in
+    the mission: before 2000-05-12 every unit still had its veto, and the 1997 pointings of
+    M82 had only PCU1 and PCU2 switched on, so PCU0 is half again as much collecting area
+    for that block.
+
+    Parameters
+    ----------
+    mjd : float
+        Modified Julian Date. A unit is kept on the day it loses its window and dropped
+        from the day after, matching how the date is quoted.
+
+    Returns
+    -------
+    tuple of int
+        The usable units, in order.
+    """
+    return tuple(p for p in ALL_PCUS if float(mjd) <= PROPANE_LOST.get(p, np.inf))
