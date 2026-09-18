@@ -194,25 +194,39 @@ that are not science products.
 string substitution, and both code paths return ``[combined_file]`` -- the cached one after
 checking the file is actually there.
 
-7. RXTE cleaned event files carry no GTI and a stale exposure
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+7. RXTE cleaned event files carried no GTI and a stale exposure -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``rxte.py:123``. The output ``<OBSID>_cl_evt.fits`` contains the surviving events, a
-``GTI_FILE`` header keyword naming the GTI file, and the *original* header -- with the
-original ``EXPOSURE``/``ONTIME``. The GTI extension itself is not appended.
+The output ``<OBSID>_cl_evt.fits`` contained the surviving events, a ``GTI_FILE`` header
+keyword naming the GTI file, and the *original* header -- with the original
+``EXPOSURE``/``ONTIME``. The GTI extension itself was not appended. Any rate derived from
+that header underestimated the flux by the ratio of screened to unscreened exposure.
 
-Any rate derived from this file's header underestimates the flux by the ratio of screened
-to unscreened exposure. Append the GTI extension and recompute the exposure keywords from
-the GTI total.
+**Fixed** in ``rxte_screened_events``. The output carries a ``GTI`` extension holding the
+union over the units, one ``GTI_PCU<n>`` extension per unit, and ``EXPOSURE``/``ONTIME``
+computed from the union. ``TSTART``/``TSTOP`` come from the intervals too.
 
-8. RXTE uses only the first event file it finds
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+8. RXTE used only the first event file it found -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``rxte.py:51``. ``setup_workspace`` breaks out of the pattern loop at the first match and
-then uses ``event_gz_files[0]``. GoodXenon observations always produce **two** files
-(``GX1_*`` and ``GX2_*``) which have to be merged; observations often contain several
-event files covering different time ranges. Silently keeping one of them discards data
-without a warning.
+``setup_workspace`` broke out of the pattern loop at the first match and then used
+``event_gz_files[0]``, discarding the rest without a warning. The old text said GoodXenon
+observations always produce two files, ``GX1`` and ``GX2``, which have to be merged; that
+describes the raw telemetry halves, and is not what the archive serves. The archive's
+``pca/GX_*.evt.gz`` are already merged, one per configuration, and a pointing can have
+several: 25 of the 863 M82 pointings do, and 90171-01-01-00 has three.
+
+**Fixed.** ``find_rxte_inputs`` returns every ``pca/GX_*.evt*``, sorted, and
+``rxte_screened_events`` reads all of them and writes one time-ordered event list.
+
+8a. RXTE good time intervals were 3.4 seconds out
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The old ``apply_gti_with_astropy`` compared ``event TIME + TIMEZERO`` against the filter
+file's ``Time`` column *without* its ``TIMEZERO``. Both files carry the same one, about
+3.4 s, so every interval boundary was offset by that much. **Fixed** in ``rxte_pcu_gtis``,
+which adds the filter file's own ``TIMEZERO``, and the output now carries absolute times
+with ``TIMEZERO = 0`` so that nothing downstream has to repeat the decision.
 
 9. ``recursive_download_s3`` never paginates -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -712,13 +726,16 @@ HEASOFT environment here has 3.7.
 
 ``retrieve_and_process_data(flags={})`` (``core.py:437``),
 ``retrieve_heasarc_data_by_obsid(flags={})`` (``core.py:532``),
-``process_nicer_obsid(config={})`` (``nicer.py:151``),
-``process_rxte_obsid(config={})`` (``rxte.py:167``).
+``process_nicer_obsid(config={})`` (``nicer.py:151``).
 
-For NICER and RXTE this is an actual bug, not just a style issue: the body reads
-``current_config = DEFAULT_CONFIG if config is None else config``, and the default ``{}``
-is not ``None``, so ``process_nicer_obsid("1234567890")`` reaches
-``config["out_data_path"]`` and raises ``KeyError``. Use ``config=None``.
+For NICER this is an actual bug, not just a style issue: ``absolute_config`` falls back to
+``DEFAULT_CONFIG`` only when the config is ``None``, and the default ``{}`` is not
+``None``, so ``process_nicer_obsid("1234567890")`` reaches ``config["out_data_path"]`` and
+raises ``KeyError``. Use ``config=None``.
+
+``process_rxte_obsid`` had the same bug and it is **fixed**: its default is now ``None``,
+with a test that the flow run reaches ``reduce_observation`` with an absolute
+``out_data_path`` taken from ``DEFAULT_CONFIG``.
 
 28. Missing ``HAS_HEASOFT`` guards -- FIXED
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

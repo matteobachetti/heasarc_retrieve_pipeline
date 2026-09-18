@@ -37,7 +37,11 @@ from .nustar import (
 )
 from . import heasoft
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
-from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
+from .rxte import (
+    process_rxte_obsid,
+    rxte_download_filter,
+    DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG,
+)
 from .xmm import (
     process_xmm_obsid,
     xmm_download_filter,
@@ -1021,6 +1025,7 @@ MISSION_CONFIG = {
         "obsid_processing": process_rxte_obsid,
         "default_config": RXTE_DEFAULT_CONFIG,
         "name_column": "target_name",
+        "download_filter": rxte_download_filter,
     },
     "xmm": {
         "table": "xmmmaster",

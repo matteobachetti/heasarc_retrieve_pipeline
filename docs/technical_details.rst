@@ -168,7 +168,8 @@ Downloading only part of an observation
 ``recursive_download`` has always taken ``re_include`` and ``re_exclude``, and for a long
 time nothing passed them: every mission downloaded whole observation directories. A
 mission that wants less declares a ``download_filter`` in ``MISSION_CONFIG``, and
-``mission_download_filter`` (``core.py``) calls it and forwards the result.
+``mission_download_filter`` (``core.py``) calls it and forwards the result. Chandra, XMM
+and RXTE declare one; NuSTAR and NICER still take the whole directory.
 
 It is a callable taking the run's config, rather than a literal pair of patterns, because
 the answer can depend on the run and not only on the mission: XMM downloads different files
@@ -1602,76 +1603,213 @@ model, etc.); none is invoked here.
 RXTE / PCA
 ----------
 
-:mod:`heasarc_retrieve_pipeline.rxte` does not use HEASOFT at all. It re-implements a
-subset of the standard PCA screening in astropy. ``process_rxte_obsid`` (``rxte.py:167``)
-runs three steps.
+What is downloaded
+~~~~~~~~~~~~~~~~~~
 
-**1. ``setup_workspace`` (``rxte.py:38``).** Finds an event-mode file by searching, in
-order, for ``GX*.evt.gz``, ``SE*.evt.gz`` and ``FS*.evt.gz`` anywhere under the
-observation directory, and gunzips the first match. If nothing matches, the observation is
-skipped with a warning -- this is the guard against binned-mode-only observations, which
-this code cannot process. The prefixes correspond to RXTE's data-mode file naming:
-GoodXenon, Science Event, and the standard FITS science files respectively.
-
-**2. ``create_gti_with_astropy`` (``rxte.py:68``).** Reads the standard filter file
-``stdprod/*.xfl.gz``, which contains housekeeping quantities sampled every ``TIMEDEL``
-seconds (16 s for RXTE), and builds good time intervals from three conditions:
+An RXTE pointing directory holds every instrument and every data mode the satellite ran at
+the time, and the reduction reads four kinds of file out of it. ``rxte_download_filter``
+(``rxte.py``) returns a single ``re_include`` pattern, ``DOWNLOAD_RE``, matched against the
+whole remote path so that the directory names in it are real anchors and not accidental
+substrings:
 
 .. list-table::
    :header-rows: 1
-   :widths: 25 20 55
+   :widths: 30 70
 
-   * - condition
-     - meaning
+   * - kept
+     - why
+   * - ``pca/GX_*.evt.gz``
+     - The GoodXenon event lists. In the archive these are already the *merged* product:
+       one file per configuration, with ``PCUID``, ``ANODEID`` and ``PHA`` as decoded
+       columns. The raw telemetry halves (``FS37``/``FS3b``, the two ``GoodXenon1`` and
+       ``GoodXenon2`` streams that ``make_se`` exists to merge) are not downloaded and not
+       needed.
+   * - ``pca/FS4a_*.gz``
+     - Standard2: the 16-second-binned housekeeping-and-spectrum mode that ran in parallel
+       with everything else. It is the source of per-PCU live time and of the background
+       model's inputs.
+   * - ``stdprod/x*.xfl.gz``
+     - The standard filter file: ``ELV``, ``OFFSET``, ``PCUn_ON``, ``ELECTRONn``,
+       ``TIME_SINCE_SAA`` and the rest, sampled every 16 s. Screening is built from it.
+   * - ``orbit/FPorbit_Day*``
+     - The satellite orbit ephemeris, which ``barycorr`` needs.
+
+Measured on the 870 pointings within a degree of M82 on 2026-09-17, these files are
+**1.05 GB of the archive's 13.0 GB**. The rest is mostly HEXTE, the other PCA data modes,
+and a 7.8 MB copy of the calibration directory repeated in every pointing.
+
+``clock/`` is deliberately *not* downloaded, although barycentring an RXTE observation does
+need a clock correction. ``barycorr``'s ``clockfile`` parameter is documented as ignored for
+RXTE, and it is: the task reads ``tdc.dat`` from HEASOFT's own reference data
+(``$LHEA_DATA``) instead. Checked on a real pointing, running with the default and running
+with ``clockfile=NONE`` differ by 5.97e-05 s, so the correction is being applied without any
+per-observation file. Leaving ``clock/`` out saves about 0.5 GB.
+
+Screening, one interval list per PCU
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``rxte_pcu_gtis`` reads the standard filter file and returns ``{pcu: (N, 2) array}``: the
+good time intervals of each Proportional Counter Unit separately. The cuts are the
+standard PCA screening, collected in ``DEFAULT_SCREENING``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - cut
      - why
    * - ``ELV > 10``
-     - Earth elevation angle above 10 degrees
-     - Below this the target is too close to the Earth's limb and the atmosphere
-       contributes X-ray absorption and albedo background.
+     - Earth elevation angle in degrees. Closer to the limb the atmosphere contributes
+       absorption and albedo background.
    * - ``OFFSET < 0.02``
-     - pointing offset below 0.02 degrees
-     - The PCA collimator response falls off over about a degree; 1.2 arcmin keeps the
-       effective area essentially constant and rejects slews and unsettled pointing.
-   * - ``NUM_PCU_ON > 0``
-     - at least one Proportional Counter Unit active
-     - There are no counts at all when every PCU is off.
+     - Pointing offset in degrees. The collimator response falls off over about a degree,
+       so 1.2 arcmin keeps the effective area flat and rejects slews.
+   * - ``TIME_SINCE_SAA > 30`` **or** ``< 0``
+     - Minutes since the South Atlantic Anomaly. The particle background decays for about
+       half an hour afterwards. The column is *negative* when no passage falls in the
+       recorded window, and negative is good time -- reading it as "less than 30 minutes
+       ago" would throw away a quarter of the 1997 and 2004 exposure for nothing.
+   * - ``PCUn_ON == 1``
+     - That unit was on.
+   * - ``ELECTRONn < 0.1``
+     - Electron ratio, which flags detector breakdown.
 
-Contiguous runs of good samples are collapsed into intervals; each interval starts at the
-``Time`` of its first good sample and stops at the ``Time`` of its last good sample plus one
-``TIMEDEL``. The intervals are written as a FITS ``GTI`` extension with
-``TELESCOP = 'XTE'``.
+Two details that are easy to get wrong:
 
-This is a **reduced** version of the standard PCA screening. What it omits, and why that
-matters:
+* ``TIMEPIXR`` is 0 in every RXTE filter file, so a sample stamped ``t`` covers
+  ``[t, t + TIMEDEL)`` -- the stamp is the *start* of the bin, not its centre.
+* The filter file carries the same ``TIMEZERO`` as the event file, about 3.4 s. Adding it
+  to the events alone, as the first version of this module did, shifted every interval
+  boundary by that much.
 
-* **South Atlantic Anomaly.** Standard screening requires ``TIME_SINCE_SAA > 30`` minutes
-  (or at least excludes the passage itself). Without it, intervals of strongly elevated and
-  rapidly decaying particle background are kept.
-* **Breakdown / electron-ratio cuts.** Standard screening cuts on ``ELECTRON2 < 0.1``
-  (per-PCU electron ratios), which flags detector breakdown events.
-* **Which PCUs.** ``NUM_PCU_ON > 0`` records *how many* PCUs were on, not *which*. Since
-  the number of active PCUs changed during most observations and no per-PCU event
-  selection is applied, the effective area varies within the resulting GTIs. A count rate
-  from these products is therefore not proportional to flux, and no valid response matrix
-  can be built for them.
-* **Deadtime.** No deadtime correction information is propagated.
+**Why per PCU.** ``NUM_PCU_ON`` records how many units were on, never which, and they are
+not on at the same times. In the 1997 pointing 20303-02-06-00, PCU0 and PCU1 give twelve
+intervals where PCU2 gives seven. A single interval list for the observation therefore
+cannot describe the collecting area, and an exposure computed from it is wrong for every
+unit. A unit that was off, or screened away entirely, keeps its key and gets an empty
+array: "off" and "screened out" are not the caller's problem to tell apart.
 
-**3. ``apply_gti_with_astropy`` (``rxte.py:123``).** Reads the event file, forms absolute
-event times as ``TIME + TIMEZERO``, marks every event that falls in any GTI, and writes the
-surviving events to ``l2_files/<OBSID>_cl_evt.fits``.
+Run over the 863 downloaded M82 pointings, the screened exposure per unit is:
 
-Two things to know about the output: the GTI extension is **not** copied into the cleaned
-file, and the exposure keywords in the events header are inherited unchanged from the
-unfiltered file. So the file records which photons survived but not how long the instrument
-was actually collecting, and any rate computed from its header will be too low.
+.. list-table::
+   :header-rows: 1
 
-RXTE data are also not barycentred by this pipeline, unlike NuSTAR and NICER.
+   * - proposal
+     - PCU0
+     - PCU1
+     - PCU2
+     - PCU3
+     - PCU4
+   * - 20303 (1997)
+     - 81.5 ks
+     - 82.2 ks
+     - 81.6 ks
+     - 2.3 ks
+     - 2.3 ks
+   * - 90121 (2004-05)
+     - 297.3 ks
+     - 175.8 ks
+     - 287.5 ks
+     - 254.1 ks
+     - 150.8 ks
+   * - 90171
+     - 16.0 ks
+     - 4.0 ks
+     - 16.0 ks
+     - 0.0 ks
+     - 5.8 ks
+   * - 92098 (2006)
+     - 140.0 ks
+     - 61.4 ks
+     - 176.5 ks
+     - 83.9 ks
+     - 74.8 ks
+   * - 93123
+     - 25.9 ks
+     - 2.8 ks
+     - 203.3 ks
+     - 100.9 ks
+     - 148.9 ks
+   * - 94123 (2009)
+     - 1.6 ks
+     - 0.7 ks
+     - 131.9 ks
+     - 33.8 ks
+     - 53.8 ks
+   * - **total**
+     - 562.2 ks
+     - 326.9 ks
+     - 896.8 ks
+     - 475.1 ks
+     - 436.4 ks
 
-**What these products are good for.** A first look at the event list of a
-single event-mode file, and nothing more. They are not calibrated, not deadtime-corrected,
-carry no response, and represent only one of the event-mode files that an observation may
-contain (GoodXenon observations always have two, ``GX1`` and ``GX2``, which must be merged;
-only the first is used here).
+PCU2 is the workhorse and is the only unit on for most of the archive. PCU0 lost its
+propane veto layer in 2000 and carries about 65% more background than the others, so the
+M82 search drops it, at a cost of 562 ks of unit-time; PCUs 2, 3 and 4 together give
+1808 ks.
+
+
+Reduction
+~~~~~~~~~
+
+:mod:`heasarc_retrieve_pipeline.rxte` uses HEASOFT for one thing only, ``barycorr``.
+Everything else is astropy and numpy. ``process_rxte_obsid`` runs two steps.
+
+**1. ``reduce_observation``** finds the pointing's files with ``find_rxte_inputs``, builds
+the per-PCU intervals described above, and hands both to ``rxte_screened_events``, which
+writes one file:
+
+* **Every** GoodXenon event file is read. A pointing can hold several -- 25 of the 863 M82
+  pointings do -- and the first version of this module silently used only the first.
+* Each event is screened against **its own** unit's intervals. An event recorded by PCU3
+  while only PCU2 was in good time is dropped, and a unit left out of the interval
+  dictionary, which is how PCU0 is dropped, contributes nothing.
+* Times come out absolute, with ``TIMEZERO = 0``. Nothing downstream has to remember to
+  add the 3.4 s.
+* The output carries a ``GTI`` extension holding the union over the units -- which is what
+  a timing tool needs, because it says when there are events at all -- and one
+  ``GTI_PCU<n>`` extension per unit, so the collecting area can be reconstructed later.
+* ``EXPOSURE`` and ``ONTIME`` are the good time actually kept. The first version inherited
+  them from the unfiltered file, so every rate computed from its header was too low.
+
+The ``Event`` column is **not** carried over. It is the raw 24-bit field that ``PCUID``,
+``ANODEID`` and ``PHA`` were decoded from, and it is redundant: checked against 1.66
+million archive events, bits 7-9 reproduce ``PCUID`` exactly and bits 16-23 reproduce
+``PHA`` exactly, bit 0 is always 1, bits 1-6 (including the propane veto flag) are always
+0, and bits 10-15 are a one-hot re-encoding of ``ANODEID``. Keeping it only invites a
+second, different decoding.
+
+What *is* kept is the set of mission keywords in ``KEPT_KEYWORDS``, ``TEVTB2`` above all.
+Stingray reads these files directly and turns ``PHA`` into keV from ``TEVTB2`` and the
+observation's epoch, so this module does no energy calibration of its own and does not
+depend on stingray to do it. On 94123-01-19-00 the product reads back as 53237 events
+between 1.95 and 126.87 keV on PCUs 2 and 4.
+
+**2. Barycentring**, through the shared ``barycenter_file``: DE430, ICRS, the pointing's
+own ``orbit/FPorbit_Day*``, and the position the caller passes -- the *searched* position,
+never a detected or header one, because an error in it goes straight into the arrival
+times. Without a position or an orbit file the reduction stops at the screened file and
+says so.
+
+No clock file is passed, and none is needed; see "What is downloaded" above.
+
+.. warning::
+
+   A GTI extension must repeat the event extension's time keywords, which is what
+   ``GTI_TIME_KEYWORDS`` is for. ``barycorr`` corrects an extension only if it can read its
+   time scale, and skips it **in silence** otherwise. Verified on 94123-01-19-00: without
+   ``TIMESYS``, ``TIMEUNIT`` and ``MJDREF*`` on the GTI extensions, the events moved by
+   298.3 s and the intervals did not, leaving a file that looked barycentred and whose
+   every interval boundary was five minutes wrong. With them, events and all three
+   interval extensions move together and ``TIMESYS`` becomes ``TDB``.
+
+**What these products are good for.** A pulsation search, which is what they were built
+for: screened, merged, barycentred arrival times with the unit, the anode layer and the
+channel kept per event. They are still not deadtime-corrected, carry no response and have
+no background model, so they are not spectroscopy products. The collecting area varies
+inside the ``GTI`` extension by construction, since that extension is the union over
+units; the per-unit extensions are there so that an exposure, and therefore an upper limit
+on a pulsed fraction, can be computed properly.
 
 
 XMM-Newton / EPIC
