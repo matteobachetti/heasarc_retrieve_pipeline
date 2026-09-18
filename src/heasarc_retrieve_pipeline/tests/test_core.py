@@ -289,6 +289,18 @@ class TestDownloadNode:
 
         assert download_node.fn(NODE, BASE, str(tmp_path), test_str="_uf") is None
 
+    def test_a_node_without_a_dot_is_fetched(self, tmp_path):
+        """
+        The HTTPS transport had the same blind spot as the S3 one: by default it fetched
+        only names containing a dot, which is every archive file except RXTE's orbit.
+        """
+        node = "https://heasarc.gsfc.nasa.gov/FTP/xte/94123-01-19-00/orbit/FPorbit_Day5510"
+        base = "https://heasarc.gsfc.nasa.gov/FTP/xte/"
+
+        result = download_node.fn(node, base, str(tmp_path), test=True)
+
+        assert result == str(tmp_path / "94123-01-19-00" / "orbit" / "FPorbit_Day5510")
+
     def test_test_mode_transfers_nothing(self, tmp_path, monkeypatch):
         def no_network(url, dest):
             raise AssertionError("test mode must not fetch")
@@ -354,6 +366,20 @@ class TestS3KeyDestination:
         dest = s3_key_destination(PREFIX + "hk/nu1A_fpm.hk.gz", PREFIX, str(tmp_path))
 
         assert dest is not None
+
+    def test_a_name_without_a_dot_is_kept(self, tmp_path):
+        """
+        RXTE's orbit ephemerides are called ``FPorbit_Day5510``, with no extension at all.
+        The old default ``test_str="."`` dropped them in silence, so no RXTE observation
+        could be barycentred.
+        """
+        dest = s3_key_destination(
+            "xte/data/archive/AO11/P94123/94123-01-19-00/orbit/FPorbit_Day5510",
+            "xte/data/archive/AO11/P94123/94123-01-19-00/",
+            str(tmp_path),
+        )
+
+        assert dest == os.path.join(str(tmp_path), "94123-01-19-00", "orbit", "FPorbit_Day5510")
 
 
 class StubS3Client:

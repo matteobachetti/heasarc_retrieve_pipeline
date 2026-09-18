@@ -1489,6 +1489,32 @@ The return value of ``merge_spectra`` is keyed by the new group names, which
 round trip co-adds the segments of one stem and therefore of one module and one mode.
 
 
+56.  Files without a dot in the name were never downloaded -- FIXED
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every download entry point defaulted to ``test_str="."``: a plain substring that the
+*local* destination path had to contain. Since none of the directories in a download tree
+has a dot either, that default read as "fetch only files with an extension". It was a
+guard against the spurious index entries of issue 10, and it outlived its cause -- issue 10
+was fixed at the source, in ``parse_directory_index``.
+
+Nothing showed until RXTE. Its orbit ephemerides are named ``FPorbit_Day5510``, with no
+extension at all, and they are the file ``barycorr`` reads. *Verified on the real bucket*:
+with ``re_include`` matching ``/orbit/FPorbit_[^/]*$``, ``s3_key_destination`` returned
+``None`` for the orbit key and a path for the event key. In an 868-pointing download of
+the M82 field, no orbit file arrived at all, with no warning: the keys were logged at
+``debug`` level as "Ignoring", the same as HEXTE. No RXTE observation could have been
+barycentred.
+
+**Fixed** by defaulting ``test_str`` to ``None`` in ``download_node``,
+``s3_key_destination``, ``recursive_download_s3``, ``recursive_download_https`` and
+``recursive_download``, and by dropping the explicit ``test_str="."`` that
+``download_and_process_observation`` passed. The parameter still works when a caller asks for it;
+it is a debugging switch for fetching a subset, and nothing in the package sets it now.
+Re-running a download adds the missing files and re-fetches nothing, because a file that is
+present and the right size is skipped.
+
+
 Science caveats
 ---------------
 

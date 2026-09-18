@@ -312,8 +312,14 @@ Two filtering mechanisms exist and are easy to confuse:
     NuSTAR event files from observing modes 01 and 06, skipping modes 02-05.
 
 ``test_str``
-    A plain substring that must appear in the *local* destination path, defaulting to
-    ``"."``. In practice this means "only fetch things with a dot in the name".
+    A plain substring that must appear in the *local* destination path. It defaults to
+    ``None``, which keeps everything. It used to default to ``"."``, which in practice
+    meant "only fetch things with a dot in the name" -- harmless until RXTE, whose orbit
+    ephemerides are called ``FPorbit_Day5510`` with no extension at all and were therefore
+    never downloaded, so no RXTE observation could be barycentred. The old default was a
+    leftover guard against the spurious index entries of issue 10 in
+    ``docs/known_issues.rst``, which is fixed at the source: ``parse_directory_index``
+    reads ``href`` and keeps only relative ones.
 
 Passing ``test=True`` anywhere in the stack fakes every download: directories and log
 messages are produced, but no bytes move. This is what the test suite uses.

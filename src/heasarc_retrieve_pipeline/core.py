@@ -540,7 +540,7 @@ def download_node(
     base_url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     verify: bool = True,
 ):
@@ -564,9 +564,10 @@ def download_node(
     cut_ndirs : int, optional
         Number of leading path components to drop from the remote path.
     test_str : str, optional
-        Substring that must appear in the local path for the node to be fetched.
-        The default ``"."`` effectively means "only names containing a dot". Pass
-        ``None`` to disable the check.
+        Substring that must appear in the local path for the node to be fetched. The
+        default, ``None``, fetches everything the regular expressions left. It used to be
+        ``"."``, which quietly meant "only names containing a dot" and dropped RXTE's
+        extension-less orbit ephemerides.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     verify : bool, optional
@@ -653,7 +654,7 @@ def s3_key_destination(
     key: str,
     prefix: str,
     outdir: str,
-    test_str: str = ".",
+    test_str: str | None = None,
     re_include=None,
     re_exclude=None,
 ):
@@ -673,7 +674,8 @@ def s3_key_destination(
     outdir : str
         Local root directory of the download.
     test_str : str, optional
-        Substring that must appear in the local path. ``None`` accepts everything.
+        Substring that must appear in the local path. The default, ``None``, accepts
+        everything.
     re_include : re.Pattern or None, optional
         Only keys matching this are kept.
     re_exclude : re.Pattern or None, optional
@@ -707,7 +709,7 @@ def recursive_download_s3(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -728,7 +730,8 @@ def recursive_download_s3(
     cut_ndirs : int, optional
         Accepted for signature compatibility with the HTTPS transport; unused here.
     test_str : str, optional
-        Substring that must appear in the local path for the key to be fetched.
+        Substring that must appear in the local path for the key to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -810,7 +813,7 @@ def recursive_download_https(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -832,7 +835,8 @@ def recursive_download_https(
     cut_ndirs : int, optional
         Number of leading path components to drop from each remote path.
     test_str : str, optional
-        Substring that must appear in the local path for a node to be fetched.
+        Substring that must appear in the local path for a node to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -932,7 +936,7 @@ def recursive_download(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -955,7 +959,8 @@ def recursive_download(
     cut_ndirs : int, optional
         Number of leading path components to drop from each remote path.
     test_str : str, optional
-        Substring that must appear in the local path for a file to be fetched.
+        Substring that must appear in the local path for a file to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -1772,7 +1777,6 @@ def download_and_process_observation(
             recursive_download(
                 url,
                 outdir,
-                test_str=".",
                 test=test,
                 **mission_download_filter(mission, config),
             )
