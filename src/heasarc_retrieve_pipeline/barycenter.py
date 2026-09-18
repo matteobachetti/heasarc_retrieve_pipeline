@@ -3,9 +3,9 @@ Barycentric correction of event arrival times, shared by the mission modules.
 """
 
 import os
-from prefect import task, get_run_logger
+from prefect import task
 
-from .utils import splitext_improved
+from .utils import get_logger, splitext_improved
 
 from . import heasoft
 from .heasoft import HAS_HEASOFT
@@ -85,17 +85,20 @@ def barycenter_file(infile, attorb, ra=None, dec=None, overwrite=False, outfile=
         If ``barycorr`` returned without creating the output file.
 
     """
-    logger = get_run_logger()
+    logger = get_logger()
     logger.info(f"Barycentering {infile}")
-    if not HAS_HEASOFT:
-        raise ImportError("heasoftpy is required for barycenter correction but is not installed.")
     if outfile is None:
         outfile = barycentered_file_name(infile)
     logger.info(f"Output file: {outfile}")
 
+    # Before the HEASOFT check on purpose: a product that is already there is already
+    # there, and re-walking a finished reduction should not need the tools that made it.
     if os.path.exists(outfile) and not overwrite:
         logger.info(f"Output file {outfile} already exists, skipping")
         return outfile
+
+    if not HAS_HEASOFT:
+        raise ImportError("heasoftpy is required for barycenter correction but is not installed.")
 
     heasoft.run(
         "barycorr",

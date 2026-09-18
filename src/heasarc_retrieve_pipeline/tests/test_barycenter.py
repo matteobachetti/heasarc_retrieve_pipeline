@@ -1,6 +1,6 @@
 import os
 
-from heasarc_retrieve_pipeline.barycenter import barycentered_file_name
+from heasarc_retrieve_pipeline.barycenter import barycenter_file, barycentered_file_name
 
 
 class TestBarycenteredFileName:
@@ -41,3 +41,18 @@ class TestBarycenteredFileName:
 
     def test_a_file_with_no_extension(self):
         assert barycentered_file_name("events") == "events_bary"
+
+
+class TestCallingItOutsideAFlow:
+    def test_an_existing_output_is_returned_without_a_prefect_run(self, tmp_path):
+        """
+        ``get_run_logger`` raises outside a flow, so the task could not be called through
+        ``.fn`` at all -- a batch driver calling it directly got
+        ``MissingContextError`` for every observation before it reached barycorr.
+        """
+        outfile = tmp_path / "x_bary.evt"
+        outfile.write_bytes(b"already there")
+
+        result = barycenter_file.fn(str(tmp_path / "x.evt"), "orbit", ra=1.0, dec=2.0)
+
+        assert result == str(outfile)
