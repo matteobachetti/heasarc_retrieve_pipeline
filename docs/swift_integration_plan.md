@@ -2,9 +2,9 @@
 
 > **Handoff document.** Written 2026-09-24 on branch `various_fixes`. It is written to be
 > picked up cold, by a person or a session with no memory of the conversation that
-> produced it. **Step 1 has landed** (`a236706`, `6dbe7de`). Step 0, a probe of the UKSSDC
-> product builder, is half done: one job has been analysed and a second one is pending
-> (see *Where step 0 stands*). Nothing else has been started.
+> produced it. **Steps 0 and 1 are done.** Step 1 is `a236706` and `6dbe7de`. Step 0, two
+> probe jobs to the UKSSDC product builder, showed the builder route works once its
+> pile-up correction is switched off (see *Where step 0 stands*). **Next is step 2.**
 >
 > Decisions marked **decided** were made by Matteo and should not be relitigated without
 > him.
@@ -96,7 +96,7 @@ job 319830):
 
 ## Steps (one commit each, tests first)
 
-0. **Probe the builder** (manual, no commit). See *Where step 0 stands*.
+0. ~~**Probe the builder**~~ — done. See *Where step 0 stands*.
 1. ~~**`spectral_fit.py` (generic)**~~ — done, `a236706` + `6dbe7de`.
    `fit_flux(spectrum, background, response, arf, model, parameters, frozen, fit_band,
    flux_band, statistic="cstat", delta_stat=2.706, min_counts=10)` returns the flux, its
@@ -126,9 +126,12 @@ job 319830):
      `MISSION_CONFIG` or the HEASARC download.
    - Tests: request construction, which swifttools can do offline, and parsing the tar
      layout from a tiny fixture.
-   - The request must carry the pile-up setting that step 0 settles.
+   - Every request must set `pcPupRate=1000.0` and `wtPupRate=1000.0`. Without them the
+     builder excises the core and applies a point-source PSF correction, which roughly
+     doubles M82's flux.
 3. **Flux table.** Refit every PC spectrum with `fit_flux` in the paper's configuration:
-   `zwabs*powerlaw`, `zwabs.Redshift=0.00067` frozen, 0.5–8 keV flux.
+   `zwabs*powerlaw`, `zwabs.Redshift=0.00067` frozen, starting at `zwabs.nH=0.1` and
+   `powerlaw.PhoIndex=2.0`, with the flux in 0.5–8 keV.
    - Fit range: the builder already marks channels below 0.3 keV bad, so the paper's
      0.2 keV lower bound cannot be reproduced. Use 0.3–10 keV and document the difference.
    - Output: `swift_xrt_fluxes.csv`, one row per observation, with obsid, MJD of the
@@ -176,36 +179,37 @@ the default pile-up setting, and an obsid-binned light curve over 0.5–8 keV. F
 - The light curve's summed PC rate (Hard + Soft) is about 2 c/s, which is also
   pile-up-corrected. Treat it the same way.
 
-**Job 319833 is pending.** It asks for the same 3 observations and the spectrum only,
-with `pcPupRate=1000.0` and `wtPupRate=1000.0` to switch the pile-up correction off.
-Submitted about 13:20 on 2026-09-24, from Matteo's Mac. To resume on another machine:
+**Job 319833: done. The builder route works.** It used the same 3 observations and the
+spectrum only, with `pcPupRate=1000.0` and `wtPupRate=1000.0`. It took about 9 minutes
+from submission to download.
 
-```python
-import json
-from swifttools.ukssdc.xrt_prods import XRTProductRequest
+- The `.areas` files now show a full `circle(148.9627,69.6793,49.56")`, with no
+  annulus, in every snapshot. The ARFs peak at 83–134 cm². **Raising `pcPupRate` does
+  switch the pile-up correction off.** Every production request must set it.
+- The builder's own `obsFlux` (0.3–10 keV, `TBabs*zTBabs*powerlaw`) is 3.20–3.30×10⁻¹¹,
+  down from 6.7×10⁻¹¹ with the correction on.
+- Refit with `fit_flux` in the paper's configuration: `zwabs*powerlaw`, z frozen,
+  0.3–10 keV fit, 0.5–8 keV flux, 90% errors. "Day" is the start MJD minus 55927, the
+  convention of Fig. 2.
 
-r = XRTProductRequest("matteo.bachetti@inaf.it", silent=True)
-r.copyOldJob(319833, becomeThis=True)
-print(r.complete, r.status, r.URL)
-if r.complete:
-    r.downloadProducts(".", format="tar.gz", clobber=True)
-    json.dump(r.retrieveSpectralFits(returnData=True), open("spec_fits.json", "w"),
-              indent=1, default=str)
-```
+  | obsid | day | counts | flux, 0.5–8 keV (erg cm⁻² s⁻¹) | nH (10²² cm⁻²) | Γ | C-stat / dof |
+  |---|---|---|---|---|---|---|
+  | 00091489001 | 95.8 | 708 | 2.81 (2.58–3.06)×10⁻¹¹ | 0.24 | 1.60 | 320.1/346 |
+  | 00091489002 | 97.0 | 1763 | 2.80 (2.66–2.96)×10⁻¹¹ | 0.22 | 1.82 | 535.9/494 |
+  | 00091489003 | 98.2 | 1984 | 2.74 (2.61–2.88)×10⁻¹¹ | 0.28 | 1.66 | 567.8/519 |
 
-Then unpack `spec.tar.gz` and the per-observation `Obs_*.tar.gz` files, and check:
+- **Compared with Fig. 2.** The paper's first cluster sits near days 95–100 and has
+  about six points between about 1.5 and 2.8×10⁻¹¹. Ours are at its upper edge:
+  consistent, but three points do not settle it. The paper has more points in that
+  cluster than there are observations. The other target IDs, or per-snapshot slicing,
+  may explain that; check it in step 3.
+- **Starting values matter.** From XSPEC's defaults (nH = 1, Γ = 1), the fit of
+  00091489001 ran away to nH ≈ 10⁶. `fit_flux` then returned NaN, with the reason "the
+  best fit has no flux in the flux band". Always pass
+  `parameters={"zwabs.nH": 0.1, "powerlaw.PhoIndex": 2.0, ...}`. Step 3 should count
+  the NaNs, and report the fits whose `error_flags` are not all `F`.
 
-1. The `.areas` file shows a full circle of 49.56″ (no annulus), and the ARF peaks
-   near 110 cm². If not, `pcPupRate` did not switch the correction off. Look for another
-   switch, or fall back to step 5.
-2. Refit `Obs_*pc.pi` with `fit_flux` in the paper's configuration (below). If the
-   0.5–8 keV fluxes land near (1–2)×10⁻¹¹, the route works. Go on to step 2. Days 110–120
-   after 2012-01-01 fall just before the paper's epoch 1 and are still in the
-   low-flux period.
-3. If they are still far off, stop and discuss with Matteo before choosing between the
-   builder and the local route.
-
-A second worry to keep in mind: the paper did **no** pile-up correction. If some
+A remaining caveat: the paper did **no** pile-up correction, and neither will we. If some
 observations truly are piled up (X-1 flared after day 1150), the paper's fluxes are low
 there too. For a reproduction, match the paper; flag it in the docs.
 
@@ -251,7 +255,8 @@ Refitting a builder spectrum in the paper's configuration:
 from heasarc_retrieve_pipeline.spectral_fit import fit_flux
 
 r = fit_flux("Obs_00091489001pc.pi", model="zwabs*powerlaw",
-             parameters={"zwabs.Redshift": 0.00067}, frozen=["zwabs.Redshift"],
+             parameters={"zwabs.Redshift": 0.00067, "zwabs.nH": 0.1, "powerlaw.PhoIndex": 2.0},
+             frozen=["zwabs.Redshift"],
              fit_band=(0.3, 10.0), flux_band=(0.5, 8.0))
 ```
 
