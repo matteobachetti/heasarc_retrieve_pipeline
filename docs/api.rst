@@ -84,6 +84,11 @@ Products
    :undoc-members:
    :show-inheritance:
 
+.. automodule:: heasarc_retrieve_pipeline.spectral_fit
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 .. automodule:: heasarc_retrieve_pipeline.roundtrip
    :members:
    :undoc-members:

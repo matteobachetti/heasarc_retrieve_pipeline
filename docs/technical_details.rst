@@ -2860,6 +2860,39 @@ Open questions
 * **Continuous Clocking.** Its ``chipx`` strips are a starting guess, never run on real
   data.
 
+Fluxes by spectral fitting
+--------------------------
+
+:func:`heasarc_retrieve_pipeline.spectral_fit.fit_flux` fits an XSPEC model to one
+spectrum and returns the observed flux in a band, with its error bounds. It is not tied
+to a mission: it takes whatever spectrum, background, response and effective-area files
+it is given. Swift/XRT is its first user. PyXspec comes with HEASOFT and cannot be
+installed with pip, so the module imports it only when called, and its tests are marked
+``heasoft``.
+
+The flux and its errors come from the ``cflux`` convolution model, in two fits. The
+first fits the model as given and computes its flux in the band. That flux is the
+starting value of ``lg10Flux`` in the second fit, of ``cflux*(model)``, where the first
+additive component's ``norm`` is frozen because ``cflux`` takes over its role. XSPEC's
+``error`` command then walks the likelihood profile of ``lg10Flux`` to where the
+statistic has risen by ``delta_stat``: 2.706 (90 per cent, the default) or 1.0
+(1 sigma). This is more reliable than ``flux err``, which assumes the covariance matrix
+describes the errors well, and that assumption fails for spectra of a few hundred counts.
+``cflux`` is placed outside the absorption, so the flux is the *observed* one, as
+Brightman et al. (2019) quote it.
+
+Two behaviours that are easy to miss:
+
+* With ``statistic="cstat"`` and a background spectrum, XSPEC uses the W-statistic,
+  not the Cash statistic. W-stat is biased when background bins hold zero counts, so
+  group the spectra to at least one count per bin before fitting.
+* XSPEC's ``fakeit`` leaves ``RESPFILE`` blank when the response's path is longer than
+  68 characters, and the fit then fails with "no energy defined range". ``fit_flux``
+  checks for a response before fitting, and says what is missing.
+
+A spectrum with fewer than ``min_counts`` counts in the fit band is not fitted. The
+function returns NaN, with the reason in ``reason``.
+
 Orchestration with Prefect
 --------------------------
 
