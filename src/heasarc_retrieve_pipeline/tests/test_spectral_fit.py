@@ -112,6 +112,19 @@ def test_fit_flux_recovers_the_simulated_flux(tmp_path):
     assert result["statistic"] == "cstat"
 
 
+def test_fit_flux_finds_companions_named_relative_to_the_spectrum(tmp_path, monkeypatch):
+    """Files named by a bare RESPFILE, as the UKSSDC builder writes them, load from any directory."""
+    spectrum, rmf, _ = fake_spectrum(tmp_path, norm=1e-2, exposure=1e3)
+    with fits.open(spectrum, mode="update") as hdul:
+        hdul[1].header["RESPFILE"] = "diag.rmf"
+    monkeypatch.chdir(tmp_path.parent)
+
+    result = fit_flux(spectrum, model=MODEL)
+
+    assert result["reason"] == ""
+    assert result["flux"] > 0
+
+
 def test_fit_flux_refuses_a_nearly_empty_spectrum(tmp_path):
     """A spectrum with fewer counts than asked for returns NaN and says why, instead of a fit."""
     spectrum, rmf, _ = fake_spectrum(tmp_path, norm=1e-5, exposure=100)

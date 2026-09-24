@@ -188,9 +188,13 @@ def fit_flux(
     xspec.Xset.logChatter = 0
     xspec.AllData.clear()
     xspec.AllModels.clear()
+    prompting = xspec.Xset.allowPrompting
     try:
-        # XSPEC resolves the keywords against the working directory, and may not find
-        # them; every companion is set again below, by absolute path.
+        # XSPEC resolves the keywords against the working directory, and when it cannot
+        # find a file it asks for another name; with nobody to answer, the whole load
+        # fails. Without prompting it loads the spectrum alone, and every companion is
+        # set again below, by absolute path.
+        xspec.Xset.allowPrompting = False
         data = xspec.Spectrum(spectrum)
         if background is not None:
             data.background = background
@@ -278,5 +282,6 @@ def fit_flux(
             **known,
         )
     finally:
+        xspec.Xset.allowPrompting = prompting
         xspec.AllData.clear()
         xspec.AllModels.clear()
