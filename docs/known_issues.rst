@@ -1600,13 +1600,12 @@ reading the outputs, and they are described in more detail in :ref:`technical_de
   contributes no power at that period. What must not be done is to quote the flux, count
   rate or spectral shape of such an extraction as X-2's: they are X-1 + X-2 together, and
   X-1 is the brighter of the pair at most epochs.
-* **XMM barycentring needs the observation's ODF housekeeping.** SAS ``barycen`` finds the
-  spacecraft orbit through ``SAS_ODF``, so the PPS route downloads about 3.8 MB of
-  housekeeping and runs ``odfingest`` on it purely to obtain a ``SUM.SAS``. An observation
-  whose ODF is missing reduces completely but is not barycentred: the step records
-  ``barycentered: false`` with a reason instead of failing the run. HEASOFT ``barycorr``
-  is not an alternative -- its own documentation limits it to RXTE, Swift, Chandra, NuSTAR
-  and NICER, and on XMM data it fails before reading an event.
+* **The XMM products-only route still downloads and ingests the ODF housekeeping.** SAS
+  ``barycen`` finds the spacecraft orbit through ``SAS_ODF``, so the route downloads about
+  3.8 MB of housekeeping and runs ``odfingest`` on it purely to obtain a ``SUM.SAS``. The
+  default tool, the ``barycenter`` package, reads the PPS orbit file instead and needs
+  none of it; the housekeeping is kept only for the ``barycen`` fallback, and dropping it
+  is a separate decision.
 * **XMM pile-up is measured and never corrected.** ``epatplot`` writes the
   observed-to-model pattern ratios onto the page; excluding the core of the point spread
   function to remove pile-up changes which photons the science is done with, and is left

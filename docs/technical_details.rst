@@ -2103,12 +2103,20 @@ fitted jointly. SAS's ``epicspeccombine`` is the right tool if one file is ever 
 Barycentring
 ~~~~~~~~~~~~
 
-SAS ``barycen``, over an ODF ingested with ``odfingest``. HEASOFT ``barycorr`` is **not**
-usable: its own documentation limits it to RXTE, Swift, Chandra, NuSTAR and NICER, and on
-XMM data it fails with "Invalid Observatory/Spacecraft position vector" before reading an
-event.
+By default the ``barycenter`` package, from the PPS orbit file
+``P<OBSID>OBX000ORBTSR0000.FTZ`` (:func:`~heasarc_retrieve_pipeline.xmm.xmm_orbit_file`). It
+needs neither SAS nor the ODF, and agrees with ``barycen`` to a constant 42 ns. Both routes
+download that file: the ODF route's filter takes it from the PPS directory alongside the
+whole ODF, since the ODF's own orbit is ASCII housekeeping only SAS can read. The tool and
+ephemeris come from ``barycenter_tool`` and ``barycenter_ephemeris``, as for NuSTAR.
 
-Two traps, both paid for:
+The fallback, used with ``barycenter_tool: official`` or when an observation has no PPS
+orbit file, is SAS ``barycen``, over an ODF ingested with ``odfingest``, told ``DE430``
+explicitly because its own default is DE200. HEASOFT ``barycorr`` is **not** usable: its own
+documentation limits it to RXTE, Swift, Chandra, NuSTAR and NICER, and on XMM data it fails
+with "Invalid Observatory/Spacecraft position vector" before reading an event.
+
+Two ``barycen`` traps, both paid for:
 
 * The ODF constituents must be staged as plain ``.FIT`` and ``.ASC``. SAS reads ``.FTZ``
   when a file is *named* to it, but ``odfingest`` does not *discover* one while scanning a
@@ -2124,8 +2132,9 @@ file: the correction sweeps 1.79 s across the exposure and agrees to 3.3 ms, con
 0.3 ms over 27 ks. The three cameras, three independent event lists, agree with each other
 to 0.1 ms.
 
-An observation whose ODF is missing reduces completely but is not barycentred; the step
-records ``barycentered: false`` with a reason rather than failing the run.
+An observation with neither a PPS orbit file nor an ODF reduces completely but is not
+barycentered; the step records ``barycentered: false`` with a reason rather than failing the
+run. The step also records which ``tool`` did the work and from which ``orbit`` file.
 
 Pulsation search of M82 X-2 in pn
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -63,20 +63,35 @@ class TestCallingItOutsideAFlow:
         assert result == str(outfile)
 
 
-def _nicer_like_files(tmp_path):
-    """A 1000 s NICER event file and a circular low-Earth orbit covering it."""
-    common = {"TELESCOP": "NICER", "MJDREFI": 56658, "MJDREFF": 7.775925925925930e-04}
+#: How each mission's orbit file spells its columns, and in what unit (1 = metres, 1e3 =
+#: kilometres): the shape the ``barycenter`` package reads, and nothing more.
+TINY_ORBITS = {
+    "NICER": (("X", "Y", "Z", "Vx", "Vy", "Vz"), 1.0, "ORBIT", 56658),
+    "XMM": (("GEI_X", "GEI_Y", "GEI_Z", "VX", "VY", "VZ"), 1e3, "ORBIT", 50814),
+    "CHANDRA": (("X", "Y", "Z", "Vx", "Vy", "Vz"), 1.0, "ORBITEPHEM", 50814),
+}
+
+
+def tiny_event_and_orbit_files(tmp_path, telescop="NICER"):
+    """
+    A 1000 s event file and a circular low-Earth orbit covering it, for one mission.
+
+    Shared with the XMM and Chandra tests. Good enough for the ``barycenter`` package to
+    run on, which is all it is for: accuracy is checked on real data.
+    """
+    names, unit, extname, mjdrefi = TINY_ORBITS[telescop]
+    common = {"TELESCOP": telescop, "MJDREFI": mjdrefi, "MJDREFF": 7.775925925925930e-04}
     common.update(TIMESYS="TT", TIMEREF="LOCAL", TIMEUNIT="s")
 
     t = np.arange(-100.0, 1101.0, 10.0)
     phase = 2 * np.pi * t / 5600.0
-    radius, speed = 6.9e6, 7.6e3
+    radius, speed = 6.9e6 / unit, 7.6e3 / unit
     orbit = fits.BinTableHDU.from_columns(
         [fits.Column(name="TIME", format="D", array=t)]
         + [
             fits.Column(name=name, format="D", array=values)
             for name, values in zip(
-                ("X", "Y", "Z", "Vx", "Vy", "Vz"),
+                names,
                 (
                     radius * np.cos(phase),
                     radius * np.sin(phase),
@@ -87,7 +102,7 @@ def _nicer_like_files(tmp_path):
                 ),
             )
         ],
-        name="ORBIT",
+        name=extname,
     )
     events = fits.BinTableHDU.from_columns(
         [fits.Column(name="TIME", format="D", array=np.linspace(100.0, 900.0, 50))],
@@ -104,7 +119,7 @@ def _nicer_like_files(tmp_path):
         hdu.header.update(common)
     events.header.update(TSTART=50.0, TSTOP=950.0, RA_OBJ=83.63, DEC_OBJ=22.01)
 
-    orbit_file, event_file = tmp_path / "ni.orb", tmp_path / "ni_cl.evt"
+    orbit_file, event_file = tmp_path / "tiny.orb", tmp_path / "tiny_cl.evt"
     fits.HDUList([fits.PrimaryHDU(), orbit]).writeto(orbit_file)
     fits.HDUList([fits.PrimaryHDU(header=fits.Header(common)), events, gti]).writeto(event_file)
     return str(event_file), str(orbit_file)
@@ -140,7 +155,7 @@ class TestWithThePackage:
         a GTI extension lacked its time keywords. Astropy's built-in ephemeris keeps the
         test offline; accuracy against the official tools is checked on real data instead.
         """
-        event_file, orbit_file = _nicer_like_files(tmp_path)
+        event_file, orbit_file = tiny_event_and_orbit_files(tmp_path)
 
         out = barycenter_file.fn(
             event_file, orbit_file, ra=83.63, dec=22.01, tool="barycenter", ephem="builtin"

@@ -53,7 +53,15 @@ import numpy as np
 
 from prefect import flow
 
-from .barycenter import barycentered_file_name
+from .barycenter import (
+    OFFICIAL_TOOL,
+    PACKAGE_TOOL,
+    barycenter_ephemeris,
+    barycenter_tool,
+    barycenter_with_package,
+    barycentered_file_name,
+    official_ephemeris_number,
+)
 from .diagnostics import diagnostics_path, no_record, record_step
 from .utils import (
     NO_SCIENCE_DATA,
@@ -146,14 +154,6 @@ BARYCENTRED_TIMESYS = "TDB"
 
 #: And what the reference position becomes.
 BARYCENTRED_TIMEREF = "SOLARSYSTEM"
-
-#: Which JPL planetary ephemeris ``barycen`` is told to use.
-#:
-#: Set explicitly because the task's own default is ``DE200``, released in 1981, while SAS
-#: ships ``JPLEPH.430`` beside ``JPLEPH.200`` in ``lib/barycendata`` and this pipeline
-#: already barycentres NuSTAR with DE430 (:mod:`heasarc_retrieve_pipeline.barycenter`).
-#: Two missions on two ephemerides cannot be timed against each other, so both use DE430.
-BARYCENTRE_EPHEMERIS = "DE430"
 
 #: What ``epproc`` and ``emproc`` leave behind. Their file names are not parsed: SAS has
 #: changed them between releases, and every event list carries the same identity in its
@@ -295,9 +295,15 @@ def _odf_housekeeping_pattern():
 #: 19 files and 39.8 MB out of 461 files and 205.8 MB.
 PPS_DOWNLOAD_RE = f"(?:{_pps_include_pattern()})|(?:{_odf_housekeeping_pattern()})"
 
-#: What the ODF route downloads: the raw telemetry, all of it. There is no cheaper answer
-#: -- ``odfingest`` wants the directory it was given, not a chosen part of it.
-ODF_DOWNLOAD_RE = r"/ODF/"
+#: Product code of the PPS orbit file, the one the ``barycenter`` package reads. The ODF
+#: carries the orbit too, but only as ASCII housekeeping that SAS alone can read.
+ORBIT_PRODUCT = "ORBTSR"
+
+#: What the ODF route downloads: the raw telemetry, all of it, and the PPS orbit file.
+#: There is no cheaper answer for the ODF -- ``odfingest`` wants the directory it was
+#: given, not a chosen part of it. The orbit file is a few hundred kilobytes and is what
+#: lets the ``barycenter`` package do the barycentering; without it, ``barycen`` does.
+ODF_DOWNLOAD_RE = rf"(?:/ODF/)|(?:/PPS/P\d{{10}}OBX000{ORBIT_PRODUCT}\d{{4}}\.FTZ$)"
 
 
 def xmm_download_filter(config):
@@ -1011,6 +1017,27 @@ def _observation_level_file(obsid, config, product, instrument=None, extension="
             continue
         return path
     return None
+
+
+def xmm_orbit_file(obsid, config):
+    """
+    The PPS orbit file of an observation, or ``None`` if it was not downloaded.
+
+    What the ``barycenter`` package barycenters with. An observation the archive has no
+    PPS for has none, and is barycentered by SAS ``barycen`` from the ODF instead.
+
+    Parameters
+    ----------
+    obsid : str
+        Observation identifier.
+    config : dict
+        Must contain ``input_data_path``.
+
+    Returns
+    -------
+    str or None
+    """
+    return _observation_level_file(obsid, config, ORBIT_PRODUCT)
 
 
 def xmm_calind_file(obsid, config):
@@ -3188,10 +3215,19 @@ def _source_coordinates(ra, dec):
 
 
 def xmm_barycenter(
-    obsid, config, events, summary, ra="NONE", dec="NONE", env=None, log_to=None, rec=None
+    obsid,
+    config,
+    events,
+    summary,
+    ra="NONE",
+    dec="NONE",
+    env=None,
+    log_to=None,
+    rec=None,
+    orbit=None,
 ):
     """
-    Write a barycentred copy of one cleaned event list.
+    Write a barycentered copy of one cleaned event list.
 
     Converts arrival times from the spacecraft to the solar system barycentre, which is
     what makes a coherent timing search possible: over one XMM orbit the correction
@@ -3199,6 +3235,13 @@ def xmm_barycenter(
     at. The original file is left alone and the correction is applied to a copy, because
     ``barycen`` edits in place and an event list whose times are silently no longer
     spacecraft times is a trap for everything downstream.
+
+    Two tools can do it, chosen as for every mission by ``barycenter_tool`` (see
+    :func:`heasarc_retrieve_pipeline.barycenter.barycenter_tool`). The default, the
+    ``barycenter`` package, reads the PPS orbit file and needs neither SAS nor the ODF; it
+    agrees with ``barycen`` to a constant 42 ns. Without an orbit file -- an observation
+    the archive has no PPS for -- SAS ``barycen`` is used instead, through the ODF
+    summary.
 
     HEASOFT ``barycorr`` is *not* usable here, which is worth stating because it is the
     obvious thing to reach for and the pipeline already wraps it for NuSTAR. Its own help
@@ -3224,8 +3267,9 @@ def xmm_barycenter(
         Pipeline configuration.
     events : str
         Cleaned event list to barycentre.
-    summary : str
-        ODF summary file from :func:`xmm_odf_summary`, for ``SAS_ODF``.
+    summary : str or None
+        ODF summary file from :func:`xmm_odf_summary`, for ``SAS_ODF``. Only ``barycen``
+        reads it.
     ra, dec : float or str, optional
         Source position in degrees, as given to :func:`process_xmm_obsid`. Anything that
         is not a pair of numbers -- the default ``"NONE"`` -- leaves ``barycen`` to read
@@ -3236,61 +3280,84 @@ def xmm_barycenter(
         File to send the task's output to.
     rec : Recorder, optional
         Diagnostics recorder.
+    orbit : str, optional
+        PPS orbit file, from :func:`xmm_orbit_file`. Only the ``barycenter`` package
+        reads it.
 
     Returns
     -------
     str or None
-        Path of the barycentred file, or ``None`` if there was no summary to work from.
+        Path of the barycentered file, or ``None`` if neither tool had what it needs.
     """
     from . import sas
 
     rec = rec or no_record()
-    if summary is None:
+    tool = barycenter_tool(config)
+    ephemeris = barycenter_ephemeris(config)
+    if tool == PACKAGE_TOOL and orbit is None:
+        get_logger().warning(
+            f"{obsid}: no PPS orbit file, so SAS barycen barycenters instead of the "
+            "barycenter package."
+        )
+        tool = OFFICIAL_TOOL
+    if tool == OFFICIAL_TOOL and summary is None:
         rec.value(barycentered=False, reason="no ODF summary")
         return None
 
     output = barycentered_file_name(events)
-    shutil.copy(events, output)
-
-    bary_env = dict(env or os.environ)
-    bary_env["SAS_ODF"] = summary
-
     position = _source_coordinates(ra, dec)
-    at_position = {"withsrccoordinates": "no"}
     if position is None:
         get_logger().warning(
             f"{obsid}: no source position was given, so {os.path.basename(output)} is "
             f"barycentred to the target in its own header -- the pointing, which is not "
             f"the source. Any timing done with it is only as accurate as that."
         )
-    else:
-        at_position = dict(withsrccoordinates="yes", srcra=position[0], srcdec=position[1])
 
-    sas.run(
-        "barycen",
-        produces=sas.IN_PLACE(output),
-        log_to=log_to,
-        env=bary_env,
-        table=f"{output}:EVENTS",
-        withtable="yes",
-        ephemeris=BARYCENTRE_EPHEMERIS,
-        **at_position,
-    )
+    if tool == PACKAGE_TOOL:
+        barycenter_with_package(
+            events,
+            orbit,
+            output,
+            ra=None if position is None else position[0],
+            dec=None if position is None else position[1],
+            ephem=ephemeris,
+        )
+    else:
+        at_position = {"withsrccoordinates": "no"}
+        if position is not None:
+            at_position = dict(withsrccoordinates="yes", srcra=position[0], srcdec=position[1])
+        # barycen edits in place, so it is handed a copy. Its ephemeris is always named:
+        # the task's own default is DE200, from 1981, though SAS ships JPLEPH.430 too.
+        shutil.copy(events, output)
+        bary_env = dict(env or os.environ)
+        bary_env["SAS_ODF"] = summary
+        sas.run(
+            "barycen",
+            produces=sas.IN_PLACE(output),
+            log_to=log_to,
+            env=bary_env,
+            table=f"{output}:EVENTS",
+            withtable="yes",
+            ephemeris=f"DE{official_ephemeris_number(ephemeris)}",
+            **at_position,
+        )
 
     timesys, timeref = _time_system(output)
     if timesys != BARYCENTRED_TIMESYS:
         raise ValueError(
-            f"barycen returned success but left {os.path.basename(output)} on "
+            f"{tool} returned success but left {os.path.basename(output)} on "
             f"{timesys or 'no'} time rather than {BARYCENTRED_TIMESYS}."
         )
 
     rec.value(
         barycentered=True,
         barycentered_file=os.path.basename(output),
+        tool=tool,
+        orbit=None if orbit is None else os.path.basename(orbit),
         summary=summary,
         timesys=timesys,
         timeref=timeref,
-        ephemeris=BARYCENTRE_EPHEMERIS,
+        ephemeris=ephemeris,
         srcra=None if position is None else position[0],
         srcdec=None if position is None else position[1],
     )
@@ -3687,6 +3754,7 @@ def process_xmm_obsid(obsid, config=None, ra="NONE", dec="NONE", flags=None):
                     env=env,
                     rec=rec,
                     log_to=tool_log_file(f"barycen_{stem}", obsid, config),
+                    orbit=xmm_orbit_file(obsid, config),
                 )
                 xmm_barycentered_source_events(
                     obsid,

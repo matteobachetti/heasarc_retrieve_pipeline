@@ -878,14 +878,19 @@ class TestWhatIsWorthDownloading:
     def test_the_odf_route_takes_the_whole_odf(self):
         arguments = xmm.xmm_download_filter({"products": "odf"})
 
-        assert what_a_filter_keeps(arguments, HER_X_1_ARCHIVE) == [
+        kept = what_a_filter_keeps(arguments, HER_X_1_ARCHIVE)
+        assert [name for name in kept if name.startswith("ODF/")] == [
             name for name in HER_X_1_ARCHIVE if name.startswith("ODF/")
         ]
 
-    def test_the_odf_route_wants_none_of_the_archive_reduction(self):
+    def test_the_odf_route_wants_only_the_orbit_from_the_archive_reduction(self):
+        """The barycenter package reads the PPS orbit file; the ODF's orbit is ASCII
+        housekeeping that only SAS can read."""
         kept = what_a_filter_keeps(xmm.xmm_download_filter({"products": "odf"}), HER_X_1_ARCHIVE)
 
-        assert not [name for name in kept if name.startswith("PPS/")]
+        assert [name for name in kept if name.startswith("PPS/")] == [
+            "PPS/P0153950401OBX000ORBTSR0000.FTZ"
+        ]
 
     def test_an_observation_with_no_pps_yields_only_housekeeping(self):
         """Which is the whole problem the route probe exists to solve: this succeeds, and
@@ -3134,6 +3139,72 @@ class TestBarycentringAnExposure:
         assert params["withsrccoordinates"] == "no"
         assert "srcra" not in params
         assert rec.values["srcra"] is None
+
+
+class TestBarycenteringWithThePackage:
+    """
+    ``xmm_barycenter`` with the ``barycenter`` package, the default: the PPS orbit file
+    instead of SAS and the ODF, and ``barycen`` only where there is no orbit file.
+    """
+
+    @pytest.fixture
+    def files(self, tmp_path):
+        from heasarc_retrieve_pipeline.barycenter import HAS_BARYCENTER
+        from heasarc_retrieve_pipeline.tests.test_barycenter import tiny_event_and_orbit_files
+
+        if not HAS_BARYCENTER:
+            pytest.skip("the barycenter package is not installed")
+        return tiny_event_and_orbit_files(tmp_path, "XMM")
+
+    #: Astropy's built-in ephemeris, so that no kernel is downloaded.
+    CONFIG = {"barycenter_ephemeris": "builtin"}
+
+    def test_with_an_orbit_file_sas_is_not_needed(self, tmp_path, files, stub_sas):
+        """No ODF summary and no barycen call: the PPS orbit file is enough."""
+        events, orbit = files
+        stub = stub_sas()
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "barycenter") as rec:
+            output = xmm.xmm_barycenter(
+                "0153950401", self.CONFIG, events, None, 254.4575, 35.3423, rec=rec, orbit=orbit
+            )
+
+        assert stub.calls == []
+        assert output.endswith("tiny_cl_bary.evt")
+        assert rec.values["tool"] == "barycenter"
+        assert rec.values["timesys"] == "TDB"
+        assert rec.values["orbit"] == os.path.basename(orbit)
+
+    def test_the_official_tool_can_still_be_asked_for(self, tmp_path, files, stub_sas):
+        events, orbit = files
+        stub = stub_sas()
+        config = dict(self.CONFIG, barycenter_tool="official", barycenter_ephemeris="DE430")
+
+        xmm.xmm_barycenter("0153950401", config, events, str(tmp_path / "s.SAS"), orbit=orbit)
+
+        (params,) = stub.task("barycen")
+        assert params["ephemeris"] == "DE430"
+
+    def test_without_an_orbit_file_barycen_takes_over(self, tmp_path, files, stub_sas):
+        """An observation the archive has no PPS for has no orbit file to read."""
+        events, _ = files
+        stub = stub_sas()
+
+        with record_step(str(tmp_path / "diag"), "0153950401", "barycenter") as rec:
+            xmm.xmm_barycenter("0153950401", {}, events, str(tmp_path / "s.SAS"), rec=rec)
+
+        assert len(stub.task("barycen")) == 1
+        assert rec.values["tool"] == "official"
+
+    def test_the_orbit_file_is_found_among_the_pps_products(self, tmp_path):
+        pps = tmp_path / "0153950401" / "PPS"
+        pps.mkdir(parents=True)
+        (pps / "P0153950401OBX000ORBTSR0000.FTZ").write_text("")
+        (pps / "P0153950401OBX000ATTTSR0000.FTZ").write_text("")
+
+        found = xmm.xmm_orbit_file("0153950401", {"input_data_path": str(tmp_path)})
+
+        assert found.endswith("OBX000ORBTSR0000.FTZ")
 
 
 class TestCuttingTheBarycentredSourceEvents:
