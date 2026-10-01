@@ -952,6 +952,16 @@ timing, orbital searches) and it is **position-dependent**: an error in the assu
 translates directly into a timing error, of order the source-position error in radians times
 500 s.
 
+**Agreement between the two tools was measured on real reductions**, one per mission, with
+``tools/barycenter_validation/validate.py`` (``barycenter`` 1.0.0, 2026-10-01). Package
+minus reference, mean over the event times: NuSTAR +31.5 ns against ``barycorr``, RXTE
++15.1 ns against ``barycorr``, XMM -62.5 ns against ``barycen``, Chandra -0.0 ns against
+``axbary`` (both on DE405). Every maximum is one or two steps of a 64-bit float at those
+mission elapsed times, the finest the reference files can record. The one systematic
+difference is that the package also corrects auxiliary time columns the mission tools
+leave alone -- NuSTAR's ``BADPIX``, XMM's ``HKAUX`` -- which nothing downstream reads. The
+directory's ``README.md`` has the full table.
+
 That last point is why it matters that ``process_nustar_obsid`` overrides the RA/Dec it was
 given with the position measured by ``get_best_source_regions``. When the detection is
 correct this is an improvement over the catalogue pointing; when the brightest thing in the
