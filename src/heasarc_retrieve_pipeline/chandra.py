@@ -4038,11 +4038,12 @@ def chandra_clean_event_list(observation, config, gti, rec=None, env=None, log_t
     return outfile
 
 
-#: ``axbary``'s reference frame, and with it the ephemeris.
+#: ``axbary``'s reference frame, and with it the ephemeris. Only used by the fallback:
+#: the default tool, the ``barycenter`` package, reads the configured ephemeris.
 #:
 #: The parameter admits exactly two values -- ``FK5``, which is DE200, and ``ICRS``, which
-#: is **DE405**. There is no DE430, so Chandra is the one mission in this pipeline not on
-#: the ephemeris every other one uses, and that break was measured rather than accepted:
+#: is **DE405**. There is no DE430, so with ``axbary`` Chandra is the one mission in this
+#: pipeline not on the ephemeris every other one uses, and that break was measured:
 #: over obsid ``6298``'s own span and position, geocentric so that only the ephemerides
 #: differ, DE430 minus DE405 is a **constant +0.377 microseconds**, varying by 0.0016 us
 #: across a two-hour observation. It cannot distort a pulse profile, a period or a
@@ -4079,7 +4080,13 @@ def chandra_barycenter(
     observation, config, events, ra="NONE", dec="NONE", rec=None, env=None, log_to=None
 ):
     """
-    Write a barycentred copy of the cleaned event list.
+    Write a barycentered copy of the cleaned event list.
+
+    Two tools can do it, chosen as for every mission by ``barycenter_tool`` (see
+    :func:`heasarc_retrieve_pipeline.barycenter.barycenter_tool`). The default, the
+    ``barycenter`` package, uses the configured ephemeris -- DE430, like every other
+    mission -- and agrees with ``axbary`` to 47 ns when both are on DE405. The fallback,
+    CIAO ``axbary``, can only reach DE405 (see :data:`BARYCENTRE_REFFRAME`).
 
     Converting arrival times from the spacecraft to the solar system barycentre is what
     makes a coherent timing search possible at all, and Chandra makes the point more
@@ -4132,15 +4139,22 @@ def chandra_barycenter(
         would otherwise leave a file that looks corrected and is not.
     """
     from . import ciao
-    from .barycenter import barycentered_file_name
+    from .barycenter import (
+        PACKAGE_TOOL,
+        barycenter_ephemeris,
+        barycenter_tool,
+        barycenter_with_package,
+        barycentered_file_name,
+    )
 
     rec = rec or no_record()
     logger = get_logger()
+    tool = barycenter_tool(config)
 
     if observation.orbit_ephemeris is None:
         reason = (
             f"{observation.obsid} has no orbit ephemeris, so its times cannot be corrected "
-            "to the barycentre. axbary needs the spacecraft's own position, and Chandra is "
+            "to the barycenter. Both tools need the spacecraft's own position, and Chandra is "
             "far enough from Earth that assuming the geocentre would smear a pulse profile."
         )
         logger.warning(reason)
@@ -4160,6 +4174,40 @@ def chandra_barycenter(
         )
     else:
         at_position = dict(ra=position[0], dec=position[1])
+
+    if tool == PACKAGE_TOOL:
+        ephemeris = barycenter_ephemeris(config)
+        barycenter_with_package(
+            events,
+            observation.orbit_ephemeris,
+            output,
+            ra=at_position.get("ra"),
+            dec=at_position.get("dec"),
+            ephem=ephemeris,
+        )
+        timesys, timeref, plephem = _barycentred_time_keywords(output)
+        if timesys != BARYCENTRED_TIMESYS:
+            raise ValueError(
+                f"barycenter left {os.path.basename(output)} on {timesys or 'no'} time "
+                f"rather than {BARYCENTRED_TIMESYS}."
+            )
+        rec.value(
+            barycentered=True,
+            barycentered_file=os.path.basename(output),
+            tool=tool,
+            orbit_ephemeris=os.path.basename(observation.orbit_ephemeris),
+            timesys=timesys,
+            timeref=timeref,
+            ephemeris=plephem,
+            srcra=None if position is None else position[0],
+            srcdec=None if position is None else position[1],
+            position_from="argument" if position is not None else "header",
+        )
+        logger.info(
+            f"{observation.obsid}: barycentered to {os.path.basename(output)} "
+            f"with {plephem} at the position asked for"
+        )
+        return output
 
     ciao.run(
         "axbary",
@@ -4184,6 +4232,7 @@ def chandra_barycenter(
     rec.value(
         barycentered=True,
         barycentered_file=os.path.basename(output),
+        tool=tool,
         orbit_ephemeris=os.path.basename(observation.orbit_ephemeris),
         refframe=BARYCENTRE_REFFRAME,
         timesys=timesys,

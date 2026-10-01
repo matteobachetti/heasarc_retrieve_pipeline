@@ -2571,11 +2571,16 @@ and a summed pulse height per event and discarded the pixel island, so the charg
 correction cannot be recomputed and very-faint-mode background cleaning is unavailable.
 The extraction works and would look ordinary; the report page carries the caveat.
 
-Barycentring: ``axbary``, and the one break with DE430
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Barycentering: the ``barycenter`` package, or ``axbary`` on DE405
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Every other mission here is barycentred with the JPL DE430 ephemeris. Chandra cannot be,
-with either tool at hand:
+By default ``chandra_barycenter`` uses the ``barycenter`` package on the orbit ephemeris
+``orbitf*_eph1.fits``, at the searched position, with the ephemeris named by
+``barycenter_ephemeris`` -- DE430, like every other mission. It needs no CIAO, and agrees
+with ``axbary`` to 47 ns when both are on DE405. The step records ``tool`` and ``PLEPHEM``.
+
+The fallback, with ``barycenter_tool: official``, is the only one of the mission tools that
+can do Chandra at all, and it cannot do DE430:
 
 * **HEASOFT ``barycorr`` has no Chandra orbit reader.** It hands the orbit file to
   ``hdaxbary``, whose only readers are for RXTE, NICER and Swift. On a real Chandra event
@@ -2586,8 +2591,8 @@ with either tool at hand:
 * **CIAO's ``axbary``** admits ``refframe=FK5`` (DE200) or ``refframe=ICRS`` (**DE405**),
   and no DE430.
 
-So ``chandra_barycenter`` uses ``axbary`` with ``refframe=ICRS``, at the searched position,
-and records ``PLEPHEM`` in the diagnostics for every observation. **The cost was measured
+So the fallback uses ``axbary`` with ``refframe=ICRS``, at the searched position, and
+records ``PLEPHEM`` in the diagnostics for every observation. **The cost was measured
 rather than assumed**: over ``6298``'s own time span and position, DE430 minus DE405 is a
 constant **+0.377 µs**, varying by 0.0016 µs across the two-hour observation. A constant
 offset cannot distort a pulse profile, a period or a periodogram within an observation, at
@@ -2629,7 +2634,7 @@ the HTML page:
    * - ``pileup_check``
      - ACIS Timed Exposure only.
    * - ``barycenter``
-     - ``axbary``, then the source events cut from the result.
+     - The ``barycenter`` package (or ``axbary``), then the source events cut from the result.
    * - ``calculate_spectra``
      - ``specextract`` and ``dmgroup``, grating collection, or a stated nothing.
 

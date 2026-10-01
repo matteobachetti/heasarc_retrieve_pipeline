@@ -3110,6 +3110,35 @@ def stub_axbary(monkeypatch):
     return calls
 
 
+class TestBarycenteringWithThePackage:
+    """``chandra_barycenter`` with the ``barycenter`` package, the default: no CIAO, and
+    the configured ephemeris instead of axbary's DE405."""
+
+    def test_the_package_corrects_without_ciao(self, tmp_path, stub_axbary):
+        from heasarc_retrieve_pipeline.barycenter import HAS_BARYCENTER
+        from heasarc_retrieve_pipeline.tests.test_barycenter import tiny_event_and_orbit_files
+
+        if not HAS_BARYCENTER:
+            pytest.skip("the barycenter package is not installed")
+        events, orbit = tiny_event_and_orbit_files(tmp_path, "CHANDRA")
+        observation = TestBarycentringWithAxbary()._observation(tmp_path)
+        observation = dataclasses.replace(observation, orbit_ephemeris=orbit)
+        config = dict(
+            chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path), barycenter_ephemeris="builtin"
+        )
+
+        with record_step(str(tmp_path / "diag"), "5644", "barycenter") as rec:
+            output = chandra.chandra_barycenter(
+                observation, config, events, ra=148.96267, dec=69.67931, rec=rec
+            )
+
+        assert stub_axbary == []
+        assert output.endswith("tiny_cl_bary.evt")
+        assert rec.values["tool"] == "barycenter"
+        assert rec.values["timesys"] == "TDB"
+        assert rec.values["ephemeris"] == "JPL-builtin"
+
+
 class TestBarycentringWithAxbary:
     def _observation(self, tmp_path, orbit="primary/orbitf240581100N001_eph1.fits.gz"):
         return chandra.Observation(
@@ -3124,7 +3153,7 @@ class TestBarycentringWithAxbary:
         )
 
     def _config(self, tmp_path):
-        return dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path))
+        return dict(chandra.DEFAULT_CONFIG, out_data_path=str(tmp_path), barycenter_tool="official")
 
     def test_the_correction_is_made_to_the_position_asked_for(self, tmp_path, stub_axbary):
         """
