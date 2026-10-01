@@ -39,7 +39,7 @@ from astropy.io.fits.verify import VerifyWarning
 from astropy.table import Table
 from prefect import flow, task
 
-from .barycenter import barycenter_file
+from .barycenter import barycenter_ephemeris, barycenter_file, barycenter_tool
 from .utils import absolute_config, get_logger, mask_from_gti, merge_intervals
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
@@ -564,9 +564,17 @@ def process_rxte_obsid(obsid: str, config=None, flags=None, ra: float = None, de
         )
         return screened
 
-    barycentred = barycenter_file(screened, orbit_file, ra=ra, dec=dec, overwrite=True)
-    logger.info(f"RXTE processing complete: {barycentred}")
-    return barycentred
+    barycentered = barycenter_file(
+        screened,
+        orbit_file,
+        ra=ra,
+        dec=dec,
+        overwrite=True,
+        tool=barycenter_tool(current_config),
+        ephem=barycenter_ephemeris(current_config),
+    )
+    logger.info(f"RXTE processing complete: {barycentered}")
+    return barycentered
 
 
 #: Modified Julian Dates of the four PCA gain changes, each of which starts a new epoch.

@@ -920,20 +920,30 @@ remove nothing.
 Barycentring
 ~~~~~~~~~~~~
 
-``barycenter_data`` (``nustar.py:514``) runs HEASOFT ``barycorr`` on every event file in the
-observation's output directory, writing ``*_bary.evt``. The ``barycorr`` call itself lives
-in :mod:`heasarc_retrieve_pipeline.barycenter`, shared with NICER: it refuses to start with
-a readable message when heasoftpy is missing, checks afterwards that ``barycorr`` actually
-wrote the file rather than assuming it did, and skips a file whose output is already there
-unless the caller passes ``overwrite=True``. The output name comes from
-``barycentered_file_name``, which puts ``_bary`` before the extension whatever that
-extension is and keeps a compression suffix last -- missions do not agree on whether an
-event file is ``.evt``, ``.fits`` or ``.ds``. The parameters are
+``barycenter_data`` (``nustar.py``) barycenters every event file in the observation's
+output directory, writing ``*_bary.evt``, through ``barycenter_file`` in
+:mod:`heasarc_retrieve_pipeline.barycenter`, which NICER and RXTE share. Two tools can do the
+work, chosen by two configuration keys:
 
-* ``ephem="JPLEPH.430"`` -- the JPL DE430 solar-system ephemeris;
-* ``refframe="ICRS"``;
-* ``orbitfiles`` -- the ``.attorb`` file produced by ``nupipeline``;
-* ``ra``/``dec`` -- the source position.
+* ``barycenter_tool`` -- ``"barycenter"`` (the default) uses the `barycenter
+  <https://pypi.org/project/barycenter/>`_ package, one pure-Python code path for every
+  mission, which agrees with each mission's own tool to better than 100 ns. ``"official"``
+  uses HEASOFT ``barycorr`` instead. If the package cannot be imported, the official tool is
+  used with a warning.
+* ``barycenter_ephemeris`` -- ``"DE430"`` by default, so that every mission is on the same
+  ephemeris. The package also accepts any other ``DEnnn`` name, or the path to a local
+  ``.bsp`` kernel, which it reads without touching the network; ``barycorr`` only knows the
+  ``JPLEPH.<nnn>`` files its installation ships, and a ``.bsp`` path is refused for it.
+
+Either way the reference frame is ICRS, the orbit file is the ``.attorb`` written by
+``nupipeline``, ``ra``/``dec`` are the source position, and a file whose output is already
+there is skipped unless the caller passes ``overwrite=True``. The ``barycorr`` route refuses
+to start with a readable message when heasoftpy is missing, and both routes check that the
+output file was actually written. The package fetches NuSTAR's current clock file from the
+CALDB by itself, where ``barycorr`` reads it from the local CALDB. The output name comes
+from ``barycentered_file_name``, which puts ``_bary`` before the extension whatever that
+extension is and keeps a compression suffix last -- missions do not agree on whether an
+event file is ``.evt``, ``.fits`` or ``.ds``.
 
 Barycentring converts photon arrival times from the spacecraft frame to the solar system
 barycentre, removing the up to ~500 s of light-travel-time modulation caused by the Earth's
@@ -1586,9 +1596,10 @@ offset and so on. Its cleaned output is the single merged file
 ``ni<OBSID>_0mpu7_cl.evt`` -- "0mpu7" means all seven Measurement/Power Units, i.e. all 52
 active detectors combined.
 
-``barycenter_data`` (``nicer.py:130``) barycentres that file against the orbit file
+``barycenter_data`` (``nicer.py``) barycenters that file against the orbit file
 ``auxil/ni<OBSID>.orb.gz``, using the shared implementation in
-:mod:`heasarc_retrieve_pipeline.barycenter` (same DE430/ICRS parameters as NuSTAR).
+:mod:`heasarc_retrieve_pipeline.barycenter` (same tool choice and DE430/ICRS parameters as
+NuSTAR).
 
 NICER has no imaging capability -- it is a collimated instrument with a roughly 3 arcmin
 field of view -- so there is no source separation step and no equivalent of the NuSTAR
@@ -1632,7 +1643,7 @@ substrings:
      - The standard filter file: ``ELV``, ``OFFSET``, ``PCUn_ON``, ``ELECTRONn``,
        ``TIME_SINCE_SAA`` and the rest, sampled every 16 s. Screening is built from it.
    * - ``orbit/FPorbit_Day*``
-     - The satellite orbit ephemeris, which ``barycorr`` needs.
+     - The satellite orbit ephemeris, which barycentering needs.
 
 Measured on the 870 pointings within a degree of M82 on 2026-09-17, these files are
 **1.05 GB of the archive's 13.0 GB**. The rest is mostly HEXTE, the other PCA data modes,
@@ -1643,7 +1654,8 @@ need a clock correction. ``barycorr``'s ``clockfile`` parameter is documented as
 RXTE, and it is: the task reads ``tdc.dat`` from HEASOFT's own reference data
 (``$LHEA_DATA``) instead. Checked on a real pointing, running with the default and running
 with ``clockfile=NONE`` differ by 5.97e-05 s, so the correction is being applied without any
-per-observation file. Leaving ``clock/`` out saves about 0.5 GB.
+per-observation file. Leaving ``clock/`` out saves about 0.5 GB. The ``barycenter`` package, the
+default tool, bundles the same ``tdc.dat``, so it needs no per-observation file either.
 
 Screening, one interval list per PCU
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
