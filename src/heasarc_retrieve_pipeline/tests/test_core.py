@@ -704,6 +704,8 @@ CATALOGUE_COLUMNS = {
         subject_category time xmm_revolution
         """.split()
     ),
+    # Recorded 2026-10-01. One row per GBM day: no position, exposure or name.
+    "fermigdays": set("__row day_number time end_time day_id tte_flag".split()),
 }
 
 
@@ -721,7 +723,8 @@ class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
     def selected_columns(self, mission):
         query = obsid_query("1", mission)
         selected = query.split("SELECT", 1)[1].split("FROM", 1)[0]
-        return [column.strip() for column in selected.split(",") if column.strip()]
+        # "day_id as obsid" asks the catalogue for day_id.
+        return [column.split()[0] for column in selected.split(",") if column.strip()]
 
     @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
     def test_every_column_a_mission_asks_for_exists_in_its_catalogue(self, mission):
@@ -741,6 +744,98 @@ class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
         tables = {config["table"] for config in MISSION_CONFIG.values()}
 
         assert tables <= set(CATALOGUE_COLUMNS)
+
+
+class TestCataloguesSlicedByTime:
+    """
+    GBM's catalogue has one row per day, not one per pointing: the instrument sees the
+    whole unocculted sky, so there is no position to cone-search on and the days are
+    found by date. The source position still comes from the name lookup.
+    """
+
+    def test_the_query_keeps_every_day_overlapping_the_interval(self):
+        """A day counts if any of it falls inside the interval, edges included."""
+        query = core.time_query(60391.5, 60392.25, "fermi_gbm")
+
+        assert "cat.time < 60392.25" in query
+        assert "cat.end_time > 60391.5" in query
+
+    def test_the_query_keeps_only_days_with_time_tagged_events(self):
+        """Before 2012-11-26 TTE was only kept around triggers; those days are no use."""
+        assert "cat.tte_flag = 'Y'" in core.time_query(60391.5, 60392.25, "fermi_gbm")
+
+    def test_the_day_identifier_is_the_obsid(self):
+        """Everything downstream names files and directories after ``obsid``."""
+        assert "day_id as obsid" in core.time_query(60391.5, 60392.25, "fermi_gbm")
+
+    def test_every_column_asked_for_exists(self):
+        """Same guard as for the OBSID query, for the date query."""
+        query = core.time_query(60391.5, 60392.25, "fermi_gbm")
+        selected = query.split("SELECT", 1)[1].split("FROM", 1)[0]
+        columns = [column.split()[0] for column in selected.split(",") if column.strip()]
+
+        assert set(columns) <= CATALOGUE_COLUMNS["fermigdays"]
+
+    @pytest.mark.parametrize("start, stop", [(60392.0, 60391.0), (60391.0, 60391.0)])
+    def test_an_empty_or_reversed_interval_is_refused(self, start, stop):
+        """It would quietly find nothing, which looks like a source never observed."""
+        with pytest.raises(ValueError, match="before"):
+            core.time_query(start, stop, "fermi_gbm")
+
+    def test_a_mission_searched_by_position_has_no_date_query(self):
+        """numaster has no tte_flag or day_id; say so rather than send the query."""
+        with pytest.raises(ValueError, match="nustar"):
+            core.time_query(60391.0, 60392.0, "nustar")
+
+    def test_a_cone_search_on_a_time_sliced_catalogue_is_refused(self):
+        """``fermigdays`` has no ra/dec: the query would fail at the archive, unexplained."""
+        with pytest.raises(ValueError, match="mjd_start"):
+            core.retrieve_heasarc_table_by_position(83.6, 22.0, mission="fermi_gbm")
+
+    def test_the_search_by_name_uses_the_dates_and_the_resolved_position(self, monkeypatch):
+        """The days come from the date query, the barycentring position from the name."""
+        position = SimpleNamespace(ra=SimpleNamespace(deg=254.46), dec=SimpleNamespace(deg=35.34))
+        calls = {}
+        monkeypatch.setattr(core, "get_source_position", lambda source: position)
+        monkeypatch.setattr(
+            core,
+            "retrieve_heasarc_table_by_time",
+            lambda start, stop, mission: calls.setdefault("dates", (start, stop, mission)),
+        )
+        monkeypatch.setattr(
+            core,
+            "retrieve_and_process_data",
+            lambda **kwargs: calls.setdefault("process", kwargs),
+        )
+
+        core.retrieve_heasarc_data_by_source_name.fn(
+            "Her X-1", mission="fermi_gbm", mjd_start=60391.0, mjd_stop=60392.0
+        )
+
+        assert calls["dates"] == (60391.0, 60392.0, "fermi_gbm")
+        assert calls["process"]["source_position"] is position
+        assert calls["process"]["result_table"] == calls["dates"]
+
+    def test_the_search_by_name_needs_the_dates(self, monkeypatch):
+        """Without them it would mean every day since 2008: 6.6 GB each."""
+        monkeypatch.setattr(core, "get_source_position", lambda source: pytest.fail("resolved"))
+
+        with pytest.raises(ValueError, match="mjd_start"):
+            core.retrieve_heasarc_data_by_source_name.fn("Her X-1", mission="fermi_gbm")
+
+    def test_dates_given_to_a_mission_searched_by_position_are_refused(self, monkeypatch):
+        """Ignoring them would download every observation, not the ones asked for."""
+        monkeypatch.setattr(core, "get_source_position", lambda source: pytest.fail("resolved"))
+
+        with pytest.raises(ValueError, match="nustar"):
+            core.retrieve_heasarc_data_by_source_name.fn(
+                "M82 X-2", mission="nustar", mjd_start=60391.0, mjd_stop=60392.0
+            )
+
+    def test_the_search_by_obsid_is_refused(self):
+        """A GBM day has no pointing to barycentre at; only a name gives a position."""
+        with pytest.raises(ValueError, match="source name"):
+            core.retrieve_heasarc_data_by_obsid.fn("20240322", mission="fermi_gbm")
 
 
 class TestThePerMissionDownloadFilter:

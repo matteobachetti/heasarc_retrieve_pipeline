@@ -225,6 +225,32 @@ Notes on the astronomy encoded here:
 The single-OBSID query (``retrieve_info_for_obsid``, ``core.py:343``) is the same shape
 with ``WHERE cat.obsid IN (...)``, and selects no ``public_date``.
 
+Catalogues sliced by time (Fermi GBM)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+GBM sees the whole sky not hidden by the Earth, so ``fermigdays`` has one row per *day*
+and no position, exposure or source name. A mission with ``"time_sliced": True`` in
+``MISSION_CONFIG`` (``is_time_sliced``) is searched by date instead (``time_query``,
+``retrieve_heasarc_table_by_time``)::
+
+    SELECT day_id as obsid, time, end_time, tte_flag, __row
+    FROM public.fermigdays as cat
+    WHERE cat.time < <mjd_stop> AND cat.end_time > <mjd_start>
+      AND cat.tte_flag = 'Y'
+    ORDER BY cat.time
+
+* Rows are kept if they *overlap* the interval: a GBM day starts at 23:59 the day before
+  (2024-03-22 has ``time`` = 60390.999), so matching on whole ``day_id`` values would be
+  wrong at the edges.
+* ``tte_flag = 'Y'`` keeps only days with continuous time-tagged events (TTE), i.e. from
+  2012-11-26 on; before that, TTE data were kept only around triggers.
+* ``retrieve_heasarc_data_by_source_name`` takes ``mjd_start``/``mjd_stop``. They are
+  required for a time-sliced mission and refused for the others, and the check runs before
+  the name is resolved. The resolved position is the one the photons are barycentred at.
+* The cone search and ``retrieve_heasarc_data_by_obsid`` refuse time-sliced missions
+  with a ``ValueError``: a day has no pointing to barycentre at. ``exposure_condition``
+  is never called for them.
+
 Locating the files
 ~~~~~~~~~~~~~~~~~~
 

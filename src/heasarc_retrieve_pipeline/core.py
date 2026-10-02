@@ -1063,6 +1063,18 @@ MISSION_CONFIG = {
         "download_filter": chandra_download_filter,
         "resolve_config": chandra_resolve_config,
     },
+    # Retrieval only, for now: the reduction arrives with fermi_gbm.py.
+    "fermi_gbm": {
+        "table": "fermigdays",
+        # One row per day, not per pointing: GBM sees the whole unocculted sky, so the
+        # catalogue has no position, exposure or name to search on. Days are found by
+        # date (time_query), and the position comes from the name lookup.
+        "time_sliced": True,
+        "obsid_column": "day_id",
+        # Before 2012-11-26 time-tagged events were kept only around triggers.
+        "condition": "cat.tte_flag = 'Y'",
+        "additional": "end_time, tte_flag",
+    },
 }
 
 
@@ -1200,6 +1212,89 @@ def read_config(config_file: str):
     return config
 
 
+def is_time_sliced(mission: str) -> bool:
+    """
+    Whether a mission's catalogue has one row per stretch of time rather than per pointing.
+
+    Such a catalogue (GBM's ``fermigdays``) has no position to cone-search on and no
+    pointing to barycentre at: it is searched with :func:`time_query`, and the source
+    position must come from elsewhere.
+
+    Examples
+    --------
+    >>> is_time_sliced("fermi_gbm"), is_time_sliced("nustar")
+    (True, False)
+    """
+    return bool(MISSION_CONFIG[mission].get("time_sliced", False))
+
+
+def time_query(mjd_start: float, mjd_stop: float, mission: str) -> str:
+    """
+    The catalogue query that finds the rows of a time-sliced catalogue in an interval.
+
+    A row is kept if any part of it overlaps ``[mjd_start, mjd_stop]``: a GBM day starts
+    at 23:59 the day before, so asking for whole calendar days by ``day_id`` would be
+    both clumsier and wrong at the edges.
+
+    Parameters
+    ----------
+    mjd_start, mjd_stop : float
+        The interval, in MJD (the catalogue's ``time`` and ``end_time`` columns).
+    mission : str
+        A key of ``MISSION_CONFIG`` for which :func:`is_time_sliced` is true.
+
+    Returns
+    -------
+    str
+        An ADQL query, aliasing the mission's ``obsid_column`` to ``obsid``.
+
+    Raises
+    ------
+    ValueError
+        If the mission is searched by position, or the interval is empty or reversed.
+    """
+    if not is_time_sliced(mission):
+        raise ValueError(
+            f"{mission} is searched by position; only missions whose catalogue is sliced "
+            "by time have a date query"
+        )
+    mjd_start, mjd_stop = float(mjd_start), float(mjd_stop)
+    if not mjd_start < mjd_stop:
+        raise ValueError(f"mjd_start ({mjd_start}) must come before mjd_stop ({mjd_stop})")
+
+    config = MISSION_CONFIG[mission]
+    return f"""SELECT {config["obsid_column"]} as obsid, time, {config["additional"]}, __row
+        FROM public.{config["table"]} as cat
+        where
+        cat.time < {mjd_stop!r} and cat.end_time > {mjd_start!r}
+        and
+        {config["condition"]} order by cat.time
+        """
+
+
+@task(log_prints=True)
+def retrieve_heasarc_table_by_time(mjd_start: float, mjd_stop: float, mission: str):
+    """
+    The rows of a time-sliced catalogue that overlap an interval.
+
+    Parameters
+    ----------
+    mjd_start, mjd_stop : float
+        The interval, in MJD.
+    mission : str
+        A key of ``MISSION_CONFIG`` for which :func:`is_time_sliced` is true.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per day (for GBM), ordered by time, with ``obsid``, ``time``, ``__row`` and
+        the mission's extra columns. ``__row`` must be preserved, as for the cone search.
+    """
+    logger = get_run_logger()
+    logger.info(f"Retrieving HEASARC table for {mission} between MJD {mjd_start} and {mjd_stop}")
+    return Heasarc.query_tap(time_query(mjd_start, mjd_stop, mission)).to_table()
+
+
 @task(log_prints=True)
 def retrieve_heasarc_table_by_position(
     ra_deg: float, dec_deg: float, mission: str = "nustar", radius_deg: float = 0.1
@@ -1238,7 +1333,17 @@ def retrieve_heasarc_table_by_position(
 
         ``__row`` is astroquery's internal row identifier and must be preserved: it
         is what ``Heasarc.locate_data`` needs in order to find the files.
+
+    Raises
+    ------
+    ValueError
+        If the mission's catalogue is sliced by time and has no position to search on.
     """
+    if is_time_sliced(mission):
+        raise ValueError(
+            f"The {mission} catalogue has no positions; search it by date "
+            "(mjd_start/mjd_stop) with retrieve_heasarc_table_by_time"
+        )
     logger = get_run_logger()
     logger.info(
         f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
@@ -1350,13 +1455,23 @@ def obsid_query(obsid, mission: str = "nustar"):
         if not OBSID_RE.fullmatch(str(one)):
             raise ValueError(f"{one!r} is not a valid OBSID")
 
+    wanted = ", ".join(f"'{one}'" for one in obsids)
+    if is_time_sliced(mission):
+        config = MISSION_CONFIG[mission]
+        return f"""SELECT {config["obsid_column"]} as obsid, time, {config["additional"]}, __row
+        FROM public.{config["table"]} as cat
+        where
+        cat.{config["obsid_column"]} IN ({wanted})
+        and
+        {config["condition"]} order by cat.time
+        """
+
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
     name_column = MISSION_CONFIG[mission]["name_column"]
     if additional != "":
         additional = f", {additional}"
-    wanted = ", ".join(f"'{one}'" for one in obsids)
 
     return f"""SELECT {name_column}, obsid, time, {expo_name}, ra, dec, __row {additional}
         FROM public.{table} as cat
@@ -2176,6 +2291,8 @@ def retrieve_heasarc_data_by_source_name(
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
+    mjd_start: typing.Union[float, None] = None,
+    mjd_stop: typing.Union[float, None] = None,
 ):
     """
     Download and reduce every observation of a named source.
@@ -2183,6 +2300,10 @@ def retrieve_heasarc_data_by_source_name(
     Top-level entry point. Resolves the name, cone-searches the mission's master
     catalogue, and hands the results to :func:`retrieve_and_process_data`, which
     locates the downloadable products for each row.
+
+    A mission whose catalogue is sliced by time (GBM) has nothing to cone-search: its
+    rows between ``mjd_start`` and ``mjd_stop`` are taken instead, and the resolved
+    position is the one they are barycentred at.
 
     Parameters
     ----------
@@ -2207,11 +2328,20 @@ def retrieve_heasarc_data_by_source_name(
         :func:`retrieve_and_process_data`.
     pgp_keys_file : str or None, optional
         Path to PGP keys file for encrypted data; see :func:`retrieve_and_process_data`.
+    mjd_start, mjd_stop : float or None, optional
+        The interval to search, in MJD. Required for a mission whose catalogue is sliced
+        by time, refused for the others.
 
     Returns
     -------
     astropy.table.Table
         The catalogue rows that were processed.
+
+    Raises
+    ------
+    ValueError
+        If a time-sliced mission is given no interval, or another mission is given one.
+        Raised before the name is resolved.
 
     Notes
     -----
@@ -2219,11 +2349,25 @@ def retrieve_heasarc_data_by_source_name(
     argument, so Level-2 pipeline parameters cannot be customised when working by
     source name.
     """
+    dates_given = mjd_start is not None or mjd_stop is not None
+    if is_time_sliced(mission) and (mjd_start is None or mjd_stop is None):
+        raise ValueError(
+            f"The {mission} catalogue is searched by date: give mjd_start and mjd_stop"
+        )
+    if not is_time_sliced(mission) and dates_given:
+        raise ValueError(
+            f"{mission} is searched by position; mjd_start/mjd_stop are only for missions "
+            "whose catalogue is sliced by time"
+        )
+
     pos = get_source_position(source)
 
-    results = retrieve_heasarc_table_by_position(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
-    )
+    if is_time_sliced(mission):
+        results = retrieve_heasarc_table_by_time(mjd_start, mjd_stop, mission)
+    else:
+        results = retrieve_heasarc_table_by_position(
+            pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+        )
     results = retrieve_and_process_data(
         result_table=results,
         source_position=pos,
@@ -2291,7 +2435,18 @@ def retrieve_heasarc_data_by_obsid(
     astropy.table.Table or None
         The catalogue rows that were processed, or ``None`` if none of the OBSIDs is in
         the catalogue.
+
+    Raises
+    ------
+    ValueError
+        For a mission whose catalogue is sliced by time: its rows have no pointing to
+        barycentre at.
     """
+    if is_time_sliced(mission):
+        raise ValueError(
+            f"A {mission} row has no pointing to barycentre at; search by source name "
+            "with mjd_start/mjd_stop instead"
+        )
     logger = get_run_logger()
 
     results = retrieve_info_for_obsid(obsid, mission=mission)

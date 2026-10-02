@@ -748,8 +748,12 @@ class TestExposureCondition:
         assert core.exposure_condition("rxte") == "cat.exposure >= 0"
 
     def test_every_mission_drops_planned_but_unexecuted_observations(self):
-        """A null or negative exposure is a plan, not an observation, for all of them."""
+        """A null or negative exposure is a plan, not an observation, for all of them.
+
+        Missions sliced by time (GBM days) have no exposure column, so they are skipped."""
         for mission in core.MISSION_CONFIG:
+            if core.is_time_sliced(mission):
+                continue
             assert core.exposure_condition(mission).endswith(("> 0", ">= 0"))
 
     def test_naming_an_obsid_keeps_it_whatever_its_exposure(self):
