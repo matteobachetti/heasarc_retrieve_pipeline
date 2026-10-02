@@ -1,0 +1,1 @@
+Merging spectra no longer crashes because of file names: a path is never written into a FITS header (``DO_ADDSPEC`` truncates it at 80 characters), and the merge, split and roundtrip commands use the same short workspace as the main flow.

@@ -45,6 +45,7 @@ extensions = [
 # toctree, and a -W build treats that as an error.
 exclude_patterns = [
     "_build",
+    "changes",
     "Thumbs.db",
     ".DS_Store",
     "completion_model_plan.md",

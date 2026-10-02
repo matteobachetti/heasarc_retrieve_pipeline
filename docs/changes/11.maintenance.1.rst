@@ -1,0 +1,1 @@
+The test suite has its own Prefect database keyed by the installed Prefect version, and the SAS stub no longer writes into the repository. Tests that need a real tool are marked, and the XMM figure tests are skipped when plotly is not installed.

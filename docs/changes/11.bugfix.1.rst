@@ -1,0 +1,1 @@
+Writing the observation's diagnostics page no longer hangs a batch of observations: the removed flare intervals are drawn in one call, since plotly's ``add_vrect`` is quadratic. A payload that was never written is no longer named in the record, and the chi2 label is left off the flare figure when no chi2 could be measured.
