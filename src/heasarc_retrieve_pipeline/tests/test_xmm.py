@@ -1861,6 +1861,7 @@ class TestExtractingTheSpectra:
         assert rec.arrays[f"spec_{stem}_bkg_rate"].tolist() == [0.001, 0.002]
 
     def test_the_recorded_band_is_the_one_the_page_will_draw(self, tmp_path, stub_sas):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         stub_sas()
@@ -2770,6 +2771,7 @@ class TestTheSpectraReachThePage:
         assert "PI in [200:12000]" in xmm.SCREENING_EXPRESSIONS[("pn", xmm.IMAGING)]
 
     def test_a_record_naming_a_band_is_drawn_over_that_band(self):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         energy = np.array([0.5, 1.0, 5.0, 50.0])
@@ -2785,6 +2787,7 @@ class TestTheSpectraReachThePage:
         assert list(trace.x) == [0.5, 1.0, 5.0], "the 50 keV point is outside XMM's band"
 
     def test_a_record_naming_no_band_still_gets_nustars(self):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         energy = np.array([0.5, 1.0, 5.0, 50.0])
@@ -2817,6 +2820,7 @@ class TestTheFlareCurveIsDrawn:
     VALUES = dict(threshold=3.4, exposure_before=1000.0, exposure_after=900.0)
 
     def test_one_curve_gives_one_panel_with_data_in_it(self):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         figure = report.flare_figure(dict(values=self.VALUES), dict(self.ARRAYS))
@@ -2826,6 +2830,7 @@ class TestTheFlareCurveIsDrawn:
         assert list(figure.data[0].y) == [2.0] * 50
 
     def test_the_threshold_and_the_removed_interval_are_both_shown(self):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         figure = report.flare_figure(dict(values=self.VALUES), dict(self.ARRAYS))
@@ -2835,6 +2840,7 @@ class TestTheFlareCurveIsDrawn:
         assert any(getattr(shape, "x0", None) == 400.0 for shape in shapes), "nothing shaded"
 
     def test_an_empty_curve_draws_nothing_rather_than_empty_axes(self):
+        pytest.importorskip("plotly")
         from heasarc_retrieve_pipeline import report
 
         empty = dict(lc_time=np.array([]), lc_rate=np.array([]))
