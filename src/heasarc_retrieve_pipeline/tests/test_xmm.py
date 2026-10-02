@@ -11,7 +11,7 @@ on 2026-09-07, and the two observations behind them are the ones
 ``docs/xmm_integration_plan.md`` picked as test targets.
 """
 
-import copy
+from dataclasses import replace
 import json
 import glob
 import gzip
@@ -2415,7 +2415,7 @@ class TestWhatTheWindowCheckRecords:
     def check(self, tmp_path, ccds, radius=30.0, mode=xmm.IMAGING, submode="PrimePartialW3"):
         path = a_windowed_event_file(tmp_path / "events.ds", ccds, SUBMODE=submode)
         exposure = an_exposure(None, mode=mode, event_list="never-opened.FTZ")
-        exposure = copy.replace(exposure, submode=submode)
+        exposure = replace(exposure, submode=submode)
         config = xmm.xmm_config(dict(self.CONFIG, src_radius_arcsec=radius))
         # The cleaned events, not the exposure's own raw list -- and `never-opened.FTZ`
         # does not exist, so a regression that went back to the raw list would fail here

@@ -46,7 +46,7 @@ import gzip
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -1383,7 +1383,7 @@ def xmm_with_submodes(exposures):
             submode = read_submode(exposure.event_list)
         except OSError as problem:
             logger.warning(f"Could not read the submode of {exposure.event_list}: {problem}")
-        filled.append(copy.replace(exposure, submode=submode))
+        filled.append(replace(exposure, submode=submode))
     return filled
 
 
@@ -2958,7 +2958,7 @@ def xmm_with_odf_flare_curves(obsid, exposures, config, env=None, log_to=None):
         )
 
     return [
-        copy.replace(exposure, flare_lightcurve=curves.get((exposure.instrument, exposure.expid)))
+        replace(exposure, flare_lightcurve=curves.get((exposure.instrument, exposure.expid)))
         for exposure in exposures
     ]
 
