@@ -57,12 +57,22 @@ from . import heasoft
 from .utils import get_logger
 
 __all__ = [
+    "ADDSPEC_NAME_LIMIT",
     "GROUPING_COMMAND",
     "apply_case_b_scaling",
     "run_addspec",
     "stage_inputs",
     "working_directory",
 ]
+
+#: How long a file name ``addspec`` will carry out of a spectrum's header. ``DO_ADDSPEC``
+#: reads ``RESPFILE`` into an 80-character buffer and truncates anything longer in
+#: silence. Measured on ``merged_80002092002_80002092004``: a 94-character absolute
+#: ``RESPFILE`` reached ``cp`` as its first 80 characters, the working copies of the
+#: responses were therefore never made, and ``ftaddrmf`` died on files that were not
+#: there -- ``CCfits::FITS::CantOpen``, ``CSPAWN Error flag = 6``. The message named a
+#: file name nobody had ever written, and said nothing about length.
+ADDSPEC_NAME_LIMIT = 80
 
 #: The grouping :func:`~heasarc_retrieve_pipeline.nustar.calculate_spectra` applies, in
 #: the form ``grppha`` takes it. 20 counts per bin is the usual minimum for chi-squared
@@ -120,19 +130,26 @@ def stage_inputs(spectra, stagedir):
     file``. A ``BACKFILE`` must therefore contain no directory at all, which leaves being
     in the right directory as the only way to say which file is meant.
 
-    That is the whole of the constraint, so the staging is no wider than it. Measured, not
-    assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and writes its
-    ``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
-    absolute too.
+    ``RESPFILE`` and ``ANCRFILE`` survive a path, but only a short one: ``DO_ADDSPEC``
+    reads them into a buffer :data:`ADDSPEC_NAME_LIMIT` characters wide and truncates
+    without a word. That limit cannot be met by keeping paths tidy. Merging spends the
+    dataset name twice -- ``<root>/merged_A_B/products/merged_A_B_A01.rsp`` -- so for the
+    two OBSIDs measured, 79 of the 80 characters are gone before the output root
+    contributes anything, and no output root but a single character would fit. A short
+    name for the tree, which is what
+    :func:`~heasarc_retrieve_pipeline.utils.short_workspace` buys elsewhere, cannot help
+    here either.
 
-    So each source spectrum is *copied* -- the originals must not be touched -- and in the
-    copy ``BACKFILE`` is reduced to a bare name while ``RESPFILE`` and ``ANCRFILE`` are
-    made absolute, pointing back at the parent's own responses. Only the background
-    spectra are linked into the directory; the 68 MB ``.rmf`` files are never linked or
-    copied at all.
+    So no pointer this package writes into a FITS header is ever a path. Each source
+    spectrum is *copied* -- the originals must not be touched -- and in the copy all three
+    keywords are reduced to bare names, with the files they name symbolically linked in
+    beside them. A link costs nothing even for a 68 MB ``.rmf``, and ``addspec`` resolves
+    it while making the working copy of the response it would have made anyway.
 
-    The file names already carry the OBSID, so spectra from different observations cannot
-    collide here.
+    That leaves the staging directory as one flat namespace, so a bare name has to mean
+    one file. NuSTAR names carry the OBSID and cannot collide; a collision would mean
+    something upstream is already wrong, and :func:`_link` raises rather than let one
+    spectrum be co-added against another's response.
 
     Parameters
     ----------
@@ -163,15 +180,11 @@ def stage_inputs(spectra, stagedir):
                     value = str(hdu.header.get(keyword, "none")).strip()
                     if not value or value.lower() in ("none", "no"):
                         continue
+                    # Bare, and linked in beside us. Never a path: mathpha reads one as
+                    # arithmetic, and DO_ADDSPEC truncates one at ADDSPEC_NAME_LIMIT.
                     referenced = os.path.basename(value)
-                    original = os.path.join(source, referenced)
-                    if keyword == "BACKFILE":
-                        # Bare, and linked in beside us: mathpha would read a path as
-                        # arithmetic. This is the only keyword that has to be handled.
-                        hdu.header[keyword] = referenced
-                        _link(original, os.path.join(stagedir, referenced))
-                    else:
-                        hdu.header[keyword] = os.path.abspath(original)
+                    hdu.header[keyword] = referenced
+                    _link(os.path.join(source, referenced), os.path.join(stagedir, referenced))
 
         staged.append(name)
         logger.debug(f"Staged {name} for merging")
@@ -183,16 +196,33 @@ def _link(source, destination):
     """
     Point ``destination`` at ``source``, quietly doing nothing if it is already there.
 
-    A symbolic link rather than a copy: a merge only reads the background spectra. Falls
-    back to copying where linking is not available.
+    A symbolic link rather than a copy: a merge only reads these files, and an ``.rmf`` is
+    68 MB. Falls back to copying where linking is not available.
+
+    Raises
+    ------
+    ValueError
+        When the name is already taken by a *different* file. Bare names are safe only
+        while they stay unique, and the whole staging directory is one flat namespace:
+        letting the second file lose would pair a spectrum with its neighbour's response
+        and give a wrong answer without a word. NuSTAR file names carry the OBSID, so a
+        collision here means something upstream is already wrong.
     """
+    source = os.path.abspath(source)
     if os.path.exists(destination) or os.path.islink(destination):
+        standing = os.path.realpath(destination)
+        if standing != os.path.realpath(source):
+            raise ValueError(
+                f"{os.path.basename(destination)} names two different files, {standing} "
+                f"and {source}. addspec resolves the names it reads out of the headers in "
+                "one directory, so only one of the two could be found there."
+            )
         return
     if not os.path.exists(source):
         get_logger().warning(f"{source} is named by a spectrum but is not there")
         return
     try:
-        os.symlink(os.path.abspath(source), destination)
+        os.symlink(source, destination)
     except OSError:  # pragma: no cover - only on filesystems without symbolic links
         shutil.copy(source, destination)
 

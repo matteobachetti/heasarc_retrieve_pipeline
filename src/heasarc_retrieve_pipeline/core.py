@@ -37,7 +37,23 @@ from .nustar import (
 )
 from . import heasoft
 from .nicer import process_nicer_obsid, DEFAULT_CONFIG as NICER_DEFAULT_CONFIG
-from .rxte import process_rxte_obsid, DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG
+from .rxte import (
+    process_rxte_obsid,
+    rxte_download_filter,
+    DEFAULT_CONFIG as RXTE_DEFAULT_CONFIG,
+)
+from .xmm import (
+    process_xmm_obsid,
+    xmm_download_filter,
+    xmm_resolve_config,
+    DEFAULT_CONFIG as XMM_DEFAULT_CONFIG,
+)
+from .chandra import (
+    chandra_download_filter,
+    chandra_resolve_config,
+    process_chandra_obsid,
+    DEFAULT_CONFIG as CHANDRA_DEFAULT_CONFIG,
+)
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
@@ -439,13 +455,96 @@ def get_remote_directory_listing(url: str):
     return walk_remote_directory(url)
 
 
+def _fetch_directory_index(url):
+    """
+    The raw index page of one remote directory, or ``None`` if it could not be read.
+
+    Kept apart from :func:`list_archive_directory` so that the parsing can be tested
+    without the network, and separate from :func:`walk_remote_directory`'s own fetch
+    because the two want different things from a failure: a walk that cannot read a
+    subdirectory has already found the tree it is descending, while a probe that cannot
+    read a directory has learnt nothing at all.
+    """
+    from urllib.request import Request, urlopen
+
+    return urlopen(Request(url.replace(" ", "%20"))).read()
+
+
+def list_archive_directory(url):
+    """
+    What one archive directory holds, without descending into it.
+
+    :func:`get_remote_directory_listing` walks a whole tree. That is what a download
+    wants, and much more than a question about the *shape* of the tree needs -- and such
+    a question is normally asked before the download that would answer it expensively.
+    XMM asks one: whether the archive holds its own reduction of an observation, or only
+    the raw telemetry.
+
+    All three transports are understood, and all three answer in the same spelling: names
+    relative to ``url``, with subdirectories keeping their trailing slash, sorted.
+
+    Parameters
+    ----------
+    url : str
+        An HTTPS URL, an ``s3://`` URL, or a local path.
+
+    Returns
+    -------
+    list of str or None
+        The entries, or ``None`` if the directory could not be listed at all.
+
+        The difference matters, and every caller should keep it: an empty list is a fact
+        about the archive -- there is nothing here -- while ``None`` is a fact about this
+        machine's network, and only the first is worth acting on. A probe that treated a
+        timeout as "no data" would quietly change what gets downloaded.
+    """
+    logger = get_logger()
+
+    if url.startswith("http"):
+        prefix = url if url.endswith("/") else url + "/"
+        try:
+            page = _fetch_directory_index(prefix)
+        except OSError as error:  # HTTPError and URLError are both OSError
+            logger.warning(f"Could not list {prefix}: {error}")
+            return None
+        if page is None:
+            return None
+        return sorted(entry[len(prefix) :] for entry in parse_directory_index(page, prefix))
+
+    if url.startswith("s3://"):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        prefix = parsed.path.lstrip("/")
+        prefix = prefix if prefix.endswith("/") else prefix + "/"
+        try:
+            # Delimiter is what makes this one directory rather than the whole tree: with
+            # it, everything below a subdirectory collapses into one common prefix.
+            response = _s3_client().list_objects_v2(
+                Bucket=parsed.netloc, Prefix=prefix, Delimiter="/"
+            )
+        except Exception as error:  # noqa: BLE001 -- botocore raises a family of its own
+            logger.warning(f"Could not list {url}: {error}")
+            return None
+        names = [common["Prefix"][len(prefix) :] for common in response.get("CommonPrefixes", [])]
+        names += [obj["Key"][len(prefix) :] for obj in response.get("Contents", [])]
+        return sorted(names)
+
+    if not os.path.isdir(url):
+        logger.warning(f"Could not list {url}: not a directory")
+        return None
+    return sorted(
+        name + "/" if os.path.isdir(os.path.join(url, name)) else name for name in os.listdir(url)
+    )
+
+
 @task(task_run_name="download_{node}", retries=3, retry_delay_seconds=10)
 def download_node(
     node: str,
     base_url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     verify: bool = True,
 ):
@@ -469,9 +568,10 @@ def download_node(
     cut_ndirs : int, optional
         Number of leading path components to drop from the remote path.
     test_str : str, optional
-        Substring that must appear in the local path for the node to be fetched.
-        The default ``"."`` effectively means "only names containing a dot". Pass
-        ``None`` to disable the check.
+        Substring that must appear in the local path for the node to be fetched. The
+        default, ``None``, fetches everything the regular expressions left. It used to be
+        ``"."``, which quietly meant "only names containing a dot" and dropped RXTE's
+        extension-less orbit ephemerides.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     verify : bool, optional
@@ -558,7 +658,7 @@ def s3_key_destination(
     key: str,
     prefix: str,
     outdir: str,
-    test_str: str = ".",
+    test_str: str | None = None,
     re_include=None,
     re_exclude=None,
 ):
@@ -578,7 +678,8 @@ def s3_key_destination(
     outdir : str
         Local root directory of the download.
     test_str : str, optional
-        Substring that must appear in the local path. ``None`` accepts everything.
+        Substring that must appear in the local path. The default, ``None``, accepts
+        everything.
     re_include : re.Pattern or None, optional
         Only keys matching this are kept.
     re_exclude : re.Pattern or None, optional
@@ -612,7 +713,7 @@ def recursive_download_s3(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -633,7 +734,8 @@ def recursive_download_s3(
     cut_ndirs : int, optional
         Accepted for signature compatibility with the HTTPS transport; unused here.
     test_str : str, optional
-        Substring that must appear in the local path for the key to be fetched.
+        Substring that must appear in the local path for the key to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -715,7 +817,7 @@ def recursive_download_https(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -737,7 +839,8 @@ def recursive_download_https(
     cut_ndirs : int, optional
         Number of leading path components to drop from each remote path.
     test_str : str, optional
-        Substring that must appear in the local path for a node to be fetched.
+        Substring that must appear in the local path for a node to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -837,7 +940,7 @@ def recursive_download(
     url: str,
     outdir: str,
     cut_ndirs: int = 0,
-    test_str: str = ".",
+    test_str: str | None = None,
     test: bool = False,
     re_include: str = "",
     re_exclude: str = "",
@@ -860,7 +963,8 @@ def recursive_download(
     cut_ndirs : int, optional
         Number of leading path components to drop from each remote path.
     test_str : str, optional
-        Substring that must appear in the local path for a file to be fetched.
+        Substring that must appear in the local path for a file to be fetched. The
+        default, ``None``, accepts everything.
     test : bool, optional
         If True, log what would happen but transfer nothing.
     re_include : str, optional
@@ -895,7 +999,7 @@ MISSION_CONFIG = {
         # numaster means it: zero exposure_a is an observation with no data, and there is
         # no point downloading it.
         "zero_exposure_may_be_wrong": False,
-        "additional": "solar_activity",
+        "additional": "cycle, solar_activity",
         "obsid_processing": process_nustar_obsid,
         "default_config": NUSTAR_DEFAULT_CONFIG,
         "name_column": "name",
@@ -907,7 +1011,7 @@ MISSION_CONFIG = {
         # nicermastr does not: it sometimes reports zero because NICER's own pipeline
         # filtered the data wrongly, and the data are fine. Download them and look.
         "zero_exposure_may_be_wrong": True,
-        "additional": "",
+        "additional": "cycle",
         "obsid_processing": process_nicer_obsid,
         "default_config": NICER_DEFAULT_CONFIG,
         "name_column": "name",
@@ -921,8 +1025,164 @@ MISSION_CONFIG = {
         "obsid_processing": process_rxte_obsid,
         "default_config": RXTE_DEFAULT_CONFIG,
         "name_column": "target_name",
+        "download_filter": rxte_download_filter,
+    },
+    "xmm": {
+        "table": "xmmmaster",
+        # xmmmaster's exposure column is `duration`, and it has no `cycle` at all --
+        # which is why `cycle` had to come out of the hardcoded OBSID query.
+        "expo_column": "duration",
+        # Assume the catalogue may be wrong, as for NICER: four of the twenty pointings
+        # at M82 report no EPIC exposure, and whether that means "nothing to reduce" is
+        # answered by the PPS directory, not by the row.
+        "zero_exposure_may_be_wrong": True,
+        # pps_flag and sas_version are carried so a run can say which route it expects
+        # before downloading anything. The route is still decided by probing the archive
+        # directory -- 0973390101 has pps_flag = "Y" and no PPS directory at all.
+        "additional": (
+            "pn_time, mos1_time, mos2_time, pn_mode, mos1_mode, mos2_mode, pps_flag, sas_version"
+        ),
+        "obsid_processing": process_xmm_obsid,
+        "default_config": XMM_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": xmm_download_filter,
+        "resolve_config": xmm_resolve_config,
+    },
+    "chandra": {
+        "table": "chanmaster",
+        "expo_column": "exposure",
+        # Assume the catalogue may be wrong, as for NICER and XMM: whether an observation
+        # has anything to reduce is answered by its primary/ directory, not by the row.
+        "zero_exposure_may_be_wrong": True,
+        # detector, grating and data_mode are carried so that a run can say what it is
+        # about to reduce -- HRC or ACIS, grating or not -- before downloading anything.
+        "additional": "cycle, status, detector, grating, data_mode, type",
+        "obsid_processing": process_chandra_obsid,
+        "default_config": CHANDRA_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": chandra_download_filter,
+        "resolve_config": chandra_resolve_config,
+    },
+    # Retrieval only, for now: the reduction arrives with fermi_gbm.py.
+    "fermi_gbm": {
+        "table": "fermigdays",
+        # One row per day, not per pointing: GBM sees the whole unocculted sky, so the
+        # catalogue has no position, exposure or name to search on. Days are found by
+        # date (time_query), and the position comes from the name lookup.
+        "time_sliced": True,
+        "obsid_column": "day_id",
+        # Before 2012-11-26 time-tagged events were kept only around triggers.
+        "condition": "cat.tte_flag = 'Y'",
+        "additional": "end_time, tte_flag",
     },
 }
+
+
+#: The arguments a ``"download_filter"`` is allowed to return. They are the two
+#: :func:`recursive_download` already takes.
+DOWNLOAD_FILTER_ARGUMENTS = frozenset({"re_include", "re_exclude"})
+
+
+def mission_download_filter(mission: str, config: dict) -> dict:
+    """
+    What of an observation directory this mission wants downloaded.
+
+    A mission may declare a ``"download_filter"`` in :data:`MISSION_CONFIG`: a callable
+    taking the run's config and returning ``re_include`` and/or ``re_exclude`` for
+    :func:`recursive_download`. It is a callable and not a literal because the filter can
+    depend on the run -- XMM downloads different files on its PPS route than on its ODF
+    route, and the route is a config key.
+
+    Most missions declare nothing and download the whole directory, which is what every
+    mission did before this existed.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of :data:`MISSION_CONFIG`.
+    config : dict
+        The run's configuration, as the mission's reduction will see it.
+
+    Returns
+    -------
+    dict
+        Keyword arguments for :func:`recursive_download`; empty if this mission filters
+        nothing.
+
+    Raises
+    ------
+    ValueError
+        If the filter names anything but ``re_include`` and ``re_exclude``. A misspelt
+        key would otherwise be dropped in silence, and the symptom -- a whole gigabyte
+        arriving where forty megabytes were meant to -- looks like a slow network rather
+        than like a bug.
+    """
+    build_filter = MISSION_CONFIG[mission].get("download_filter")
+    if build_filter is None:
+        return {}
+
+    arguments = build_filter(config)
+    unknown = set(arguments) - DOWNLOAD_FILTER_ARGUMENTS
+    if unknown:
+        raise ValueError(
+            f"The download filter of {mission} names {', '.join(sorted(unknown))}, which "
+            f"recursive_download does not take. It takes "
+            f"{', '.join(sorted(DOWNLOAD_FILTER_ARGUMENTS))}."
+        )
+    return arguments
+
+
+def mission_resolve_config(mission: str, config: dict, url: str) -> dict:
+    """
+    The configuration this observation will actually be reduced with.
+
+    A mission may declare a ``"resolve_config"`` in :data:`MISSION_CONFIG`: a callable
+    taking the run's config and the observation's URL and returning the config to use. It
+    runs before the download, so that what it decides can change what is downloaded.
+
+    XMM is why it exists, and the reason is a fact about the archive rather than about the
+    code. ``xmmmaster``'s ``pps_flag`` says whether an observation was reduced by the
+    Pipeline Processing System, and it is wrong often enough to matter: ``0973390101`` is
+    flagged ``Y`` and has no PPS directory mirrored at HEASARC at all, only ``ODF/``. A
+    run that trusted the flag would download five megabytes of housekeeping, find no
+    event lists, and report a perfectly good observation as holding no science data. One
+    listing of the observation directory settles it.
+
+    Most missions declare nothing and are handed their configuration back unchanged.
+
+    Parameters
+    ----------
+    mission : str
+        One of the keys of :data:`MISSION_CONFIG`.
+    config : dict
+        The run's configuration, before the archive has been looked at.
+    url : str
+        Where this observation will be downloaded from.
+
+    Returns
+    -------
+    dict
+        The configuration to reduce with. The same object, for a mission that declares
+        nothing.
+
+    Raises
+    ------
+    TypeError
+        If the hook returns something that is not a configuration. A hook that forgets to
+        return would otherwise fail several steps later, inside the mission's own
+        reduction, under a name that has nothing to do with the mistake.
+    """
+    resolve = MISSION_CONFIG[mission].get("resolve_config")
+    if resolve is None:
+        return config
+
+    resolved = resolve(config, url)
+    if not isinstance(resolved, dict):
+        raise TypeError(
+            f"The resolve_config of {mission} returned {type(resolved).__name__}, not a "
+            f"configuration dictionary."
+        )
+    return resolved
 
 
 @task(task_run_name="read_config_{config_file}")
@@ -950,6 +1210,89 @@ def read_config(config_file: str):
     with open(config_file, "r") as f:
         config = yaml.load(f)
     return config
+
+
+def is_time_sliced(mission: str) -> bool:
+    """
+    Whether a mission's catalogue has one row per stretch of time rather than per pointing.
+
+    Such a catalogue (GBM's ``fermigdays``) has no position to cone-search on and no
+    pointing to barycentre at: it is searched with :func:`time_query`, and the source
+    position must come from elsewhere.
+
+    Examples
+    --------
+    >>> is_time_sliced("fermi_gbm"), is_time_sliced("nustar")
+    (True, False)
+    """
+    return bool(MISSION_CONFIG[mission].get("time_sliced", False))
+
+
+def time_query(mjd_start: float, mjd_stop: float, mission: str) -> str:
+    """
+    The catalogue query that finds the rows of a time-sliced catalogue in an interval.
+
+    A row is kept if any part of it overlaps ``[mjd_start, mjd_stop]``: a GBM day starts
+    at 23:59 the day before, so asking for whole calendar days by ``day_id`` would be
+    both clumsier and wrong at the edges.
+
+    Parameters
+    ----------
+    mjd_start, mjd_stop : float
+        The interval, in MJD (the catalogue's ``time`` and ``end_time`` columns).
+    mission : str
+        A key of ``MISSION_CONFIG`` for which :func:`is_time_sliced` is true.
+
+    Returns
+    -------
+    str
+        An ADQL query, aliasing the mission's ``obsid_column`` to ``obsid``.
+
+    Raises
+    ------
+    ValueError
+        If the mission is searched by position, or the interval is empty or reversed.
+    """
+    if not is_time_sliced(mission):
+        raise ValueError(
+            f"{mission} is searched by position; only missions whose catalogue is sliced "
+            "by time have a date query"
+        )
+    mjd_start, mjd_stop = float(mjd_start), float(mjd_stop)
+    if not mjd_start < mjd_stop:
+        raise ValueError(f"mjd_start ({mjd_start}) must come before mjd_stop ({mjd_stop})")
+
+    config = MISSION_CONFIG[mission]
+    return f"""SELECT {config["obsid_column"]} as obsid, time, {config["additional"]}, __row
+        FROM public.{config["table"]} as cat
+        where
+        cat.time < {mjd_stop!r} and cat.end_time > {mjd_start!r}
+        and
+        {config["condition"]} order by cat.time
+        """
+
+
+@task(log_prints=True)
+def retrieve_heasarc_table_by_time(mjd_start: float, mjd_stop: float, mission: str):
+    """
+    The rows of a time-sliced catalogue that overlap an interval.
+
+    Parameters
+    ----------
+    mjd_start, mjd_stop : float
+        The interval, in MJD.
+    mission : str
+        A key of ``MISSION_CONFIG`` for which :func:`is_time_sliced` is true.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per day (for GBM), ordered by time, with ``obsid``, ``time``, ``__row`` and
+        the mission's extra columns. ``__row`` must be preserved, as for the cone search.
+    """
+    logger = get_run_logger()
+    logger.info(f"Retrieving HEASARC table for {mission} between MJD {mjd_start} and {mjd_stop}")
+    return Heasarc.query_tap(time_query(mjd_start, mjd_stop, mission)).to_table()
 
 
 @task(log_prints=True)
@@ -990,7 +1333,17 @@ def retrieve_heasarc_table_by_position(
 
         ``__row`` is astroquery's internal row identifier and must be preserved: it
         is what ``Heasarc.locate_data`` needs in order to find the files.
+
+    Raises
+    ------
+    ValueError
+        If the mission's catalogue is sliced by time and has no position to search on.
     """
+    if is_time_sliced(mission):
+        raise ValueError(
+            f"The {mission} catalogue has no positions; search it by date "
+            "(mjd_start/mjd_stop) with retrieve_heasarc_table_by_time"
+        )
     logger = get_run_logger()
     logger.info(
         f"Retrieving HEASARC table for {mission} at RA: {ra_deg}, Dec: {dec_deg}, Radius: {radius_deg}"
@@ -1085,6 +1438,11 @@ def obsid_query(obsid, mission: str = "nustar"):
     an OBSID has been named explicitly, returning nothing at all is more confusing than
     returning the row and letting the reduction say what it found.
 
+    Only the columns every master catalogue has are written into the query text. Anything
+    else, ``cycle`` included, belongs in the mission's ``"additional"`` string: ``cycle``
+    is in ``numaster``, ``nicermastr`` and ``xtemaster`` but not in ``xmmmaster``, so a
+    query that always asked for it could not reach XMM at all.
+
     Raises
     ------
     ValueError
@@ -1097,15 +1455,25 @@ def obsid_query(obsid, mission: str = "nustar"):
         if not OBSID_RE.fullmatch(str(one)):
             raise ValueError(f"{one!r} is not a valid OBSID")
 
+    wanted = ", ".join(f"'{one}'" for one in obsids)
+    if is_time_sliced(mission):
+        config = MISSION_CONFIG[mission]
+        return f"""SELECT {config["obsid_column"]} as obsid, time, {config["additional"]}, __row
+        FROM public.{config["table"]} as cat
+        where
+        cat.{config["obsid_column"]} IN ({wanted})
+        and
+        {config["condition"]} order by cat.time
+        """
+
     expo_name = MISSION_CONFIG[mission]["expo_column"]
     additional = MISSION_CONFIG[mission]["additional"]
     table = MISSION_CONFIG[mission]["table"]
     name_column = MISSION_CONFIG[mission]["name_column"]
     if additional != "":
         additional = f", {additional}"
-    wanted = ", ".join(f"'{one}'" for one in obsids)
 
-    return f"""SELECT {name_column}, cycle, obsid, time, {expo_name}, ra, dec, __row {additional}
+    return f"""SELECT {name_column}, obsid, time, {expo_name}, ra, dec, __row {additional}
         FROM public.{table} as cat
         where
         cat.obsid IN ({wanted})
@@ -1130,8 +1498,8 @@ def retrieve_info_for_obsid(obsid, mission: str = "nustar"):
     Returns
     -------
     astropy.table.Table
-        One row per OBSID found, with the mission's name, ``cycle``, ``obsid``, ``time``,
-        exposure, ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
+        One row per OBSID found, with the mission's name, ``obsid``, ``time``, exposure,
+        ``ra``, ``dec``, ``__row`` and any mission-specific extra columns.
 
     Notes
     -----
@@ -1400,7 +1768,8 @@ def observation_work_items(
 
     items = []
     for row in result_table:
-        obsid = row["obsid"]
+        # chanmaster answers with int32 OBSIDs, and every path downstream is built from one.
+        obsid = str(row["obsid"])
         link = link_by_row.get(row["__row"])
 
         url = None
@@ -1452,6 +1821,7 @@ def download_and_process_observation(
     flags=None,
     test=False,
     pgp_passphrase=None,
+    config=None,
 ):
     """
     Download one observation and reduce it, in this process alone.
@@ -1484,11 +1854,17 @@ def download_and_process_observation(
         If True, fake the download and do not process.
     pgp_passphrase : str, optional
         PGP passphrase for decryption, if this is encrypted data.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
     """
     prepare_worker(pfiles_root, work_root)
 
+    # The caller's settings with the run's own paths over them: a worker writes where the
+    # flow put it, whatever the dictionary says.
     config = absolute_config(
-        dict(input_data_path=outdir, out_data_path=outdir),
+        dict(config or {}, input_data_path=outdir, out_data_path=outdir),
         MISSION_CONFIG[mission]["default_config"],
     )
 
@@ -1515,7 +1891,15 @@ def download_and_process_observation(
                 rec.skip("files already downloaded and decrypted in a prior run")
                 return None
 
-            recursive_download(url, outdir, test_str=".", test=test)
+            # Before the download, because what it decides is what gets downloaded.
+            config = mission_resolve_config(mission, config, url)
+
+            recursive_download(
+                url,
+                outdir,
+                test=test,
+                **mission_download_filter(mission, config),
+            )
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None
@@ -1582,7 +1966,9 @@ def write_page(obsid, outdir):
 
 
 @flow(flow_run_name="process_{mission}_observations")
-def process_observations(items, outdir, mission, pfiles_root, work_root, flags=None, test=False):
+def process_observations(
+    items, outdir, mission, pfiles_root, work_root, flags=None, test=False, config=None
+):
     """
     Reduce every observation, one process each.
 
@@ -1608,6 +1994,10 @@ def process_observations(items, outdir, mission, pfiles_root, work_root, flags=N
         Extra parameters for the mission's Level-2 pipeline.
     test : bool, optional
         If True, fake the downloads and process nothing.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
 
     Returns
     -------
@@ -1647,6 +2037,7 @@ def process_observations(items, outdir, mission, pfiles_root, work_root, flags=N
             work_root=work_root,
             flags=flags,
             test=test,
+            config=config,
         )
         if "pgp_passphrase" in item:
             kwargs["pgp_passphrase"] = item["pgp_passphrase"]
@@ -1755,6 +2146,7 @@ def retrieve_and_process_data(
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
+    config: typing.Union[dict, None] = None,
 ):
     """
     Download and reduce every observation in a catalogue table.
@@ -1807,6 +2199,10 @@ def retrieve_and_process_data(
     pgp_keys_file : str or None, optional
         Path to PGP keys file for encrypted data. If ``None``, defaults to
         ``~/.heasarc_retrieve_pgp_keys``. File format: ``mission obsid passphrase``.
+    config : dict, optional
+        Mission configuration to reduce with, over the mission's defaults -- for instance
+        ``{"cameras": ["pn"]}`` for XMM. The two paths are always the run's own, whatever
+        this says.
 
     Returns
     -------
@@ -1877,6 +2273,7 @@ def retrieve_and_process_data(
             work_root=workspace.work,
             flags=flags,
             test=test,
+            config=config,
         )
 
     return result_table
@@ -1894,6 +2291,8 @@ def retrieve_heasarc_data_by_source_name(
     n_workers: int = 1,
     scratch_dir: typing.Union[str, None] = None,
     pgp_keys_file: typing.Union[str, None] = None,
+    mjd_start: typing.Union[float, None] = None,
+    mjd_stop: typing.Union[float, None] = None,
 ):
     """
     Download and reduce every observation of a named source.
@@ -1901,6 +2300,10 @@ def retrieve_heasarc_data_by_source_name(
     Top-level entry point. Resolves the name, cone-searches the mission's master
     catalogue, and hands the results to :func:`retrieve_and_process_data`, which
     locates the downloadable products for each row.
+
+    A mission whose catalogue is sliced by time (GBM) has nothing to cone-search: its
+    rows between ``mjd_start`` and ``mjd_stop`` are taken instead, and the resolved
+    position is the one they are barycentred at.
 
     Parameters
     ----------
@@ -1925,11 +2328,20 @@ def retrieve_heasarc_data_by_source_name(
         :func:`retrieve_and_process_data`.
     pgp_keys_file : str or None, optional
         Path to PGP keys file for encrypted data; see :func:`retrieve_and_process_data`.
+    mjd_start, mjd_stop : float or None, optional
+        The interval to search, in MJD. Required for a mission whose catalogue is sliced
+        by time, refused for the others.
 
     Returns
     -------
     astropy.table.Table
         The catalogue rows that were processed.
+
+    Raises
+    ------
+    ValueError
+        If a time-sliced mission is given no interval, or another mission is given one.
+        Raised before the name is resolved.
 
     Notes
     -----
@@ -1937,11 +2349,25 @@ def retrieve_heasarc_data_by_source_name(
     argument, so Level-2 pipeline parameters cannot be customised when working by
     source name.
     """
+    dates_given = mjd_start is not None or mjd_stop is not None
+    if is_time_sliced(mission) and (mjd_start is None or mjd_stop is None):
+        raise ValueError(
+            f"The {mission} catalogue is searched by date: give mjd_start and mjd_stop"
+        )
+    if not is_time_sliced(mission) and dates_given:
+        raise ValueError(
+            f"{mission} is searched by position; mjd_start/mjd_stop are only for missions "
+            "whose catalogue is sliced by time"
+        )
+
     pos = get_source_position(source)
 
-    results = retrieve_heasarc_table_by_position(
-        pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
-    )
+    if is_time_sliced(mission):
+        results = retrieve_heasarc_table_by_time(mjd_start, mjd_stop, mission)
+    else:
+        results = retrieve_heasarc_table_by_position(
+            pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+        )
     results = retrieve_and_process_data(
         result_table=results,
         source_position=pos,
@@ -2009,7 +2435,18 @@ def retrieve_heasarc_data_by_obsid(
     astropy.table.Table or None
         The catalogue rows that were processed, or ``None`` if none of the OBSIDs is in
         the catalogue.
+
+    Raises
+    ------
+    ValueError
+        For a mission whose catalogue is sliced by time: its rows have no pointing to
+        barycentre at.
     """
+    if is_time_sliced(mission):
+        raise ValueError(
+            f"A {mission} row has no pointing to barycentre at; search by source name "
+            "with mjd_start/mjd_stop instead"
+        )
     logger = get_run_logger()
 
     results = retrieve_info_for_obsid(obsid, mission=mission)

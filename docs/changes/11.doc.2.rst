@@ -1,0 +1,1 @@
+Added planning documents for the Swift/XRT and XMM-Newton integrations, with the probes and measurements behind their decisions.

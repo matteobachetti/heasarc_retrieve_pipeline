@@ -217,6 +217,19 @@ class TestObservationWorkItems:
         assert items[0]["url"] == "s3://bucket/90901333002"
         assert items[1]["url"] == "s3://bucket/80002092008"
 
+    def test_a_numeric_obsid_becomes_a_string(self):
+        """``chanmaster`` answers with ``int32`` OBSIDs, and every path is built from one."""
+        import numpy as np
+
+        table = catalogue((1411, "1", 148.9, 69.6))
+        table["obsid"] = table["obsid"].astype(np.int32)
+        links = datalink(("http://x/?1", "s3://bucket/chandra/1411/", "https://h/1411/"))
+
+        items = observation_work_items(table, links, "aws", mission="chandra")
+
+        assert items[0]["obsid"] == "1411"
+        assert isinstance(items[0]["obsid"], str)
+
 
 class TestObsidQuery:
     """The catalogue query behind "reduce these observations"."""
@@ -320,14 +333,16 @@ class TestOneFailureDoesNotStopTheRest:
             for i in range(n)
         ]
 
-    def run(self, monkeypatch, tmp_path, failing, no_science=()):
+    def run(self, monkeypatch, tmp_path, failing, no_science=(), **kwargs):
         """Run the flow with the download and the reduction stubbed out."""
         processed = []
+        self.configs = {}
 
         def stub_download(url, outdir, test_str=".", test=False):
             return []
 
         def stub_processing(obsid, config=None, ra=None, dec=None, flags=None):
+            self.configs[obsid] = config
             if obsid in failing:
                 raise ValueError(f"{obsid} is no good")
             if obsid in no_science:
@@ -345,8 +360,18 @@ class TestOneFailureDoesNotStopTheRest:
             mission="nustar",
             pfiles_root=str(tmp_path / ".pfiles"),
             work_root=str(tmp_path / ".workers"),
+            **kwargs,
         )
         return failed, processed
+
+    def test_the_caller_config_reaches_every_observation(self, tmp_path, monkeypatch):
+        self.run(monkeypatch, tmp_path, failing=set(), config={"cameras": ["pn"]})
+
+        assert {obsid: c["cameras"] for obsid, c in self.configs.items()} == {
+            "obs0": ["pn"],
+            "obs1": ["pn"],
+            "obs2": ["pn"],
+        }
 
     def test_every_observation_gets_a_manifest_even_the_failing_one(self, tmp_path, monkeypatch):
         self.run(monkeypatch, tmp_path, failing={"obs1"})
@@ -505,8 +530,10 @@ class TestTheFlowUsesAShortWorkspace:
                 work_root,
                 flags=None,
                 test=False,
+                config=None,
             ):
                 seen["outdir"] = outdir
+                seen["config"] = config
                 seen["pfiles_root"] = pfiles_root
                 seen["work_root"] = work_root
                 # A worker writes its results through the name it was given.
@@ -581,6 +608,14 @@ class TestTheFlowUsesAShortWorkspace:
         assert not os.path.exists(seen["pfiles_root"])
         assert not os.path.exists(seen["work_root"])
         assert (outdir / "a_result.txt").is_file()
+
+    def test_the_caller_config_reaches_the_workers(self, tmp_path, monkeypatch):
+        outdir = tmp_path / "out"
+        outdir.mkdir()
+
+        seen = self.run(monkeypatch, outdir, config={"cameras": ["pn"]})
+
+        assert seen["config"] == {"cameras": ["pn"]}
 
 
 class TestTheFlowRefusesNamesHeasoftCannotHandle:
@@ -713,8 +748,12 @@ class TestExposureCondition:
         assert core.exposure_condition("rxte") == "cat.exposure >= 0"
 
     def test_every_mission_drops_planned_but_unexecuted_observations(self):
-        """A null or negative exposure is a plan, not an observation, for all of them."""
+        """A null or negative exposure is a plan, not an observation, for all of them.
+
+        Missions sliced by time (GBM days) have no exposure column, so they are skipped."""
         for mission in core.MISSION_CONFIG:
+            if core.is_time_sliced(mission):
+                continue
             assert core.exposure_condition(mission).endswith(("> 0", ">= 0"))
 
     def test_naming_an_obsid_keeps_it_whatever_its_exposure(self):

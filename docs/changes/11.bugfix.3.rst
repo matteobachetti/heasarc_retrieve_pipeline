@@ -1,0 +1,1 @@
+Files without a dot in their name are downloaded.

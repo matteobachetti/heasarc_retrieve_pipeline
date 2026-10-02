@@ -66,3 +66,15 @@ def test_recursive_download(host):
     )
     assert len(results) == 2
     shutil.rmtree("out_test")
+
+
+@pytest.mark.remote_data
+def test_gbm_days_are_found_by_date():
+    """The live fermigdays answer: 2024-03-22 runs from 23:59 the day before, so a
+    window inside that day finds it and nothing else."""
+    from heasarc_retrieve_pipeline.core import retrieve_heasarc_table_by_time
+
+    results = retrieve_heasarc_table_by_time(60391.2, 60391.8, "fermi_gbm")
+
+    assert list(results["obsid"]) == ["20240322"]
+    assert "__row" in results.colnames

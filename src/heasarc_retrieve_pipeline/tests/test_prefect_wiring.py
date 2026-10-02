@@ -6,10 +6,13 @@ sidestepped by a code path that happens not to be exercised.
 """
 
 import ast
+import os
 import pathlib
 import string
 
 import pytest
+
+from .. import conftest
 
 
 MODULES = sorted(
@@ -251,3 +254,43 @@ def test_nothing_steers_the_pipeline_by_changing_directory(path):
     offenders = [name for name in chdir_calls(path.read_text()) if name not in CHDIR_ALLOWED_IN]
 
     assert offenders == [], f"{path.name}: os.chdir in {offenders}"
+
+
+class TestTheSuiteGetsItsOwnPrefectDatabase:
+    """``PREFECT_HOME`` defaults to ``~/.prefect``, one database for the whole machine.
+
+    A Prefect server starting migrates that file to the schema of whichever Prefect started
+    it, and a Prefect older than the file cannot start a server at all. The suite sees that
+    as every test that touches a server waiting out a connection timeout -- and, worse, as a
+    diagnostic record quietly missing everything the task that could not run would have
+    written, because the caller logs a failed diagnostic rather than raising it. Neither
+    symptom points at the cause.
+
+    So the suite uses a database of its own, named after the Prefect that migrates it, and
+    two versions never meet in one file. See ``conftest.py``.
+    """
+
+    def test_the_suite_is_not_using_the_shared_database(self):
+        assert (
+            pathlib.Path(os.environ["PREFECT_HOME"]).resolve()
+            != pathlib.Path("~/.prefect").expanduser().resolve()
+        )
+
+    def test_two_prefect_versions_do_not_share_one_database(self):
+        """The whole point: the older one must not meet what the newer one migrated."""
+        assert conftest.private_prefect_home("3.7.4") != conftest.private_prefect_home("3.8.4")
+
+    def test_the_directory_is_named_after_the_prefect_that_migrates_it(self):
+        import prefect
+
+        assert prefect.__version__ in conftest.private_prefect_home(prefect.__version__)
+
+    def test_it_is_somewhere_prefect_can_write(self):
+        assert os.path.isdir(os.environ["PREFECT_HOME"])
+        assert os.access(os.environ["PREFECT_HOME"], os.W_OK)
+
+    def test_the_one_the_developer_asked_for_wins(self, tmp_path):
+        """``setdefault``, so a run that wants the real database, or a scratch one, says so."""
+        source = pathlib.Path(conftest.__file__).read_text()
+
+        assert 'os.environ.setdefault("PREFECT_HOME"' in source

@@ -15,10 +15,14 @@ dependencies = [
   "numpy",
   "astroquery",
   "pyvo",
-  "prefect",
+  "prefect>3",
   "pysmartdl",
   "beautifulsoup4",
   "pyyaml",
+  # Barycentering, the default over barycorr/barycen/axbary. 1.0.0 is the first release
+  # with the native engine for every mission, and the first that reads local inputs in
+  # place instead of copying them into the current directory.
+  "barycenter>=1.0.0",
 ]
 dynamic = ["version"]
 
@@ -33,6 +37,12 @@ s3 = ["boto3"]
 report = ["plotly"]
 # Solar flare filtering (nustar.filter_solar_flares)
 solar = ["sunpy"]
+# XMM-Newton (heasarc_retrieve_pipeline.xmm). Declares nothing installable on purpose:
+# the reduction needs ESA's SAS, which has no pip or conda distribution -- the `pysas` on
+# PyPI is an unrelated speech-analysis package, ESA's ships inside SAS itself, and the
+# HEASARC conda channel carries no SAS. So SAS is an *environment* requirement exactly as
+# HEADAS is, and this extra exists to say so and to name what XMM does need from Python.
+xmm = ["boto3"]
 # SNR-optimised extraction regions and radial profiles. nustar_gen is not on PyPI, so a
 # direct reference is the only way to declare it, and that is also why it is left out of
 # `all`: cloning a repository in every CI run buys nothing, since no test imports it.
@@ -122,6 +132,7 @@ addopts = "--doctest-glob=*.rst"
 markers = [
   "slow: expensive test, deselected unless --run-slow is given",
   "heasoft: needs a real HEASOFT installation, not a recorded double",
+  "ciao: needs a real CIAO installation, not a recorded double",
 ]
 
 [tool.coverage.run]

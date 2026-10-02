@@ -1,0 +1,1 @@
+Fermi GBM's day catalogue can be searched by date, with the source position taken from a name lookup.
