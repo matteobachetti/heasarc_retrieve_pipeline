@@ -41,6 +41,7 @@ PC-mode (Photon Counting, the imaging mode) exposure, 603 ks in total. Why the p
 
 ```python
 from astroquery.heasarc import Heasarc
+
 q = Heasarc.query_tap(
     "SELECT obsid, name, start_time, xrt_exposure, xrt_expo_pc, xrt_expo_wt, ra, dec "
     "FROM swiftmastr WHERE CONTAINS(POINT('ICRS',ra,dec),CIRCLE('ICRS',148.96,69.68,0.2))=1 "
@@ -221,12 +222,27 @@ from swifttools.ukssdc.xrt_prods import XRTProductRequest
 
 obs = "00091489001,00091489002,00091489003"
 r = XRTProductRequest("matteo.bachetti@inaf.it", silent=False)
-r.setGlobalPars(name="M82_probe", targ="00091489", getT0=True, RA=148.9627, Dec=69.6793,
-                centroid=False, useSXPS=False, posErr=1)   # 319833 adds pcPupRate=1000.0, wtPupRate=1000.0
-r.addSpectrum(whichData="user", useObs=obs, timeslice="obsid", srcrad=21,
-              hasRedshift=True, redshift=0.00067, galactic=True)
+r.setGlobalPars(
+    name="M82_probe",
+    targ="00091489",
+    getT0=True,
+    RA=148.9627,
+    Dec=69.6793,
+    centroid=False,
+    useSXPS=False,
+    posErr=1,
+)  # 319833 adds pcPupRate=1000.0, wtPupRate=1000.0
+r.addSpectrum(
+    whichData="user",
+    useObs=obs,
+    timeslice="obsid",
+    srcrad=21,
+    hasRedshift=True,
+    redshift=0.00067,
+    galactic=True,
+)
 r.addLightCurve(binMeth="obsid", whichData="user", useObs=obs, minEnergy=0.5, maxEnergy=8.0)
-r.submit()                     # r.submitError raises if submission *succeeded*: don't print it
+r.submit()  # r.submitError raises if submission *succeeded*: don't print it
 ```
 
 `targ` is the Swift target ID, zero-padded to 8 digits: the first 8 digits of the obsid.
@@ -254,10 +270,14 @@ Refitting a builder spectrum in the paper's configuration:
 ```python
 from heasarc_retrieve_pipeline.spectral_fit import fit_flux
 
-r = fit_flux("Obs_00091489001pc.pi", model="zwabs*powerlaw",
-             parameters={"zwabs.Redshift": 0.00067, "zwabs.nH": 0.1, "powerlaw.PhoIndex": 2.0},
-             frozen=["zwabs.Redshift"],
-             fit_band=(0.3, 10.0), flux_band=(0.5, 8.0))
+r = fit_flux(
+    "Obs_00091489001pc.pi",
+    model="zwabs*powerlaw",
+    parameters={"zwabs.Redshift": 0.00067, "zwabs.nH": 0.1, "powerlaw.PhoIndex": 2.0},
+    frozen=["zwabs.Redshift"],
+    fit_band=(0.3, 10.0),
+    flux_band=(0.5, 8.0),
+)
 ```
 
 To reproduce the builder's own numbers instead, set `xspec.Xset.abund = "wilm"` and
