@@ -130,23 +130,53 @@ in the download half of the code:
      - ``numaster``
      - ``exposure_a``
      - ``name``
-     - ``solar_activity``
+     - ``cycle``, ``solar_activity``
    * - ``nicer``
      - ``nicermastr``
      - ``exposure``
      - ``name``
-     - --
+     - ``cycle``
    * - ``rxte``
      - ``xtemaster``
      - ``exposure``
      - ``target_name``
      - ``cycle``, ``prnb``
+   * - ``chandra``
+     - ``chanmaster``
+     - ``exposure``
+     - ``name``
+     - ``cycle``, ``status``, ``detector``, ``grating``, ``data_mode``, ``type``
 
-Each entry also carries ``obsid_processing``, the flow that reduces one observation.
+Each entry also carries ``obsid_processing``, the flow that reduces one observation, and
+may carry an optional ``download_filter``.
 
 The differences are real archive quirks, not arbitrary: NuSTAR's master catalogue reports
 per-telescope exposures (``exposure_a`` is FPMA), and RXTE's catalogue uses ``target_name``
-rather than ``name`` and needs ``cycle`` and ``prnb`` selected alongside it.
+rather than ``name`` and needs ``prnb`` selected alongside it.
+
+``cycle`` is in the extra columns of every mission above, and not in the query text,
+because it is not universal: ``numaster``, ``nicermastr``, ``xtemaster`` and ``chanmaster``
+have it and ``xmmmaster`` does not. Only the columns *every* master catalogue has may be written into a query
+literally; anything else belongs to the mission that has it. ``test_core.py`` holds a
+recorded copy of each catalogue's schema and asserts that no mission asks for a column its
+catalogue lacks, so a mission added later cannot rediscover this by failing against the
+live archive.
+
+Downloading only part of an observation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``recursive_download`` has always taken ``re_include`` and ``re_exclude``, and for a long
+time nothing passed them: every mission downloaded whole observation directories. A
+mission that wants less declares a ``download_filter`` in ``MISSION_CONFIG``, and
+``mission_download_filter`` (``core.py``) calls it and forwards the result. Chandra, XMM
+and RXTE declare one; NuSTAR and NICER still take the whole directory.
+
+It is a callable taking the run's config, rather than a literal pair of patterns, because
+the answer can depend on the run and not only on the mission: XMM downloads different files
+on its PPS route than on its ODF route, and which route is taken is a config key. A filter
+that returns anything but ``re_include`` and ``re_exclude`` raises, because a misspelt key
+would be dropped in silence and the symptom -- a whole gigabyte arriving where forty
+megabytes were meant to -- reads as a slow network rather than as a bug.
 
 Entries used to carry a ``path_func`` as well, building an archive path from the OBSID.
 Nothing needs it: the URL of an observation's directory comes from the datalink service,
@@ -193,8 +223,33 @@ Notes on the astronomy encoded here:
   filtering the caller does on the table.
 
 The single-OBSID query (``retrieve_info_for_obsid``, ``core.py:343``) is the same shape
-with ``WHERE cat.obsid = '<obsid>'``, and additionally selects ``cycle`` for every mission
-(all three master catalogues have it).
+with ``WHERE cat.obsid IN (...)``, and selects no ``public_date``.
+
+Catalogues sliced by time (Fermi GBM)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+GBM sees the whole sky not hidden by the Earth, so ``fermigdays`` has one row per *day*
+and no position, exposure or source name. A mission with ``"time_sliced": True`` in
+``MISSION_CONFIG`` (``is_time_sliced``) is searched by date instead (``time_query``,
+``retrieve_heasarc_table_by_time``)::
+
+    SELECT day_id as obsid, time, end_time, tte_flag, __row
+    FROM public.fermigdays as cat
+    WHERE cat.time < <mjd_stop> AND cat.end_time > <mjd_start>
+      AND cat.tte_flag = 'Y'
+    ORDER BY cat.time
+
+* Rows are kept if they *overlap* the interval: a GBM day starts at 23:59 the day before
+  (2024-03-22 has ``time`` = 60390.999), so matching on whole ``day_id`` values would be
+  wrong at the edges.
+* ``tte_flag = 'Y'`` keeps only days with continuous time-tagged events (TTE), i.e. from
+  2012-11-26 on; before that, TTE data were kept only around triggers.
+* ``retrieve_heasarc_data_by_source_name`` takes ``mjd_start``/``mjd_stop``. They are
+  required for a time-sliced mission and refused for the others, and the check runs before
+  the name is resolved. The resolved position is the one the photons are barycentred at.
+* The cone search and ``retrieve_heasarc_data_by_obsid`` refuse time-sliced missions
+  with a ``ValueError``: a day has no pointing to barycentre at. ``exposure_condition``
+  is never called for them.
 
 Locating the files
 ~~~~~~~~~~~~~~~~~~
@@ -284,8 +339,14 @@ Two filtering mechanisms exist and are easy to confuse:
     NuSTAR event files from observing modes 01 and 06, skipping modes 02-05.
 
 ``test_str``
-    A plain substring that must appear in the *local* destination path, defaulting to
-    ``"."``. In practice this means "only fetch things with a dot in the name".
+    A plain substring that must appear in the *local* destination path. It defaults to
+    ``None``, which keeps everything. It used to default to ``"."``, which in practice
+    meant "only fetch things with a dot in the name" -- harmless until RXTE, whose orbit
+    ephemerides are called ``FPorbit_Day5510`` with no extension at all and were therefore
+    never downloaded, so no RXTE observation could be barycentred. The old default was a
+    leftover guard against the spurious index entries of issue 10 in
+    ``docs/known_issues.rst``, which is fixed at the source: ``parse_directory_index``
+    reads ``href`` and keeps only relative ones.
 
 Passing ``test=True`` anywhere in the stack fakes every download: directories and log
 messages are produced, but no bytes move. This is what the test suite uses.
@@ -885,20 +946,30 @@ remove nothing.
 Barycentring
 ~~~~~~~~~~~~
 
-``barycenter_data`` (``nustar.py:514``) runs HEASOFT ``barycorr`` on every event file in the
-observation's output directory, writing ``*_bary.evt``. The ``barycorr`` call itself lives
-in :mod:`heasarc_retrieve_pipeline.barycenter`, shared with NICER: it refuses to start with
-a readable message when heasoftpy is missing, checks afterwards that ``barycorr`` actually
-wrote the file rather than assuming it did, and skips a file whose output is already there
-unless the caller passes ``overwrite=True``. The output name comes from
-``barycentered_file_name``, which puts ``_bary`` before the extension whatever that
-extension is and keeps a compression suffix last -- missions do not agree on whether an
-event file is ``.evt``, ``.fits`` or ``.ds``. The parameters are
+``barycenter_data`` (``nustar.py``) barycenters every event file in the observation's
+output directory, writing ``*_bary.evt``, through ``barycenter_file`` in
+:mod:`heasarc_retrieve_pipeline.barycenter`, which NICER and RXTE share. Two tools can do the
+work, chosen by two configuration keys:
 
-* ``ephem="JPLEPH.430"`` -- the JPL DE430 solar-system ephemeris;
-* ``refframe="ICRS"``;
-* ``orbitfiles`` -- the ``.attorb`` file produced by ``nupipeline``;
-* ``ra``/``dec`` -- the source position.
+* ``barycenter_tool`` -- ``"barycenter"`` (the default) uses the `barycenter
+  <https://pypi.org/project/barycenter/>`_ package, one pure-Python code path for every
+  mission, which agrees with each mission's own tool to better than 100 ns. ``"official"``
+  uses HEASOFT ``barycorr`` instead. If the package cannot be imported, the official tool is
+  used with a warning.
+* ``barycenter_ephemeris`` -- ``"DE430"`` by default, so that every mission is on the same
+  ephemeris. The package also accepts any other ``DEnnn`` name, or the path to a local
+  ``.bsp`` kernel, which it reads without touching the network; ``barycorr`` only knows the
+  ``JPLEPH.<nnn>`` files its installation ships, and a ``.bsp`` path is refused for it.
+
+Either way the reference frame is ICRS, the orbit file is the ``.attorb`` written by
+``nupipeline``, ``ra``/``dec`` are the source position, and a file whose output is already
+there is skipped unless the caller passes ``overwrite=True``. The ``barycorr`` route refuses
+to start with a readable message when heasoftpy is missing, and both routes check that the
+output file was actually written. The package fetches NuSTAR's current clock file from the
+CALDB by itself, where ``barycorr`` reads it from the local CALDB. The output name comes
+from ``barycentered_file_name``, which puts ``_bary`` before the extension whatever that
+extension is and keeps a compression suffix last -- missions do not agree on whether an
+event file is ``.evt``, ``.fits`` or ``.ds``.
 
 Barycentring converts photon arrival times from the spacecraft frame to the solar system
 barycentre, removing the up to ~500 s of light-travel-time modulation caused by the Earth's
@@ -906,6 +977,16 @@ and the satellite's motion. It is a prerequisite for any coherent timing analysi
 timing, orbital searches) and it is **position-dependent**: an error in the assumed RA/Dec
 translates directly into a timing error, of order the source-position error in radians times
 500 s.
+
+**Agreement between the two tools was measured on real reductions**, one per mission, with
+``tools/barycenter_validation/validate.py`` (``barycenter`` 1.0.0, 2026-10-01). Package
+minus reference, mean over the event times: NuSTAR +31.5 ns against ``barycorr``, RXTE
++15.1 ns against ``barycorr``, XMM -62.5 ns against ``barycen``, Chandra -0.0 ns against
+``axbary`` (both on DE405). Every maximum is one or two steps of a 64-bit float at those
+mission elapsed times, the finest the reference files can record. The one systematic
+difference is that the package also corrects auxiliary time columns the mission tools
+leave alone -- NuSTAR's ``BADPIX``, XMM's ``HKAUX`` -- which nothing downstream reads. The
+directory's ``README.md`` has the full table.
 
 That last point is why it matters that ``process_nustar_obsid`` overrides the RA/Dec it was
 given with the position measured by ``get_best_source_regions``. When the detection is
@@ -1393,13 +1474,45 @@ operator and the run dies on ``fitsio 4.060 error message: could not open the na
 file``. A ``BACKFILE`` must therefore carry no directory at all, and being in the right
 directory is then the only way to say which file is meant.
 
-The staging is no wider than that constraint, which was established by experiment rather
-than assumed: with only ``BACKFILE`` made bare, ``addspec`` completes and builds its
-``.rsp`` while the list file holds absolute paths and ``RESPFILE``/``ANCRFILE`` are
-absolute too. So each spectrum is copied -- the originals are never touched -- with
-``BACKFILE`` reduced to a bare name and ``RESPFILE``/``ANCRFILE`` made absolute, and only
-the background spectra are linked in beside it. The 68 MB ``.rmf`` files are neither
-copied nor linked.
+``RESPFILE`` and ``ANCRFILE`` survive a path, but only a short one. ``DO_ADDSPEC`` reads
+them into an 80-character buffer -- ``coadd.ADDSPEC_NAME_LIMIT`` -- and truncates anything
+longer without a word about having done so. Measured on
+``merged_80002092002_80002092004``: a 94-character absolute ``RESPFILE`` was handed to
+``cp`` as its first 80 characters, so the working copies of the responses were never made,
+and ``ftaddrmf`` then died on files that were not there:
+
+.. code-block:: text
+
+    cp: cannot stat '.../products/merged_80002092002_80002'
+    terminate called after throwing an instance of 'CCfits::FITS::CantOpen'
+    ** DO_ADDSPEC 1.2.1   ERROR:   Problem with FTADDRMF spawn
+     ... CSPAWN Error flag =            6
+
+Nothing in that names a length, and the path it complains about is one nobody ever wrote.
+
+That limit cannot be met by keeping paths tidy, because merging spends the dataset name
+twice, once as the directory and once as the file:
+
+.. code-block:: text
+
+    <root>/merged_80002092002_80002092004/products/merged_80002092002_80002092004_A01.rsp
+            └──────────── 30 ────────────┘          └──────────── 30 ────────────┘
+
+That is 79 characters before the output root contributes anything, leaving room for an
+output root of exactly one character. Giving the tree a short name under ``/tmp``, which
+is what ``short_workspace`` buys against the 128-character limit elsewhere, does not help
+here: the root in the failing run was already only ``/tmp/mergesplit``.
+
+So no pointer this package writes into a FITS header is ever a path. Each spectrum is
+copied -- the originals are never touched -- with all three keywords reduced to bare names
+and the files they name symbolically linked in beside them. A link costs nothing even for
+a 68 MB ``.rmf``, and ``addspec`` resolves it while making the working copy of the response
+it would have made anyway.
+
+That makes the staging directory one flat namespace, so a bare name has to mean one file.
+NuSTAR file names carry the OBSID and cannot collide; a collision would mean something
+upstream is already wrong, and ``coadd._link`` raises rather than let one spectrum be
+co-added against another observation's response.
 
 Changing the working directory is otherwise forbidden in this package, and
 ``test_prefect_wiring`` enforces that by walking the AST for ``os.chdir``. The one
@@ -1519,9 +1632,10 @@ offset and so on. Its cleaned output is the single merged file
 ``ni<OBSID>_0mpu7_cl.evt`` -- "0mpu7" means all seven Measurement/Power Units, i.e. all 52
 active detectors combined.
 
-``barycenter_data`` (``nicer.py:130``) barycentres that file against the orbit file
+``barycenter_data`` (``nicer.py``) barycenters that file against the orbit file
 ``auxil/ni<OBSID>.orb.gz``, using the shared implementation in
-:mod:`heasarc_retrieve_pipeline.barycenter` (same DE430/ICRS parameters as NuSTAR).
+:mod:`heasarc_retrieve_pipeline.barycenter` (same tool choice and DE430/ICRS parameters as
+NuSTAR).
 
 NICER has no imaging capability -- it is a collimated instrument with a roughly 3 arcmin
 field of view -- so there is no source separation step and no equivalent of the NuSTAR
@@ -1536,77 +1650,1310 @@ model, etc.); none is invoked here.
 RXTE / PCA
 ----------
 
-:mod:`heasarc_retrieve_pipeline.rxte` does not use HEASOFT at all. It re-implements a
-subset of the standard PCA screening in astropy. ``process_rxte_obsid`` (``rxte.py:167``)
-runs three steps.
+What is downloaded
+~~~~~~~~~~~~~~~~~~
 
-**1. ``setup_workspace`` (``rxte.py:38``).** Finds an event-mode file by searching, in
-order, for ``GX*.evt.gz``, ``SE*.evt.gz`` and ``FS*.evt.gz`` anywhere under the
-observation directory, and gunzips the first match. If nothing matches, the observation is
-skipped with a warning -- this is the guard against binned-mode-only observations, which
-this code cannot process. The prefixes correspond to RXTE's data-mode file naming:
-GoodXenon, Science Event, and the standard FITS science files respectively.
-
-**2. ``create_gti_with_astropy`` (``rxte.py:68``).** Reads the standard filter file
-``stdprod/*.xfl.gz``, which contains housekeeping quantities sampled every ``TIMEDEL``
-seconds (16 s for RXTE), and builds good time intervals from three conditions:
+An RXTE pointing directory holds every instrument and every data mode the satellite ran at
+the time, and the reduction reads four kinds of file out of it. ``rxte_download_filter``
+(``rxte.py``) returns a single ``re_include`` pattern, ``DOWNLOAD_RE``, matched against the
+whole remote path so that the directory names in it are real anchors and not accidental
+substrings:
 
 .. list-table::
    :header-rows: 1
-   :widths: 25 20 55
+   :widths: 30 70
 
-   * - condition
-     - meaning
+   * - kept
+     - why
+   * - ``pca/GX_*.evt.gz``
+     - The GoodXenon event lists. In the archive these are already the *merged* product:
+       one file per configuration, with ``PCUID``, ``ANODEID`` and ``PHA`` as decoded
+       columns. The raw telemetry halves (``FS37``/``FS3b``, the two ``GoodXenon1`` and
+       ``GoodXenon2`` streams that ``make_se`` exists to merge) are not downloaded and not
+       needed.
+   * - ``pca/FS4a_*.gz``
+     - Standard2: the 16-second-binned housekeeping-and-spectrum mode that ran in parallel
+       with everything else. It is the source of per-PCU live time and of the background
+       model's inputs.
+   * - ``stdprod/x*.xfl.gz``
+     - The standard filter file: ``ELV``, ``OFFSET``, ``PCUn_ON``, ``ELECTRONn``,
+       ``TIME_SINCE_SAA`` and the rest, sampled every 16 s. Screening is built from it.
+   * - ``orbit/FPorbit_Day*``
+     - The satellite orbit ephemeris, which barycentering needs.
+
+Measured on the 870 pointings within a degree of M82 on 2026-09-17, these files are
+**1.05 GB of the archive's 13.0 GB**. The rest is mostly HEXTE, the other PCA data modes,
+and a 7.8 MB copy of the calibration directory repeated in every pointing.
+
+``clock/`` is deliberately *not* downloaded, although barycentring an RXTE observation does
+need a clock correction. ``barycorr``'s ``clockfile`` parameter is documented as ignored for
+RXTE, and it is: the task reads ``tdc.dat`` from HEASOFT's own reference data
+(``$LHEA_DATA``) instead. Checked on a real pointing, running with the default and running
+with ``clockfile=NONE`` differ by 5.97e-05 s, so the correction is being applied without any
+per-observation file. Leaving ``clock/`` out saves about 0.5 GB. The ``barycenter`` package, the
+default tool, bundles the same ``tdc.dat``, so it needs no per-observation file either.
+
+Screening, one interval list per PCU
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``rxte_pcu_gtis`` reads the standard filter file and returns ``{pcu: (N, 2) array}``: the
+good time intervals of each Proportional Counter Unit separately. The cuts are the
+standard PCA screening, collected in ``DEFAULT_SCREENING``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - cut
      - why
    * - ``ELV > 10``
-     - Earth elevation angle above 10 degrees
-     - Below this the target is too close to the Earth's limb and the atmosphere
-       contributes X-ray absorption and albedo background.
+     - Earth elevation angle in degrees. Closer to the limb the atmosphere contributes
+       absorption and albedo background.
    * - ``OFFSET < 0.02``
-     - pointing offset below 0.02 degrees
-     - The PCA collimator response falls off over about a degree; 1.2 arcmin keeps the
-       effective area essentially constant and rejects slews and unsettled pointing.
-   * - ``NUM_PCU_ON > 0``
-     - at least one Proportional Counter Unit active
-     - There are no counts at all when every PCU is off.
+     - Pointing offset in degrees. The collimator response falls off over about a degree,
+       so 1.2 arcmin keeps the effective area flat and rejects slews.
+   * - ``TIME_SINCE_SAA > 30`` **or** ``< 0``
+     - Minutes since the South Atlantic Anomaly. The particle background decays for about
+       half an hour afterwards. The column is *negative* when no passage falls in the
+       recorded window, and negative is good time -- reading it as "less than 30 minutes
+       ago" would throw away a quarter of the 1997 and 2004 exposure for nothing.
+   * - ``PCUn_ON == 1``
+     - That unit was on.
+   * - ``ELECTRONn < 0.1``
+     - Electron ratio, which flags detector breakdown.
 
-Contiguous runs of good samples are collapsed into intervals; each interval starts at the
-``Time`` of its first good sample and stops at the ``Time`` of its last good sample plus one
-``TIMEDEL``. The intervals are written as a FITS ``GTI`` extension with
-``TELESCOP = 'XTE'``.
+Two details that are easy to get wrong:
 
-This is a **reduced** version of the standard PCA screening. What it omits, and why that
-matters:
+* ``TIMEPIXR`` is 0 in every RXTE filter file, so a sample stamped ``t`` covers
+  ``[t, t + TIMEDEL)`` -- the stamp is the *start* of the bin, not its centre.
+* The filter file carries the same ``TIMEZERO`` as the event file, about 3.4 s. Adding it
+  to the events alone, as the first version of this module did, shifted every interval
+  boundary by that much.
 
-* **South Atlantic Anomaly.** Standard screening requires ``TIME_SINCE_SAA > 30`` minutes
-  (or at least excludes the passage itself). Without it, intervals of strongly elevated and
-  rapidly decaying particle background are kept.
-* **Breakdown / electron-ratio cuts.** Standard screening cuts on ``ELECTRON2 < 0.1``
-  (per-PCU electron ratios), which flags detector breakdown events.
-* **Which PCUs.** ``NUM_PCU_ON > 0`` records *how many* PCUs were on, not *which*. Since
-  the number of active PCUs changed during most observations and no per-PCU event
-  selection is applied, the effective area varies within the resulting GTIs. A count rate
-  from these products is therefore not proportional to flux, and no valid response matrix
-  can be built for them.
-* **Deadtime.** No deadtime correction information is propagated.
+**Why per PCU.** ``NUM_PCU_ON`` records how many units were on, never which, and they are
+not on at the same times. In the 1997 pointing 20303-02-06-00, PCU0 and PCU1 give twelve
+intervals where PCU2 gives seven. A single interval list for the observation therefore
+cannot describe the collecting area, and an exposure computed from it is wrong for every
+unit. A unit that was off, or screened away entirely, keeps its key and gets an empty
+array: "off" and "screened out" are not the caller's problem to tell apart.
 
-**3. ``apply_gti_with_astropy`` (``rxte.py:123``).** Reads the event file, forms absolute
-event times as ``TIME + TIMEZERO``, marks every event that falls in any GTI, and writes the
-surviving events to ``l2_files/<OBSID>_cl_evt.fits``.
+Run over the 863 downloaded M82 pointings, the screened exposure per unit is:
 
-Two things to know about the output: the GTI extension is **not** copied into the cleaned
-file, and the exposure keywords in the events header are inherited unchanged from the
-unfiltered file. So the file records which photons survived but not how long the instrument
-was actually collecting, and any rate computed from its header will be too low.
+.. list-table::
+   :header-rows: 1
 
-RXTE data are also not barycentred by this pipeline, unlike NuSTAR and NICER.
+   * - proposal
+     - PCU0
+     - PCU1
+     - PCU2
+     - PCU3
+     - PCU4
+   * - 20303 (1997)
+     - 81.5 ks
+     - 82.2 ks
+     - 81.6 ks
+     - 2.3 ks
+     - 2.3 ks
+   * - 90121 (2004-05)
+     - 297.3 ks
+     - 175.8 ks
+     - 287.5 ks
+     - 254.1 ks
+     - 150.8 ks
+   * - 90171
+     - 16.0 ks
+     - 4.0 ks
+     - 16.0 ks
+     - 0.0 ks
+     - 5.8 ks
+   * - 92098 (2006)
+     - 140.0 ks
+     - 61.4 ks
+     - 176.5 ks
+     - 83.9 ks
+     - 74.8 ks
+   * - 93123
+     - 25.9 ks
+     - 2.8 ks
+     - 203.3 ks
+     - 100.9 ks
+     - 148.9 ks
+   * - 94123 (2009)
+     - 1.6 ks
+     - 0.7 ks
+     - 131.9 ks
+     - 33.8 ks
+     - 53.8 ks
+   * - **total**
+     - 562.2 ks
+     - 326.9 ks
+     - 896.8 ks
+     - 475.1 ks
+     - 436.4 ks
 
-**What these products are good for.** A first look at the event list of a
-single event-mode file, and nothing more. They are not calibrated, not deadtime-corrected,
-carry no response, and represent only one of the event-mode files that an observation may
-contain (GoodXenon observations always have two, ``GX1`` and ``GX2``, which must be merged;
-only the first is used here).
+PCU2 is the workhorse and is the only unit on for most of the archive.
 
+Which units to keep is a question with a date in it. Each PCU has a propane layer in front
+of its xenon that vetoes charged particles; PCU0 lost its window on 2000-05-12 and PCU1 on
+2006-12-25, and from then on their top xenon layer collects several times the particle
+background of the others. The usual advice is to drop those units outright, which is right
+after those dates and wasteful before them: ``pcus_with_propane_veto(mjd)`` returns the
+units that still had their veto. For M82 this is not a detail. The 30 pointings of 1997
+were taken with **only PCU1 and PCU2 switched on** -- PCU3 and PCU4 have ``PCU3_ON = 0``
+for every sample of those filter files -- so putting PCU0 back gives that block three
+units instead of two, half again the collecting area, for 85 ks of exposure.
+
+Reducing with all five units and choosing later raised the barycentred good time from
+903.2 ks to 912.9 ks and the top-layer events in the merged windows from 31.28 to 32.43
+million.
+
+Reduction
+~~~~~~~~~
+
+:mod:`heasarc_retrieve_pipeline.rxte` uses HEASOFT for one thing only, ``barycorr``.
+Everything else is astropy and numpy. ``process_rxte_obsid`` runs two steps.
+
+**1. ``reduce_observation``** finds the pointing's files with ``find_rxte_inputs``, builds
+the per-PCU intervals described above, and hands both to ``rxte_screened_events``, which
+writes one file:
+
+* **Every** GoodXenon event file is read. A pointing can hold several -- 25 of the 863 M82
+  pointings do -- and the first version of this module silently used only the first.
+* Each event is screened against **its own** unit's intervals. An event recorded by PCU3
+  while only PCU2 was in good time is dropped, and a unit left out of the interval
+  dictionary, which is how PCU0 is dropped, contributes nothing.
+* Times come out absolute, with ``TIMEZERO = 0``. Nothing downstream has to remember to
+  add the 3.4 s.
+* The output carries a ``GTI`` extension holding the union over the units -- which is what
+  a timing tool needs, because it says when there are events at all -- and one
+  ``GTI_PCU<n>`` extension per unit, so the collecting area can be reconstructed later.
+* ``EXPOSURE`` and ``ONTIME`` are the good time actually kept. The first version inherited
+  them from the unfiltered file, so every rate computed from its header was too low.
+
+The ``Event`` column is **not** carried over. It is the raw 24-bit field that ``PCUID``,
+``ANODEID`` and ``PHA`` were decoded from, and it is redundant: checked against 1.66
+million archive events, bits 7-9 reproduce ``PCUID`` exactly and bits 16-23 reproduce
+``PHA`` exactly, bit 0 is always 1, bits 1-6 (including the propane veto flag) are always
+0, and bits 10-15 are a one-hot re-encoding of ``ANODEID``. Keeping it only invites a
+second, different decoding.
+
+What *is* kept is the set of mission keywords in ``KEPT_KEYWORDS``, ``TEVTB2`` above all.
+Stingray reads these files directly and turns ``PHA`` into keV from ``TEVTB2`` and the
+observation's epoch, so this module does no energy calibration of its own and does not
+depend on stingray to do it. On 94123-01-19-00 the product reads back as 53237 events
+between 1.95 and 126.87 keV on PCUs 2 and 4.
+
+**2. Barycentring**, through the shared ``barycenter_file``: DE430, ICRS, the pointing's
+own ``orbit/FPorbit_Day*``, and the position the caller passes -- the *searched* position,
+never a detected or header one, because an error in it goes straight into the arrival
+times. Without a position or an orbit file the reduction stops at the screened file and
+says so.
+
+No clock file is passed, and none is needed; see "What is downloaded" above.
+
+.. warning::
+
+   A GTI extension must repeat the event extension's time keywords, which is what
+   ``GTI_TIME_KEYWORDS`` is for. ``barycorr`` corrects an extension only if it can read its
+   time scale, and skips it **in silence** otherwise. Verified on 94123-01-19-00: without
+   ``TIMESYS``, ``TIMEUNIT`` and ``MJDREF*`` on the GTI extensions, the events moved by
+   298.3 s and the intervals did not, leaving a file that looked barycentred and whose
+   every interval boundary was five minutes wrong. With them, events and all three
+   interval extensions move together and ``TIMESYS`` becomes ``TDB``.
+
+**What these products are good for.** A pulsation search, which is what they were built
+for: screened, merged, barycentred arrival times with the unit, the anode layer and the
+channel kept per event. They are still not deadtime-corrected, carry no response and have
+no background model, so they are not spectroscopy products. The collecting area varies
+inside the ``GTI`` extension by construction, since that extension is the union over
+units; the per-unit extensions are there so that an exposure, and therefore an upper limit
+on a pulsed fraction, can be computed properly.
+
+
+Fusing days
+~~~~~~~~~~~
+
+An RXTE pointing on M82 is short: a median of 880 s, and 15 ks at the very best. A
+coherent search of one of them has no sensitivity at all to a 0.73 Hz pulsar at the flux of
+X-2. The pointings have to be fused, and ``join_rxte_events`` is the step that does it.
+
+It concatenates reduced pointings into one event list, **unions** their good time
+intervals -- so the days between two pointings stay a gap, and ``EXPOSURE`` is the good
+time summed over the intervals rather than the span -- and applies two selections that the
+reduction deliberately left open:
+
+``pcus``
+    Which units to keep, normally ``pcus_with_propane_veto`` of the window's date.
+
+``layers``
+    Which xenon layers to keep, through ``LAYER_ANODES``: ``ANODEID`` 10 and 11 are the
+    left and right halves of the top layer, 20/21 and 30/31 the two below it. The top
+    layer is the default. It holds 52% of the archive's events and much the best ratio of
+    a faint source's 2-10 keV counts to background.
+
+``observation_windows(starts, stops, max_span, max_gap=None)`` decides what goes together.
+It grows a window greedily from the earliest pointing not yet in one and closes it as soon
+as adding the next would take it past ``max_span``. The span is the knob that matters: it
+is how far the frequency model has to hold, and the trial count of a coherent search grows
+with it. For the 847 reduced M82 pointings:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 14 18 18 18
+
+   * - Max span
+     - Windows
+     - Median exposure
+     - Largest window
+     - Windows over 10 ks
+   * - 1 day
+     - 812
+     - 0.9 ks
+     - 20.5 ks
+     - 2
+   * - 3 days
+     - 422
+     - 1.7 ks
+     - 22.3 ks
+     - 3
+   * - 10 days
+     - 160
+     - 4.3 ks
+     - 24.7 ks
+     - 23
+   * - 30 days
+     - 63
+     - 11.6 ks
+     - 40.0 ks
+     - 53
+
+A window may never cross a **gain epoch**. The PCA high voltage was retuned on 1996-03-21,
+1996-04-15, 1999-03-22 and 2000-05-13, and the same ``PHA`` means a different energy either
+side of each; ``pca_gain_epoch(mjd)`` gives the number, 1 to 5. A merged file carries a
+single epoch and a single ``TEVTB2``, and stingray calibrates from them, so joining across
+an epoch would silently mislabel the energies of half the events. ``join_rxte_events``
+refuses. In practice this costs nothing: the M82 archive has 30 pointings in epoch 3 (1997)
+and 817 in epoch 5 (2004 onwards), seven years apart, and all 847 share one ``TEVTB2``.
+
+.. note::
+
+   Summing the pointings' ``EXPOSURE`` keywords gives 1.6 s more than the merged windows do,
+   over 912.9 ks. That is not a rounding error: consecutive pointings occasionally share a
+   second of good time at their boundary, and the union counts it once, which is correct.
+
+.. note::
+
+   After barycentring, the sum of a pointing's intervals differs from its ``EXPOSURE``
+   keyword by up to 0.43 s, median -1.1 ms, never more than a second. This is physical and
+   is left alone. ``barycorr`` shifts the start and the stop of an interval by the light
+   travel time to the barycentre *at each of those two instants*, and the Earth moves 30
+   km/s between them, so an interval a few kiloseconds long is stretched or squeezed by a
+   few tenths of a second -- 4 x 10\ :sup:`-4` of the exposure. The interval boundaries are
+   the trustworthy numbers; the keyword is the one computed before the correction.
+
+XMM-Newton / EPIC
+-----------------
+
+The one mission here whose reduction software is **not** HEASOFT.
+:mod:`heasarc_retrieve_pipeline.xmm` drives ESA's Science Analysis System (SAS) through
+:mod:`heasarc_retrieve_pipeline.sas`, which runs one task at a time with
+``subprocess.run`` and an argument list. SAS has no pip or conda distribution: it is an
+*environment* requirement, initialised by sourcing ``setsas.sh``, and every SAS-marked
+test skips without it. ``sas.run`` takes a mandatory ``produces``, because a SAS task's
+zero return code is not evidence that it wrote anything -- ``epatplot`` returns 0 while
+writing a PDF where PostScript was asked for, and ``barycen`` edits its input in place.
+
+Two routes, one back end
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``config["products"]`` chooses:
+
+* ``"pps"`` (the default) reads the archive's own reduction. An observation is 200 MB to
+  1.2 GB and the EPIC reduction wants about a fortieth of it, so ``xmm_download_filter``
+  fetches only the event lists, background time series, source list and calibration index
+  -- plus 3.8 MB of ODF housekeeping, which barycentring needs.
+* ``"odf"`` reprocesses from raw telemetry with ``epproc`` and ``emproc``. Slower by an
+  order of magnitude, and the reason to want it is calibration: a PPS event list carries
+  whatever the SOC had when it was made.
+
+``xmm_pps_front_end`` and ``xmm_odf_front_end`` each return ``(exposures, env, summary)``
+and everything after them is shared. The two differ in more than speed:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * -
+     - PPS
+     - ODF
+   * - exposure discovery
+     - parse product file names
+     - read ``INSTRUME`` / ``EXPIDSTR`` / ``DATAMODE``
+   * - flare light curve
+     - ``FBKTSR``, from the SOC
+     - built with ``evselect``
+   * - flare threshold
+     - the file's ``FLCUTTHR``
+     - ``odf_flare_rate_limit``
+   * - ``DATE-OBS`` for ``cifbuild``
+     - an event list
+     - the ODF housekeeping
+
+The ODF route reads header keywords rather than parsing names because those names are
+SAS's own and have changed between releases, while ``INSTRUME``, ``EXPIDSTR`` and
+``DATAMODE`` are written by the same code on either route's files. The PPS route does
+parse names, because there they are a published archive convention.
+
+What an exposure is
+~~~~~~~~~~~~~~~~~~~
+
+``Exposure`` is keyed on ``(instrument, expid, mode)``, and the mode is not decoration.
+MOS ``FastUncompressed`` reads its central CCD in timing and its outer six in imaging, and
+PPS writes both under one exposure identifier. Keyed on camera and exposure alone, one of
+the two would be dropped in silence.
+
+``config["cameras"]`` restricts the reduction to some cameras, all three by default. Both
+routes list every exposure the observation holds and ``xmm_selected_exposures`` narrows the
+list, logging what it leaves out. The reason is timing: a search for M82 X-2's 1.37 s spin
+needs pn alone, because MOS reads out every 0.9 s (``PrimePartialW3``) or 2.6 s (full
+window), too slowly to sample it. On the ODF route ``emproc`` still runs; what is saved is
+the per-exposure reduction. An empty list, a bare string or an unknown name is refused by
+``xmm_config``: a typo there would otherwise be a reduction that finds nothing to do, and
+an observation holding none of the cameras asked for is reported as ``NO_SCIENCE_DATA``.
+
+The calibration index is built, not downloaded
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``xmm_build_calibration_index`` runs ``cifbuild withobservationdate=yes
+observationdate=<DATE-OBS>``, once per observation, rather than using the downloaded
+``CALIND``. The local CCF mirror is ESA's *Valid CCF Set* -- what is needed to process any
+ODF **at the current date** -- so an archival ``CALIND`` naming superseded constituents
+cannot be satisfied from it. Building the index costs 26 s and removes the failure mode
+instead of catching it. One consequence to state plainly: PPS event lists were generated
+with an older calibration, so responses built against a newer index are marginally
+inconsistent with those events' ``PI`` values. That is the ordinary situation for anyone
+reanalysing archival data with current SAS.
+
+Flare screening
+~~~~~~~~~~~~~~~
+
+Soft protons funnelled by the mirrors raise the background by orders of magnitude for
+minutes at a time. ``xmm_flare_gti`` thresholds the background light curve and inverts the
+result into good time intervals -- pure arithmetic, no SAS, fully testable offline.
+
+**The SAS cookbook's 0.4 and 0.35 counts/s do not apply to a PPS ``FBKTSR``.** Those
+numbers are for a curve you build yourself with ``evselect`` above 10 keV, which is what
+the ODF route does and what ``odf_flare_rate_limit`` keeps them for. An ``FBKTSR`` is made
+by ``epiclccorr`` and is on quite another scale: measured across the archive its median
+rate ranges from 0.9 to 45 counts/s, and the same camera in the same observation can differ
+twentyfold between exposures. PPS has already chosen a threshold per exposure and written
+it into the file as ``FLCUTTHR``, and that is what the PPS route uses.
+
+A timing exposure is screened with the imaging curve of the same exposure where there is
+one: a flare illuminates the whole detector, so a rise seen in the outer CCDs is happening
+during the timing read-out too. The curve's provenance is recorded so the choice is visible.
+
+Extraction regions, and whether they fit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Imaging mode extracts a circle on the sky, its centre converted from the requested RA/Dec
+by ``ecoordconv`` -- the only SAS task here whose output is parsed, because it writes no
+file. Timing mode has no sky image and extracts a strip of ``RAWX`` detector columns
+instead. **MOS timing has no default strip**: pn's ``[31:45]`` is trustworthy because a pn
+timing read-out puts the source at a column fixed by the boresight, and MOS has no
+equivalent constant, so a MOS timing exposure is cleaned, warned about and skipped rather
+than extracted at an invented column. Setting ``timing_src_rawx`` for that camera extracts
+it.
+
+``xmm_check_extraction_window`` measures whether the background annulus fits on the
+illuminated part of the chip. It *measures* rather than looking up a table of window sizes:
+the question is not "how big is a ``PrimePartialW3`` window" but "does the annulus for this
+source at this position fall off the chip". Two details are load-bearing and were both
+found on real data:
+
+* It reads the **cleaned** events, not the archive's unscreened list. The raw list carries
+  flagged events out to the chip edges: on ``0870940101``'s pn it reads 96.1 arcsec against
+  the cleaned 87.6, on either side of the 90 the default annulus needs.
+* The edge is a **percentile**, not a minimum and maximum. Taking the extreme events put a
+  300x300-pixel MOS window at 8.8 x 11.4 arcmin against its true 5.5, because a handful of
+  stray events set the answer. Clipping 0.1% from each end fixes it, and ``BACKSCAL``
+  confirms the robust figure independently.
+
+A clipped annulus is not silently wrong -- ``BACKSCAL`` follows the *exposed* area, so the
+scaling stays right and the cost is counts -- but it is worth a warning, which is what this
+produces.
+
+Pile-up is measured and never corrected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``epatplot`` writes the observed-to-model singles and doubles pattern fractions onto the
+event list as ``SNGL_OTM`` and ``DBLE_OTM``, with errors, and those keywords are read
+rather than its screen output. Correcting pile-up means excluding the core of the point
+spread function, which changes which photons the science is done with; that is a decision
+for whoever reads the plot.
+
+What the reduction writes
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every file an exposure produces is built on one stem,
+``xmm<OBSID>_<camera>_<expid>_<mode>``, so that a file carried out of the tree still says
+where it came from -- the same reasoning behind NuSTAR's ``nu<OBSID><FPM><mode>_cl.evt``.
+The mode is part of the identity and not decoration: a MOS ``FastUncompressed`` exposure
+writes an imaging *and* a timing event list under one exposure identifier, and without the
+mode the second would overwrite the first::
+
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl.evt        screened events
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.gti     the flare cut applied to them
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_flare.lc      background curve, ODF route only
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src.evt       the source region alone
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_pat.pdf       the pile-up diagram
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_cl_bary.evt   barycentred
+    <OBSID>/event_cl/xmm<OBSID>_pn_S003_imaging_src_bary.evt  barycentred, source region
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_src.pi        source spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_bkg.pi        background spectrum
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging.arf  .rmf     responses
+    <OBSID>/products/xmm<OBSID>_pn_S003_imaging_grp.pi        grouped, the one you fit
+
+Log files and diagnostics records use a *shorter* key, ``pnS003_imaging``, because both are
+read inside the observation's own directory and are already keyed by its identifier.
+
+The longest of these names is 38 characters, which matters: ``especget`` writes them into
+``BACKFILE``, ``RESPFILE`` and ``ANCRFILE``, where a FITS card holds 80. A test guards the
+margin.
+
+Spectra
+~~~~~~~
+
+``especget`` produces source and background spectra, ARF and RMF in one call, with
+``withfilestem=no`` so that all four outputs are named outright rather than by a convention
+that has to be trusted. It is run with ``cwd`` set to the products directory and handed
+bare file names, because it writes the names it is *given* into ``BACKFILE``, ``RESPFILE``
+and ``ANCRFILE``, and a FITS header card holds 80 characters -- absolute paths were being
+truncated. The source position is passed to ``arfgen`` explicitly; left alone it would take
+the centre of the extraction region, which is meaningless for a strip of columns.
+
+The three cameras' spectra are **not** co-added. pn, MOS1 and MOS2 are different detectors
+with different responses, so ``addspec``'s case B does not apply; they are meant to be
+fitted jointly. SAS's ``epicspeccombine`` is the right tool if one file is ever wanted.
+
+Barycentring
+~~~~~~~~~~~~
+
+By default the ``barycenter`` package, from the PPS orbit file
+``P<OBSID>OBX000ORBTSR0000.FTZ`` (:func:`~heasarc_retrieve_pipeline.xmm.xmm_orbit_file`). It
+needs neither SAS nor the ODF, and agrees with ``barycen`` to a constant 42 ns. Both routes
+download that file: the ODF route's filter takes it from the PPS directory alongside the
+whole ODF, since the ODF's own orbit is ASCII housekeeping only SAS can read. The tool and
+ephemeris come from ``barycenter_tool`` and ``barycenter_ephemeris``, as for NuSTAR.
+
+The fallback, used with ``barycenter_tool: official`` or when an observation has no PPS
+orbit file, is SAS ``barycen``, over an ODF ingested with ``odfingest``, told ``DE430``
+explicitly because its own default is DE200. HEASOFT ``barycorr`` is **not** usable: its own
+documentation limits it to RXTE, Swift, Chandra, NuSTAR and NICER, and on XMM data it fails
+with "Invalid Observatory/Spacecraft position vector" before reading an event.
+
+Two ``barycen`` traps, both paid for:
+
+* The ODF constituents must be staged as plain ``.FIT`` and ``.ASC``. SAS reads ``.FTZ``
+  when a file is *named* to it, but ``odfingest`` does not *discover* one while scanning a
+  directory: a ``.FTZ``-staged ODF ingests as though the housekeeping were absent and
+  writes a truncated summary that ``barycen`` then rejects.
+* ``barycen`` edits in place, so the correction is applied to a copy and the spacecraft
+  times survive. The evidence that it worked is the rewritten ``TIMESYS``, which is
+  checked -- ``produces=IN_PLACE`` can only confirm that the copy we made ourselves is
+  still there.
+
+Verified on ``0870940101`` against an independent astropy calculation from the same orbit
+file: the correction sweeps 1.79 s across the exposure and agrees to 3.3 ms, constant to
+0.3 ms over 27 ks. The three cameras, three independent event lists, agree with each other
+to 0.1 ms.
+
+An observation with neither a PPS orbit file nor an ODF reduces completely but is not
+barycentered; the step records ``barycentered: false`` with a reason rather than failing the
+run. The step also records which ``tool`` did the work and from which ``orbit`` file.
+
+Pulsation search of M82 X-2 in pn
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All 16 observations with EPIC data within 12 arcmin of M82 were reduced on 2026-09-14 through
+``core.retrieve_and_process_data(..., config={"cameras": ["pn"]})`` and barycentred at M82 X-2
+with DE430. pn frames every 73 ms (full window) or 48 ms (large window); MOS cannot sample the
+spin (see *What an exposure is*). Each pn exposure was searched with the same targeted Z²₁
+settings as Chandra -- the two-segment spin solution, ``orbital_decay.par``,
+``HENzsearch --fast --oversample 4``, ``p_value_best`` -- in two energy bands fixed beforehand,
+3-8 keV and 0.2-12 keV (HENDRICS reads XMM ``PI`` as eV).
+
+Both of Liu et al. 2024's XMM detections are recovered at 3-8 keV, within one frequency bin
+(``1/T``) of their frequency:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 30 30
+
+   * -
+     - ``0112290201`` (2001)
+     - ``0657801701`` (2011)
+   * - Liu et al. 2024
+     - 0.755017 Hz, 4.0 σ, 5 ± 1%
+     - 0.731409 Hz, 5.0 σ, 8 ± 2%
+   * - found
+     - +10.7 µHz, 3.4 σ, 4.7 ± 0.9%
+     - +2.4 µHz, 5.2 σ, 8.6 ± 1.6%
+   * - one frequency bin
+     - 36.6 µHz
+     - 49.1 µHz
+
+The 2011 frequency proves little, because the spin solution was anchored on that observation;
+its significance does. In 0.2-12 keV the other sources in the circle dilute the pulse: 2011
+falls to 3.5 σ and 2001 vanishes.
+
+**The frequency derivative is held at zero in short exposures,** with
+``--fdotmin 0 --fdotmax 0``, whenever ``1/T² > 2e-10`` Hz/s (``T = TSTOP - TSTART``). Only
+``0206080101`` (103 ks) searches it freely. This rule was adopted *after* 2001 failed the
+recovery test with a free derivative: ``--fast`` then ranked a noise point 112 µHz away, on
+the ridge that a free derivative opens in the frequency-derivative plane (Z²₁ 38.6), above the
+true peak at zero derivative (28.9). The orbit was ruled out as the cause, because Liu's
+orbital solution differs from ours by 403 s in 2001 and gives the same peak. The rule is
+physical: the residual spin derivative (below 1e-10 Hz/s) is smaller than one grid step
+(``1/T²``, 1-3e-9 Hz/s) in every other exposure. The Chandra searches below still search the
+derivative freely, and are to be rerun with the same rule; until then the two sets are not
+computed the same way.
+
+No new detection among the other 14 exposures. The smallest ``p_value_best`` is 0.42%
+(``0560590101``, 3-8 keV, 13.7 mHz above the prediction), about 11% across the 28 searches.
+Every amplitude is a fraction of all the events in the 30 arcsec circle, which always holds
+M82 X-1, about 5 arcsec from X-2, and the galaxy's diffuse emission. A falling pulsed fraction
+can therefore mean a weaker pulse or more unpulsed light. The **pulsed count rate** tells them
+apart, because unpulsed light adds no pulsed counts. It is HENDRICS' ``pulse_amp`` -- ``a`` in
+``λ(1 + a sin φ)``, the pulsed fraction of a sinusoid -- times the circle's mean rate in the
+searched band, over the summed good time intervals. Limits are taken at the highest Z²₁
+anywhere in the periodogram, not in the candidate table, which misses the tallest peak in 5 of
+the 32 searches. That makes them valid at any frequency in the band.
+
+In 3-8 keV the 2011 detection pulses at 107 ± 20 mcts/s. Three weeks before and after, the
+90% limits are 46 and 56 mcts/s, while the circle's total 3-8 keV rate was *lower* than during
+the detection (0.85 and 0.55 counts/s, against 1.25). X-1 did not hide the pulse: it faded. All
+14 other exposures fall below 107 mcts/s, and ten below 68. X-1 matters for sensitivity
+instead, because a pulsed-rate limit grows as the square root of the counts:
+``0560590101``, the brightest circle at 2.2 counts/s, barely reaches the 2011 level. The 2001
+pulse is about half as strong (56 ± 11 mcts/s), and only ``0206080101`` (below 30) is
+clearly beneath it. The per-exposure table, commands and
+logs are kept outside the repository, in ``~/tmp/m82_xmm/M82X2_XMM_search_results.md``.
+
+Chandra / ACIS and HRC
+----------------------
+
+The second mission whose reduction software is not HEASOFT.
+:mod:`heasarc_retrieve_pipeline.chandra` drives the Chandra X-ray Center's CIAO (Chandra
+Interactive Analysis of Observations) through :mod:`heasarc_retrieve_pipeline.ciao`, which
+is ``sas.py``'s shape a third time: one task at a time under a lock, an argument list and
+never a shell -- a Data Model filter such as ``evt2.fits[sky=circle(4100,4131,1.7)]`` is
+made of exactly the characters a shell reinterprets -- and a mandatory ``produces``.
+``ciao.py`` duplicates ``sas.py`` rather than sharing a base with it, by decision; its
+module docstring says why.
+
+CIAO installs from conda, but it is built against its own Python and is several gigabytes
+with its calibration database, so it is an *environment* requirement and not a
+dependency: the pipeline runs in its usual environment and finds CIAO's tasks on ``PATH``.
+Two things about the installation are worth knowing before the first run:
+
+* **The calibration database.** ``ciao.ciao_environment`` sets ``CALDB`` to
+  ``$ASCDS_INSTALL/CALDB`` whenever that directory exists, overriding the machine's own
+  ``CALDB``. A machine set up for HEASOFT exports a ``CALDB`` with no Chandra data in it,
+  and every CIAO task pointed there would use no calibration at all. ``config["caldb"]``
+  overrides both.
+* **NumPy.** CIAO 4.18.0's conda environment resolved NumPy 2.5, which removed
+  ``np.chararray`` and with it ``pycrates`` -- and so every Python-based CIAO tool,
+  ``specextract``, ``psfsize_srcs`` and ``chandra_repro`` among them. NumPy below 2.5
+  (2.4.6 here) fixes it. A fresh installation that fails at ``import pycrates`` has this
+  problem.
+
+One observation, one environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CIAO tools are driven by parameter files, and one of them is shared state keyed to a single
+observation: ``ardlib.par`` holds the observation's bad-pixel file, which ``specextract``,
+``mkarf`` and ``mkacisrmf`` read back without being told where it came from. A worker
+process reduces several observations one after another, so a shared ``PFILES`` would give
+the second observation the first one's bad pixels -- a wrong effective area, with no
+warning and a zero return code. ``ciao_environment(obsid, config)`` therefore returns a
+*copy* of the environment with a private ``PFILES`` and ``ASCDS_WORK_PATH`` under
+``<out_data_path>/.ciao/<OBSID>/``, and every CIAO call in the reduction takes it
+explicitly. ``os.environ`` is never modified.
+
+Two routes, one reader
+~~~~~~~~~~~~~~~~~~~~~~
+
+``config["products"]`` chooses, deliberately mirroring XMM's PPS and ODF routes:
+
+* ``"archive"`` (the default) reads the archive's own level-2 products.
+  ``chandra_download_filter`` fetches only what the reduction reads -- 30%, 34% and 39% of
+  the three observations it was measured on -- and the largest saving is a single file, the
+  human-readable verification report under ``secondary/``, which is 60 MB of one
+  observation's 265.
+* ``"repro"`` runs ``chandra_repro`` on the download first, with ``set_ardlib=no`` because
+  ``ardlib.par`` is managed per observation as above. The filter then keeps everything but
+  the reports and images, about 78%.
+
+``chandra_resolve_config`` switches an ``"archive"`` run to ``"repro"`` when the archive has
+no level-2 event list. The probe lists ``primary/`` rather than the top level, because every
+Chandra observation directory has the same top level; it is one request, and a listing that
+fails or comes back empty changes nothing.
+
+The bad-pixel file is **in a different directory for the two instruments** --
+``primary/`` for ACIS and ``secondary/`` for HRC. A filter anchored on ``primary/`` alone
+silently drops it for every HRC observation, and the symptom appears much later, in
+``specextract``. The tests assert it is selected for both.
+
+Both routes end in ``chandra_archive_front_end``, which returns one ``Observation``. That
+needed a search path, because ``chandra_repro``'s output is not a directory the level-2
+reader could be pointed at unchanged:
+
+* it is **flat**, where every archive pattern is anchored on ``primary/`` or
+  ``secondary/``;
+* it **copies** the archive's ``bpix1`` and ``fov1`` beside the new ones, so a loose
+  ``*_bpix1.fits`` matches two files;
+* its good-time file is ``*_repro_flt2.fits``, **not** ``flt1`` -- asking for ``flt1``
+  finds nothing there, falls through to the download, and screens against the good times
+  of the file that is *not* being reduced;
+* it has **no** orbit ephemeris, HRC dead-time file or grating products at all.
+
+So each product getter names its file on each route, and the first directory holding a
+match wins: ``<out>/<OBSID>/repro/`` first on the reprocessing route, then the download.
+Families the reprocessing never writes skip ``repro/``.
+
+Three more behaviours of ``chandra_repro``, all measured on obsid ``5644``:
+
+* It will not create a nested output directory, and says so with **exit code 0**. The
+  front end makes the directory itself.
+* It does **not** update ``CALDBVER``: the reprocessed event list keeps the archive's
+  ``4.9.2`` while ``ASCDSVER`` moves to ``CIAO 4.18.0``. The calibration-staleness
+  diagnostic, which compares ``CALDBVER`` with the installed CALDB, therefore says nothing
+  about an observation that has already been reprocessed, and the record says so.
+* It needs the level-1 event list, which the archive route's filter does not fetch. A tree
+  downloaded on one route and reduced on the other raises ``FileNotFoundError`` naming the
+  fix, rather than quietly falling back to the level-2 file.
+
+What an observation is
+~~~~~~~~~~~~~~~~~~~~~~
+
+**One detector in one mode.** None of XMM's per-exposure fan-out is needed, and one
+failing step fails the observation, because there are no other cameras to carry on with.
+
+HRC names its configuration in ``DETNAM`` (``HRC-I``, ``HRC-S``). ACIS does not: its
+``DETNAM`` lists the chips that were read out, and both aimpoint chips -- I3 and S3 -- are
+often on together (50 of 150 randomly chosen archived ACIS observations). ``SIM_Z``, where
+the instrument module was parked, separates ACIS-I from ACIS-S with an 18 mm gap and no
+overlap, and ``chandra_detector`` reads that instead, with the threshold at -205 mm.
+
+Every output is named from ``chandra<OBSID padded to 5>_<detector>_<mode>``, for the reason
+XMM's are: the files leave the tree that gives them context. The OBSID is padded because
+the catalogue returns it as an integer while the archive's own names are padded
+(``acisf05644``); the download *directory* is unpadded, which the path helpers handle.
+
+An observation taken in parts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some observations were taken in several separate pointings under one obsid. Chandra calls
+each an OBI, an observation interval; the code calls it a *part*. ``1411`` (HRC-I) is two
+parts 84 days apart, ``380`` (ACIS-I) two parts 35.6 days apart. The archive merges the
+parts' events into one level-2 list and ships everything else once per part: dead time,
+aspect, orbit, bad pixels, mask, good times.
+
+**Each part is reduced as an observation of its own** from the source region on, with
+``_obiNNN`` added to its names (``chandra00380_acisi_timed_obi002``). Nothing is merged
+across the gap: no combined barycentred list and no combined spectrum, because
+``specextract`` takes one mask file per observation. This is also what the CXC's
+``splitobs`` is for.
+
+Pairing the files with the parts (``chandra_observation_parts``):
+
+* Files whose names carry a part number (``hrcf01411_002N006_dtf1``) are paired by it.
+  Numbers can skip and need not start at zero: ``433`` is parts 1, 3 and 4.
+* Files named by time are paired by the time they cover. Every orbit ephemeris is one, and
+  so are the oldest aspect solutions (``433`` has five for three parts). Where such a file
+  has ``OBI_NUM``, it must agree with the part its time falls in.
+* Parts may come from different processing versions (``108``); two versions of one file
+  within one part are refused.
+* Parts whose ``READMODE``, ``TIMEDEL`` or ``DETNAM`` differ are refused: one stem and one
+  time resolution cannot describe them.
+
+**The time resolution in the front end's record is combined over the parts**, and each
+part is then reduced at its own. For ACIS the parts agree by construction. For HRC the
+per-part answers from the dead-time files are weighted by exposure when they are on the
+same side of the veto threshold (``1411``: 4.82 and 5.18 ms, recorded as 4.93), and the
+coarser is taken when they are not or a dead-time file is missing.
+
+**On the archive route** a part's events are cut out of the merged list by its times, and
+the cut's ``TSTART`` and ``TSTOP`` are rewritten to the part's. ``dmcopy``'s time filter
+trims the good-time blocks, the exposure and the events but not those two keywords, and
+``dmextract`` bins a light curve over them: on ``380``'s second part that was 15 447 bins of
+200 s, 7 with any exposure. The cut is also given the part's own ``RA_PNT``, ``DEC_PNT`` and
+``ROLL_PNT``, read from its good-time, mask or bad-pixel file. The merged list has none
+where the parts pointed differently (``380`` was rolled 251.6 and 282.8 degrees, ``1411``
+60.3 and 147.3), and ``psfsize_srcs`` stops without them. Its ``OBI_NUM`` is set to the
+part's number too: CIAO keeps a list of the obsids taken in parts, and ``specextract``
+refuses an event list of one that does not say which part it holds ("For multi-OBI datasets
+like 380 the obi argument must be set"). The cut's ``PBKFILE`` is still the merged list's,
+which names one part's parameter-block file; no file of a part carries the right one.
+
+When checking that the parts were read out the same way, ``TIMEDEL`` is compared only
+between files of one kind. An HRC good-time file's ``TIMEDEL`` is its own sampling, 0.25625
+s on both of ``1411``'s parts, not the event list's 1.5625e-05 s.
+
+**On the reprocessing route** ``chandra_repro`` refuses an observation in parts, so
+``splitobs`` separates them into ``<out>/<obsid>/split/<obsid>_NNN`` and ``chandra_repro``
+runs once per part into ``<out>/<obsid>/repro_obiNNN``, since its product names carry no
+part number and two parts would overwrite each other in one directory. The result spans that part alone, ``TSTART``, ``TSTOP`` and ``OBI_NUM`` included, and is used
+without a cut. The orbit ephemeris and HRC dead-time file are not copied by either task and
+still come from the download, paired by time. Both tasks return 0 when they fail: with
+``ASCDS_CALIB`` unset, ``splitobs`` cannot read a header, says only that the observation
+"is neither interleaved nor multiobi", and makes nothing. Each part's directory and event
+list are therefore checked.
+
+**A failing part does not fail the others**, the rule XMM applies to its exposures: the
+failure is logged and recorded, the remaining parts are reduced, and only when every part
+fails does the observation raise. This is the exception to "one failing step fails the
+observation" above.
+
+**The split is announced**, in the log, in the front end's record under ``warnings``, and
+at the top of the observation's report page: how many parts, when each was taken, how far
+apart, and what its products are called. A timing search over more than one part has to be
+chosen deliberately.
+
+The time resolution the data can support
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The part of Chandra a naive reduction gets wrong. ``chandra_time_resolution`` states, for
+every observation, the resolution the data really support, the basis for it, and a
+plain-English reason, all of which are recorded. No CIAO is involved.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - configuration
+     - what the data support
+   * - ACIS Timed Exposure
+     - ``TIMEDEL``, the frame time: 3.14 or 3.24 s at full frame, but **0.44 s** or
+       **0.54 s** on the single-chip subarrays M82 was observed with
+   * - ACIS Continuous Clocking
+     - 2.85 ms, with one spatial dimension gone
+   * - HRC with on-board vetoing
+     - one over the trigger rate, **about 4 ms** -- not the 16 µs the header says
+   * - HRC-S with vetoing off (``S_TIMING``)
+     - ``TIMEDEL``, 15.625 µs
+
+**No header distinguishes the two HRC cases.** A wiring error latches every event's time
+on the *next* trigger; where the spacecraft vetoed triggers on board, the shift cannot be
+undone, and the uncertainty is about one over the total trigger rate. Obsid ``6298``
+(HRC-I, really ~4 ms) and ``17661`` (HRC-S ``S_TIMING``, really 16 µs) carry identical
+timing keywords. The dead-time file, ``*_dtf1``, does distinguish them: the ratio of its
+``VALID_EVT_COUNT`` to ``TOTAL_EVT_COUNT`` is the fraction of triggers that survived, and
+it is 0.296 on ``6298`` (228.8 triggers/s, hence 4.37 ms, matching the CXC's documented
+"about 4 ms") and exactly 1.000 on ``17661``. **The ratio is tested first**: applying the
+rate formula to ``17661`` would give 16.67 ms, a thousand times worse than the truth.
+
+Do not pre-select observations on the catalogue's ``data_mode``. It does not reveal an ACIS
+subarray -- ``5644`` is ``TE_006AC`` and has a 0.44 s frame -- and thirteen of the sixteen
+HRC observations of M82 carry the custom mode string ``OBS20743``, neither ``DEFAULT`` nor
+``S_TIMING``. The dead-time ratio reads a number instead of parsing a name.
+
+Extraction regions
+~~~~~~~~~~~~~~~~~~
+
+``dmcoords`` converts the requested RA and Dec to sky and chip coordinates -- the position
+asked for, never the header's. On ``5644`` that difference is the whole result: the
+header's target is M82 X-1, and the pulsar is M82 X-2, 4.6 arcsec away.
+
+The source radius comes from ``psfsize_srcs``, as the radius enclosing ``psf_ecf`` (90%)
+of the counts at ``psf_energy_kev`` at the source's off-axis angle, because Chandra's
+point spread function grows from under an arcsecond on-axis to over ten at eight
+arcminutes: ``5644`` at 0.29 arcmin gets 0.830 arcsec, ``8190`` at 3.58 arcmin gets
+2.186 arcsec. ``src_radius_arcsec`` overrides it. The background is an annulus at
+``bkg_inner_factor`` and ``bkg_outer_factor`` times that radius. Continuous Clocking uses
+strips of ``chipx`` instead, the analogue of XMM's ``RAWX`` strips.
+
+``psfsize_srcs`` also reports a ``NEAR_CHIP_EDGE`` flag, and **it is not used**: on every
+ACIS subarray it computes the top of the window as ``NROWS - 1 - edge`` instead of
+``FIRSTROW + NROWS - 1 - edge``, so every position is flagged. ``chandra_chip_edge``
+reports the clearance in chip pixels from ``FIRSTROW`` and ``NROWS`` instead: 47.95 on
+``5644``, and 27.22 on ``8190``, which is genuinely inside the 32-pixel dither.
+
+In a crowded field the annulus is not necessarily background, and around M82 X-2 it never
+is: M82 X-1 is 4.6 arcsec away. Measured on 2026-09-13 on all 35 cleaned lists on disk, the
+background scaled to the source circle is 6.3% and 6.6% of the source counts on the on-axis
+``5644`` and ``6361``, whose rings end at 2.5 arcsec, but **28-515%** on the seventeen
+off-axis ACIS observations and 34-186% on HRC. One wedge of twelve typically holds 5 to 112
+times the median wedge, and leaving that wedge out does not cure it, because X-1's point
+spread function spills into its neighbours. Nothing in a spectrum file shows any of this.
+
+``chandra_background_ring_check`` therefore measures the ring on the cleaned list. It cuts
+the ring into ``bkg_crowding_sectors`` (12) wedges around the source and calls it crowded
+when the brightest wedge is both **unlikely from sky alone** -- a Poisson probability around
+the median wedge, charged for every wedge, below ``bkg_crowding_probability`` (1.35e-3) --
+and **more than** ``bkg_crowding_ratio`` (3) **times the median**. Either condition alone
+misfires: the probability flags a harmless excess of a few per cent on a well-exposed ring,
+and the ratio flags four counts against one. The wedge counts and the background share, with
+and without the brightest wedge, go into the ``clean_event_list`` record, with a warning in
+the log. All 35 M82 observations are flagged. Two isolated sources, reduced through ``core``
+on 2026-09-13/14, are not:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 14 14 14 14 14
+
+   * - observation
+     - source counts
+     - source radius
+     - brightest / median
+     - chance probability
+     - background share
+   * - ``741``, PSR J0437-4715
+     - 6 761
+     - 2.6 arcsec
+     - 25 / 12.5 = 2.0
+     - 1.4e-2
+     - 0.4%
+   * - ``731``, RBS 1223
+     - 7 069
+     - 6.6 arcsec
+     - 38 / 15 = 2.5
+     - 5.6e-6
+     - 0.4%
+
+``731`` shows why both conditions are needed: its brightest wedge is far too bright to be
+chance, yet only 2.5 times the median, and on the probability alone it would be flagged.
+Reduced first at the position the name resolver returns for "RBS 1223", 6.9 arcsec from the
+source, ``731`` *was* flagged, and rightly: the source itself lay in the ring, 341 counts in
+one wedge and 22 times the median, while the source circle held 19 events. So a misplaced
+source region shows up here too. **Nothing is corrected**: the regions do not change, and the timing
+analysis, which uses the source events alone, is unaffected. Look at the field before
+fitting a crowded one.
+
+Flare screening
+~~~~~~~~~~~~~~~
+
+The background light curve is made with ``dmextract`` from as much of the detector as can
+be had with the source kept out: for ACIS the source's own chip minus the source circle,
+in 0.5-7 keV; for HRC the whole plate, unbanded; for Continuous Clocking the background
+strips. It is thresholded by the same pure-Python interval functions NuSTAR and XMM use,
+at ``flare_sigma`` above a sigma-clipped quiescent level measured from the observation
+itself -- there is no fixed rate.
+
+**This step is deliberately reluctant.** Chandra's background flares matter far less than
+XMM's for bright sources, and the costly failure is not a missed flare but a cut that eats
+a good observation, which a variable source leaking into the background region imitates
+perfectly. A cut that would remove more than ``flare_max_removed_fraction`` (30%) of the
+exposure is recorded and not applied; one above ``flare_warn_fraction`` (10%) is applied
+with a warning. On the two verification observations the default removes 200 s of
+75 131 and nothing at all.
+
+Three facts about the CIAO tasks decide how this is written, and all three are checked
+against the real tools in ``tests/test_ciao_tools.py``:
+
+* **``[exclude sky=...]`` cannot be combined with any other filter** ("cannot mix EXCLUDE
+  and FILTER"). The source is cut out with region algebra, ``[sky=field()-circle(...)]``.
+* **``dmextract`` writes bins in the gaps of the good times**, with ``EXPOSURE = 0`` and a
+  rate of zero -- 16 of 393 on ``5644``. Read at face value they are the quietest bins in
+  the observation and drag the threshold down, so ``read_chandra_lightcurve`` turns them
+  into ``NaN``.
+* **``dmcopy "evt2.fits[@flare.gti]"`` intersects** the named table with the file's own
+  good times rather than replacing them. The intervals written are nonetheless already
+  intersected in Python, so that the exposure recorded for the report and the exposure
+  of the cleaned file are the same number.
+
+Where the curve does not reach -- a curve shorter than the observation -- the uncovered
+stretch is kept: not measured must not mean cut.
+
+Pile-up is measured and never corrected
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ruling given for XMM applies unchanged. ``pileup_map`` runs on a single-pixel image of
+the source chip with **no energy filter** -- pile-up pushes two photons into one event of
+higher energy, so a band cut discards the evidence -- and the recorded number is the 90th
+percentile of counts per frame inside the source circle, converted to a pile-up fraction
+by interpolating the CXC's table (0.02 counts per frame is 1%, 0.2 is 10%). A source at
+0.07 counts/s is already 10% piled at a 3.2 s frame, so for the sources this pipeline is
+aimed at pile-up is the normal condition of ACIS imaging. It is skipped for HRC and for
+Continuous Clocking, which have no frames in that sense, and a map that turns out not to
+contain the source reports no number rather than a wrong one.
+
+Spectra
+~~~~~~~
+
+``specextract`` for ACIS, producing source and background spectra with their responses.
+Three things found by running it:
+
+* **Its own grouping does nothing.** Asked for ``grouptype=NUM_CTS binspec=15``, CIAO
+  4.18.0 returned an ungrouped spectrum with no warning. ``specextract`` is therefore asked
+  for ``grouptype=NONE`` and ``dmgroup`` groups it in a second call (351 groups from
+  10 577 counts on ``5644``), carrying ``BACKFILE``, ``RESPFILE`` and ``ANCRFILE`` through.
+* **``correctpsf=yes`` is required**, because the extraction circle is sized to enclose
+  90% of the point spread function and so always leaves some source outside it. The
+  corrected effective area is ``<stem>_src.corr.arf``, and ``ANCRFILE`` points there.
+* **The names are ``specextract``'s own**, with ``outroot=<stem>_src`` chosen to make them
+  follow the naming rule, because the task writes them into three header cards of two
+  files and renaming afterwards would mean keeping those in step. The background is
+  therefore ``<stem>_src_bkg.pi``.
+
+**Grating observations are collected, never extracted.** The archive's ``pha2`` and its
+responses are copied under the archive's own names, which already carry the OBSID and are
+cross-referenced in ways this pipeline did not create; ``tgextract`` is never run. **HRC
+gets no spectrum**, since it has no usable energy resolution, and the record says so.
+
+An ACIS observation telemetered in ``GRADED`` mode -- ``5644`` is one -- sent down a grade
+and a summed pulse height per event and discarded the pixel island, so the charge-transfer
+correction cannot be recomputed and very-faint-mode background cleaning is unavailable.
+The extraction works and would look ordinary; the report page carries the caveat.
+
+Barycentering: the ``barycenter`` package, or ``axbary`` on DE405
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default ``chandra_barycenter`` uses the ``barycenter`` package on the orbit ephemeris
+``orbitf*_eph1.fits``, at the searched position, with the ephemeris named by
+``barycenter_ephemeris`` -- DE430, like every other mission. It needs no CIAO, and agrees
+with ``axbary`` to 47 ns when both are on DE405. The step records ``tool`` and ``PLEPHEM``.
+
+The fallback, with ``barycenter_tool: official``, is the only one of the mission tools that
+can do Chandra at all, and it cannot do DE430:
+
+* **HEASOFT ``barycorr`` has no Chandra orbit reader.** It hands the orbit file to
+  ``hdaxbary``, whose only readers are for RXTE, NICER and Swift. On a real Chandra event
+  list with its own orbit file it stops with "no bracketing sample found" and "Invalid
+  Observatory/Spacecraft position vector" -- with the orbit file demonstrably sound:
+  monotonic, gap-free, and bracketing the event times. Renaming columns, converting units,
+  naming the extension and rewriting ``TELESCOP`` all failed.
+* **CIAO's ``axbary``** admits ``refframe=FK5`` (DE200) or ``refframe=ICRS`` (**DE405**),
+  and no DE430.
+
+So the fallback uses ``axbary`` with ``refframe=ICRS``, at the searched position, and
+records ``PLEPHEM`` in the diagnostics for every observation. **The cost was measured
+rather than assumed**: over ``6298``'s own time span and position, DE430 minus DE405 is a
+constant **+0.377 µs**, varying by 0.0016 µs across the two-hour observation. A constant
+offset cannot distort a pulse profile, a period or a periodogram within an observation, at
+any Chandra time resolution; it survives only as an absolute phase offset against another
+mission's DE430 times, where against M82 X-2's 1.37 s spin it is 3e-7 of a cycle.
+
+``axbary`` refuses a gzipped *event* or aspect file ("Failed to re-open output file", error
+112), though it reads a gzipped orbit file. The events it is given come uncompressed from
+``dmcopy``. The source events are cut from the barycentred list afterwards, giving
+``<stem>_src_bary.evt``, the file a timing search starts from.
+
+**The aspect solution is not barycentred**, although the CXC's thread does it. Nothing in
+this reduction pairs barycentred events with an aspect solution: pile-up and
+``specextract`` both run on the uncorrected cleaned list, and the barycentred list exists
+only to be folded. This choice is still awaiting review.
+
+The reduction, step by step
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_chandra_obsid`` records seven steps, each a diagnostics record and a section of
+the HTML page:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - step
+     - what it does
+   * - ``chandra_front_end``
+     - Reads the observation off either route: detector, mode, time resolution, calibration
+       age. ``NO_SCIENCE_DATA`` if there is no event list of any kind.
+   * - ``source_region``
+     - Position and extraction regions.
+   * - ``flare_filtering``
+     - The background curve and the good time intervals.
+   * - ``clean_event_list``
+     - ``dmcopy`` with those intervals; the whole field, not the source region. Then the
+       background ring is checked for another source.
+   * - ``pileup_check``
+     - ACIS Timed Exposure only.
+   * - ``barycenter``
+     - The ``barycenter`` package (or ``axbary``), then the source events cut from the result.
+   * - ``calculate_spectra``
+     - ``specextract`` and ``dmgroup``, grating collection, or a stated nothing.
+
+Regions come first, because the flare curve is measured with the source cut out.
+Barycentring comes before the spectrum, because timing is what this module is judged on and
+``specextract`` is both the slowest task and the most fragile: an observation whose
+spectrum fails still leaves its barycentred events behind.
+
+**With no position**, the front end still runs -- so what the observation *is* gets
+recorded -- and ``source_region`` records a skip saying why nothing else did, since every
+later step needs a position, barycentring included. XMM, by contrast, fails inside its
+first position-dependent task.
+
+The report page needed no Chandra code: ``report.py`` chooses figures by step name and array
+key, and the Chandra steps use XMM's conventions. There is no extraction-region figure,
+because that figure plots a radial profile and PSF-sized regions record none.
+
+What the reduction writes, for ``5644``::
+
+    <OBSID>/event_cl/chandra05644_aciss_timed_psf.reg          psfsize_srcs's region
+    <OBSID>/event_cl/chandra05644_aciss_timed_bkg_lc.fits      background light curve
+    <OBSID>/event_cl/chandra05644_aciss_timed_flare.gti        the intervals applied
+    <OBSID>/event_cl/chandra05644_aciss_timed_cl.evt           screened events
+    <OBSID>/event_cl/chandra05644_aciss_timed_chipimg.fits     source chip, for pile-up
+    <OBSID>/event_cl/chandra05644_aciss_timed_pileup.fits      pileup_map's output
+    <OBSID>/event_cl/chandra05644_aciss_timed_cl_bary.evt.gz   barycentred, gzipped
+    <OBSID>/event_cl/chandra05644_aciss_timed_src_bary.evt     barycentred, source region
+    <OBSID>/products/chandra05644_aciss_timed_src.pi           source spectrum
+    <OBSID>/products/chandra05644_aciss_timed_src_bkg.pi       background spectrum
+    <OBSID>/products/chandra05644_aciss_timed_src.corr.arf     PSF-corrected area (ANCRFILE)
+    <OBSID>/products/chandra05644_aciss_timed_src.rmf          response
+    <OBSID>/products/chandra05644_aciss_timed_src_grp.pi       grouped, the one you fit
+    <OBSID>/repro/                                             chandra_repro, repro route only
+    <out_data_path>/.ciao/<OBSID>/                             private PFILES and scratch
+
+Verified against a published pulsation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+M82 X-2 is a pulsating ultraluminous X-ray source, and Liu et al. (2024,
+doi:10.3847/1538-4357/ad17c7) report its pulsation in two ACIS-S subarray observations.
+Both were reduced by the module and searched blind over 0.722-0.756 Hz with HENDRICS,
+deorbited with the source's orbital ephemeris:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 30 30
+
+   * -
+     - ``5644``
+     - ``8190``
+   * - extraction radius
+     - 0.830 arcsec
+     - 2.186 arcsec
+   * - source events
+     - 10 577
+     - 19 025
+   * - measured period
+     - 1.3453202 s
+     - 1.3504294 s
+   * - Liu et al. 2024
+     - 1.345321(5) s
+     - 1.350429(4) s
+   * - Z²₁, and the tallest other peak in the band
+     - 59.32, 14.60
+     - 26.55, 21.58
+   * - significance after trials
+     - 6.2 σ
+     - 2.7 σ
+
+``8190`` is off-axis and blended, and is the weaker detection, as expected; restricted to
+Liu's own 2-8 keV band it gives 3.24 σ against their 3.3 σ. Run through the whole flow,
+``process_chandra_obsid`` gives ``5644``'s result to the last digit, and the reprocessing
+route gives Z²₁ = 59.25 at the same period, from three more events.
+
+Two search settings matter, and both cost a real non-detection before they were found:
+
+* **Z²₁, not Z²₂.** The profiles are close to sinusoidal, and at a 0.44 s frame the second
+  harmonic (1.49 Hz) is above the Nyquist frequency (1.13 Hz), so ``-N 2`` adds aliased
+  noise.
+* **Oversample the frequency grid.** At ``HENzsearch --fast``'s default sampling the grid
+  points are too far apart for a peak about ``1/T`` wide, and ``5644`` reports Z²₁ = 30.30,
+  2.6 σ -- a non-detection of a signal that is really there at 6 σ. ``--oversample 16``
+  recovers it; the exact search without ``--fast`` at ``--oversample 8`` agrees to better
+  than 1%. The symptom is a peak frequency that wanders between runs that should agree.
+
+The acceptance run: every HRC observation of M82
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The module was accepted on a batch chosen to test timing, where Chandra is hard: all 16 HRC
+observations within 12 arcminutes of M82, 266 ks, run through
+``core.retrieve_and_process_data`` on 2026-09-12 and barycentred at M82 X-2. Two are HRC-S
+in ``S_TIMING`` (``8189``, ``8505``) and genuinely deliver 15.625 µs; fourteen are HRC-I
+and do not; all sixteen headers carry the same ``TIMEDEL``. Thirteen of them have the
+custom ``data_mode`` ``OBS20743``, which is why the mode is read from the dead-time file and
+not matched against known names.
+
+**15 of 16 reduced, and every timing criterion was met.** ``1411`` was refused because it
+was taken in two separate pointings (OBIs), 84 days apart. Once observations in parts were
+supported it was reduced too, on 2026-09-14: each part barycentred at M82 X-2 with its own
+orbit file, 4.82 and 5.18 ms measured (4.93 ms recorded), 822 and 16 source events.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 45 55
+
+   * - criterion
+     - result
+   * - the two ``S_TIMING`` observations at 15.625 µs, and no other
+     - ``8189`` and ``8505``, veto ratio 1.000; none of the rest on ``TIMEDEL`` alone
+   * - every other observation measured, with its own reason
+     - the thirteen HRC-I pointings: 3.13-3.66 ms, veto ratio 0.424-0.438, 273-319
+       triggers/s
+   * - every observation barycentred at the position asked for
+     - all 15, ``refframe=ICRS``, DE405 recorded
+   * - the numbers physical
+     - veto ratio near 1 only for ``S_TIMING``; trigger rates consistent across pointings
+       of the same field
+
+**Low source counts are astrophysical, not a fault**: 51 events in ``8189`` and 102 in
+``8505``. M82 X-2 is absent or faint in 2007 and in ``23469`` and ``26111``, and present in
+``23466`` at 0.21 arcsec from the position searched. M82 X-1's offset from its catalogue
+position is the same in ``8189`` and ``23466``, so the astrometry is sound.
+
+Four faults were found by the run and fixed:
+
+* **The catalogue returns OBSIDs as 32-bit integers** (``0949b46``).
+  ``core.observation_work_items`` stores them as strings, since every path downstream is
+  built from one.
+* **CIAO on ``PATH`` is not CIAO activated** (``518ed30``). ``psfsize_srcs`` stopped at
+  "Please set the $ASCDS_CALIB environment variable". ``ciao_environment`` now fills in the
+  variables CIAO's activation script derives from the installation alone -- ``ASCDS_CALIB``,
+  ``ASCDS_BIN``, ``ASCDS_LIB``, ``ASCDS_OTS``, ``ASCDS_CONTRIB`` and ``XPA_METHOD`` -- and
+  keeps an activated shell's own values.
+* **The sky pixel scale is read from the event list** (``b889b55``), from the ``TCDLT`` of
+  its ``x`` column: 0.492 arcsec for ACIS, **0.1318** for HRC. Drawn with ACIS's scale, every
+  HRC region was 3.7 times too small.
+* **The whole-field barycentred list is gzipped** (``d6d21e6``) once the source events have
+  been cut from it. Nothing reads it again, but another source in the field can still be cut
+  from it, and CIAO reads a gzipped event list directly. Level 1 is used: on ``8505``'s
+  319 MB list it gives 244 MB in 6 s, where level 6 gives 240 MB in 15 s. The file is written
+  under a temporary name and renamed, so an interrupted run leaves no truncated ``.gz``.
+
+**No pulsation was detected in any of them**, and none was expected to be: detection was
+never a pass criterion. The search used the settings above plus a prior spin solution
+fixed before looking (HENDRICS ``--known-freq 0.728 --known-fdot -5e-11
+--known-pepoch 56682``), over 0.728-0.77 Hz for 2007 and 0.70-0.73 Hz for 2020-21. It was
+rerun with the two-segment solution and then with the calibrated false-alarm probability
+described under *Fast-frame ACIS observations of M82*, adding both parts of ``1411``
+(0.728-0.77 Hz). The smallest is then 3.4% (``23463``, a peak 9 mHz from the prediction),
+about 40% across the fifteen searches. With 8-172 source events the 90% upper limits on the
+pulsed amplitude are 29% or more. ``1411``'s first part, 822 events, gives 19.9% at the
+predicted frequency. All are above the 5-12% seen with ACIS, so these observations are not
+sensitive enough to rule the pulsation out. The per-observation table, commands and logs
+are kept outside the repository, in ``~/tmp/m82_hrc/M82X2_HRC_search_results.md``.
+
+**Rerun 2026-09-14 with the fdot rule from the XMM pn survey** (see *Pulsation search of
+M82 X-2 in pn*): fdot fixed at 0 when ``1/T² > 2e-10`` Hz/s for an event file's own
+exposure, free otherwise. Fourteen of the fifteen searchable event files meet the fixed
+case; only ``8505`` (85 ks) keeps a free fdot, and its best candidate lands on
+``fdot = -1.2e-9`` Hz/s, off the two-segment solution -- the same free-fdot noise-ridge
+effect seen in XMM's 2001 observation. The XMM survey also splits 2-8 keV from the full
+band; HRC's event lists carry no calibrated ``ENERGY`` column, only a raw ``PI`` channel
+with no established keV mapping, so that split is not attempted here and HRC keeps one
+unfiltered search per file, as before. Still no detection: smallest false-alarm
+probability 11%, none below 1%; the tightest limit is unchanged, ``1411``'s first part at
+19.9%. Table in the same results file, under *Rerun 2026-09-14*.
+
+Fast-frame ACIS observations of M82
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A 1.37 s spin can be searched only where the frame time samples it, and the catalogue cannot
+say where: ``data_mode`` does not decode to a frame time (``TE_006AC`` is 0.44 s,
+``TE_0085E`` is 3.14 s). So ``TIMEDEL`` is read from each event list, whose first 400 kB,
+gzipped, already hold the header. Of the 43 archived ACIS observations within 12 arcmin of
+M82 on 2026-09-13 (nine more are catalogued and not yet observed):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 62 20
+
+   * - frame time
+     - observations
+     - samples per cycle
+   * - 0.44104 s
+     - 8, ACIS-S on one chip: ``5644``, ``6097``, ``6361``, ``8190``, ``10025``, ``10026``,
+       ``10027``, ``17578``
+     - 3.1
+   * - 0.54104 s
+     - 13, ACIS-I on one chip, 2015-16: ``17678`` and ``18062``-``18073``
+     - 2.5
+   * - 3.14104 or 3.24104 s
+     - the other 22, among them the long ``10542``, ``10543`` and ``10544`` (315 ks)
+     - 0.4
+
+What decides it is the Nyquist frequency, ``1/(2 TIMEDEL)``, against a spin frequency of
+0.72-0.75 Hz: 1.13 Hz at 0.44 s and 0.92 Hz at 0.54 s, but 0.16 Hz at full frame. A frame
+also averages the signal over its length, multiplying a sinusoid's amplitude by
+``sin(πfT)/(πfT)``: 0.83 at 0.44 s, 0.77 at 0.54 s, 0.11 at 3.14 s. Scaled from ``5644``'s
+Z²₁ = 59, the three long full-frame observations, with four times its counts, would give
+Z²₁ of about 5, which is noise, so they were not searched. A first rule of
+``TIMEDEL < 0.5 s`` stood in for three samples per cycle and would have dropped the 0.54 s
+observations for no reason.
+
+The nineteen fast-frame observations not already verified were reduced through ``core`` on
+2026-09-13: all 19 at their header frame time, all barycentred at M82 X-2 with DE405, and
+pile-up at most 3.1% (``6361``, on-axis). ``10025``, ``10026``, ``18062`` and ``18063``
+sit within the dither of their chip's edge and lose some counts to it.
+
+A targeted Z²₁ search of all nineteen, with a two-segment spin solution that follows Liu et al.
+2024, fixed beforehand, finds no pulsation. The first run reported false-alarm probabilities
+all below 0.38, five of them below 1%: a targeted search did not pay for picking its best
+candidate. HENDRICS now charges for it (``p_value_best``, calibrated by simulation), and in the
+rerun, with ``--oversample 4`` (the same grid, now counted per 1/T), the smallest is 1.9%
+(``18066``, a peak 2.5 mHz from the prediction), about 30% across the nineteen.
+
+The strongest peak of ``6097``'s band limits the pulsed amplitude to 8.3%, below the 10.6% seen
+in ``5644``. Lower limits elsewhere (6.8% in ``18063``) are computed at a candidate within a
+frequency bin of the prediction. The solution misses the frequencies measured in ``5644`` and
+``8190`` by 0.6-0.75 mHz, so those limits hold only for a pulse at the predicted frequency. The
+per-observation table is in ``~/tmp/m82_acis/M82X2_ACIS_search_results.md``.
+
+**Rerun 2026-09-14 to match the XMM pn survey's criteria** (Matteo): fdot fixed at 0 when
+``1/T² > 2e-10`` Hz/s for an event file's own exposure, free otherwise, and two energy
+bands, 2-8 keV and 0.2-12 keV. All nineteen observations have ``T`` between 11.7 and
+60 ks, so the rule fixes fdot at 0 everywhere. Unlike XMM's PI, ACIS's ``ENERGY`` column
+is genuinely calibrated (eV, converted to keV from the column's own unit), so the 2-8 keV
+cut needs no workaround. Still no detection in either band: smallest false-alarm
+probability 2.3% (``18073``, full band), none below 1%. The tightest limits stay under
+5644's 10.6% -- ``6097`` at 7.1% (full band) / 8.5% (2-8 keV), ``10027`` at 8.3% / 12.1%
+-- though both candidates sit away from the exact prediction, so the limits hold at the
+frequency found, not necessarily the predicted one. Table in the same results file, under
+*Rerun 2026-09-14*.
+
+Open questions
+~~~~~~~~~~~~~~
+
+* **The ``S_TIMING`` threshold.** ``hrc_veto_ratio_threshold = 0.99`` was chosen from two
+  observations, at 1.000 and 0.296; the fifteen M82 HRC observations since fall well clear
+  of it (1.000, and 0.424-0.438). Its distribution across the ~1 669 HRC-S observations is
+  unmeasured.
+* **The catalogue's ``data_mode`` as a cross-check** on the inferred HRC mode would need
+  ``core`` to hand the catalogue row to the reduction. Not done, because the dead-time ratio
+  makes it unnecessary; worth doing only if that inference proves unreliable.
+* **How long ``chandra_repro`` takes**, which decides whether the reprocessing route is
+  usable in a batch, is unmeasured.
+* **ACIS frame times across the archive.** Only M82's 43 have been read. The share of fast
+  frames among the 22 953 Timed Exposure observations needs one header read each; do not
+  quote one until it is measured.
+* **Continuous Clocking.** Its ``chipx`` strips are a starting guess, never run on real
+  data.
+
+Fluxes by spectral fitting
+--------------------------
+
+:func:`heasarc_retrieve_pipeline.spectral_fit.fit_flux` fits an XSPEC model to one
+spectrum and returns the observed flux in a band, with its error bounds. It is not tied
+to a mission: it takes whatever spectrum, background, response and effective-area files
+it is given. Swift/XRT is its first user. PyXspec comes with HEASOFT and cannot be
+installed with pip, so the module imports it only when called, and its tests are marked
+``heasoft``.
+
+The flux and its errors come from the ``cflux`` convolution model, in two fits. The
+first fits the model as given and computes its flux in the band. That flux is the
+starting value of ``lg10Flux`` in the second fit, of ``cflux*(model)``, where the first
+additive component's ``norm`` is frozen because ``cflux`` takes over its role. XSPEC's
+``error`` command then walks the likelihood profile of ``lg10Flux`` to where the
+statistic has risen by ``delta_stat``: 2.706 (90 per cent, the default) or 1.0
+(1 sigma). This is more reliable than ``flux err``, which assumes the covariance matrix
+describes the errors well, and that assumption fails for spectra of a few hundred counts.
+``cflux`` is placed outside the absorption, so the flux is the *observed* one, as
+Brightman et al. (2019) quote it.
+
+Two behaviours that are easy to miss:
+
+* With ``statistic="cstat"`` and a background spectrum, XSPEC uses the W-statistic,
+  not the Cash statistic. W-stat is biased when background bins hold zero counts, so
+  group the spectra to at least one count per bin before fitting.
+* XSPEC's ``fakeit`` leaves ``RESPFILE`` blank when the response's path is longer than
+  68 characters, and the fit then fails with "no energy defined range". ``fit_flux``
+  checks for a response before fitting, and says what is missing.
+
+A spectrum with fewer than ``min_counts`` counts in the fit band is not fitted. The
+function returns NaN, with the reason in ``reason``.
 
 Orchestration with Prefect
 --------------------------
@@ -1989,6 +3336,16 @@ step (``ftmerge``, ``ftmgtime``, ``ftsort``, ``fappend``) both succeeded, and th
 per-CHU event files came out with the same event counts and the same exposure, to the
 microsecond, as a reduction of the same observation through the real path.
 
+The three post-processing entry points take the same link. ``hrp-merge-obsids``,
+``hrp-split-obsid`` and ``hrp-check-roundtrip`` are run by hand against a finished tree,
+so they build their own configuration rather than inheriting the flow's, and until they
+were wrapped they ran against the real path however long it was. ``hrp-check-roundtrip``
+shortens the *copy* it works in rather than the tree it reads from -- every HEASOFT call
+in the check happens inside the copy, and the read side is the one measured good to 247
+characters. This is insurance against the 128-character limit only; it does nothing for
+``addspec``'s 80-character ``RESPFILE`` buffer, which is why the staging above makes bare
+names instead.
+
 The workspace also has to survive being where the temporary directory is long.
 ``tempfile.gettempdir()`` honours ``TMPDIR``, which on macOS is 48 characters under
 ``/var/folders``; ``short_workspace`` therefore takes the shortest writable choice among
@@ -2153,6 +3510,17 @@ one-writer-one-file-name rule below is untouched.
 ``arrays_from_earlier_run`` says which of the two happened. Where it is true the page
 draws the figure and says, next to it, that this run did not run the step -- the timeline
 goes on reporting ``skipped``, because a page must never claim work that did not happen.
+
+That flag is about *provenance*, not about existence, and conflating the two cost a
+second bug. ``recover.py`` sets it by hand, through ``rec.from_earlier_outputs()``,
+because it measures now but measures an old run's output -- and ``as_dict()`` took the
+flag alone as reason enough to name a payload. A recovered step that records no arrays,
+which is the ordinary fate of a CHU-split event file with fewer than twenty usable
+events, then wrote down the name of an ``.npz`` that had never been created, and every
+later read of that record logged ``Ignoring unreadable array payload``. Forty lines of it
+per run. ``as_dict()`` now decides the two questions separately: the record names a
+payload only when one is really on disk, and only such a record can be marked as coming
+from an earlier run.
 
 Source separation needed one more change to fit this. It skips per *directory* and used
 to ``continue`` in silence, opening no record at all, so the step was missing from the
@@ -2319,7 +3687,7 @@ Building the pages
 
 Plotly, with a hand-written ``string.Template`` shell rather than jinja2, and imported
 inside the figure builders so that ``import heasarc_retrieve_pipeline`` still works
-without it. Four measurements shaped the rest:
+without it. Five measurements shaped the rest:
 
 * ``to_html(..., include_plotlyjs="directory")`` emits a **bare** ``src="plotly.min.js"``
   with no directory part, and ``to_html`` never copies the bundle -- only ``write_html``
@@ -2331,6 +3699,36 @@ without it. Four measurements shaped the rest:
   theme boilerplate saved per page.
 * dtype drives page size linearly, so arrays are cast before they reach plotly: a
   100x100 image is 110.7 kB as float64, 55.9 as float32 and 27.1 as uint16.
+* ``add_vrect`` is not usable in a loop. On a subplot figure it spans every row by
+  default, and before adding each shape it scans the shapes already present to find the
+  empty subplots. Drawing the removed intervals of ``flare_figure`` one call at a time
+  therefore cost more than the square of their number:
+
+  .. list-table::
+     :header-rows: 1
+
+     * - intervals
+       - one ``add_vrect`` each
+       - one ``update_layout``
+     * - 100
+       - 21.7 s
+       - 0.045 s
+     * - 200
+       - 110.4 s
+       - 0.074 s
+     * - 400
+       - 662.4 s
+       - 0.150 s
+     * - 800
+       - 4285.9 s
+       - 0.260 s
+
+  This was the batch hang: a solar-flare filtering that removed several hundred intervals
+  left ``write_page`` drawing for the best part of an hour, holding a worker of the
+  process pool, and with two workers gone that way a four-wide run looked stopped. The
+  shapes are now built by ``_row_spans`` and assigned in one call, which is linear -- 800
+  intervals in 0.3 s. ``_row_spans`` reproduces ``add_vrect`` exactly, empty-row
+  exclusion included, and the tests assert that against ``add_vrect`` itself.
 
 The figure data is inline in the page, deliberately. Moving it to sidecar files the page
 fetched would be smaller, but ``fetch()`` against ``file://`` is blocked, and these pages
@@ -2374,7 +3772,13 @@ Relevant environment:
     directory of ``utils.short_workspace``. Do not set it by hand for a parallel
     run: a shared parameter directory is what the private one exists to avoid.
 ``CALDB``
-    Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``.
+    Required by ``nupipeline``, ``nicerl2``, ``nuproducts`` and ``barycorr``. For Chandra,
+    ``ciao.ciao_environment`` overrides it with the calibration database beside a conda
+    CIAO installation, when there is one -- see *Chandra / ACIS and HRC*.
+``ASCDS_INSTALL``, and CIAO's tasks on ``PATH``
+    Required for Chandra. CIAO is reached with ``subprocess``, never imported, so it can
+    live in an environment of its own with its own Python; putting ``$ASCDS_INSTALL/bin``
+    on ``PATH`` is enough. ``ciao.HAS_CIAO`` records whether both are present.
 
 Required at runtime, beyond the standard scientific stack: ``prefect``, ``astroquery``,
 ``pyvo``, ``pySmartDL``, ``beautifulsoup4`` and ``pyyaml``. Everything else is an extra,
@@ -2393,7 +3797,7 @@ The suite lives in ``heasarc_retrieve_pipeline/tests`` and is run with::
     pytest --pyargs heasarc_retrieve_pipeline
 
 Almost all of it is offline and needs no HEASOFT: about 900 tests and 47 module doctests,
-in under a minute. Four markers divide up what is not:
+in under a minute. Five markers divide up what is not:
 
 ``remote_data``
     The four functions in ``tests/test_pipeline.py`` that talk to HEASARC and to AWS.
@@ -2417,6 +3821,19 @@ in under a minute. Four markers divide up what is not:
     ``nupipeline``, ``nuproducts``, ``nusplitsc``, ``nicerl2`` and ``barycorr`` need
     calibration files and minutes of CPU, and stay stubbed.
 
+``ciao``
+    ``tests/test_ciao_tools.py``: the same idea for CIAO, on a fabricated event list so
+    that no calibration or download is needed. Skipped unless ``ASCDS_INSTALL`` is set
+    and ``dmlist`` is on ``PATH``, which CI never has, so they run locally. They check the
+    three beliefs the Chandra flare step is built on -- that ``dmcopy "[@file.gti]"``
+    intersects with the file's own good times, that ``[exclude ...]`` beside another
+    filter is refused, and that ``dmextract`` writes zero-exposure bins in a gap of the
+    good times -- and that the filter strings :mod:`heasarc_retrieve_pipeline.chandra`
+    builds are accepted by the real tools. ``specextract``, ``psfsize_srcs``,
+    ``pileup_map``, ``axbary`` and ``chandra_repro`` need calibration or a real
+    observation and stay stubbed; they were verified end to end on obsids ``5644`` and
+    ``8190``.
+
 (no marker)
     Everything else: the path builders, the GTI arithmetic, the image analysis, the RXTE
     screening, the report writer, the split/merge round trip, and a set of tests that
@@ -2426,3 +3843,51 @@ in under a minute. Four markers divide up what is not:
 
 Continuous integration runs all of this through ``tox``; see ``tox.ini`` and
 ``.github/workflows/ci_tests.yml``. Every environment CI uses can be run locally by name.
+
+One temporary Prefect server per environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Several tests call a flow's ``.fn`` to run its body without Prefect, and that body then
+calls a task -- ``filter_from_solar_flares`` calls ``record_flare_filtering`` this way.
+A task invoked with no flow context makes Prefect start a **temporary server**, and a
+server starting runs ``alembic upgrade head`` on ``$PREFECT_HOME/prefect.db``.
+
+``PREFECT_HOME`` defaults to ``~/.prefect``, so **every environment on the machine shares
+one database**, and they do not all have the same Prefect. The first run in the newer one
+migrates the file and stamps a revision the older one's migration scripts do not contain;
+from then on the older environment cannot start a server at all::
+
+    alembic.util.exc.CommandError: Can't locate revision identified by 'f416ea180ae1'
+    ERROR | uvicorn.error - Application startup failed. Exiting.
+
+Nothing says so where it happens. ``filter_from_solar_flares`` logs its diagnostic's
+failure rather than raising it -- the science product is already written -- so the
+``RuntimeError: Timed out while attempting to connect to ephemeral Prefect API server``
+appears only as a warning, and the test fails later on a record that is simply missing
+everything ``record_flare_filtering`` would have put in it::
+
+    KeyError: 'n_intervals_removed'
+
+``conftest.py`` therefore gives the suite a database of its own, before Prefect is
+imported, under the system temporary directory and **named after the installed Prefect**::
+
+    $TMPDIR/heasarc_retrieve_pipeline-prefect-3.7.4
+
+Keying the directory on the version is what makes this a fix rather than a reprieve:
+emptying the shared database works until the next run in the newer environment migrates it
+forward again, while two versions that never share a file cannot collide at all. It is
+``setdefault``, so a run that wants a particular database -- the real one, or the scratch
+one a parallel reduction is pointed at -- still says so from the outside. Four guards in
+``tests/test_prefect_wiring.py`` hold it.
+
+Measured on 2026-09-12, ``test_nustar.py`` in an environment with Prefect 3.7.4 against a
+``~/.prefect`` last migrated by 3.8.4: **15 failed** in 150 s, every one of them waiting out
+a server timeout. With the private home: **164 passed, 6 skipped in 11 s**.
+
+A **production** run is not covered by any of this -- nothing imports ``conftest.py`` -- so
+set ``PREFECT_HOME`` for it as above, which the parallel-run recipe earlier in this document
+already does for a different reason. To tell the failure apart from a real one, compare the
+database's stamp with the migrations the installed Prefect actually has::
+
+    sqlite3 ~/.prefect/prefect.db 'select * from alembic_version'
+    ls $CONDA_PREFIX/lib/python3.*/site-packages/prefect/server/database/_migrations/versions/sqlite/

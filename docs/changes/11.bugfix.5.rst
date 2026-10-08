@@ -1,0 +1,1 @@
+An observation with no science data is no longer counted as a reduction, and a previous run's ODF summary is cleared so that an XMM observation can be reduced twice.

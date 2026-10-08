@@ -34,7 +34,7 @@ from prefect.tasks import task_input_hash
 import subprocess
 import os
 
-from .barycenter import barycenter_file
+from .barycenter import barycenter_ephemeris, barycenter_file, barycenter_tool
 from .utils import absolute_config
 
 from . import heasoft
@@ -257,6 +257,8 @@ def barycenter_data(obsid: str, ra: float, dec: float, config: dict):
         attorb=orbit_file,
         ra=float(ra),
         dec=float(dec),
+        tool=barycenter_tool(config),
+        ephem=barycenter_ephemeris(config),
     )
 
 

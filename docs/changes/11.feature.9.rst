@@ -1,0 +1,1 @@
+The package version is logged at info level on import and in every ``hrp-*`` command, and those commands' own logging is no longer silenced by Prefect.

@@ -461,3 +461,21 @@ class TestARerunKeepsWhatTheLastRunMeasured:
         record = read_records(str(tmp_path))[0]
         assert record["arrays"] is None
         assert record["arrays_from_earlier_run"] is False
+
+    def test_a_recovery_that_measures_nothing_promises_no_payload(self, tmp_path):
+        """
+        ``from_earlier_outputs`` says the work is old, not that a payload exists.
+
+        :mod:`heasarc_retrieve_pipeline.recover` marks every record it opens, and then
+        the measurement can decline to record arrays -- a CHU-split event file with
+        fewer than 20 usable events, which is most of them. Naming a ``.npz`` that was
+        never written makes every later read of that record warn.
+        """
+        with record_step(str(tmp_path), OBSID, "join") as rec:
+            rec.from_earlier_outputs()
+            rec.skip("fewer than 20 events passed the energy and sky-position filter")
+
+        record = read_records(str(tmp_path))[0]
+        assert record["arrays"] is None
+        assert record["arrays_from_earlier_run"] is False
+        assert read_arrays(str(tmp_path), record) is None

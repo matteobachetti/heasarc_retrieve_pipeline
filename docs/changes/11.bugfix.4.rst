@@ -1,0 +1,1 @@
+A Chandra HRC observation is no longer given ACIS's pixel scale, HRC parts compare their time resolution like with like, and a cut part is given its own pointing and a name that ``specextract`` accepts. The time resolution a Chandra observation can actually support is reported, not what the header claims.

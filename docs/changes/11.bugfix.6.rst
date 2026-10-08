@@ -1,0 +1,1 @@
+``dataclasses.replace`` replaces ``copy.replace``, which only exists from Python 3.13, so the package works again on Python 3.10 to 3.12.

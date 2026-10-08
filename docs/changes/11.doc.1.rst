@@ -1,0 +1,1 @@
+Added the technical details, API and README sections for XMM-Newton, Chandra (including observations in parts), RXTE and the ``barycenter`` engine, and the known-issues entries and acceptance results for the M82 X-2 reductions.

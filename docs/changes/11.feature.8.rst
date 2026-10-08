@@ -1,0 +1,1 @@
+A mission can download only part of an observation directory, and each catalogue is queried only for the columns it actually has, which makes ``xmmmaster`` and ``chanmaster`` queryable. Catalogue OBSIDs are stored as strings.

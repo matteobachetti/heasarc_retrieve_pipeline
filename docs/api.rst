@@ -48,6 +48,24 @@ Missions
    :undoc-members:
    :show-inheritance:
 
+.. automodule:: heasarc_retrieve_pipeline.xmm
+   :members:
+   :show-inheritance:
+
+.. automodule:: heasarc_retrieve_pipeline.sas
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: heasarc_retrieve_pipeline.chandra
+   :members:
+   :show-inheritance:
+
+.. automodule:: heasarc_retrieve_pipeline.ciao
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Products
 --------
 
@@ -62,6 +80,11 @@ Products
    :show-inheritance:
 
 .. automodule:: heasarc_retrieve_pipeline.coadd
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: heasarc_retrieve_pipeline.spectral_fit
    :members:
    :undoc-members:
    :show-inheritance:

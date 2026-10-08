@@ -1,0 +1,1 @@
+RXTE PCA pointings are reduced: only the files that are read are downloaded, each PCU is screened separately (with the propane-veto rule deciding which units are usable on which dates), and the result is merged and barycentred. Pointings are then fused into searchable windows, with a guard against crossing a gain epoch.

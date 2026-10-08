@@ -1,0 +1,1 @@
+Observed fluxes with errors can be measured by fitting the extracted spectra in PyXspec, through ``cflux``. Spectra whose companion files (background, response) are named relative to them are loaded by turning XSPEC's prompting off.

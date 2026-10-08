@@ -42,7 +42,7 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
-from .barycenter import barycenter_file
+from .barycenter import barycenter_ephemeris, barycenter_file, barycenter_tool
 from .coadd import apply_case_b_scaling, run_addspec
 from .diagnostics import diagnostics_path, no_record, record_step
 from .image_utils import filter_sources_in_images
@@ -2013,6 +2013,8 @@ def barycenter_data(obsid, ra, dec, config, src=1):
             os.path.join(pipe_outdir, f"nu{obsid}A.attorb"),
             ra=ra,
             dec=dec,
+            tool=barycenter_tool(config),
+            ephem=barycenter_ephemeris(config),
         )
 
 

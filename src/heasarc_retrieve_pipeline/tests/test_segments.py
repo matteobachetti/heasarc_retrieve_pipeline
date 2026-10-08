@@ -641,6 +641,24 @@ class TestCommandLine:
         assert status == 0
         assert "2 segment(s)" in capsys.readouterr().out
 
+    def test_the_split_is_given_a_short_name_for_the_tree(self, tmp_path, monkeypatch):
+        """``nusplitsc`` was the tool the 128-character truncation was first measured on.
+        See utils.short_workspace."""
+        seen = {}
+
+        def fake_split(obsid, config, mjds, **kwargs):
+            # Resolved here, not in the assertion: short_workspace removes the link on
+            # the way out, and realpath of a name that is gone is the name itself.
+            seen.update(config, real=os.path.realpath(config["out_data_path"]))
+            return {"bounds": [], "spectra": [], "event_files": []}
+
+        monkeypatch.setattr(segments, "split_obsid", fake_split)
+        deep = tmp_path / ("d" * 60) / "out"
+        segments.main([str(deep), OBSID, "56000.5"])
+
+        assert len(seen["out_data_path"]) < len(str(deep))
+        assert seen["real"] == os.path.realpath(deep)
+
 
 class TestSegmentsSpanEachFile:
     """

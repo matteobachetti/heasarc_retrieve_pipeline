@@ -1,0 +1,1 @@
+SAS and CIAO tasks are invoked through one locked, checked entry point each (``sas.py``, ``ciao.py``) with per-observation parameter directories, and a missing ``pysas`` no longer means "no SAS".
