@@ -1,1 +1,1 @@
-Reduce XRISM/Resolve observations for timing: download the cleaned events and the orbit file, merge the cleaned files, and barycentre with the ``barycenter`` package, or HEASOFT ``barycen`` on DE200.
+Reduce XRISM/Resolve observations for timing: download the cleaned events and the orbit file, merge the cleaned files, optionally in an energy band, and barycentre with the ``barycenter`` package, or HEASOFT ``barycen`` on DE200.

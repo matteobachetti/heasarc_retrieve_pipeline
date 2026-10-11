@@ -143,6 +143,10 @@ DEFAULT_ITYPES = (0, 1, 2, 3, 4)
 CALIBRATION_PIXEL = 12
 
 #: Keywords that would be wrong in the merged file if copied from the first input.
+#: Resolve's ``PI`` channels per keV: one channel is 0.5 eV, over 0--59999. Checked on
+#: 101002010, where ``PI`` is twice ``EPI``, the energy in eV, for every event.
+PI_PER_KEV = 2000
+
 STALE_KEYWORDS = ("CHECKSUM", "DATASUM")
 
 
@@ -164,7 +168,11 @@ def _check_disjoint(gtis, event_files):
 
 
 def resolve_screened_events(
-    event_files, outfile, itypes=DEFAULT_ITYPES, exclude_pixels=(CALIBRATION_PIXEL,)
+    event_files,
+    outfile,
+    itypes=DEFAULT_ITYPES,
+    exclude_pixels=(CALIBRATION_PIXEL,),
+    energy_band=None,
 ):
     """
     Merge an observation's cleaned Resolve event files into one, keeping some grades.
@@ -183,6 +191,9 @@ def resolve_screened_events(
         Grades to keep (see :data:`ITYPE_NAMES`).
     exclude_pixels : iterable of int, optional
         Pixels to drop.
+    energy_band : (float, float), optional
+        Lowest and highest energy to keep, in keV, from ``PI``; the lower edge is kept and
+        the upper one is not. ``None`` keeps every energy.
 
     Returns
     -------
@@ -192,7 +203,8 @@ def resolve_screened_events(
     Raises
     ------
     ValueError
-        If the files' good time intervals overlap, or their columns differ.
+        If the files' good time intervals overlap, their columns differ, or
+        ``energy_band`` is empty.
 
     Notes
     -----
@@ -204,6 +216,10 @@ def resolve_screened_events(
     logger = get_logger()
     itypes = list(itypes)
     exclude_pixels = list(exclude_pixels)
+    if energy_band is not None:
+        emin, emax = (float(e) for e in energy_band)
+        if not emin < emax:
+            raise ValueError(f"The energy band {energy_band} keeps nothing.")
 
     parts, gtis, filters, exposure = [], [], [], 0.0
     for i, path in enumerate(event_files):
@@ -218,6 +234,9 @@ def resolve_screened_events(
                 raise ValueError(f"{path} has different columns from {event_files[0]}")
             data = events.data
             keep = np.isin(data["ITYPE"], itypes) & ~np.isin(data["PIXEL"], exclude_pixels)
+            if energy_band is not None:
+                pi = data["PI"]
+                keep &= (pi >= emin * PI_PER_KEV) & (pi < emax * PI_PER_KEV)
             parts.append(data[keep].copy())
             gtis.append(_intervals(hdul["GTI"].data))
             filters.append(str(events.header.get("FILTER", "UNKNOWN")).strip())
@@ -260,6 +279,9 @@ def resolve_screened_events(
     merged.header["ONTIME"] = ontime
     merged.header["FILTER"] = ",".join(dict.fromkeys(filters))
     merged.header["ITYPES"] = (",".join(str(t) for t in itypes), "Resolve grades kept")
+    if energy_band is not None:
+        merged.header["EMIN_KEV"] = (emin, "Lowest energy kept, from PI")
+        merged.header["EMAX_KEV"] = (emax, "Energy kept up to, excluded, from PI")
     for path, filt in zip(event_files, filters):
         merged.header["HISTORY"] = f"Merged {os.path.basename(path)} (FILTER={filt})"
     merged.header["HISTORY"] = "Merged by heasarc_retrieve_pipeline.xrism"
@@ -368,7 +390,8 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict):
     obsid : str
         Observation identifier.
     config : dict
-        ``resolve_itypes`` chooses the grades (default :data:`DEFAULT_ITYPES`).
+        ``resolve_itypes`` chooses the grades (default :data:`DEFAULT_ITYPES`), and
+        ``resolve_energy_band``, ``[emin, emax]`` in keV, the energies (default: all).
 
     Returns
     -------
@@ -386,7 +409,10 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict):
     os.makedirs(l2_dir, exist_ok=True)
     outfile = os.path.join(l2_dir, f"{obsid}_rsl_cl.evt")
     written = resolve_screened_events(
-        event_files, outfile, itypes=config.get("resolve_itypes", DEFAULT_ITYPES)
+        event_files,
+        outfile,
+        itypes=config.get("resolve_itypes", DEFAULT_ITYPES),
+        energy_band=config.get("resolve_energy_band"),
     )
     if written is None:
         logger.warning(f"{obsid}: no Resolve event survived screening")

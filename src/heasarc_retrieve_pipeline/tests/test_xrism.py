@@ -10,6 +10,7 @@ from heasarc_retrieve_pipeline.xrism import (
     barycentre_resolve,
     find_xrism_inputs,
     process_xrism_obsid,
+    reduce_observation,
     resolve_screened_events,
     xrism_base_output_path,
     xrism_download_filter,
@@ -125,8 +126,10 @@ class TestFindingTheInputs:
         assert os.path.basename(found["orbit_file"]) == "xa101002010.orb.gz"
 
 
-def write_resolve_file(path, times, itypes, pixels, gti, filt="OPEN", exposure=None):
-    """A minimal cleaned Resolve event file: the columns and keywords the merge reads."""
+def write_resolve_file(path, times, itypes, pixels, gti, filt="OPEN", exposure=None, pis=None):
+    """A minimal cleaned Resolve event file: the columns and keywords the merge reads.
+    PI defaults to 4000, 2 keV."""
+    pis = np.full(len(times), 4000) if pis is None else pis
     status = np.zeros((len(times), 16), dtype=bool)
     status[:, 3] = True
     events = fits.BinTableHDU.from_columns(
@@ -134,6 +137,7 @@ def write_resolve_file(path, times, itypes, pixels, gti, filt="OPEN", exposure=N
             fits.Column("TIME", "D", unit="s", array=times),
             fits.Column("ITYPE", "B", array=itypes),
             fits.Column("PIXEL", "B", array=pixels),
+            fits.Column("PI", "J", array=pis),
             fits.Column("STATUS", "16X", array=status),
         ],
         name="EVENTS",
@@ -207,6 +211,31 @@ class TestMergingTheCleanedFiles:
 
         assert list(fits.getdata(out, "EVENTS")["TIME"]) == [1.0, 31.0]
         assert fits.getheader(out, "EVENTS")["ITYPES"] == "0,1"
+
+    def test_an_energy_band_keeps_the_events_inside_it(self, tmp_path):
+        """PI counts 0.5 eV per channel; the band includes its lower edge, excludes its upper
+        one, and is recorded in the header."""
+        a = write_resolve_file(
+            tmp_path / "a.evt",
+            [1.0, 2.0, 3.0, 4.0],
+            [0] * 4,
+            [0] * 4,
+            [[0.0, 10.0]],
+            pis=[3000, 4000, 10000, 16000],
+        )
+
+        out = resolve_screened_events([a], str(tmp_path / "cl.evt"), energy_band=(2.0, 8.0))
+
+        assert list(fits.getdata(out, "EVENTS")["PI"]) == [4000, 10000]
+        header = fits.getheader(out, "EVENTS")
+        assert (header["EMIN_KEV"], header["EMAX_KEV"]) == (2.0, 8.0)
+
+    def test_an_empty_energy_band_is_refused(self, tmp_path):
+        """A band given upside down would otherwise silently keep nothing."""
+        a = write_resolve_file(tmp_path / "a.evt", [1.0], [0], [0], [[0.0, 10.0]])
+
+        with pytest.raises(ValueError, match="band"):
+            resolve_screened_events([a], str(tmp_path / "cl.evt"), energy_band=(8.0, 2.0))
 
     def test_files_that_overlap_in_time_are_refused(self, tmp_path):
         """Merging them would count the shared stretch twice."""
@@ -330,3 +359,20 @@ class TestTheFlow:
         out = process_xrism_obsid.fn(OBSID, config={"out_data_path": str(tmp_path)})
 
         assert out == os.path.join(str(root), "l2_files", f"{OBSID}_rsl_cl.evt")
+
+    def test_the_energy_band_comes_from_the_configuration(self, tmp_path):
+        """resolve_energy_band reaches the merge; without it every energy is kept."""
+        root = tmp_path / OBSID
+        (root / "resolve" / "event_cl").mkdir(parents=True)
+        write_resolve_file(
+            root / "resolve" / "event_cl" / f"xa{OBSID}rsl_p0px1000_cl.evt",
+            [1.0, 2.0],
+            [0, 0],
+            [0, 0],
+            [[0.0, 10.0]],
+            pis=[3000, 4000],
+        )
+
+        out = reduce_observation.fn(str(root), OBSID, {"resolve_energy_band": [2, 8]})
+
+        assert list(fits.getdata(out, "EVENTS")["PI"]) == [4000]

@@ -2976,6 +2976,15 @@ an event's energy is measured; every grade carries a time, and all five are kept
 default. On the Crab, Z^2_2 on the radio ephemeris is 7954 with all five and 6228 without
 Ls.
 
+Energies are chosen with ``config["resolve_energy_band"]``, ``[emin, emax]`` in keV,
+applied to ``PI``: one channel is 0.5 eV (on 101002010, ``PI`` is exactly twice ``EPI``,
+the energy in eV). The lower edge is kept and the upper one is not, the band is recorded
+as ``EMIN_KEV`` and ``EMAX_KEV``, and by default every energy is kept. Since Resolve cannot
+separate sources (see above), a band is how to cut the background and unpulsed sources
+for a faint pulsar. It is a single band: on a ``FILTER = FE55`` observation it removes the
+calibration source's 5.9 and 6.5 keV Mn K lines only if it lies wholly below or above
+them. 2--10 keV keeps 877596 of 101002010's 941064 events.
+
 Barycentring
 ~~~~~~~~~~~~
 
