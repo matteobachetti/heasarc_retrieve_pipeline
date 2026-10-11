@@ -2931,10 +2931,16 @@ timing. Xtend, the CCD camera, is not reduced: its frames are 4 s long, or 0.5 s
 
 Resolve is a 6x6 pixel array covering about 3 arcmin, with event times assigned to 5
 microseconds (``TIMEDEL``). As for NICER there is no source separation: everything on the
-array is in the event file. Pixel 12 is the calibration pixel, lit by its own 55Fe source
-and outside the sky aperture; the archive's cleaned files leave it out, and
-``resolve_screened_events`` drops it again in case one doesn't. The gate valve has been
-closed since launch (``GATEVALV = CLOSED``), which cuts the sensitivity below about 1.7 keV.
+array is in the event file. Choosing pixels would not help either: the mirror's
+half-power diameter is about 1.3 arcmin, against 30 arcsec pixels, so each source spreads
+over most of the array and a neighbour within an arcminute or two lands on the same
+pixels. A faint source's pulsed fraction is diluted by everything else in the field, and
+an energy band is the only cut that can improve it.
+
+Pixel 12 is the calibration pixel, lit by its own 55Fe source and outside the sky
+aperture; the archive's cleaned files leave it out, and ``resolve_screened_events`` drops
+it again in case one doesn't. The gate valve has been closed since launch
+(``GATEVALV = CLOSED``), which cuts the sensitivity below about 1.7 keV.
 
 What is downloaded
 ~~~~~~~~~~~~~~~~~~
@@ -2994,18 +3000,39 @@ sits a constant 190 microseconds (spread 0.03) from the DE440 one.
 The Crab check
 ~~~~~~~~~~~~~~
 
-Run by hand on 2026-10-11 on 101002010, through ``process_xrism_obsid`` at the Jodrell Bank
-position (83.6332180, 22.0144636), and folded on the Jodrell Bank CGRO-format monthly
-ephemeris valid for MJD 60584--60615 (epoch 60599, DE200), with the radio pulse time
-moved to the barycentre with astropy on DE430. The pulse is detected at Z^2_2 = 7983 on
-941064 events, so the barycentring holds coherently across the observation.
+Run on 2026-10-11 on 101002010 (processing version 03.00.013.009) at the Jodrell Bank
+position, in FK5 (83.63321667, 22.01446389), and folded with TOAExtractor on the Jodrell
+Bank CGRO-format monthly ephemeris valid for MJD 60584--60615 (epoch 60599). TOAExtractor
+reads the ephemeris from ``PLEPHEM`` and builds the radio model on it, so the radio and
+X-ray times are always on the same one. The barycentred events were made five ways:
+``barycen`` in FK5 (DE200), and the ``barycenter`` package on DE200, DE430 and DE440, all
+on the merged file, plus the package on DE200 on the ``px1000`` file alone at the
+position 83.6331221, 22.0144819.
 
-The X-ray main peak leads the radio one by about 550 microseconds (Hp; 2000 phase bins,
-Gaussian-smoothed). Other missions measure 150--400. This is an open question, not a
-pipeline defect that has been found: DE200 against DE440 is of order 20 microseconds for
-the Crab, too small to explain it, and the data were processed with version 03.00.013.009;
-later Crab observations processed with 03.03.015 have not been looked at. The Lp grade's
-peak sits a further ~150 microseconds earlier, on 52000 events.
+All five agree to 2 microseconds. TOAExtractor gives two measures of the main peak's
+offset from the radio one, and they differ:
+
+* ``residual``, the shift that best matches the whole profile to TOAExtractor's generic
+  Crab template: the X-ray peak leads by **328** microseconds;
+* ``fit_residual``, the maximum of an analytic model fitted to this profile: it leads by
+  **401 +- 18** microseconds. This is the figure in the ``barycenter`` package's own
+  documentation, which used the same data.
+
+The two measure different things when the X-ray profile is not the template's shape, so
+compare the same field between missions. A NICER observation folded the same way gives
+246 and 296, so Resolve's peak comes 80--105 microseconds before NICER's whichever field
+is used. That difference is not from barycentring, which agrees with ``barycen`` to
+89 ns; it may be instrumental timing, or the two epochs. Later Crab observations,
+processed with 03.03.015, have not been looked at.
+
+``residual_err`` is not to be trusted here: on the same events it came out anywhere
+between 9 microseconds and 1.4 ms. ``fit_residual_err`` was stable at 18. Moving the
+position by 0.32 arcsec shifts every event by 710 microseconds, but TOAExtractor builds
+the radio model at the file's own position, so the shift cancels in the offset; an error
+in the position only cancels like this when the timing model is built at it too.
+
+The pulse is detected at Z^2_2 = 7983 on 941064 events, so the barycentring holds
+coherently across the observation.
 
 Fluxes by spectral fitting
 --------------------------
