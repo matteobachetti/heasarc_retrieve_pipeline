@@ -1,0 +1,1 @@
+Reduce XRISM/Resolve observations for timing: download the cleaned events and the orbit file, merge the cleaned files, and barycentre with HEASOFT ``barycen``.

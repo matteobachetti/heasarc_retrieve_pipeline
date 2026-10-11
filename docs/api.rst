@@ -66,6 +66,11 @@ Missions
    :undoc-members:
    :show-inheritance:
 
+.. automodule:: heasarc_retrieve_pipeline.xrism
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 Products
 --------
 

@@ -2922,6 +2922,81 @@ Open questions
 * **Continuous Clocking.** Its ``chipx`` strips are a starting guess, never run on real
   data.
 
+XRISM / Resolve
+---------------
+
+:mod:`heasarc_retrieve_pipeline.xrism` reduces Resolve, XRISM's microcalorimeter, for
+timing. Xtend, the CCD camera, is not reduced: its frames are 4 s long, or 0.5 s in the
+1/8 window, which is too slow for most pulsars.
+
+Resolve is a 6x6 pixel array covering about 3 arcmin, with event times assigned to 5
+microseconds (``TIMEDEL``). As for NICER there is no source separation: everything on the
+array is in the event file. Pixel 12 is the calibration pixel, lit by its own 55Fe source
+and outside the sky aperture; the archive's cleaned files leave it out, and
+``resolve_screened_events`` drops it again in case one doesn't. The gate valve has been
+closed since launch (``GATEVALV = CLOSED``), which cuts the sensitivity below about 1.7 keV.
+
+What is downloaded
+~~~~~~~~~~~~~~~~~~
+
+The reduction starts from the archive's cleaned events, not from a rerun of
+``xapipeline``: they are already calibrated, clock-corrected (``CLOCKAPP = T``) and
+screened. ``DOWNLOAD_RE`` keeps the orbit file ``auxil/xa<OBSID>.orb`` and every
+``resolve/event_cl/xa<OBSID>rsl_*_cl.evt`` -- 62 MB of 101002010, whose attitude file alone
+is 33 MB. Calibration pointings (OBSIDs starting ``000``) have no cleaned files and are
+reported, not raised.
+
+Merging the cleaned files
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The archive writes one cleaned file per filter-wheel position, which the ``px<nnnn>`` code
+in the name stands for; read the ``FILTER`` keyword rather than the code. 101002010 (the
+Crab, 2024-10-03) has a 10.3 ks ``px1000`` file with ``FILTER = OPEN`` and a 16 s
+``px0000`` one with ``FILTER = UNDEF``, taken while the wheel moved, which fills a gap in
+the first file's good time intervals exactly. 100006040 (the Crab during performance
+verification) has a single ``px5000`` file with ``FILTER = FE55`` for its whole 15 ks: the
+calibration source was in the beam, so the file also holds unpulsed 5.9 keV Mn K photons.
+
+``resolve_screened_events`` concatenates the files, sorts the events by time and joins the
+intervals. Files whose intervals overlap are refused rather than double counted.
+``EXPOSURE`` is the sum of the inputs' (10356 s for 101002010, the catalogue's
+``exposure``), ``ONTIME`` the length of the joined intervals, and ``FILTER`` lists the
+inputs' values. The table is built column by column with ``BinTableHDU.from_columns``: a
+plain numpy concatenation turns the ``STATUS`` bit flags into raw bytes.
+
+Grades are chosen with ``config["resolve_itypes"]``. ``ITYPE`` 0--4 are Hp, Mp, Ms, Lp
+and Ls (high, medium and low resolution, primary or secondary). The grade sets how well
+an event's energy is measured; every grade carries a time, and all five are kept by
+default. On the Crab, Z^2_2 on the radio ephemeris is 7954 with all five and 6228 without
+Ls.
+
+Barycentring
+~~~~~~~~~~~~
+
+``barycentre_resolve`` runs HEASOFT ``barycen``, the barycentring task for Hitomi and XRISM
+(``barycorr`` cannot read their Keplerian orbit files), at the searched position, on the
+merged file and its good time intervals. ``barycen`` has no ephemeris parameter: its
+``refframe`` chooses DE200 (``FK5``) or **DE440** (``ICRS``), so XRISM is on DE440 and not
+on the DE430 of the other missions. The difference has not been measured. The
+``barycenter`` package is not used yet: asking for it, or for another ephemeris, logs a
+warning and runs ``barycen``.
+
+The Crab check
+~~~~~~~~~~~~~~
+
+Run by hand on 2026-10-11 on 101002010, through ``process_xrism_obsid`` at the Jodrell Bank
+position (83.6332180, 22.0144636), and folded on the Jodrell Bank CGRO-format monthly
+ephemeris valid for MJD 60584--60615 (epoch 60599, DE200), with the radio pulse time
+moved to the barycentre with astropy on DE430. The pulse is detected at Z^2_2 = 7983 on
+941064 events, so the barycentring holds coherently across the observation.
+
+The X-ray main peak leads the radio one by about 550 microseconds (Hp; 2000 phase bins,
+Gaussian-smoothed). Other missions measure 150--400. This is an open question, not a
+pipeline defect that has been found: DE200 against DE440 is of order 20 microseconds for
+the Crab, too small to explain it, and the data were processed with version 03.00.013.009;
+later Crab observations processed with 03.03.015 have not been looked at. The Lp grade's
+peak sits a further ~150 microseconds earlier, on 52000 events.
+
 Fluxes by spectral fitting
 --------------------------
 
