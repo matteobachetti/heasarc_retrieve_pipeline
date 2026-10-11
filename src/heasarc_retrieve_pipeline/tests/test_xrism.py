@@ -1,8 +1,13 @@
 import os
 import re
 
+import numpy as np
+import pytest
+from astropy.io import fits
+
 from heasarc_retrieve_pipeline.xrism import (
     find_xrism_inputs,
+    resolve_screened_events,
     xrism_base_output_path,
     xrism_download_filter,
 )
@@ -115,3 +120,100 @@ class TestFindingTheInputs:
 
         assert len(found["event_files"]) == 2
         assert os.path.basename(found["orbit_file"]) == "xa101002010.orb.gz"
+
+
+def write_resolve_file(path, times, itypes, pixels, gti, filt="OPEN", exposure=None):
+    """A minimal cleaned Resolve event file: the columns and keywords the merge reads."""
+    status = np.zeros((len(times), 16), dtype=bool)
+    status[:, 3] = True
+    events = fits.BinTableHDU.from_columns(
+        [
+            fits.Column("TIME", "D", unit="s", array=times),
+            fits.Column("ITYPE", "B", array=itypes),
+            fits.Column("PIXEL", "B", array=pixels),
+            fits.Column("STATUS", "16X", array=status),
+        ],
+        name="EVENTS",
+    )
+    gti = np.asarray(gti, dtype=float)
+    gti_hdu = fits.BinTableHDU.from_columns(
+        [fits.Column("START", "D", array=gti[:, 0]), fits.Column("STOP", "D", array=gti[:, 1])],
+        name="GTI",
+    )
+    for header in (events.header, gti_hdu.header):
+        header.update(TELESCOP="XRISM", INSTRUME="RESOLVE", TIMESYS="TT", MJDREFI=58484)
+        header.update(MJDREFF=0.000800740740741, TIMEUNIT="s", TSTART=gti[0, 0])
+        header["TSTOP"] = gti[-1, 1]
+    events.header["FILTER"] = filt
+    events.header["EXPOSURE"] = exposure if exposure is not None else float(np.ptp(gti))
+    events.header["CHECKSUM"] = "stale"
+    fits.HDUList([fits.PrimaryHDU(), events, gti_hdu]).writeto(path)
+    return str(path)
+
+
+class TestMergingTheCleanedFiles:
+    def make_crab_like(self, tmp_path):
+        """Two files shaped like 101002010's: a science one with a gap, and the short
+        filter-in-motion one that fills it exactly."""
+        science = write_resolve_file(
+            tmp_path / "px1000.evt",
+            [1.0, 2.0, 30.0, 31.0],
+            [0, 4, 3, 1],
+            [0, 35, 12, 5],
+            [[0.0, 10.0], [20.0, 40.0]],
+            exposure=29.0,
+        )
+        undef = write_resolve_file(
+            tmp_path / "px0000.evt", [15.0], [2], [7], [[10.0, 20.0]], filt="UNDEF"
+        )
+        return [science, undef]
+
+    def test_events_are_merged_in_time_order_without_the_calibration_pixel(self, tmp_path):
+        out = resolve_screened_events(self.make_crab_like(tmp_path), str(tmp_path / "cl.evt"))
+
+        with fits.open(out) as hdul:
+            assert list(hdul["EVENTS"].data["TIME"]) == [1.0, 2.0, 15.0, 31.0]
+            assert list(hdul["GTI"].data["START"]) == [0.0]
+            assert list(hdul["GTI"].data["STOP"]) == [40.0]
+
+    def test_bit_array_columns_survive_the_merge(self, tmp_path):
+        """A plain numpy concatenation turns the 16X STATUS flags into raw bytes."""
+        out = resolve_screened_events(self.make_crab_like(tmp_path), str(tmp_path / "cl.evt"))
+
+        status = fits.getdata(out, "EVENTS")["STATUS"]
+        assert status.shape == (4, 16)
+        assert status[:, 3].all() and not status[:, 4].any()
+
+    def test_the_exposure_keywords_describe_the_merged_file(self, tmp_path):
+        """EXPOSURE adds up the inputs', ONTIME is the joined intervals, and no stale
+        checksum is carried over from the first file."""
+        out = resolve_screened_events(self.make_crab_like(tmp_path), str(tmp_path / "cl.evt"))
+
+        header = fits.getheader(out, "EVENTS")
+        assert header["EXPOSURE"] == pytest.approx(29.0 + 10.0)
+        assert header["ONTIME"] == pytest.approx(40.0)
+        assert (header["TSTART"], header["TSTOP"]) == (0.0, 40.0)
+        assert header["FILTER"] == "OPEN,UNDEF"
+        assert "CHECKSUM" not in header
+        assert fits.getheader(out, "GTI")["TIMESYS"] == "TT"
+
+    def test_grades_can_be_chosen(self, tmp_path):
+        out = resolve_screened_events(
+            self.make_crab_like(tmp_path), str(tmp_path / "cl.evt"), itypes=[0, 1]
+        )
+
+        assert list(fits.getdata(out, "EVENTS")["TIME"]) == [1.0, 31.0]
+        assert fits.getheader(out, "EVENTS")["ITYPES"] == "0,1"
+
+    def test_files_that_overlap_in_time_are_refused(self, tmp_path):
+        """Merging them would count the shared stretch twice."""
+        a = write_resolve_file(tmp_path / "a.evt", [1.0], [0], [0], [[0.0, 10.0]])
+        b = write_resolve_file(tmp_path / "b.evt", [9.0], [0], [0], [[9.0, 20.0]])
+
+        with pytest.raises(ValueError, match="overlap"):
+            resolve_screened_events([a, b], str(tmp_path / "cl.evt"))
+
+    def test_nothing_surviving_is_reported_as_none(self, tmp_path):
+        a = write_resolve_file(tmp_path / "a.evt", [1.0], [0], [12], [[0.0, 10.0]])
+
+        assert resolve_screened_events([a], str(tmp_path / "cl.evt")) is None

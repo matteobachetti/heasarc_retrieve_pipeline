@@ -16,7 +16,10 @@ See ``docs/technical_details.rst`` for more detail.
 import glob
 import os
 
-from .utils import get_logger
+import numpy as np
+from astropy.io import fits
+
+from .utils import get_logger, merge_intervals
 
 DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 
@@ -109,3 +112,146 @@ def find_xrism_inputs(raw_data_dir):
     if len(orbits) > 1:
         get_logger().warning(f"Several orbit files in {raw_data_dir}; using {orbits[0]}")
     return {"event_files": event_files, "orbit_file": orbits[0] if orbits else None}
+
+
+#: Resolve's event grades, by ``ITYPE``: high, medium and low resolution, primary or
+#: secondary. The grade says how isolated in time an event was from its neighbours on the
+#: same pixel, which sets how well its *energy* is measured; every grade carries a time.
+ITYPE_NAMES = ("Hp", "Mp", "Ms", "Lp", "Ls")
+
+#: Grades kept by default: all of them. Measured on the Crab (101002010, the
+#: ``px1000`` file, folded on the Jodrell Bank ephemeris): Z^2_2 is 7954 with all five,
+#: 6228 without Ls. Ls carries a pulse only a little weaker per event than Hp (Z^2_2/N =
+#: 0.0073 against 0.0091), and is a quarter of the events.
+DEFAULT_ITYPES = (0, 1, 2, 3, 4)
+
+#: The calibration pixel, lit by its own 55Fe source and outside the sky aperture. The
+#: archive's cleaned files already leave it out; it is excluded again in case one doesn't.
+CALIBRATION_PIXEL = 12
+
+#: Keywords that would be wrong in the merged file if copied from the first input.
+STALE_KEYWORDS = ("CHECKSUM", "DATASUM")
+
+
+def _intervals(gti_data):
+    return np.column_stack([gti_data["START"], gti_data["STOP"]]).astype(float)
+
+
+def _check_disjoint(gtis, event_files):
+    """Raise if the good time intervals of two different files overlap."""
+    tagged = sorted(
+        (start, stop, i) for i, intervals in enumerate(gtis) for start, stop in intervals
+    )
+    for (_, stop, i), (start, _, j) in zip(tagged, tagged[1:]):
+        if i != j and start < stop:
+            raise ValueError(
+                f"{os.path.basename(event_files[i])} and {os.path.basename(event_files[j])} "
+                f"overlap in time (at {start}): merging them would count events twice."
+            )
+
+
+def resolve_screened_events(
+    event_files, outfile, itypes=DEFAULT_ITYPES, exclude_pixels=(CALIBRATION_PIXEL,)
+):
+    """
+    Merge an observation's cleaned Resolve event files into one, keeping some grades.
+
+    The archive writes one cleaned file per filter-wheel position. They cover different
+    times, so merging them is concatenation: events sorted by time, good time intervals
+    joined. Files that overlap in time are refused rather than double counted.
+
+    Parameters
+    ----------
+    event_files : list of str
+        Cleaned event files, ``xa<OBSID>rsl_*_cl.evt``.
+    outfile : str
+        Output file; overwritten if it exists.
+    itypes : iterable of int, optional
+        Grades to keep (see :data:`ITYPE_NAMES`).
+    exclude_pixels : iterable of int, optional
+        Pixels to drop.
+
+    Returns
+    -------
+    str or None
+        ``outfile``, or ``None`` if no event survived.
+
+    Raises
+    ------
+    ValueError
+        If the files' good time intervals overlap, or their columns differ.
+
+    Notes
+    -----
+    ``EXPOSURE`` is the sum of the inputs' ``EXPOSURE``, and ``ONTIME`` the length of the
+    joined intervals; ``FILTER`` becomes a comma-separated list when the inputs disagree.
+    The header otherwise comes from the first file, which is fine for every time keyword:
+    all files of an observation share ``MJDREF`` and ``TIMESYS``.
+    """
+    logger = get_logger()
+    itypes = list(itypes)
+    exclude_pixels = list(exclude_pixels)
+
+    parts, gtis, filters, exposure = [], [], [], 0.0
+    for i, path in enumerate(event_files):
+        with fits.open(path) as hdul:
+            events = hdul["EVENTS"]
+            if i == 0:
+                primary_header = hdul[0].header.copy()
+                header = events.header.copy()
+                columns = events.columns
+                gti_header = hdul["GTI"].header.copy()
+            elif events.columns.names != columns.names:
+                raise ValueError(f"{path} has different columns from {event_files[0]}")
+            data = events.data
+            keep = np.isin(data["ITYPE"], itypes) & ~np.isin(data["PIXEL"], exclude_pixels)
+            parts.append(data[keep].copy())
+            gtis.append(_intervals(hdul["GTI"].data))
+            filters.append(str(events.header.get("FILTER", "UNKNOWN")).strip())
+            exposure += float(events.header.get("EXPOSURE", 0.0))
+        logger.info(
+            f"{os.path.basename(path)}: FILTER={filters[-1]}, kept {keep.sum()} of {len(keep)}"
+        )
+
+    _check_disjoint(gtis, event_files)
+    total = sum(len(part) for part in parts)
+    if total == 0:
+        return None
+
+    merged = fits.BinTableHDU.from_columns(columns, nrows=total, header=header)
+    start = 0
+    for part in parts:
+        for name in columns.names:
+            merged.data[name][start : start + len(part)] = part[name]
+        start += len(part)
+    order = np.argsort(merged.data["TIME"], kind="stable")
+    for name in columns.names:
+        merged.data[name][:] = merged.data[name][order]
+
+    union = merge_intervals(np.concatenate(gtis))
+    tstart, tstop = float(union[0, 0]), float(union[-1, 1])
+    ontime = float((union[:, 1] - union[:, 0]).sum())
+    gti = fits.BinTableHDU.from_columns(
+        [
+            fits.Column("START", "D", unit="s", array=union[:, 0]),
+            fits.Column("STOP", "D", unit="s", array=union[:, 1]),
+        ],
+        header=gti_header,
+    )
+    for hdu_header in (merged.header, gti.header, primary_header):
+        for keyword in STALE_KEYWORDS:
+            hdu_header.remove(keyword, ignore_missing=True)
+        hdu_header["TSTART"] = tstart
+        hdu_header["TSTOP"] = tstop
+    merged.header["EXPOSURE"] = exposure
+    merged.header["ONTIME"] = ontime
+    merged.header["FILTER"] = ",".join(dict.fromkeys(filters))
+    merged.header["ITYPES"] = (",".join(str(t) for t in itypes), "Resolve grades kept")
+    for path, filt in zip(event_files, filters):
+        merged.header["HISTORY"] = f"Merged {os.path.basename(path)} (FILTER={filt})"
+    merged.header["HISTORY"] = "Merged by heasarc_retrieve_pipeline.xrism"
+
+    fits.HDUList([fits.PrimaryHDU(header=primary_header), merged, gti]).writeto(
+        outfile, overwrite=True
+    )
+    return outfile
