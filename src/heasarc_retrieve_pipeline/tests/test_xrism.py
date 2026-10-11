@@ -5,8 +5,11 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
+from heasarc_retrieve_pipeline import xrism
 from heasarc_retrieve_pipeline.xrism import (
+    barycentre_resolve,
     find_xrism_inputs,
+    process_xrism_obsid,
     resolve_screened_events,
     xrism_base_output_path,
     xrism_download_filter,
@@ -217,3 +220,81 @@ class TestMergingTheCleanedFiles:
         a = write_resolve_file(tmp_path / "a.evt", [1.0], [0], [12], [[0.0, 10.0]])
 
         assert resolve_screened_events([a], str(tmp_path / "cl.evt")) is None
+
+
+def fake_barycen(calls, timesys="TDB"):
+    """Stand-in for heasoft.run: records the call and writes a file on ``timesys``."""
+
+    def run(name, *, produces, **params):
+        calls.append((name, params))
+        write_resolve_file(params["outfile"], [1.0], [0], [0], [[0.0, 2.0]])
+        with fits.open(params["outfile"], mode="update") as hdul:
+            hdul["EVENTS"].header["TIMESYS"] = timesys
+
+    return run
+
+
+class TestBarycentring:
+    def test_barycen_gets_the_position_and_the_icrs_frame(self, tmp_path, monkeypatch):
+        """The searched position is passed explicitly, never left to the header, and ICRS
+        is what selects DE440 rather than barycen's DE200."""
+        calls = []
+        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen(calls))
+
+        out = barycentre_resolve(
+            "in_cl.evt", "xa1.orb.gz", 83.633218, 22.014464, outfile=str(tmp_path / "bary.evt")
+        )
+
+        ((name, params),) = calls
+        assert name == "barycen"
+        assert (params["ra"], params["dec"]) == (83.633218, 22.014464)
+        assert params["orbfile"] == "xa1.orb.gz"
+        assert params["refframe"] == "ICRS"
+        assert out == str(tmp_path / "bary.evt")
+
+    def test_a_file_left_on_spacecraft_time_is_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([], timesys="TT"))
+
+        with pytest.raises(RuntimeError, match="TT"):
+            barycentre_resolve("in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"))
+
+    def test_asking_for_the_package_or_another_ephemeris_warns(self, tmp_path, monkeypatch, caplog):
+        """barycen can do neither, and a run that asked should say so, not fail."""
+        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([]))
+        config = {"barycenter_tool": "barycenter", "barycenter_ephemeris": "DE430"}
+
+        barycentre_resolve(
+            "in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"), config=config
+        )
+
+        assert "does not handle XRISM" in caplog.text
+        assert "not DE430" in caplog.text
+
+    def test_a_default_run_does_not_warn(self, tmp_path, monkeypatch, caplog):
+        """The defaults name the package and DE430; warning about them every run is noise."""
+        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([]))
+
+        barycentre_resolve("in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"))
+
+        assert "WARNING" not in caplog.text
+
+
+class TestTheFlow:
+    def test_without_a_position_it_stops_at_the_merged_file(self, tmp_path, monkeypatch):
+        """No position means no barycentring: never fall back to the header target."""
+        root = tmp_path / OBSID
+        (root / "resolve" / "event_cl").mkdir(parents=True)
+        (root / "auxil").mkdir()
+        (root / "auxil" / f"xa{OBSID}.orb.gz").write_bytes(b"")
+        write_resolve_file(
+            root / "resolve" / "event_cl" / f"xa{OBSID}rsl_p0px1000_cl.evt",
+            [1.0],
+            [0],
+            [0],
+            [[0.0, 2.0]],
+        )
+        monkeypatch.setattr(xrism, "barycentre_resolve", lambda *a, **k: pytest.fail("called"))
+
+        out = process_xrism_obsid.fn(OBSID, config={"out_data_path": str(tmp_path)})
+
+        assert out == os.path.join(str(root), "l2_files", f"{OBSID}_rsl_cl.evt")

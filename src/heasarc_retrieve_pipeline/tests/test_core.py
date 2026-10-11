@@ -704,6 +704,20 @@ CATALOGUE_COLUMNS = {
         subject_category time xmm_revolution
         """.split()
     ),
+    # Recorded 2026-10-11.
+    "xrismmastr": set(
+        """
+        __row __x_ra_dec __y_ra_dec __z_ra_dec abstract bii caldb_version category_code
+        copi_fname copi_lname country cycle dec distribution_date duration end_time
+        exposure gencode lii name num_processed obs_type obsid pi_fname pi_lname priority
+        prnb processing_date processing_status processing_version public_date ra remarks
+        roll_angle rsl_adr rsl_datamode rsl_fil_be rsl_fil_fe55 rsl_fil_nd rsl_fil_open
+        rsl_fil_poly rsl_fil_undef rsl_gateval rsl_mxs1 rsl_mxs2 rsl_mxs3 rsl_mxs4 rsl_shp
+        rsl_thr rslcode software_version status subject_category time time_awarded title
+        xtd_dataclas1 xtd_dataclas2 xtd_datamode1 xtd_datamode2 xtd_exp_win1
+        xtd_exp_win1b xtd_exp_win2 xtd_exp_win2b xtd_expo xtd_num_modes xtdcode
+        """.split()
+    ),
     # Recorded 2026-10-01. One row per GBM day: no position, exposure or name.
     "fermigdays": set("__row day_number time end_time day_id tte_flag".split()),
 }
