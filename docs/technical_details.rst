@@ -2973,13 +2973,23 @@ Ls.
 Barycentring
 ~~~~~~~~~~~~
 
-``barycentre_resolve`` runs HEASOFT ``barycen``, the barycentring task for Hitomi and XRISM
-(``barycorr`` cannot read their Keplerian orbit files), at the searched position, on the
-merged file and its good time intervals. ``barycen`` has no ephemeris parameter: its
-``refframe`` chooses DE200 (``FK5``) or **DE440** (``ICRS``), so XRISM is on DE440 and not
-on the DE430 of the other missions. The difference has not been measured. The
-``barycenter`` package is not used yet: asking for it, or for another ephemeris, logs a
-warning and runs ``barycen``.
+``barycentre_resolve`` corrects the merged file and its good time intervals at the
+searched position. By default the ``barycenter`` package does it, on
+``barycenter_ephemeris`` (DE430 unless configured), like every other mission.
+
+With ``barycenter_tool: official`` it runs HEASOFT ``barycen`` instead, the barycentring
+task for Hitomi and XRISM (``barycorr`` cannot read their Keplerian orbit files).
+``barycen`` has no ephemeris parameter: its ``refframe`` chooses DE200 (``FK5``) or DE440
+(``ICRS``). Both were checked against the package, to 89 ns, but ``barycen`` writes
+``PLEPHEM = 'JPL-DE200'`` in either case, so a DE440 output would claim the wrong
+ephemeris, and a timing model built from that keyword (TOAExtractor builds one) would be
+off by the difference: DE440 minus DE200 is -788 microseconds on 101002010. The fallback is
+therefore always ``FK5`` and DE200, whose header is truthful, and asking it for another
+ephemeris logs a warning. ``refframe`` also sets the frame of ``ra`` and ``dec``, and
+DE200 timing models such as Jodrell Bank's quote FK5 positions.
+
+On 101002010 the fallback reproduces a hand ``barycen`` run exactly, and the DE430 output
+sits a constant 190 microseconds (spread 0.03) from the DE440 one.
 
 The Crab check
 ~~~~~~~~~~~~~~

@@ -7,7 +7,8 @@ inside the array is "the source", as for NICER. Xtend, the CCD camera, is not re
 its frames are seconds long, too slow for most pulsars.
 
 The entry point is :func:`process_xrism_obsid`: :func:`reduce_observation` merges the
-cleaned files, then :func:`barycentre_resolve` corrects them with HEASOFT ``barycen``.
+cleaned files, then :func:`barycentre_resolve` corrects them with the ``barycenter``
+package or, as a fallback, HEASOFT ``barycen``.
 
 The reduction does not rerun ``xapipeline``. The archive's ``resolve/event_cl`` files
 are already calibrated, clock-corrected (``CLOCKAPP = T``) and screened, and are what this
@@ -25,9 +26,10 @@ from prefect import flow, task
 
 from . import heasoft
 from .barycenter import (
-    OFFICIAL_TOOL,
+    PACKAGE_TOOL,
     barycenter_ephemeris,
     barycenter_tool,
+    barycenter_with_package,
     barycentered_file_name,
 )
 from .utils import absolute_config, get_logger, merge_intervals
@@ -37,7 +39,7 @@ DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
 #: What of an XRISM observation directory the reduction reads, matched on the whole
 #: remote path so that the directory anchors hold.
 #:
-#: * ``auxil/xa<OBSID>.orb``: the orbit file, which ``barycen`` reads.
+#: * ``auxil/xa<OBSID>.orb``: the orbit file, which barycentring reads.
 #: * ``resolve/event_cl/xa<OBSID>rsl_*_cl.evt``: every cleaned Resolve event file. An
 #:   observation can have several, one per filter-wheel position: 101002010 (the Crab,
 #:   2024-10-03) has a 10.3 ks ``px1000`` file with ``FILTER = OPEN`` and a 16 s ``px0000``
@@ -268,28 +270,49 @@ def resolve_screened_events(
     return outfile
 
 
-#: ``barycen``'s reference frame, and with it the ephemeris: ``FK5`` is DE200 and
-#: ``ICRS`` is **DE440**, and there is no other choice, so XRISM is not on the DE430 the
-#: other missions use. The difference has not been measured yet. ``refframe`` also says
-#: what frame ``ra`` and ``dec`` are in; the cleaned files say ``RADECSYS = FK5``, which
-#: ``barycen`` warns about and which, for a position given explicitly, does not matter.
-BARYCENTRE_REFFRAME = "ICRS"
+#: ``barycen``'s reference frame, and with it the ephemeris: ``FK5`` is DE200 and ``ICRS``
+#: is DE440, and there is no other choice. Both were checked against the ``barycenter``
+#: package to 89 ns, but ``barycen`` writes ``PLEPHEM = 'JPL-DE200'`` whichever it used, so
+#: only FK5 leaves a header that tells the truth. ``refframe`` also says what frame ``ra``
+#: and ``dec`` are in, and DE200 timing models such as Jodrell Bank's give FK5 positions.
+BARYCEN_REFFRAME = "FK5"
 
-#: The ephemeris :data:`BARYCENTRE_REFFRAME` implies.
-BARYCEN_EPHEMERIS = "DE440"
+#: The ephemeris :data:`BARYCEN_REFFRAME` implies.
+BARYCEN_EPHEMERIS = "DE200"
+
+
+def _barycen(infile, orbit_file, outfile, ra, dec, config):
+    """Run HEASOFT ``barycen`` on DE200, warning if the run asked for another ephemeris."""
+    asked = barycenter_ephemeris(config)
+    if "barycenter_ephemeris" in config and asked.strip().upper() != BARYCEN_EPHEMERIS:
+        get_logger().warning(
+            f"barycen is run on {BARYCEN_EPHEMERIS}, not {asked}: it cannot read a kernel, "
+            "and its DE440 mode mislabels its output. Use barycenter_tool: barycenter."
+        )
+    heasoft.run(
+        "barycen",
+        produces=outfile,
+        infile=infile,
+        outfile=outfile,
+        orbfile=orbit_file,
+        ra=float(ra),
+        dec=float(dec),
+        refframe=BARYCEN_REFFRAME,
+        clobber="yes",
+        chatter=2,
+    )
+    return BARYCEN_EPHEMERIS
 
 
 def barycentre_resolve(infile, orbit_file, ra, dec, outfile=None, config=None):
     """
-    Barycentre a Resolve event file with HEASOFT ``barycen``.
+    Barycentre a Resolve event file.
 
-    ``barycen`` is HEASOFT's barycentring task for Hitomi and XRISM, whose orbit files
-    hold Keplerian elements that ``barycorr`` cannot read. Events and good time intervals
-    are both corrected, and ``TIMESYS`` becomes ``TDB``.
-
-    The ``barycenter`` package is not used yet, whatever ``barycenter_tool`` says: asking
-    for it logs a warning and runs ``barycen``. Nor can the ephemeris be chosen: asking for
-    anything but :data:`BARYCEN_EPHEMERIS` logs a warning too.
+    The ``barycenter`` package does it by default, on ``barycenter_ephemeris`` (DE430
+    unless configured otherwise), like every other mission. With ``barycenter_tool:
+    official`` HEASOFT ``barycen`` does it instead, always on DE200: see
+    :data:`BARYCEN_REFFRAME` for why. Events and good time intervals are both corrected,
+    and ``TIMESYS`` becomes ``TDB``.
 
     Parameters
     ----------
@@ -303,7 +326,7 @@ def barycentre_resolve(infile, orbit_file, ra, dec, outfile=None, config=None):
     outfile : str, optional
         Defaults to :func:`~heasarc_retrieve_pipeline.barycenter.barycentered_file_name`.
     config : dict, optional
-        Read for ``barycenter_tool`` and ``barycenter_ephemeris``, only to warn.
+        Read for ``barycenter_tool`` and ``barycenter_ephemeris``.
 
     Returns
     -------
@@ -313,36 +336,23 @@ def barycentre_resolve(infile, orbit_file, ra, dec, outfile=None, config=None):
     Raises
     ------
     RuntimeError
-        If ``barycen`` fails, or reports success and leaves the file on spacecraft time.
+        If the tool fails, or reports success and leaves the file on spacecraft time.
     """
-    logger = get_logger()
-    # Warn only about what the run asked for explicitly; the defaults would make every
-    # XRISM run warn about the same thing.
     config = config or {}
-    if "barycenter_tool" in config and barycenter_tool(config) != OFFICIAL_TOOL:
-        logger.warning("The barycenter package does not handle XRISM yet: using barycen.")
-    asked = barycenter_ephemeris(config)
-    if "barycenter_ephemeris" in config and asked.strip().upper() != BARYCEN_EPHEMERIS:
-        logger.warning(f"barycen can only use {BARYCEN_EPHEMERIS}, not {asked}.")
     if outfile is None:
         outfile = barycentered_file_name(infile)
-
-    heasoft.run(
-        "barycen",
-        produces=outfile,
-        infile=infile,
-        outfile=outfile,
-        orbfile=orbit_file,
-        ra=float(ra),
-        dec=float(dec),
-        refframe=BARYCENTRE_REFFRAME,
-        clobber="yes",
-        chatter=2,
-    )
+    tool = barycenter_tool(config)
+    if tool == PACKAGE_TOOL:
+        ephemeris = barycenter_ephemeris(config)
+        barycenter_with_package(
+            infile, orbit_file, outfile, ra=float(ra), dec=float(dec), ephem=ephemeris
+        )
+    else:
+        ephemeris = _barycen(infile, orbit_file, outfile, ra, dec, config)
     timesys = fits.getheader(outfile, "EVENTS").get("TIMESYS")
     if timesys != "TDB":
-        raise RuntimeError(f"barycen returned success but left {outfile} on {timesys}")
-    logger.info(f"Barycentred {os.path.basename(outfile)} with barycen on {BARYCEN_EPHEMERIS}")
+        raise RuntimeError(f"{tool} returned success but left {outfile} on {timesys}")
+    get_logger().info(f"Barycentred {os.path.basename(outfile)} with {tool} on {ephemeris}")
     return outfile
 
 

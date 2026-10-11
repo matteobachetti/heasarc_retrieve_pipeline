@@ -234,49 +234,81 @@ def fake_barycen(calls, timesys="TDB"):
     return run
 
 
+def fake_package(calls, timesys="TDB"):
+    """Stand-in for barycenter_with_package: records the call and writes a file on ``timesys``."""
+
+    def run(infile, orbit, outfile, ra=None, dec=None, ephem=None, clockfile=None):
+        calls.append(dict(infile=infile, orbit=orbit, ra=ra, dec=dec, ephem=ephem))
+        fake_barycen([], timesys)("barycenter", produces=outfile, outfile=outfile)
+        return outfile
+
+    return run
+
+
+OFFICIAL = {"barycenter_tool": "official"}
+
+
 class TestBarycentring:
-    def test_barycen_gets_the_position_and_the_icrs_frame(self, tmp_path, monkeypatch):
-        """The searched position is passed explicitly, never left to the header, and ICRS
-        is what selects DE440 rather than barycen's DE200."""
+    def test_the_package_gets_the_position_and_the_configured_ephemeris(
+        self, tmp_path, monkeypatch
+    ):
+        """By default the package barycentres, at the searched position and on DE430, the
+        ephemeris every other mission uses."""
         calls = []
-        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen(calls))
+        monkeypatch.setattr(xrism, "barycenter_tool", lambda config: "barycenter")
+        monkeypatch.setattr(xrism, "barycenter_with_package", fake_package(calls))
 
         out = barycentre_resolve(
             "in_cl.evt", "xa1.orb.gz", 83.633218, 22.014464, outfile=str(tmp_path / "bary.evt")
+        )
+
+        (call,) = calls
+        assert (call["ra"], call["dec"]) == (83.633218, 22.014464)
+        assert call["orbit"] == "xa1.orb.gz"
+        assert call["ephem"] == "DE430"
+        assert out == str(tmp_path / "bary.evt")
+
+    def test_barycen_gets_the_position_and_the_fk5_frame(self, tmp_path, monkeypatch):
+        """The fallback runs barycen in FK5, which is DE200: the only frame whose output says
+        truthfully which ephemeris it used."""
+        calls = []
+        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen(calls))
+
+        barycentre_resolve(
+            "in_cl.evt",
+            "xa1.orb.gz",
+            83.633218,
+            22.014464,
+            outfile=str(tmp_path / "b.evt"),
+            config=OFFICIAL,
         )
 
         ((name, params),) = calls
         assert name == "barycen"
         assert (params["ra"], params["dec"]) == (83.633218, 22.014464)
         assert params["orbfile"] == "xa1.orb.gz"
-        assert params["refframe"] == "ICRS"
-        assert out == str(tmp_path / "bary.evt")
+        assert params["refframe"] == "FK5"
 
-    def test_a_file_left_on_spacecraft_time_is_an_error(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("tool", ["barycenter", "official"])
+    def test_a_file_left_on_spacecraft_time_is_an_error(self, tmp_path, monkeypatch, tool):
+        """Either tool reporting success on a file still on TT must not pass for barycentred."""
+        monkeypatch.setattr(xrism, "barycenter_tool", lambda config: tool)
+        monkeypatch.setattr(xrism, "barycenter_with_package", fake_package([], timesys="TT"))
         monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([], timesys="TT"))
 
         with pytest.raises(RuntimeError, match="TT"):
             barycentre_resolve("in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"))
 
-    def test_asking_for_the_package_or_another_ephemeris_warns(self, tmp_path, monkeypatch, caplog):
-        """barycen can do neither, and a run that asked should say so, not fail."""
+    def test_asking_barycen_for_another_ephemeris_warns(self, tmp_path, monkeypatch, caplog):
+        """barycen cannot do DE430, and a run that asked for it should say so, not fail."""
         monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([]))
-        config = {"barycenter_tool": "barycenter", "barycenter_ephemeris": "DE430"}
+        config = dict(OFFICIAL, barycenter_ephemeris="DE430")
 
         barycentre_resolve(
             "in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"), config=config
         )
 
-        assert "does not handle XRISM" in caplog.text
         assert "not DE430" in caplog.text
-
-    def test_a_default_run_does_not_warn(self, tmp_path, monkeypatch, caplog):
-        """The defaults name the package and DE430; warning about them every run is noise."""
-        monkeypatch.setattr(xrism.heasoft, "run", fake_barycen([]))
-
-        barycentre_resolve("in.evt", "o.orb", 0.0, 0.0, outfile=str(tmp_path / "b.evt"))
-
-        assert "WARNING" not in caplog.text
 
 
 class TestTheFlow:
