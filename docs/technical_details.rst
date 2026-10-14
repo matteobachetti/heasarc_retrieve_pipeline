@@ -2922,6 +2922,127 @@ Open questions
 * **Continuous Clocking.** Its ``chipx`` strips are a starting guess, never run on real
   data.
 
+XRISM / Resolve
+---------------
+
+:mod:`heasarc_retrieve_pipeline.xrism` reduces Resolve, XRISM's microcalorimeter, for
+timing. Xtend, the CCD camera, is not reduced: its frames are 4 s long, or 0.5 s in the
+1/8 window, which is too slow for most pulsars.
+
+Resolve is a 6x6 pixel array covering about 3 arcmin, with event times assigned to 5
+microseconds (``TIMEDEL``). As for NICER there is no source separation: everything on the
+array is in the event file. Choosing pixels would not help either: the mirror's
+half-power diameter is about 1.3 arcmin, against 30 arcsec pixels, so each source spreads
+over most of the array and a neighbour within an arcminute or two lands on the same
+pixels. A faint source's pulsed fraction is diluted by everything else in the field, and
+an energy band is the only cut that can improve it.
+
+Pixel 12 is the calibration pixel, lit by its own 55Fe source and outside the sky
+aperture; the archive's cleaned files leave it out, and ``resolve_screened_events`` drops
+it again in case one doesn't. The gate valve has been closed since launch
+(``GATEVALV = CLOSED``), which cuts the sensitivity below about 1.7 keV.
+
+What is downloaded
+~~~~~~~~~~~~~~~~~~
+
+The reduction starts from the archive's cleaned events, not from a rerun of
+``xapipeline``: they are already calibrated, clock-corrected (``CLOCKAPP = T``) and
+screened. ``DOWNLOAD_RE`` keeps the orbit file ``auxil/xa<OBSID>.orb`` and every
+``resolve/event_cl/xa<OBSID>rsl_*_cl.evt`` -- 62 MB of 101002010, whose attitude file alone
+is 33 MB. Calibration pointings (OBSIDs starting ``000``) have no cleaned files and are
+reported, not raised.
+
+Merging the cleaned files
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The archive writes one cleaned file per filter-wheel position, which the ``px<nnnn>`` code
+in the name stands for; read the ``FILTER`` keyword rather than the code. 101002010 (the
+Crab, 2024-10-03) has a 10.3 ks ``px1000`` file with ``FILTER = OPEN`` and a 16 s
+``px0000`` one with ``FILTER = UNDEF``, taken while the wheel moved, which fills a gap in
+the first file's good time intervals exactly. 100006040 (the Crab during performance
+verification) has a single ``px5000`` file with ``FILTER = FE55`` for its whole 15 ks: the
+calibration source was in the beam, so the file also holds unpulsed 5.9 keV Mn K photons.
+
+``resolve_screened_events`` concatenates the files, sorts the events by time and joins the
+intervals. Files whose intervals overlap are refused rather than double counted.
+``EXPOSURE`` is the sum of the inputs' (10356 s for 101002010, the catalogue's
+``exposure``), ``ONTIME`` the length of the joined intervals, and ``FILTER`` lists the
+inputs' values. The table is built column by column with ``BinTableHDU.from_columns``: a
+plain numpy concatenation turns the ``STATUS`` bit flags into raw bytes.
+
+Grades are chosen with ``config["resolve_itypes"]``. ``ITYPE`` 0--4 are Hp, Mp, Ms, Lp
+and Ls (high, medium and low resolution, primary or secondary). The grade sets how well
+an event's energy is measured; every grade carries a time, and all five are kept by
+default. On the Crab, Z^2_2 on the radio ephemeris is 7954 with all five and 6228 without
+Ls.
+
+Energies are chosen with ``config["resolve_energy_band"]``, ``[emin, emax]`` in keV,
+applied to ``PI``: one channel is 0.5 eV (on 101002010, ``PI`` is exactly twice ``EPI``,
+the energy in eV). The lower edge is kept and the upper one is not, the band is recorded
+as ``EMIN_KEV`` and ``EMAX_KEV``, and by default every energy is kept. Since Resolve cannot
+separate sources (see above), a band is how to cut the background and unpulsed sources
+for a faint pulsar. It is a single band: on a ``FILTER = FE55`` observation it removes the
+calibration source's 5.9 and 6.5 keV Mn K lines only if it lies wholly below or above
+them. 2--10 keV keeps 877596 of 101002010's 941064 events.
+
+Barycentring
+~~~~~~~~~~~~
+
+``barycentre_resolve`` corrects the merged file and its good time intervals at the
+searched position. By default the ``barycenter`` package does it, on
+``barycenter_ephemeris`` (DE430 unless configured), like every other mission.
+
+With ``barycenter_tool: official`` it runs HEASOFT ``barycen`` instead, the barycentring
+task for Hitomi and XRISM (``barycorr`` cannot read their Keplerian orbit files).
+``barycen`` has no ephemeris parameter: its ``refframe`` chooses DE200 (``FK5``) or DE440
+(``ICRS``). Both were checked against the package, to 89 ns, but ``barycen`` writes
+``PLEPHEM = 'JPL-DE200'`` in either case, so a DE440 output would claim the wrong
+ephemeris, and a timing model built from that keyword (TOAExtractor builds one) would be
+off by the difference: DE440 minus DE200 is -788 microseconds on 101002010. The fallback is
+therefore always ``FK5`` and DE200, whose header is truthful, and asking it for another
+ephemeris logs a warning. ``refframe`` also sets the frame of ``ra`` and ``dec``, and
+DE200 timing models such as Jodrell Bank's quote FK5 positions.
+
+On 101002010 the fallback reproduces a hand ``barycen`` run exactly, and the DE430 output
+sits a constant 190 microseconds (spread 0.03) from the DE440 one.
+
+The Crab check
+~~~~~~~~~~~~~~
+
+Run on 2026-10-11 on 101002010 (processing version 03.00.013.009) at the Jodrell Bank
+position, in FK5 (83.63321667, 22.01446389), and folded with TOAExtractor on the Jodrell
+Bank CGRO-format monthly ephemeris valid for MJD 60584--60615 (epoch 60599). TOAExtractor
+reads the ephemeris from ``PLEPHEM`` and builds the radio model on it, so the radio and
+X-ray times are always on the same one. The barycentred events were made five ways:
+``barycen`` in FK5 (DE200), and the ``barycenter`` package on DE200, DE430 and DE440, all
+on the merged file, plus the package on DE200 on the ``px1000`` file alone at the
+position 83.6331221, 22.0144819.
+
+All five agree to 2 microseconds. TOAExtractor gives two measures of the main peak's
+offset from the radio one, and they differ:
+
+* ``residual``, the shift that best matches the whole profile to TOAExtractor's generic
+  Crab template: the X-ray peak leads by **328** microseconds;
+* ``fit_residual``, the maximum of an analytic model fitted to this profile: it leads by
+  **401 +- 18** microseconds. This is the figure in the ``barycenter`` package's own
+  documentation, which used the same data.
+
+The two measure different things when the X-ray profile is not the template's shape, so
+compare the same field between missions. A NICER observation folded the same way gives
+246 and 296, so Resolve's peak comes 80--105 microseconds before NICER's whichever field
+is used. That difference is not from barycentring, which agrees with ``barycen`` to
+89 ns; it may be instrumental timing, or the two epochs. Later Crab observations,
+processed with 03.03.015, have not been looked at.
+
+``residual_err`` is not to be trusted here: on the same events it came out anywhere
+between 9 microseconds and 1.4 ms. ``fit_residual_err`` was stable at 18. Moving the
+position by 0.32 arcsec shifts every event by 710 microseconds, but TOAExtractor builds
+the radio model at the file's own position, so the shift cancels in the offset; an error
+in the position only cancels like this when the timing model is built at it too.
+
+The pulse is detected at Z^2_2 = 7983 on 941064 events, so the barycentring holds
+coherently across the observation.
+
 Fluxes by spectral fitting
 --------------------------
 

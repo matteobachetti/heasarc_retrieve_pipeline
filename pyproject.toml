@@ -63,6 +63,10 @@ test = [
 docs = [
     "sphinx",
 ]
+# Assembling the changelog from docs/changes/
+dev = [
+    "towncrier",
+]
 
 
 [project.scripts]
@@ -97,6 +101,45 @@ include = ["heasarc_retrieve_pipeline*"]
 
 [tool.setuptools_scm]
 version_file = "src/heasarc_retrieve_pipeline/_version.py"
+
+######## Changelog ########
+# One snippet per change in docs/changes/, named <PR number>.<type>[.<n>].rst; see
+# docs/changes/README.rst. `towncrier build --version X` folds them into CHANGES.rst.
+[tool.towncrier]
+package = "heasarc_retrieve_pipeline"
+package_dir = "src"
+directory = "docs/changes"
+filename = "CHANGES.rst"
+start_string = ".. towncrier release notes start\n"
+# CHANGES.rst's own title is "=", so a release is "-" and its sections are "^".
+underlines = ["-", "^", "~"]
+title_format = "{version} ({project_date})"
+issue_format = "`#{issue} <https://github.com/matteobachetti/heasarc_retrieve_pipeline/pull/{issue}>`__"
+
+[[tool.towncrier.type]]
+directory = "breaking"
+name = "Backwards-incompatible changes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "feature"
+name = "New features"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "bugfix"
+name = "Bug fixes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "doc"
+name = "Documentation"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "maintenance"
+name = "Internal changes"
+showcontent = true
 
 [tool.ruff]
 line-length = 100

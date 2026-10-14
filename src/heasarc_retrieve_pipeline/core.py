@@ -5,7 +5,7 @@ This module holds the parts of the pipeline that do not depend on which mission 
 data come from:
 
 * the ADQL queries against the HEASARC master catalogues
-  (``numaster``, ``nicermastr``, ``xtemaster``);
+  (``numaster``, ``nicermastr``, ``xtemaster``, ``xrismmastr``, ...);
 * the three download transports -- HTTPS directory scraping, anonymous S3, and a plain
   local copy for SciServer, all dispatched by :func:`recursive_download`;
 * the ``MISSION_CONFIG`` dispatch table, which maps a mission name to its catalogue,
@@ -53,6 +53,12 @@ from .chandra import (
     chandra_resolve_config,
     process_chandra_obsid,
     DEFAULT_CONFIG as CHANDRA_DEFAULT_CONFIG,
+)
+
+from .xrism import (
+    process_xrism_obsid,
+    xrism_download_filter,
+    DEFAULT_CONFIG as XRISM_DEFAULT_CONFIG,
 )
 
 from prefect import flow, task, get_run_logger
@@ -1062,6 +1068,22 @@ MISSION_CONFIG = {
         "name_column": "name",
         "download_filter": chandra_download_filter,
         "resolve_config": chandra_resolve_config,
+    },
+    "xrism": {
+        "table": "xrismmastr",
+        # The Resolve exposure: 10356 s for 101002010, the EXPOSURE of its cleaned files
+        # added up. Xtend's is xtd_expo.
+        "expo_column": "exposure",
+        # Untested; assume the catalogue may be wrong, as for NICER.
+        "zero_exposure_may_be_wrong": True,
+        # rsl_datamode and rsl_gateval are carried so that a run can say what it is about
+        # to reduce. The gate valve has been closed since launch, which cuts the
+        # sensitivity below ~1.7 keV.
+        "additional": "cycle, status, rsl_datamode, rsl_gateval",
+        "obsid_processing": process_xrism_obsid,
+        "default_config": XRISM_DEFAULT_CONFIG,
+        "name_column": "name",
+        "download_filter": xrism_download_filter,
     },
     # Retrieval only, for now: the reduction arrives with fermi_gbm.py.
     "fermi_gbm": {
