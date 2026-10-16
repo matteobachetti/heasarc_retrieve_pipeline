@@ -69,6 +69,68 @@ Pass ``source_position`` (an astropy ``SkyCoord``) to barycentre at a position o
 choosing. Without it, each observation is barycentred at its pointing -- for NuSTAR, at the
 position measured from the image. For a pulsar, always give the position you searched for.
 
+Searching by source name
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``retrieve_heasarc_data_by_source_name`` finds and reduces every observation of a source:
+
+.. code-block:: python
+
+    # See what would be reduced, without downloading anything
+    retrieve_heasarc_data_by_source_name("M82 X-2", mission="nustar", test=True)
+
+    # Then reduce all of it, four observations at a time
+    retrieve_heasarc_data_by_source_name("M82 X-2", mission="nustar", outdir="data",
+                                         radius_deg=0.2, n_workers=4)
+
+What it does, in order:
+
+1. **Resolves the name** with ``SkyCoord.from_name``, which asks the CDS name resolver (Sesame: SIMBAD,
+   NED, VizieR).
+2. **Cone-searches the mission's master catalogue** (``numaster``, ``nicermastr``,
+   ``xtemaster``, ``xmmmaster``, ``chanmaster``, ``xrismmastr``) for observations whose
+   *pointing* lies within ``radius_deg`` of the source, oldest first. The default, 0.1
+   degrees (6 arcmin), is cautious: a source well inside NuSTAR's or XMM's field can be
+   further than that from the pointing. Widen it to catch off-axis coverage.
+3. **Drops rows that are plans, not observations**: no exposure, or a negative one. A
+   zero exposure is also dropped for NuSTAR, where the catalogue means it, and kept for the
+   other missions, where it can be wrong.
+4. **Skips observations with no public data**, normally because they are still
+   proprietary, and says so in the log. Encrypted data can be reduced if you have the
+   passphrase: put ``<mission> <obsid> <passphrase>`` lines in
+   ``~/.heasarc_retrieve_pgp_keys``, or pass ``pgp_keys_file``.
+5. **Downloads and reduces** every observation found, exactly as
+   ``retrieve_heasarc_data_by_obsid`` would, with one difference: every observation is
+   barycentred at the **resolved position of the source**, not at its own pointing. For a
+   pulsation search, this is the call to use.
+
+It returns the catalogue table of the observations it processed. Two things it cannot do:
+pass ``flags`` to the Level-2 pipeline, or a mission ``config``. For those, run the same
+search as two steps:
+
+.. code-block:: python
+
+    from heasarc_retrieve_pipeline.core import (
+        get_source_position,
+        retrieve_heasarc_table_by_position,
+    )
+
+    position = get_source_position("M82 X-2")
+    table = retrieve_heasarc_table_by_position(position.ra.deg, position.dec.deg,
+                                               mission="xmm", radius_deg=0.2)
+    table = table[table["duration"] > 10000]    # any selection, but keep the __row column
+    retrieve_and_process_data(table, mission="xmm", outdir="data",
+                              source_position=position, config={"cameras": ["pn"]})
+
+The table can be filtered in any way in between, provided the ``__row`` column survives:
+it is what the archive uses to find the files.
+
+Fermi GBM is the exception: its catalogue has no positions, so ``mjd_start`` and
+``mjd_stop`` are required, and the resolved position is kept for barycentring.
+
+Every reduction also writes a record of what it did, step by step, and ``hrp-report``
+turns it into an HTML page per observation.
+
 **HEASOFT** must be set up (``HEADAS`` and ``CALDB``) for every mission: even where it
 does not reduce, it barycentres or provides reference data. Without it the package still
 queries and downloads, and stops there.
@@ -92,6 +154,27 @@ Downloaded         the whole observation directory
     # nupipeline parameters go through flags, for example
     retrieve_heasarc_data_by_obsid("80002092008", mission="nustar", outdir="data",
                                    flags={"saamode": "STRICT", "tentacle": "yes"})
+
+What the reduction does to the data:
+
+1. **Level 2** with ``nupipeline``: calibration, screening, cleaned event files per
+   module (FPMA, FPMB) and per observing mode. An observation with neither mode 01
+   (normal science) nor mode 06 (aspect from the spacecraft star trackers, usually
+   thrown away) is a slew or an engineering run, and stops here as "no science data".
+2. **Recovers mode 06** with ``nusplitsc``, which splits it by star-tracker combination,
+   each with its own aspect reconstruction.
+3. **Finds the source and its region** in the 3--79 keV image, with the extraction radius
+   that maximises signal-to-noise (at most 80 arcsec; needs the ``snr`` extra), and
+   **separates** each detected source and the background into their own event files.
+4. **Merges** the pieces, per module with the union of their good time intervals, then
+   the two modules together with their intersection, so the combined file has a
+   constant collecting area.
+5. **Removes solar flares**: intervals of GOES 1--8 A flux at or above C5, or HEK flares
+   of that class, are cut, once per observation.
+6. **Barycentres** every event file, at the given position, on DE430.
+7. **Spectra** with ``nuproducts``, one per module and per mode-06 piece, each with a
+   region measured in its own frame; then the two modules are **co-added** into
+   ``comb01`` (mode 01 only), ``comb06`` and ``comb0106`` (both, when there is mode 06).
 
 What lands on disk::
 
@@ -121,6 +204,16 @@ Downloaded         the whole observation directory
     # nicerl2 screening changes go through flags
     retrieve_heasarc_data_by_obsid("1104010106", mission="nicer", outdir="data",
                                    flags={"underonly_range": "0-400"})
+
+What the reduction does to the data:
+
+1. **Level 2** with ``nicerl2``: calibration, merging of all seven detector groups, and
+   the standard screening (orbit day/night, undershoot and overshoot rates, pointing
+   offset), into one cleaned event file. ``flags`` change the screening.
+2. **Barycentres** it with the observation's orbit file, on DE430.
+
+NICER has no imaging, so there is no source separation: everything in its 3-arcmin field
+is in the file.
 
 What lands on disk::
 
@@ -160,6 +253,22 @@ keeping depends on the date: PCU0 lost its propane veto layer on 2000-05-12 and 
     retrieve_and_process_data(table, mission="rxte", outdir="data",
                               config={"pcus": pcus})
 
+What the reduction does to the data -- all in Python except the last step:
+
+1. **Builds good time intervals per detector unit** from the filter file: Earth elevation
+   above 10 degrees, pointing offset below 0.02 degrees, more than 30 minutes since the
+   South Atlantic Anomaly, the unit switched on, and its electron ratio below 0.1. Per
+   unit, because units were switched on and off at different times.
+2. **Screens and merges the events**: every GoodXenon file of the pointing is read, and
+   each event is kept only inside its *own* unit's good time. Times are made absolute.
+   The good time of the union of units goes in ``GTI``, each unit's in ``GTI_PCU<n>``, and
+   ``EXPOSURE`` is the good time actually kept.
+3. **Barycentres** the events and all the interval extensions, with the pointing's orbit
+   file, on DE430.
+
+No energy calibration is applied: ``PHA`` and the mission keywords are kept, so that
+Stingray and HENDRICS can convert to keV themselves.
+
 What lands on disk::
 
     data/10408-01-05-000/...                    the raw pointing, as downloaded
@@ -196,6 +305,25 @@ The ODF route is about ten times slower. Its reason to exist is calibration, sin
 event list carries whatever the calibration was when it was made. Other useful keys:
 ``src_radius_arcsec`` (30), ``flare_rate_limit`` (``None`` means PPS's own threshold), and
 ``timing_src_rawx`` for timing-mode extraction.
+
+What the reduction does to the data, for every EPIC exposure (one camera, one exposure,
+one read-out mode) of the cameras asked for:
+
+1. **Front end**: on the PPS route, the archive's calibrated event lists; on the ODF route,
+   new ones from ``epproc`` and ``emproc``.
+2. **Calibration index** built with ``cifbuild`` for the observation date, against the
+   local calibration mirror.
+3. **Flare screening**: the background light curve is cut at PPS's own threshold for that
+   exposure (PPS route) or at 0.4 (pn) and 0.35 (MOS) counts/s above 10 keV (ODF route).
+   A timing exposure uses the imaging curve of the same exposure where there is one.
+4. **Regions**: a 30-arcsec circle and a background annulus (1.5--3 times the radius) in
+   imaging mode, checked to fit on the illuminated chip; detector columns 31--45 in pn
+   timing mode. MOS timing exposures are cleaned and skipped, as there is no safe default.
+5. **Pile-up** is measured with ``epatplot`` and reported, never corrected.
+6. **Barycentres** the cleaned and source event lists, with the PPS orbit file, on DE430.
+7. **Spectra** with ``especget``: source, background, ARF and RMF, grouped to 25 counts a
+   bin without oversampling the resolution by more than 3. pn, MOS1 and MOS2 are kept
+   apart, to be fitted jointly.
 
 What lands on disk, one set per exposure, named
 ``xmm<OBSID>_<camera>_<expid>_<mode>``::
@@ -238,6 +366,27 @@ An observation with no level-2 event list in the archive is switched to ``"repro
 own. CIAO's calibration database is found at ``$ASCDS_INSTALL/CALDB``, overriding the
 HEASOFT ``CALDB``; ``config["caldb"]`` overrides both.
 
+What the reduction does to the data:
+
+1. **Front end**: reads the archive's level-2 event list, or the one ``chandra_repro``
+   makes. Records the detector, the mode, the time resolution the data really support
+   (for HRC, from the dead-time file, not the header), and how old the calibration is.
+2. **Regions**: the source circle from the PSF size at 1 keV (90% of the energy), and an
+   annulus 1.5--3 times as large, checked for other sources.
+3. **Flare screening**: a background light curve in 200-s bins with the source cut out
+   (0.5--7 keV on ACIS); bins 3 sigma above the quiescent level are removed. A cut of
+   more than 10% of the exposure gets a warning, and one of more than 30% is reported
+   but not applied: on Chandra, a cut that eats a good observation is the worse mistake.
+4. **Cleaned events**: the whole field, with those intervals applied.
+5. **Pile-up** is measured for ACIS in timed-exposure mode and reported, never corrected.
+6. **Barycentres** with the ``barycenter`` package (or CIAO ``axbary``), then cuts the
+   source events out of the result.
+7. **Spectra** with ``specextract``, PSF-corrected, grouped to 15 counts a bin; grating
+   observations get their grating products instead.
+
+Barycentring comes before the spectrum, so an observation whose spectrum fails still has
+its timing products.
+
 What lands on disk, named ``chandra<OBSID, five digits>_<detector>_<mode>``::
 
     data/5644/primary/ secondary/                       the download
@@ -271,6 +420,18 @@ Downloaded         the orbit file and the cleaned Resolve event files: 62 MB
 ``resolve_energy_band`` is ``[emin, emax]`` in keV, all energies by default; 2--10 keV keeps
 877596 of this observation's 941064 events. ``resolve_itypes`` chooses the event grades, all
 five by default.
+
+What the reduction does to the data:
+
+1. **Merges the cleaned files**: the archive writes one per filter-wheel position. They
+   are joined in time, overlapping intervals are refused, and ``EXPOSURE`` is the sum.
+   Pixel 12, the calibration pixel, is dropped.
+2. **Selects** event grades (``resolve_itypes``) and the energy band
+   (``resolve_energy_band``), if asked to.
+3. **Barycentres** the merged file at the given position, on DE430.
+
+Resolve cannot separate sources: the mirror spreads each one over most of the array. An
+energy band is the only cut that helps a faint pulsar.
 
 What lands on disk::
 
