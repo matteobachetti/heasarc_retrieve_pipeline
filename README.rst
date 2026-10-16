@@ -57,6 +57,20 @@ through ``heasoftpy``, which pip cannot install; use the
 source build, and set ``HEADAS`` and ``CALDB`` before running anything. Without it the
 package still imports, queries and downloads -- it simply cannot reduce.
 
+Getting data
+------------
+
+.. code-block:: python
+
+    from heasarc_retrieve_pipeline.core import retrieve_heasarc_data_by_obsid
+
+    retrieve_heasarc_data_by_obsid("80002092008", mission="nustar", outdir="data")
+
+downloads one NuSTAR observation into ``data/80002092008/`` and reduces it there.
+``docs/examples.rst`` has one small example for each mission -- NuSTAR, NICER, RXTE,
+XMM-Newton, Chandra, XRISM, and the Fermi GBM query -- with what each needs installed
+and what it writes.
+
 Command-line tools
 ------------------
 

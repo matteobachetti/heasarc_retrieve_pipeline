@@ -1,0 +1,1 @@
+Add ``docs/examples.rst``: one small observation per mission, from the query to the products on disk.
