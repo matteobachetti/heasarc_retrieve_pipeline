@@ -1,0 +1,1 @@
+Publish the documentation on GitHub Pages from every push to ``main``, with the new ``docs_deploy.yml`` workflow.

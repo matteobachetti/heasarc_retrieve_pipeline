@@ -1,0 +1,71 @@
+# Publish the documentation on GitHub Pages.
+#
+# The build is the same tox environment the pull-request CI uses (`tox -e build_docs`,
+# which runs sphinx-build with warnings as errors), so a page that deploys is a page
+# that passed review. Only pushes to main deploy; pull requests only build, in ci_tests.yml.
+#
+# One-off setup, in the repository settings: Pages -> Build and deployment -> Source =
+# "GitHub Actions". Without it the deploy job fails with a 404.
+
+name: Deploy documentation
+
+on:
+  push:
+    branches:
+      - main
+  # Lets the maintainer republish by hand from the Actions tab.
+  workflow_dispatch:
+
+# What the deploy job needs, and nothing else.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deployment half way; a newer one waits its turn instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the HTML
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # setuptools-scm reads the version from git tags, so it needs the history.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tox
+        run: python -m pip install --upgrade pip tox
+
+      - name: Build the documentation
+        run: tox -e build_docs
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
