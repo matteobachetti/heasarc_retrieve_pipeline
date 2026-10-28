@@ -1,0 +1,1 @@
+SVOM reductions no longer crash on archive files whose ``DEADC`` keyword has no value; it counts as 1, like a missing one.

@@ -33,8 +33,11 @@ def identity(burst, pass_id):
     return dict(TIMING, OBS_ID=OBS_ID, BURST_ID=burst, PASS_ID=pass_id)
 
 
-def write_events(path, times, burst="n.a.", pass_id="000001_HBX", flag=None, pi=None, span=None):
-    """An ECLAIRs event file; ``span`` is (TSTART, TSTOP), the events' extent by default."""
+def write_events(
+    path, times, burst="n.a.", pass_id="000001_HBX", flag=None, pi=None, span=None, blank=()
+):
+    """An ECLAIRs event file; ``span`` is (TSTART, TSTOP), the events' extent by default;
+    the keywords in ``blank`` are written without a value, as the archive sometimes does."""
     times = np.asarray(times, dtype=float)
     n = times.size
     table = Table(
@@ -52,6 +55,8 @@ def write_events(path, times, burst="n.a.", pass_id="000001_HBX", flag=None, pi=
     hdu = fits.table_to_hdu(table)
     hdu.name = ecl.EVENTS_EXTNAME
     hdu.header.update(header)
+    for key in blank:
+        hdu.header[key] = None
     fits.HDUList([fits.PrimaryHDU(header=fits.Header(header)), hdu]).writeto(path)
     return str(path)
 
@@ -166,6 +171,23 @@ def test_a_pass_keeps_unflagged_events_once_and_only_inside_every_cut(tmp_path):
     assert summary["written"] == times.size
     assert summary["exposure_archive"] == 90.0
     assert summary["exposure_orbit"] == 80.0
+
+
+def test_blank_dead_time_keywords_give_an_exposure_equal_to_the_good_time(tmp_path):
+    """Archive files can carry ``DEADC`` and ``EXPOSURE`` with no value; a blank ``DEADC``
+    counts as 1, like a missing one, so ``EXPOSURE`` becomes the total good time."""
+    pairs = [
+        (
+            write_events(
+                tmp_path / "e.fits", np.arange(0.5, 10.0), span=(0, 10), blank=("DEADC", "EXPOSURE")
+            ),
+            write_gtis(tmp_path / "g.fits", all_good(0, 10)),
+        )
+    ]
+
+    written, _ = ecl.reduce_pass(pairs, str(tmp_path / "pass.evt"))
+
+    assert fits.getheader(written, ecl.EVENTS_EXTNAME)["EXPOSURE"] == 10.0
 
 
 def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, monkeypatch):

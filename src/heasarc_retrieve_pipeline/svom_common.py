@@ -331,7 +331,8 @@ def write_events(
     Write joined events under an input file's headers, with their GTI.
 
     ``TSTART``, ``TSTOP`` and ``TELAPSE`` describe the GTI and ``ONTIME`` is its total.
-    Without ``livetime``, an ``EXPOSURE`` already there becomes ``ONTIME`` times ``DEADC``;
+    Without ``livetime``, an ``EXPOSURE`` already there becomes ``ONTIME`` times ``DEADC``
+    (1 if missing or blank);
     with it, the events get ``LIVETIME`` and ``EXPOSURE`` equal to it, and ``DEADC`` their
     ratio to ``ONTIME``. ``stale_keywords`` are dropped from both headers.
 
@@ -367,7 +368,8 @@ def write_events(
         if "ONTIME" in hdu.header:
             hdu.header["ONTIME"] = ontime
         if "EXPOSURE" in hdu.header and livetime is None:
-            hdu.header["EXPOSURE"] = ontime * float(hdu.header.get("DEADC", 1.0))
+            deadc = hdu.header.get("DEADC")  # missing, or present without a value
+            hdu.header["EXPOSURE"] = ontime * (1.0 if deadc is None else float(deadc))
     if livetime is not None:
         events.header["ONTIME"] = (ontime, "[s] total of the GTI")
         events.header["LIVETIME"] = (livetime, "[s] ONTIME minus the summed DEAD_TIME")
