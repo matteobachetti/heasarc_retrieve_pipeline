@@ -1192,3 +1192,121 @@ class TestTheDownloadFilterReachesTheDownload:
 
         assert seen["re_include"] == r"EVLI"
         assert seen["re_exclude"] == r"\.PNG$"
+
+
+class TestMissionsOutsideHeasarc:
+    """
+    A mission whose data are not at HEASARC (SVOM) declares three hooks.
+
+    ``"catalogue"`` replaces the HEASARC query, ``"work_items"`` the datalink lookup and
+    ``"download"`` :func:`recursive_download`. Missions that declare none of them are
+    untouched, which the rest of this file already checks.
+    """
+
+    def fictional(self, monkeypatch, **hooks):
+        """Register a fictional mission with the given hooks, and nothing from HEASARC."""
+        monkeypatch.setitem(
+            core.MISSION_CONFIG, "fictional", dict(MISSION_CONFIG["nustar"], **hooks)
+        )
+        monkeypatch.setattr(core, "retrieve_heasarc_table_by_position", self.heasarc)
+        monkeypatch.setattr(core, "retrieve_info_for_obsid", self.heasarc)
+        monkeypatch.setattr(core, "locate_data", self.heasarc)
+        monkeypatch.setattr(core, "recursive_download", self.heasarc)
+        logger = SimpleNamespace(info=print, warning=print)
+        monkeypatch.setattr(core, "get_run_logger", lambda: logger)
+        return "fictional"
+
+    @staticmethod
+    def heasarc(*args, **kwargs):
+        pytest.fail("HEASARC was asked")
+
+    def test_the_search_by_name_asks_the_mission_catalogue(self, monkeypatch):
+        """Position, radius and the optional dates go to the hook, and its table is processed."""
+        position = SimpleNamespace(ra=SimpleNamespace(deg=83.6), dec=SimpleNamespace(deg=22.0))
+        calls = {}
+        mission = self.fictional(
+            monkeypatch, catalogue=lambda **kwargs: calls.setdefault("catalogue", kwargs)
+        )
+        monkeypatch.setattr(core, "get_source_position", lambda source: position)
+        monkeypatch.setattr(
+            core, "retrieve_and_process_data", lambda **kwargs: calls.setdefault("process", kwargs)
+        )
+
+        core.retrieve_heasarc_data_by_source_name.fn(
+            "Crab", mission=mission, radius_deg=40.0, mjd_start=60900.0, mjd_stop=60901.0
+        )
+
+        assert calls["catalogue"] == dict(
+            position=position, radius_deg=40.0, mjd_start=60900.0, mjd_stop=60901.0
+        )
+        assert calls["process"]["result_table"] is calls["catalogue"]
+
+    def test_the_search_by_obsid_asks_the_mission_catalogue(self, monkeypatch):
+        """OBSIDs go to the hook as a list, whether one or several were given."""
+        from astropy.table import Table
+
+        calls = {}
+
+        def catalogue(**kwargs):
+            calls["catalogue"] = kwargs
+            return Table({"obsid": ["123"]})
+
+        mission = self.fictional(monkeypatch, catalogue=catalogue)
+        monkeypatch.setattr(
+            core, "retrieve_and_process_data", lambda **kwargs: calls.setdefault("process", kwargs)
+        )
+
+        core.retrieve_heasarc_data_by_obsid.fn("123", mission=mission)
+
+        assert calls["catalogue"] == dict(obsids=["123"])
+        assert list(calls["process"]["result_table"]["obsid"]) == ["123"]
+
+    def test_the_work_items_come_from_the_mission(self, tmp_path, monkeypatch):
+        """No datalink lookup: the hook turns catalogue rows into work items directly."""
+        from astropy.table import Table
+
+        seen = {}
+        item = dict(obsid="123", url="fsc:123", ra=1.0, dec=2.0)
+        mission = self.fictional(
+            monkeypatch,
+            work_items=lambda table, position: (
+                seen.setdefault("args", (table, position)) and [item]
+            ),
+        )
+
+        def process(items, **kwargs):
+            seen["items"] = items
+
+        monkeypatch.setattr(
+            core, "process_observations", SimpleNamespace(with_options=lambda **kw: process)
+        )
+        table = Table({"obsid": ["123"]})
+
+        core.retrieve_and_process_data.fn(table, mission=mission, outdir=str(tmp_path))
+
+        assert seen["args"] == (table, None)
+        assert seen["items"] == [item]
+
+    def test_the_download_comes_from_the_mission(self, tmp_path, monkeypatch):
+        """The hook downloads, with the resolved config and the test flag."""
+        seen = {}
+        mission = self.fictional(
+            monkeypatch,
+            download=lambda obsid, url, outdir, config, test=False: seen.update(
+                obsid=obsid, url=url, outdir=outdir, test=test
+            ),
+        )
+
+        core.download_and_process_observation.fn(
+            "123",
+            "fsc:123",
+            83.0,
+            22.0,
+            str(tmp_path),
+            mission,
+            str(tmp_path / "pfiles"),
+            str(tmp_path / "work"),
+            test=True,
+        )
+
+        assert seen == dict(obsid="123", url="fsc:123", outdir=str(tmp_path), test=True)

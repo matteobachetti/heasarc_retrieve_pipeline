@@ -1099,6 +1099,18 @@ MISSION_CONFIG = {
     },
 }
 
+# A mission whose data are not at HEASARC (SVOM, at the French Science Center) declares
+# three more entries, and the HEASARC query, the datalink lookup and the HTTPS/S3 download
+# are not used for it:
+#
+# * ``"catalogue"``: ``catalogue(position=, radius_deg=, mjd_start=, mjd_stop=)`` for a
+#   search by name, ``catalogue(obsids=[...])`` for one by OBSID; returns a table with at
+#   least ``obsid``, ``ra`` and ``dec``;
+# * ``"work_items"``: ``work_items(result_table, source_position)``, the list of dicts
+#   :func:`observation_work_items` would return;
+# * ``"download"``: ``download(obsid, url, outdir, config, test=False)``, which fills
+#   ``<outdir>/<obsid>`` as :func:`recursive_download` would.
+
 
 #: The arguments a ``"download_filter"`` is allowed to return. They are the two
 #: :func:`recursive_download` already takes.
@@ -1916,12 +1928,16 @@ def download_and_process_observation(
             # Before the download, because what it decides is what gets downloaded.
             config = mission_resolve_config(mission, config, url)
 
-            recursive_download(
-                url,
-                outdir,
-                test=test,
-                **mission_download_filter(mission, config),
-            )
+            download = MISSION_CONFIG[mission].get("download")
+            if download is not None:
+                download(obsid, url, outdir, config, test=test)
+            else:
+                recursive_download(
+                    url,
+                    outdir,
+                    test=test,
+                    **mission_download_filter(mission, config),
+                )
             if test:
                 rec.skip("a test run: nothing was downloaded and nothing was processed")
                 return None
@@ -2249,26 +2265,31 @@ def retrieve_and_process_data(
     os.makedirs(outdir, exist_ok=True)
     logger = get_run_logger()
 
-    links = locate_data(result_table, MISSION_CONFIG[mission]["table"])
-    # Restore this once astroquery #3652 is fixed, and delete ``locate_data`` above:
-    # links = Heasarc.locate_data(
-    #     result_table, catalog_name=MISSION_CONFIG[mission]["table"]
-    # )
-    link_col_name = download_link_column(force_heasarc, force_s3)
-    if n_workers > 1 and link_col_name == "access_url":
-        logger.warning(
-            f"{n_workers} workers will scrape the HEASARC HTTPS archive in parallel. "
-            "The S3 mirror (the default, force_s3=True) serves parallel readers better."
-        )
+    work_items = MISSION_CONFIG[mission].get("work_items")
+    if work_items is not None:
+        # Not at HEASARC: no links to look up, no mirror to choose.
+        items = work_items(result_table, source_position)
+    else:
+        links = locate_data(result_table, MISSION_CONFIG[mission]["table"])
+        # Restore this once astroquery #3652 is fixed, and delete ``locate_data`` above:
+        # links = Heasarc.locate_data(
+        #     result_table, catalog_name=MISSION_CONFIG[mission]["table"]
+        # )
+        link_col_name = download_link_column(force_heasarc, force_s3)
+        if n_workers > 1 and link_col_name == "access_url":
+            logger.warning(
+                f"{n_workers} workers will scrape the HEASARC HTTPS archive in parallel. "
+                "The S3 mirror (the default, force_s3=True) serves parallel readers better."
+            )
 
-    items = observation_work_items(
-        result_table,
-        links,
-        link_col_name,
-        source_position,
-        mission=mission,
-        pgp_keys_file=pgp_keys_file,
-    )
+        items = observation_work_items(
+            result_table,
+            links,
+            link_col_name,
+            source_position,
+            mission=mission,
+            pgp_keys_file=pgp_keys_file,
+        )
     if test:
         items = items[:1]
 
@@ -2306,7 +2327,7 @@ def retrieve_heasarc_data_by_source_name(
     source: str,
     outdir: str = "out",
     mission: str = "nustar",
-    radius_deg: float = 0.1,
+    radius_deg: typing.Union[float, None] = None,
     test: bool = False,
     force_heasarc: bool = False,
     force_s3: bool = False,
@@ -2336,7 +2357,9 @@ def retrieve_heasarc_data_by_source_name(
     mission : str, optional
         One of the keys of ``MISSION_CONFIG``.
     radius_deg : float, optional
-        Cone-search radius in degrees, applied to the observation pointing.
+        Cone-search radius in degrees, applied to the observation pointing. The default
+        is 0.1 for the HEASARC catalogues; a mission with its own ``"catalogue"`` chooses
+        its own.
     test : bool, optional
         If True, fake the downloads and stop after the first observation.
     force_heasarc : bool, optional
@@ -2352,7 +2375,8 @@ def retrieve_heasarc_data_by_source_name(
         Path to PGP keys file for encrypted data; see :func:`retrieve_and_process_data`.
     mjd_start, mjd_stop : float or None, optional
         The interval to search, in MJD. Required for a mission whose catalogue is sliced
-        by time, refused for the others.
+        by time, optional for a mission with its own ``"catalogue"``, refused for the
+        others.
 
     Returns
     -------
@@ -2371,12 +2395,13 @@ def retrieve_heasarc_data_by_source_name(
     argument, so Level-2 pipeline parameters cannot be customised when working by
     source name.
     """
+    catalogue = MISSION_CONFIG[mission].get("catalogue")
     dates_given = mjd_start is not None or mjd_stop is not None
     if is_time_sliced(mission) and (mjd_start is None or mjd_stop is None):
         raise ValueError(
             f"The {mission} catalogue is searched by date: give mjd_start and mjd_stop"
         )
-    if not is_time_sliced(mission) and dates_given:
+    if catalogue is None and not is_time_sliced(mission) and dates_given:
         raise ValueError(
             f"{mission} is searched by position; mjd_start/mjd_stop are only for missions "
             "whose catalogue is sliced by time"
@@ -2384,11 +2409,18 @@ def retrieve_heasarc_data_by_source_name(
 
     pos = get_source_position(source)
 
-    if is_time_sliced(mission):
+    if catalogue is not None:
+        results = catalogue(
+            position=pos, radius_deg=radius_deg, mjd_start=mjd_start, mjd_stop=mjd_stop
+        )
+    elif is_time_sliced(mission):
         results = retrieve_heasarc_table_by_time(mjd_start, mjd_stop, mission)
     else:
         results = retrieve_heasarc_table_by_position(
-            pos.ra.deg, pos.dec.deg, mission=mission, radius_deg=radius_deg
+            pos.ra.deg,
+            pos.dec.deg,
+            mission=mission,
+            radius_deg=0.1 if radius_deg is None else radius_deg,
         )
     results = retrieve_and_process_data(
         result_table=results,
@@ -2471,7 +2503,11 @@ def retrieve_heasarc_data_by_obsid(
         )
     logger = get_run_logger()
 
-    results = retrieve_info_for_obsid(obsid, mission=mission)
+    catalogue = MISSION_CONFIG[mission].get("catalogue")
+    if catalogue is not None:
+        results = catalogue(obsids=[obsid] if isinstance(obsid, str) else list(obsid))
+    else:
+        results = retrieve_info_for_obsid(obsid, mission=mission)
     if not results:
         logger.warning(f"No observations found for OBSID {obsid} in HEASARC query.")
         return None

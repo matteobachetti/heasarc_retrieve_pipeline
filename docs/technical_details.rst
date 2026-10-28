@@ -183,6 +183,31 @@ Nothing needs it: the URL of an observation's directory comes from the datalink 
 which is authoritative, while a hand-built path encodes a layout convention that can drift.
 The builders and their only caller were deleted with the legacy fallback path they served.
 
+Missions that are not at HEASARC
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SVOM's data are at the French Science Center, behind the instrument team's own query and
+download tools, so none of the HEASARC machinery applies: no master catalogue, no datalink
+service, no HTTPS or S3 directory to mirror. Such a mission declares three more entries in
+``MISSION_CONFIG``, and each replaces one HEASARC step while the rest of the run -- the
+worker processes, the per-observation record and page, the mission's own reduction --
+stays the same:
+
+``catalogue``
+   Replaces the cone search and the OBSID lookup. Called as
+   ``catalogue(position=, radius_deg=, mjd_start=, mjd_stop=)`` by
+   ``retrieve_heasarc_data_by_source_name`` and as ``catalogue(obsids=[...])`` by
+   ``retrieve_heasarc_data_by_obsid``; returns a table with at least ``obsid``, ``ra``
+   and ``dec``. Dates are accepted, not required, and ``radius_deg`` is passed as given:
+   its 0.1-degree default belongs to the HEASARC cone search, and a wide-field instrument
+   chooses its own.
+``work_items``
+   Replaces the datalink lookup: ``work_items(result_table, source_position)`` returns
+   the list of dictionaries ``observation_work_items`` would.
+``download``
+   Replaces ``recursive_download``: ``download(obsid, url, outdir, config, test=False)``
+   fills ``<outdir>/<obsid>``. ``download_filter`` does not apply to it.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 
