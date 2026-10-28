@@ -13,6 +13,7 @@ from astropy.table import Table
 
 from heasarc_retrieve_pipeline import svom_common
 from heasarc_retrieve_pipeline import svom_eclairs as ecl
+from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, read_arrays, read_records
 from heasarc_retrieve_pipeline.tests.test_svom_geometry import circular_orbit
 
 OBS_ID = 1000000001
@@ -169,7 +170,8 @@ def test_a_pass_keeps_unflagged_events_once_and_only_inside_every_cut(tmp_path):
 
 def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, monkeypatch):
     """The flow writes one file per pass and a summary table, and only barycentres, with
-    every orbit file of the observation, when it is given a position."""
+    every orbit file of the observation, when it is given a position. Each pass leaves a
+    screening record (events removed per cut, off-axis angles) and a barycentring one."""
     obsdir = tmp_path / str(OBS_ID)
     obsdir.mkdir()
     for pass_id, start in (("P1", 0.0), ("P2", 1000.0)):
@@ -194,7 +196,13 @@ def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, 
     monkeypatch.setattr(svom_common, "barycenter_with_package", fake_barycentre)
     config = {"out_data_path": str(tmp_path)}
 
+    diagnostics = diagnostics_path(str(OBS_ID), config)
+
+    def records():
+        return {(r["step"], r["key"]): r for r in read_records(diagnostics)}
+
     unbarycentred = ecl.process_eclairs_obsid.fn(str(OBS_ID), config=config)
+    assert records()["barycenter", "P1"]["reason"] == "no position given"
     barycentred = ecl.process_eclairs_obsid.fn(str(OBS_ID), config=config, ra=0.0, dec=0.0)
 
     assert [os.path.basename(f) for f in unbarycentred] == [
@@ -209,3 +217,13 @@ def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, 
     summary = Table.read(os.path.join(os.path.dirname(unbarycentred[0]), f"{OBS_ID}_ecl.ecsv"))
     assert summary["pass"].tolist() == ["P1", "P2"]
     assert summary["written"].tolist() == [500, 500]
+    screening = records()["svom_screening", "P1"]
+    values = screening["values"]
+    assert screening["status"] == "done"
+    assert values["cuts"] == ["archive", "orbit", "orbit_jumps", "visible", "attitude", "offaxis"]
+    assert sum(values[f"removed_{name}"] for name in values["cuts"][1:]) == values["outside_gti"]
+    assert values["offaxis_max_deg"] == 0.0
+    arrays = read_arrays(diagnostics, screening)
+    assert {"gti_archive", "gti_offaxis"} <= set(arrays)
+    assert np.allclose(np.diff(arrays["offaxis_time"]), 10.0)
+    assert records()["barycenter", "P1"]["values"]["ephem"] == "DE430"

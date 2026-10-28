@@ -377,8 +377,19 @@ Output
 Report
    ``l2_files/<obsid>_ecl.ecsv``, one row per pass: files used; events read, flagged,
    out of band, outside the file's archive GTI, duplicated, outside the final GTI, and
-   written; and the exposure after the archive GTIs and after each geometric cut. Its
-   metadata counts the orbit's ``ORIGIN`` and ``FLAG_PVT`` changes and position jumps.
+   written; the exposure after the archive GTIs and after each geometric cut, and the
+   events each cut removed (``removed_<cut>``, charged to the first cut that leaves an
+   event out, summing to ``outside_gti``). Its metadata counts the orbit's ``ORIGIN`` and
+   ``FLAG_PVT`` changes and position jumps.
+Diagnostics (``svom_common.record_screening``)
+   Each pass leaves an ``svom_screening`` record keyed by the pass, with the same numbers;
+   the cut names in order and the good time after each (``gti_<cut>`` arrays); the orbit
+   discontinuities left inside the final good time; and the off-axis angle's minimum,
+   median and maximum over the good time *before* the off-axis cut, which is what a
+   different threshold would have to choose from, with the angle every 10 s for the
+   report. A pass that writes nothing is recorded as skipped, naming the cut that left no
+   good time (or "no event left"). Barycentring leaves a ``barycenter`` record per pass:
+   position, ephemeris, number of orbit files and output, or skipped with the reason.
 Barycentring (``svom_common.barycentre_events``)
    With the ``barycenter`` package, at the searched position, on
    ``barycenter_ephemeris`` (DE430 by default), passing it every orbit file of the
@@ -444,7 +455,9 @@ Output and report
    ``EBOUNDS`` is copied into the output. ``l2_files/<obsid>_grm.ecsv`` has one row per
    detector: events read, rejected by the flags, out of band, outside the file's GTI,
    duplicated, outside the final GTI and written; the dead time and live time; the band
-   actually kept; and the exposure after each cut.
+   actually kept; the exposure after each cut and the events each removed. The
+   diagnostics are those of ECLAIRs, keyed ``grd<n>``, the off-axis angle that of the
+   detector's own axis.
 
 On the real file at the Crab (default settings) the three detectors take 2.7 minutes in
 all, about 7 GB of memory at peak. Of each detector's ~100 million events, 2 % are

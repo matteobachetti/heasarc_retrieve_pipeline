@@ -69,15 +69,18 @@ from prefect import flow, task
 from .svom_common import (
     COMMON_STALE_KEYWORDS,
     DEFAULT_CONFIG,
-    barycentre_events,
+    apply_cuts,
+    barycentre_units,
+    count_removed,
     discontinuity_counts,
     find_inputs,
     geometry_cuts,
     is_data_file,
     join_events,
-    total_time,
+    record_screening,
     write_events,
 )
+from .diagnostics import diagnostics_path, record_step
 from .utils import (
     absolute_config,
     get_logger,
@@ -263,8 +266,10 @@ def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
         ``None`` if no event is left.
     summary : dict
         The :data:`COUNTS`; ``exposure_archive`` and ``exposure_<name>``, the good time left
-        after each cut, in seconds; and ``skipped``, ``(file, reason)`` for each file left
-        out for a missing criterion.
+        after each cut, in seconds; ``removed_<name>``, the events each cut removed; and,
+        not scalars, ``skipped``, ``(file, reason)`` for each file left out for a missing
+        criterion, and ``steps``, from
+        :func:`~heasarc_retrieve_pipeline.svom_common.apply_cuts`.
     """
     logger = get_logger()
     cuts = cuts or {}
@@ -286,17 +291,13 @@ def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
         headers = headers or (primary, header)
 
     gti = merge_intervals(np.concatenate(gtis)) if gtis else np.zeros((0, 2))
-    summary["exposure_archive"] = total_time(gti)
-    for name, cut in cuts.items():
-        gti = intersect_intervals(gti, cut)
-        summary[f"exposure_{name}"] = total_time(gti)
+    summary["steps"] = apply_cuts(gti, cuts, "archive", summary)
+    gti = summary["steps"][-1][1]
     if not tables:
         return None, summary
 
     table, summary["duplicates"] = join_events(tables)
-    good = mask_from_gti(table["TIME"], gti)
-    summary["outside_gti"] = int((~good).sum())
-    table = table[good]
+    table = table[count_removed(table["TIME"], summary["steps"], summary)]
     summary["written"] = len(table)
     if not len(table):
         logger.warning(f"{os.path.basename(outfile)}: no event left")
@@ -311,8 +312,8 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
 
     Returns
     -------
-    written : list of str
-        One event file per pass with events left.
+    written : dict
+        ``{pass: event file}``, for each pass with events left.
     orbit_files : list of str
     """
     logger = get_logger()
@@ -323,16 +324,17 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
         record_skipped_input(obsid, config, path, reason)
     if not passes:
         logger.warning(f"{obsid}: no ECLAIRs event file with its GTI file")
-        return [], []
+        return {}, []
 
     orbit_files = inputs["SVO-ORB-CNV"]
-    cuts, meta = {}, {}
+    cuts, meta, orbit, angles = {}, {}, None, None
+    max_offaxis = config.get("eclairs_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG)
     if orbit_files:
-        (cuts,), orbit = geometry_cuts(
+        (cuts,), orbit, (angles,) = geometry_cuts(
             inputs,
             source=source,
             axes=["POINTING"],
-            max_offaxis_deg=config.get("eclairs_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG),
+            max_offaxis_deg=max_offaxis,
             saa=config.get("eclairs_saa"),
         )
         meta = discontinuity_counts(orbit)
@@ -341,20 +343,23 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
 
     l2_dir = os.path.join(raw_data_dir, "l2_files")
     os.makedirs(l2_dir, exist_ok=True)
-    written, rows = [], []
+    written, rows = {}, []
     for pass_id, pairs in passes.items():
-        outfile, summary = reduce_pass(
-            pairs,
-            os.path.join(l2_dir, f"{obsid}_{pass_id}_ecl.evt"),
-            cuts=cuts,
-            extra_criteria=config.get("eclairs_gti_criteria", ()),
-            pi_band=config.get("eclairs_pi_band"),
-        )
-        for path, reason in summary.pop("skipped"):
-            record_skipped_input(obsid, config, path, reason)
+        with record_step(diagnostics_path(obsid, config), obsid, "svom_screening", pass_id) as rec:
+            outfile, summary = reduce_pass(
+                pairs,
+                os.path.join(l2_dir, f"{obsid}_{pass_id}_ecl.evt"),
+                cuts=cuts,
+                extra_criteria=config.get("eclairs_gti_criteria", ()),
+                pi_band=config.get("eclairs_pi_band"),
+            )
+            for path, reason in summary.pop("skipped"):
+                record_skipped_input(obsid, config, path, reason)
+            steps = summary.pop("steps")
+            record_screening(rec, summary, steps, orbit, angles, max_offaxis)
         rows.append(dict(summary, **{"pass": pass_id}))
         if outfile is not None:
-            written.append(outfile)
+            written[pass_id] = outfile
     table = Table(rows=rows)
     table = table[["pass"] + [name for name in table.colnames if name != "pass"]]
     table.meta["orbit_discontinuities"] = meta
@@ -393,12 +398,4 @@ def process_eclairs_obsid(obsid: str, config=None, flags=None, ra: float = None,
     written, orbit_files = reduce_observation(raw_data_dir, obsid, current_config, source=source)
     if not written:
         return None
-    if source is None or not orbit_files:
-        logger.warning(
-            f"{obsid}: not barycentred -- "
-            + ("no orbit file" if not orbit_files else "no position given")
-        )
-        return written
-    return [
-        barycentre_events(infile, orbit_files, ra, dec, config=current_config) for infile in written
-    ]
+    return barycentre_units(written, orbit_files, ra, dec, obsid, current_config)

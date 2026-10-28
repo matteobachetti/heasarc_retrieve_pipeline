@@ -52,14 +52,18 @@ from prefect import flow, task
 from .svom_common import (
     COMMON_STALE_KEYWORDS,
     DEFAULT_CONFIG,
-    barycentre_events,
+    apply_cuts,
+    barycentre_units,
+    count_removed,
     discontinuity_counts,
     find_inputs,
     geometry_cuts,
     join_events,
+    record_screening,
     total_time,
     write_events,
 )
+from .diagnostics import diagnostics_path, record_step
 from .utils import (
     absolute_config,
     get_logger,
@@ -156,8 +160,10 @@ def reduce_detector(files, detector, outfile, cuts=None, band_kev=DEFAULT_ENERGY
         ``None`` if no event is left.
     summary : dict
         The :data:`COUNTS`; ``dead_time`` and ``livetime`` in seconds; ``exposure_file``
-        and ``exposure_<name>``, the good time left after each cut; ``emin_kev`` and
-        ``emax_kev``, the band actually kept.
+        and ``exposure_<name>``, the good time left after each cut; ``removed_<name>``,
+        the events each cut removed; ``emin_kev`` and ``emax_kev``, the band actually
+        kept; and, not a scalar, ``steps``, from
+        :func:`~heasarc_retrieve_pipeline.svom_common.apply_cuts`.
     """
     extname = events_extname(detector)
     cuts = cuts or {}
@@ -166,10 +172,8 @@ def reduce_detector(files, detector, outfile, cuts=None, band_kev=DEFAULT_ENERGY
     own = [_file_gti(path, extname) for path in files]
 
     gti = merge_intervals(np.concatenate([g for g, _ in own]))
-    summary["exposure_file"] = total_time(gti)
-    for name, cut in cuts.items():
-        gti = intersect_intervals(gti, cut)
-        summary[f"exposure_{name}"] = total_time(gti)
+    summary["steps"] = apply_cuts(gti, cuts, "file", summary)
+    gti = summary["steps"][-1][1]
 
     tables, headers, covered, dead_us = [], None, np.zeros((0, 2)), 0.0
     for path, (file_gti, span) in zip(files, own):
@@ -206,9 +210,7 @@ def reduce_detector(files, detector, outfile, cuts=None, band_kev=DEFAULT_ENERGY
     summary["dead_time"] = dead_us * 1e-6
     summary["livetime"] = total_time(gti) - summary["dead_time"]
     table, summary["duplicates"] = join_events(tables)
-    good = mask_from_gti(table["TIME"], gti)
-    summary["outside_gti"] = int((~good).sum())
-    table = table[good]
+    table = table[count_removed(table["TIME"], summary["steps"], summary)]
     summary["written"] = len(table)
     if not len(table):
         get_logger().warning(f"{os.path.basename(outfile)}: no event left")
@@ -233,8 +235,8 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
 
     Returns
     -------
-    written : list of str
-        One event file per detector with events left.
+    written : dict
+        ``{"grd<n>": event file}``, for each detector with events left.
     orbit_files : list of str
     """
     logger = get_logger()
@@ -242,16 +244,18 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
     files = inputs[FIRST_EXTNAME]
     if not files:
         logger.warning(f"{obsid}: no GRM event file")
-        return [], []
+        return {}, []
 
     orbit_files = inputs["SVO-ORB-CNV"]
     cuts, meta = [{}] * len(DETECTORS), {}
+    orbit, angles = None, [None] * len(DETECTORS)
+    max_offaxis = config.get("grm_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG)
     if orbit_files:
-        cuts, orbit = geometry_cuts(
+        cuts, orbit, angles = geometry_cuts(
             inputs,
             source=source,
             axes=[f"GRDX_{n}" for n in DETECTORS],
-            max_offaxis_deg=config.get("grm_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG),
+            max_offaxis_deg=max_offaxis,
             saa=config.get("grm_saa"),
         )
         meta = discontinuity_counts(orbit)
@@ -260,18 +264,22 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
 
     l2_dir = os.path.join(raw_data_dir, "l2_files")
     os.makedirs(l2_dir, exist_ok=True)
-    written, rows = [], []
-    for detector, detector_cuts in zip(DETECTORS, cuts):
-        outfile, summary = reduce_detector(
-            files,
-            detector,
-            os.path.join(l2_dir, f"{obsid}_grd{detector}.evt"),
-            cuts=detector_cuts,
-            band_kev=config.get("grm_energy_band_kev", DEFAULT_ENERGY_BAND_KEV),
-        )
+    written, rows = {}, []
+    for detector, detector_cuts, detector_angles in zip(DETECTORS, cuts, angles):
+        key = f"grd{detector}"
+        with record_step(diagnostics_path(obsid, config), obsid, "svom_screening", key) as rec:
+            outfile, summary = reduce_detector(
+                files,
+                detector,
+                os.path.join(l2_dir, f"{obsid}_{key}.evt"),
+                cuts=detector_cuts,
+                band_kev=config.get("grm_energy_band_kev", DEFAULT_ENERGY_BAND_KEV),
+            )
+            steps = summary.pop("steps")
+            record_screening(rec, summary, steps, orbit, detector_angles, max_offaxis)
         rows.append(dict(summary, detector=detector))
         if outfile is not None:
-            written.append(outfile)
+            written[key] = outfile
     table = Table(rows=rows)
     table = table[["detector"] + [name for name in table.colnames if name != "detector"]]
     table.meta["orbit_discontinuities"] = meta
@@ -310,12 +318,4 @@ def process_grm_obsid(obsid: str, config=None, flags=None, ra: float = None, dec
     written, orbit_files = reduce_observation(raw_data_dir, obsid, current_config, source=source)
     if not written:
         return None
-    if source is None or not orbit_files:
-        logger.warning(
-            f"{obsid}: not barycentred -- "
-            + ("no orbit file" if not orbit_files else "no position given")
-        )
-        return written
-    return [
-        barycentre_events(infile, orbit_files, ra, dec, config=current_config) for infile in written
-    ]
+    return barycentre_units(written, orbit_files, ra, dec, obsid, current_config)

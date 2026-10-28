@@ -12,6 +12,7 @@ from astropy.table import Table
 
 from heasarc_retrieve_pipeline import svom_common
 from heasarc_retrieve_pipeline import svom_grm as grm
+from heasarc_retrieve_pipeline.diagnostics import diagnostics_path, read_records
 from heasarc_retrieve_pipeline.tests.test_svom_geometry import circular_orbit
 
 OBS_ID = 1000000001
@@ -127,7 +128,8 @@ def test_overlapping_files_give_each_event_and_its_dead_time_once(tmp_path):
 
 def test_each_detector_gets_its_own_offaxis_cut_and_is_barycentred(tmp_path, monkeypatch):
     """Detectors 1 and 3 face the source and detector 2 faces away: two files, each
-    barycentred with every orbit file, and a summary row per detector."""
+    barycentred with every orbit file, a summary row per detector, and a screening record
+    for detector 2 that says which cut left it empty."""
     obsdir = tmp_path / str(OBS_ID)
     obsdir.mkdir()
     write_grm(obsdir / "grm.fits", np.arange(0.5, 1000.0), span=(0.0, 1000.0))
@@ -163,3 +165,8 @@ def test_each_detector_gets_its_own_offaxis_cut_and_is_barycentred(tmp_path, mon
     summary = Table.read(os.path.join(os.path.dirname(out[0]), f"{OBS_ID}_grm.ecsv"))
     assert summary["detector"].tolist() == [1, 2, 3]
     assert summary["written"].tolist() == [1000, 0, 1000]
+    records = read_records(diagnostics_path(str(OBS_ID), {"out_data_path": str(tmp_path)}))
+    (empty,) = [r for r in records if (r["step"], r["key"]) == ("svom_screening", "grd2")]
+    assert empty["status"] == "skipped"
+    assert empty["reason"] == "no good time left after the offaxis cut"
+    assert empty["values"]["offaxis_min_deg"] == 180.0
