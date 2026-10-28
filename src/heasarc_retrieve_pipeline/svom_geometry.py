@@ -75,6 +75,8 @@ def read_aux_series(files, hdu=1):
     first = np.r_[True, np.diff(times) != 0]
     group = np.cumsum(first) - 1
     kept = table[first]
+    if first.all():
+        return kept, 0
     differs = np.zeros((~first).sum(), bool)
     for name in table.colnames:
         repeat = np.asarray(table[name][~first])
