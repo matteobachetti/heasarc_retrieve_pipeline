@@ -79,9 +79,10 @@ def geometry_cuts(inputs, source=None, axes=("POINTING",), max_offaxis_deg=None,
     """
     The geometric cuts of an observation for each instrument axis, in the order applied.
 
-    ``orbit``, where the orbit is measured; with a ``source``, ``visible`` (above the
-    Earth's limb), ``attitude`` (where the attitude is known) and ``offaxis`` (within
-    ``max_offaxis_deg`` of the axis); with ``saa`` (``"deep"`` or ``"ext"``), ``saa``.
+    ``orbit``, where the orbit is measured; ``orbit_jumps``, without its position jumps
+    (:func:`~heasarc_retrieve_pipeline.svom_geometry.orbit_jump_gti`); with a ``source``,
+    ``visible`` (above the Earth's limb), ``attitude`` (where the attitude is known) and
+    ``offaxis`` (within ``max_offaxis_deg`` of the axis); with ``saa`` (``"deep"`` or ``"ext"``), ``saa``.
     Only ``offaxis`` differs from one axis to the next; the orbit and attitude are read
     once.
 
@@ -101,7 +102,7 @@ def geometry_cuts(inputs, source=None, axes=("POINTING",), max_offaxis_deg=None,
     """
     orbit, _ = geo.read_aux_series(inputs[ORBIT_EXTNAME])
     times = np.asarray(orbit["TIME"], dtype=float)
-    common = dict(orbit=geo.orbit_coverage_gti(orbit))
+    common = dict(orbit=geo.orbit_coverage_gti(orbit), orbit_jumps=geo.orbit_jump_gti(orbit))
     offaxis = [None] * len(axes)
     if source is not None:
         common["visible"] = geo.visibility_gti(orbit, source)

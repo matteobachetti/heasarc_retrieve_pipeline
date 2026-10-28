@@ -44,6 +44,15 @@ TELEMETRY_GAP = 0x08
 #: Smallest step in position, beyond what the velocity explains, reported as a jump.
 JUMP_M = 1000.0
 
+#: Jumps closer than this are one excursion: out, and back.
+JUMP_CLUSTER_S = 300.0
+
+#: Margin cut on each side of an excursion. The ``barycenter`` package interpolates the
+#: correction with a cubic spline on a 5 s grid, and a spline spreads an error at one knot
+#: to its neighbours, about 3.7 times smaller per knot. Four knots take the 2.8 µs seen on
+#: a real excursion below one float64 step (0.06 µs).
+JUMP_PAD_S = 20.0
+
 
 def read_aux_series(files, hdu=1):
     """
@@ -138,6 +147,38 @@ def orbit_discontinuities(orbit, jump_m=JUMP_M):
         rows.append((times[i + 1], "jump", step[i]))
     rows.sort(key=lambda row: row[0])
     return Table(rows=rows, names=["time", "kind", "value"], dtype=[float, str, float])
+
+
+def orbit_jump_gti(orbit, jump_m=JUMP_M, cluster_s=JUMP_CLUSTER_S, pad_s=JUMP_PAD_S):
+    """
+    The orbit's span without its position jumps.
+
+    Real orbit files hold unflagged excursions: the position steps by kilometres and steps
+    back some seconds later, each km worth up to 3.3 µs of light travel time. Jumps closer
+    than ``cluster_s`` are taken as one excursion, cut from the sample before the first
+    to the last, ``pad_s`` wider on each side. A lone jump is cut the same way, so only
+    its neighbourhood goes.
+
+    Examples
+    --------
+    >>> from astropy.table import Table
+    >>> t = np.arange(0.0, 100.0)
+    >>> position = np.zeros((100, 3))
+    >>> position[40:50, 0] = 2e3
+    >>> orbit = Table(dict(TIME=t, POSITION=position, VELOCITY=np.zeros((100, 3)),
+    ...                    ORIGIN=np.zeros(100), FLAG_PVT=np.zeros(100)))
+    >>> orbit_jump_gti(orbit).tolist()
+    [[0.0, 19.0], [70.0, 99.0]]
+    """
+    times = np.asarray(orbit["TIME"], dtype=float)
+    found = orbit_discontinuities(orbit, jump_m=jump_m)
+    jumps = np.asarray(found["time"][found["kind"] == "jump"], dtype=float)
+    if not jumps.size:
+        return np.array([[times[0], times[-1]]])
+    clusters = np.split(jumps, np.flatnonzero(np.diff(jumps) > cluster_s) + 1)
+    before = {jump: times[np.searchsorted(times, jump) - 1] for jump in jumps}
+    bad = [[before[cluster[0]] - pad_s, cluster[-1] + pad_s] for cluster in clusters]
+    return good_intervals(bad, times[0], times[-1])
 
 
 def intervals_where_positive(times, values):

@@ -289,9 +289,21 @@ Orbit coverage (``orbit_coverage_gti``)
    2.1 s, which is cut: 2 s lost, against a bridged interpolation error never checked.
 Discontinuities (``orbit_discontinuities``)
    Changes of ``ORIGIN`` or ``FLAG_PVT``, and steps in position larger than
-   ``JUMP_M`` = 1 km beyond what the mean velocity of the two samples explains. Reported,
-   not cut: whether they matter for timing is for the acceptance runs to show. A day of
-   real orbit gave about a dozen ``ORIGIN`` changes and two steps of 1-2 km.
+   ``JUMP_M`` = 1 km beyond what the mean velocity of the two samples explains. A day of
+   real orbit gave about a dozen ``ORIGIN`` changes and five jumps of 1-2 km, no flag
+   set, in two groups; one is an excursion out and back 18 s later. ``ORIGIN`` and
+   ``FLAG_PVT`` changes are only reported; the jumps are cut, see below.
+Orbit jumps (``orbit_jump_gti``)
+   One kilometre is up to 3.3 µs of light travel time, and at one such excursion the
+   barycentred times are off by up to 2.8 µs (see `SVOM/GRM reduction (svom_grm.py)`_),
+   so jumps are cut. Jumps less than ``JUMP_CLUSTER_S`` = 300 s apart are one excursion,
+   cut from the sample before the first to the last, ``JUMP_PAD_S`` = 20 s wider on each
+   side. The margin is set by the ``barycenter`` package, which interpolates the
+   correction with a cubic spline on a 5 s grid: a spline spreads an error at one knot to
+   its neighbours, about 3.7 times smaller per knot, and on the real excursion the error
+   was still 0.36 µs 5 s outside it and one float64 step (0.06 µs) only 15 s outside.
+   A lone jump loses the same margin around it. On a day of real orbit the cut costs
+   about 200 s.
 Earth occultation (``visibility_gti``)
    The source is hidden when it is within the angular radius of a sphere of radius
    6378.137 km plus ``ATMOSPHERE_M`` = 100 km from the direction of the Earth's centre.
@@ -350,10 +362,10 @@ Joining (``join_events``)
    share events, and an exact-row rule removes those without cutting anything else.
 Geometry (``svom_common.geometry_cuts``)
    The union of the files' archive GTIs is intersected, in this order, with the orbit
-   coverage, the source's visibility above the Earth's limb, the attitude coverage and
+   coverage, the orbit's span without its position jumps, the source's visibility above the Earth's limb, the attitude coverage and
    the off-axis cut (``eclairs_max_offaxis_deg``, default 40°), and, only if
    ``eclairs_saa`` is ``"deep"`` or ``"ext"``, the SAA table; see `SVOM geometry
-   (svom_geometry.py)`_. Without a position only the orbit coverage applies. Both the
+   (svom_geometry.py)`_. Without a position only the two orbit cuts apply. Both the
    archive's occultation criterion (Earth in the *field of view*) and the computed
    visibility (Earth in front of *the source*) are kept: the acceptance runs will show
    whether either can go.
@@ -406,8 +418,9 @@ hours. Per detector (``reduce_detector``):
 
 GTI
    The files' own ``GTI``, each clipped to its ``TSTART``-``TSTOP``, intersected with
-   orbit coverage, the source's visibility above the Earth's limb, attitude coverage and
-   the angle between the source and *this detector's* axis (``GRDX_n``) below
+   orbit coverage, the orbit jumps, the source's visibility above the Earth's limb,
+   attitude coverage and the angle between the source and *this detector's* axis
+   (``GRDX_n``) below
    ``grm_max_offaxis_deg`` (default 60°). No SAA cut unless ``grm_saa`` is ``"deep"`` or
    ``"ext"``: the file's GTI already does the deep one.
 Dead time
@@ -444,7 +457,7 @@ the raw file, agrees to 0.06 µs everywhere except one 42 s stretch, where it di
 to 2.8 µs. There the orbit file's position jumps by 2.1 km and back 18 s later, with no
 flag set. The exact calculation follows that excursion and the package's default 5 s
 interpolation grid (used above 100 000 events) partly smooths it, so neither is right
-there. ``orbit_discontinuities`` lists such jumps.
+there; that is why ``orbit_jump_gti`` now cuts such stretches.
 
 Catalogue queries
 ~~~~~~~~~~~~~~~~~

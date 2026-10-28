@@ -1,0 +1,1 @@
+Cut unflagged position jumps in the SVOM orbit files, with a 20 s margin either side, from the ECLAIRs and GRM good time intervals: a 2 km excursion moved the barycentred times by up to 2.8 µs.

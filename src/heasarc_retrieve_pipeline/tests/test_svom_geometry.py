@@ -82,6 +82,18 @@ def test_position_jumps_and_origin_changes_are_reported():
     assert [(row["time"], row["kind"]) for row in found] == [(50.0, "ORIGIN"), (120.0, "jump")]
 
 
+def test_an_orbit_excursion_is_cut_with_a_margin_and_a_lone_jump_around_itself():
+    """An 18 s, 2 km excursion (out at 100, back at 118) is cut from the sample before it
+    to the return, 20 s wider each side; a lone step at 500 loses 20 s each side of it."""
+    orbit = circular_orbit(np.arange(0.0, 1000.0))
+    orbit["POSITION"][100:118] += np.float32(2e3)
+    orbit["POSITION"][500:] += np.float32(5e3)
+
+    gti = geo.orbit_jump_gti(orbit)
+
+    assert gti.tolist() == [[0.0, 79.0], [138.0, 479.0], [520.0, 999.0]]
+
+
 def test_files_are_joined_once_per_sample_skipping_macos_metadata(tmp_path):
     """Two abutting files that share 50 samples give each second once, sorted; the
     shared samples that disagree are counted; ``._`` files are ignored."""
