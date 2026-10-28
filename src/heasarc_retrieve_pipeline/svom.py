@@ -43,6 +43,7 @@ from astropy.time import Time
 
 from .diagnostics import catalogue_row
 from .svom_eclairs import process_eclairs_obsid
+from .svom_grm import process_grm_obsid
 from .utils import get_logger
 
 #: The helper run inside the ECPI environment; see its docstring.
@@ -444,9 +445,8 @@ def process_svom_obsid(instrument, obsid, config=None, ra=None, dec=None, flags=
     """
     The ``"obsid_processing"`` hook: reduce one ObsID's files for ``instrument``.
 
-    ECLAIRs is :func:`heasarc_retrieve_pipeline.svom_eclairs.process_eclairs_obsid`; the
-    GRM reduction is not written yet.
+    :func:`heasarc_retrieve_pipeline.svom_eclairs.process_eclairs_obsid` or
+    :func:`heasarc_retrieve_pipeline.svom_grm.process_grm_obsid`.
     """
-    if instrument == "eclairs":
-        return process_eclairs_obsid(obsid, config=config, flags=flags, ra=ra, dec=dec)
-    raise NotImplementedError(f"The SVOM {instrument} reduction is not written yet.")
+    process = {"eclairs": process_eclairs_obsid, "grm": process_grm_obsid}[instrument]
+    return process(obsid, config=config, flags=flags, ra=ra, dec=dec)

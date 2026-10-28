@@ -383,6 +383,63 @@ GTI, with ``ONTIME`` equal to the GTI total, and the package's correction at mid
 agrees with astropy's geocentric light-travel time plus TDB-TT to 7 ms, within the
 23 ms the satellite's distance from the Earth's centre can add.
 
+SVOM/GRM reduction (``svom_grm.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_grm_obsid``, reached through ``svom.process_svom_obsid("grm", ...)``, writes
+one event file per detector (GRD, Gamma-Ray Detector), ``l2_files/<obsid>_grd<n>.evt``
+with the events in an extension called ``EVENTS``, and barycentres each. The three
+detectors point in different directions, so each has its own off-axis cut and GTI, and a
+delay in one detector's readout would show as an offset between files. What the two SVOM
+reductions share -- finding the files, the geometric cuts, joining, writing and
+barycentring -- is in ``svom_common.py``.
+
+A ``GRM-EVT`` file covers an ObsID, with one event table per detector (``EVENTS01..03``,
+``DETNAM = GRD_0n``), an ``EBOUNDS`` table (``PI`` is the channel, 0 to 258, 5 keV to
+20 MeV) and one ``GTI``. In the 22.7-hour file surveyed: 5.4 GB, about 100 million events
+per detector, time-sorted, no two at the same time; the ``GTI`` has 14 rows and its gaps
+are exactly the gaps in the data; it already leaves out the deep SAA (51 s of
+``SAA-DEEP-ECL`` fall inside it), while ``SAA-EXT-ECL`` would remove 7.6 of its 15.5
+hours. Per detector (``reduce_detector``):
+
+GTI
+   The files' own ``GTI``, each clipped to its ``TSTART``-``TSTOP``, intersected with
+   orbit coverage, the source's visibility above the Earth's limb, attitude coverage and
+   the angle between the source and *this detector's* axis (``GRDX_n``) below
+   ``grm_max_offaxis_deg`` (default 60°). No SAA cut unless ``grm_saa`` is ``"deep"`` or
+   ``"ext"``: the file's GTI already does the deep one.
+Dead time
+   ``DEAD_TIME`` (µs) summed over *every* event inside the final GTI, those the selection
+   below removes included, since each kept the detector busy; where files overlap, the
+   earlier file's events count. ``LIVETIME`` = ``ONTIME`` minus that sum, ``EXPOSURE`` =
+   ``LIVETIME``, ``DEADC`` = their ratio. About 0.56 % of the time in the file surveyed.
+Event selection
+   ``FLAG``, ``EVT_TYPE`` and ``ANTI_COIN`` all 0, and ``PI`` in the channels lying
+   entirely inside ``grm_energy_band_kev`` (default 20-300 keV, a first guess to be tuned
+   on the Crab). The meaning of the flags is read from the energies they carry, not from
+   a description, and should be confirmed with the GRM team: ``EVT_TYPE = 1`` (1.5 % of
+   events) are all in the top channel, an overflow; ``ANTI_COIN = 1`` (0.7 %) only
+   between 24 and 62 keV, most likely the americium-241 calibration source (59.5 keV);
+   ``GAIN_TYPE = 1`` (6 %) are the events above ~1.3 MeV, which the band removes;
+   ``FLAG = 1`` is 0.01 %.
+Joining
+   The files in time order, rows identical in every column kept once (``join_events``,
+   as for ECLAIRs); events outside the GTI dropped.
+Output and report
+   ``EBOUNDS`` is copied into the output. ``l2_files/<obsid>_grm.ecsv`` has one row per
+   detector: events read, rejected by the flags, out of band, outside the file's GTI,
+   duplicated, outside the final GTI and written; the dead time and live time; the band
+   actually kept; and the exposure after each cut.
+
+On the real file at the Crab (default settings) the three detectors take 2.7 minutes in
+all, about 7 GB of memory at peak. Of each detector's ~100 million events, 2 % are
+rejected by the flags and a third fall outside 20-300 keV (20.9-296.7 keV once whole
+channels are kept). The Earth leaves 38 400 s of the file's 55 900 s. Detectors 1 and 3
+keep all of it inside 60° and write about 47 million events each, with dead time 0.85 %
+of the live time. Detector 2 is never within 60° and writes nothing. The barycentred
+detector 3 agrees with astropy's geocentric light-travel time plus TDB-TT to 19 ms,
+within the 23 ms the satellite's distance from the Earth's centre can add.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 

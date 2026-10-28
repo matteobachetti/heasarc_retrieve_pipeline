@@ -1101,7 +1101,7 @@ MISSION_CONFIG = {
     },
     # Not at HEASARC: the catalogue, the work items and the download are SVOM's own, at
     # the French Science Center; see svom.py. One work item per ObsID, which ECLAIRs and
-    # GRM share. The GRM reduction is not written yet.
+    # GRM share.
     "svom_eclairs": {
         "catalogue": partial(svom.svom_catalogue, "eclairs"),
         "work_items": svom.svom_work_items,

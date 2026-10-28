@@ -63,17 +63,20 @@ from collections import defaultdict
 import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.table import Table, vstack
+from astropy.table import Table
 from prefect import flow, task
 
 from .svom_common import (
+    COMMON_STALE_KEYWORDS,
     DEFAULT_CONFIG,
     barycentre_events,
     discontinuity_counts,
     find_inputs,
     geometry_cuts,
     is_data_file,
+    join_events,
     total_time,
+    write_events,
 )
 from .utils import (
     absolute_config,
@@ -82,7 +85,6 @@ from .utils import (
     mask_from_gti,
     merge_intervals,
     record_skipped_input,
-    update_time_bounds,
 )
 
 #: The event extension, and the first extension of an event file.
@@ -108,12 +110,7 @@ GOOD_FLAG = 0
 DEFAULT_MAX_OFFAXIS_DEG = 40.0
 
 #: Header keywords of the input files that do not describe a joined pass, and are dropped.
-STALE_KEYWORDS = (
-    "BURST_ID",
-    "CHECKSUM",
-    "DATASUM",
-    "DATE-BEG",
-    "DATE-END",
+STALE_KEYWORDS = COMMON_STALE_KEYWORDS + (
     "GTISTART",
     "GTISTOP",
     "SJDSTART",
@@ -121,19 +118,6 @@ STALE_KEYWORDS = (
     "EARTH_FR",
     "EARTHMIN",
     "EARTHMAX",
-)
-
-#: Keywords copied from the events into the GTI extension.
-GTI_KEYWORDS = (
-    "TELESCOP",
-    "INSTRUME",
-    "TIMESYS",
-    "TIMEREF",
-    "TIMEUNIT",
-    "MJDREFI",
-    "MJDREFF",
-    "OBS_ID",
-    "PASS_ID",
 )
 
 #: The counts in a pass's summary, in the order they are taken.
@@ -257,71 +241,6 @@ def _read_file(event_file, gti_file, extra_criteria, pi_band, counts):
     return table[good], gti, primary, header
 
 
-def join_events(tables):
-    """
-    Join event tables in time order, keeping rows identical in every column once.
-
-    Returns
-    -------
-    table : astropy.table.Table
-    n_duplicates : int
-
-    Examples
-    --------
-    >>> a = Table(dict(TIME=[2.0, 1.0], PI=[5, 6]))
-    >>> b = Table(dict(TIME=[2.0, 2.0], PI=[5, 7]))
-    >>> table, n = join_events([a, b])
-    >>> table["TIME"].tolist(), table["PI"].tolist(), n
-    ([1.0, 2.0, 2.0], [6, 5, 7], 1)
-    """
-    table = vstack(tables, metadata_conflicts="silent")
-    columns = [np.asarray(table[name]) for name in table.colnames]
-    table = table[np.lexsort(columns[::-1])]
-    same = np.ones(max(len(table) - 1, 0), bool)
-    for name in table.colnames:
-        values = np.asarray(table[name])
-        same &= values[1:] == values[:-1]
-    return table[np.r_[True, ~same] if len(table) else []], int(same.sum())
-
-
-def _clean(header):
-    header = header.copy()
-    for key in STALE_KEYWORDS:
-        header.remove(key, ignore_missing=True, remove_all=True)
-    return header
-
-
-def write_pass(table, gti, primary, header, outfile):
-    """
-    Write a joined pass: the events, under the first file's headers, and its GTI.
-
-    ``TSTART``, ``TSTOP`` and ``TELAPSE`` describe the GTI, ``ONTIME`` is its total and
-    ``EXPOSURE`` that times ``DEADC``; :data:`STALE_KEYWORDS` are dropped.
-    """
-    table.meta.clear()  # Table.read put the first file's keywords there, stale ones too
-    events = fits.table_to_hdu(table)
-    for card in _clean(header).cards:
-        if card.keyword in ("COMMENT", "HISTORY") or card.keyword not in events.header:
-            events.header.append(card)
-    events.name = EVENTS_EXTNAME
-
-    gti_hdu = fits.BinTableHDU(Table(dict(START=gti[:, 0], STOP=gti[:, 1])), name="GTI")
-    for key in GTI_KEYWORDS:
-        if key in events.header:
-            gti_hdu.header[key] = events.header[key]
-
-    hdul = fits.HDUList([fits.PrimaryHDU(header=_clean(primary)), events, gti_hdu])
-    update_time_bounds(hdul, gti)
-    ontime = total_time(gti)
-    for hdu in hdul[:2]:
-        if "ONTIME" in hdu.header:
-            hdu.header["ONTIME"] = ontime
-        if "EXPOSURE" in hdu.header:
-            hdu.header["EXPOSURE"] = ontime * float(hdu.header.get("DEADC", 1.0))
-    hdul.writeto(outfile, overwrite=True)
-    return outfile
-
-
 def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
     """
     Reduce one pass: screen each file on its own GTIs, join, cut on ``cuts``, write.
@@ -382,7 +301,7 @@ def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
     if not len(table):
         logger.warning(f"{os.path.basename(outfile)}: no event left")
         return None, summary
-    return write_pass(table, gti, *headers, outfile), summary
+    return write_events(table, gti, *headers, outfile, EVENTS_EXTNAME, STALE_KEYWORDS), summary
 
 
 @task(name="reduce_eclairs_obsid")
@@ -409,10 +328,10 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
     orbit_files = inputs["SVO-ORB-CNV"]
     cuts, meta = {}, {}
     if orbit_files:
-        cuts, orbit = geometry_cuts(
+        (cuts,), orbit = geometry_cuts(
             inputs,
             source=source,
-            axis="POINTING",
+            axes=["POINTING"],
             max_offaxis_deg=config.get("eclairs_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG),
             saa=config.get("eclairs_saa"),
         )

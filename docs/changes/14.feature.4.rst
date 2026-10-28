@@ -1,0 +1,1 @@
+Add the SVOM/GRM reduction (``svom_grm``): one event file per detector, with that detector's own off-axis cut, flagged, overflow and calibration events removed, an energy band (default 20-300 keV), live time from the summed dead time, and barycentred; the parts shared with ECLAIRs move to ``svom_common``.
