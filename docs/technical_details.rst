@@ -245,8 +245,10 @@ The steps:
 ``download``
    ``download_plan`` asks the helper ``data/svom_fsc.py`` (run with the SVOM Python, in
    isolated mode) for the event products with this ``OBS_ID``, keeps the highest
-   ``PROC_VER`` of each, then asks for every orbit (``SVO-ORB-CNV``) and attitude
-   (``SVO-ATT-CNV``) file overlapping the events' span widened by 600 s. These come one per
+   ``PROC_VER`` of each, then asks for every orbit (``SVO-ORB-CNV``), attitude
+   (``SVO-ATT-CNV``) and SAA (``SAA-DEEP-ECL``, ``SAA-EXT-ECL``: South Atlantic Anomaly
+   entry and exit times, one table per week, made for ECLAIRs and the only ones there
+   are) file overlapping the events' span widened by 600 s. These come one per
    downlink pass, and an event file can start minutes before its own pass's orbit file,
    so they are searched by time, not by pass. A GRM event file usually spans several
    passes, and gets one orbit and one attitude file for each. Each file is then fetched by

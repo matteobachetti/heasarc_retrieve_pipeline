@@ -1,1 +1,1 @@
-Add SVOM ECLAIRs and GRM retrieval from the French Science Center, through the SVOM team's own tools run in their environment (``SVOM_ECPI_PYTHON``): catalogue by ObsID, event files with every orbit and attitude file around them. The reductions are not written yet.
+Add SVOM ECLAIRs and GRM retrieval from the French Science Center, through the SVOM team's own tools run in their environment (``SVOM_ECPI_PYTHON``): catalogue by ObsID, event files with every orbit, attitude and SAA file around them. The reductions are not written yet.

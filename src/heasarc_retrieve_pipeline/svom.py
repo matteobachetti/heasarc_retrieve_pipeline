@@ -13,8 +13,9 @@ Both instruments share the catalogue and the auxiliary files:
 * **One catalogue, by ObsID.** ECLAIRs and GRM files of the same pointing carry the same
   ``OBS_ID``. ``ecpi_find_files`` searches ECLAIRs files by position (it knows no GRM
   product), and its one-row-per-file answer is grouped into one row per ObsID.
-* **Orbit and attitude by time.** ``SVO-ORB-CNV`` and ``SVO-ATT-CNV`` come one per
-  downlink pass. An event file can start minutes before its own pass's orbit file, inside
+* **Orbit, attitude and SAA by time.** ``SVO-ORB-CNV`` and ``SVO-ATT-CNV`` come one per
+  downlink pass, the SAA tables (South Atlantic Anomaly entry and exit times) one per
+  week. An event file can start minutes before its own pass's orbit file, inside
   the previous one's, so every file overlapping the events (with :data:`AUX_MARGIN_S` on
   either side) is fetched, whatever its pass.
 
@@ -55,8 +56,10 @@ EVENT_PRODUCTS = {
     "grm": ("GRM-EVT",),
 }
 
-#: Orbit and attitude, one file of each per pass.
-AUX_PRODUCTS = ("SVO-ORB-CNV", "SVO-ATT-CNV")
+#: Orbit and attitude, one file of each per pass, and the SAA entry and exit times, one
+#: table per week, made for ECLAIRs (there is none for GRM): ``DEEP`` is the core of the
+#: anomaly, ``EXT`` the wide region around it.
+AUX_PRODUCTS = ("SVO-ORB-CNV", "SVO-ATT-CNV", "SAA-DEEP-ECL", "SAA-EXT-ECL")
 
 #: How far beyond the events' span orbit and attitude files are looked for. Event files
 #: were seen starting up to 5 minutes before their pass's orbit file.
@@ -372,9 +375,10 @@ def latest_versions(products):
 
 def download_plan(instrument, obsid):
     """
-    Every file to download for one ObsID: its event products, then orbit and attitude.
+    Every file to download for one ObsID: its event products, then orbit, attitude and
+    SAA.
 
-    Orbit and attitude files are all those overlapping the events' span, widened by
+    The auxiliary files (:data:`AUX_PRODUCTS`) are all those overlapping the events' span, widened by
     :data:`AUX_MARGIN_S`, whatever their pass. An ObsID with no event products for this
     instrument gives an empty plan.
     """

@@ -142,17 +142,21 @@ class TestDownload:
             product("SVO-ORB-CNV", -3000.0, 1200.0, pass_id="000001_KUX"),
         ],
         "SVO-ATT-CNV": [product("SVO-ATT-CNV", 1200.0, 9000.0, pass_id="000002_HBX")],
+        # Weekly SAA entry/exit tables, covering the events whatever their pass.
+        "SAA-DEEP-ECL": [product("SAA-DEEP-ECL", -5e5, 5e5)],
+        "SAA-EXT-ECL": [product("SAA-EXT-ECL", -5e5, 5e5)],
     }
+    AUX = ["SVO-ORB-CNV"] * 2 + ["SVO-ATT-CNV", "SAA-DEEP-ECL", "SAA-EXT-ECL"]
 
-    def test_events_then_every_orbit_and_attitude_file_around_them(self, ecpi, monkeypatch):
-        """The latest event version, and orbit/attitude searched by time with the margin,
-        so the previous pass's orbit file comes too."""
+    def test_events_then_every_auxiliary_file_around_them(self, ecpi, monkeypatch):
+        """The latest event version, and orbit, attitude and SAA files searched by time
+        with the margin, so the previous pass's orbit file comes too."""
         fsc = FakeFSC(self.PRODUCTS)
         monkeypatch.setattr(svom, "run_ecpi", fsc)
 
         plan = svom.download_plan("grm", 7)
 
-        assert [p["acronym"] for p in plan] == ["GRM-EVT"] + ["SVO-ORB-CNV"] * 2 + ["SVO-ATT-CNV"]
+        assert [p["acronym"] for p in plan] == ["GRM-EVT"] + self.AUX
         assert plan[0]["header"]["PROC_VER"] == 2
         orbit_search = fsc.searched("SVO-ORB-CNV")[0]
         assert orbit_search[-4:] == ["--tmin", "400.0", "--tmax", "5600.0"]
@@ -177,10 +181,10 @@ class TestDownload:
         gets = [call for call in fsc.calls if call[3] == "get"]
         download("7", "fsc:7", str(tmp_path), {})
 
-        assert len(gets) == 4
-        assert len(os.listdir(tmp_path / "7")) == 4
+        assert len(gets) == 6
+        assert len(os.listdir(tmp_path / "7")) == 6
         assert gets[0][-2:] == ["OBS_ID=7", "PROC_VER=2"]
-        assert len([call for call in fsc.calls if call[3] == "get"]) == 4
+        assert len([call for call in fsc.calls if call[3] == "get"]) == 6
 
     def test_a_test_run_only_makes_the_plan(self, ecpi, monkeypatch, tmp_path):
         """``test=True`` searches but downloads nothing."""
@@ -196,13 +200,13 @@ class TestDownload:
 @pytest.mark.skipif(not svom.has_ecpi(), reason="SVOM_ECPI_PYTHON is not set")
 def test_the_fsc_answers_a_grm_search_and_a_plan():
     """Live: a day of GRM-EVT products, and the plan for the first ObsID found has its
-    event file and orbit and attitude files."""
+    event file and its orbit, attitude and SAA files."""
     found = svom.search_products("GRM-EVT", tmin=280000000.0, tmax=280086400.0)
     assert found and {"acronym", "url", "header"} <= set(found[0])
 
     plan = svom.download_plan("grm", found[0]["header"]["OBS_ID"])
 
-    assert {p["acronym"] for p in plan} == {"GRM-EVT", "SVO-ORB-CNV", "SVO-ATT-CNV"}
+    assert {p["acronym"] for p in plan} == {"GRM-EVT", *svom.AUX_PRODUCTS}
 
 
 def test_an_empty_answer_is_an_empty_catalogue(ecpi, monkeypatch):
