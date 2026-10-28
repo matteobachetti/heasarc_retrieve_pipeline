@@ -252,8 +252,12 @@ The steps:
    downlink pass, and an event file can start minutes before its own pass's orbit file,
    so they are searched by time, not by pass. A GRM event file usually spans several
    passes, and gets one orbit and one attitude file for each. Each file is then fetched by
-   the keywords that pick exactly its version, under the archive's own file name, and
-   skipped if already there. On an exFAT disk macOS adds a ``._<name>`` file beside each
+   the URL its search returned, under the archive's own file name, and skipped if already
+   there. Not by header keywords: an SAA table has no ObsID or pass, and the archive
+   answers a search that matches several products with its latest one, which can be
+   another week's table. ``svom.messaging`` downloads a URL only through a private
+   method, ``SdbIo._dump_remote_fits_file``; the helper stops with a clear error if a
+   new version drops it. On an exFAT disk macOS adds a ``._<name>`` file beside each
    download; the reductions must ignore them.
 
 ``ecpi_find_files`` cannot search GRM products, so the helper uses ``svom.messaging``'s

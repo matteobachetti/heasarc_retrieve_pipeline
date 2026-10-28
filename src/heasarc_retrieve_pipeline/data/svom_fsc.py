@@ -13,9 +13,9 @@ Two commands, both printing JSON on standard output:
     Every product with this acronym whose primary header matches, and, with
     ``--tmin``/``--tmax``, whose ``TSTART``-``TSTOP`` overlaps that interval (SVOM
     seconds). A list of ``{"acronym", "url", "header"}``.
-``get ACRONYM OUTDIR FILENAME KEY=VALUE [...]``
-    Download the latest product matching the criteria to ``OUTDIR/FILENAME``. Prints
-    ``{"path": ...}``.
+``get URL OUTDIR FILENAME``
+    Download the product at ``URL``, as ``search`` returned it, to ``OUTDIR/FILENAME``.
+    Prints ``{"path": ...}``.
 """
 
 import argparse
@@ -76,11 +76,16 @@ def search(acronym, crit):
         page += 1
 
 
-def get(acronym, outdir, filename, crit):
+def get(url, outdir, filename):
+    # By URL, not by search criteria: a product without ObsID or pass (the weekly SAA
+    # tables) has no criteria that pick it, and the archive answers a vague search with
+    # its latest product. svom.messaging only downloads a product URL through this
+    # private method, the one its own save_latest_fits_file uses.
+    sdb = client()
+    if not hasattr(sdb, "_dump_remote_fits_file"):
+        raise RuntimeError("svom.messaging changed: SdbIo._dump_remote_fits_file is gone")
     os.makedirs(outdir, exist_ok=True)
-    client().save_latest_fits_file(
-        dirname=outdir, filename=filename, acronym=acronym, criteria=crit, timeout=1800
-    )
+    sdb._dump_remote_fits_file(url, dirname=outdir, filename=filename, timeout=1800)
     return dict(path=os.path.join(outdir, filename))
 
 
@@ -93,16 +98,15 @@ def main(argv=None):
     find.add_argument("--tmin", type=float, default=None)
     find.add_argument("--tmax", type=float, default=None)
     fetch = commands.add_parser("get")
-    fetch.add_argument("acronym")
+    fetch.add_argument("url")
     fetch.add_argument("outdir")
     fetch.add_argument("filename")
-    fetch.add_argument("pairs", nargs="+")
     args = parser.parse_args(argv)
 
     if args.command == "search":
         result = search(args.acronym, criteria(args.pairs, args.tmin, args.tmax))
     else:
-        result = get(args.acronym, args.outdir, args.filename, criteria(args.pairs))
+        result = get(args.url, args.outdir, args.filename)
     json.dump(result, sys.stdout)
 
 

@@ -411,24 +411,6 @@ def aux_window(events, margin=AUX_MARGIN_S):
     return tstart - margin, tstop + margin
 
 
-def download_criteria(product):
-    """
-    ``KEY=VALUE`` pairs that pick exactly this product and version at the FSC.
-
-    Examples
-    --------
-    >>> download_criteria(dict(header=dict(OBS_ID=None, BURST_ID=None, PASS_ID="000001_HBX",
-    ...                                    PROC_VER=1)))
-    ['PASS_ID=000001_HBX', 'PROC_VER=1']
-    """
-    header = product["header"]
-    return [
-        f"{key}={header[key]}"
-        for key in IDENTIFYING_KEYWORDS + ("PROC_VER",)
-        if header.get(key) is not None
-    ]
-
-
 def local_name(product):
     """The archive's own file name, from the end of the product's URL."""
     return os.path.basename(product["url"])
@@ -438,7 +420,8 @@ def svom_download(instrument, obsid, url, outdir, config, test=False):
     """
     The ``"download"`` hook: fetch one ObsID's files into ``<outdir>/<obsid>``.
 
-    Files already there are not downloaded again. With ``test``, only the plan is made
+    Each file is fetched by the URL its search returned, so it is exactly the version
+    chosen in the plan. Files already there are not downloaded again. With ``test``, only the plan is made
     and logged.
     """
     logger = get_logger()
@@ -452,9 +435,7 @@ def svom_download(instrument, obsid, url, outdir, config, test=False):
         if os.path.exists(os.path.join(destination, name)):
             logger.info(f"{obsid}: {name} already downloaded")
             continue
-        run_ecpi(
-            helper_argv("get", product["acronym"], destination, name, *download_criteria(product))
-        )
+        run_ecpi(helper_argv("get", product["url"], destination, name))
     return plan
 
 

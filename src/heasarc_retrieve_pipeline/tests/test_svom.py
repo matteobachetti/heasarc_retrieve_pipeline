@@ -172,7 +172,8 @@ class TestDownload:
     def test_the_download_hook_fetches_into_the_obsid_directory_once(
         self, ecpi, monkeypatch, tmp_path
     ):
-        """Each file once, by the criteria that pick its exact version; a rerun skips them."""
+        """Each file once, by the URL its search returned (an SAA table has no ObsID or
+        pass to pick it by); a rerun skips them."""
         fsc = FakeFSC(self.PRODUCTS)
         monkeypatch.setattr(svom, "run_ecpi", fsc)
         download = core.MISSION_CONFIG["svom_grm"]["download"]
@@ -183,7 +184,8 @@ class TestDownload:
 
         assert len(gets) == 6
         assert len(os.listdir(tmp_path / "7")) == 6
-        assert gets[0][-2:] == ["OBS_ID=7", "PROC_VER=2"]
+        urls = [p["url"] for products in self.PRODUCTS.values() for p in products]
+        assert [call[4] for call in gets] == [urls[1]] + urls[2:]
         assert len([call for call in fsc.calls if call[3] == "get"]) == 6
 
     def test_a_test_run_only_makes_the_plan(self, ecpi, monkeypatch, tmp_path):
