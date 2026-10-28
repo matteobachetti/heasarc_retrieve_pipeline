@@ -310,6 +310,79 @@ SAA (``saa_gti``)
    ECLAIRs (it costs exposure without improving the pulse per photon) and the deep
    region for GRM, whose detectors cannot separate source from background.
 
+SVOM/ECLAIRs reduction (``svom_eclairs.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_eclairs_obsid``, reached through ``svom.process_svom_obsid("eclairs", ...)``,
+writes one event file per downlink pass, ``l2_files/<obsid>_<pass>_ecl.evt``, and
+barycentres each. An ObsID is a day of survey and a few hundred million events (one
+surveyed ObsID had 273 million in 14 files); a pass is about a tenth of that, which fits
+in memory and is the unit the timing work is organised by.
+
+The archive gives each event file (``ECL-EVT-CAL``) a GTI file (``ECL-GTI-CAL``) of its
+own, with one extension per criterion (``GTICAL-STA``, ``-TLM``, ``-EGP``, ``-NSA``,
+``-NEO``, ``-PEO``, ``-TEO``: stable attitude, no telemetry gap, instrument good, outside
+the SAA, no, partial and total Earth occultation of the field of view). Per pass:
+
+Pairing (``pair_event_and_gti_files``)
+   By ``OBS_ID``, ``BURST_ID`` and ``PASS_ID`` from the primary headers. An event file
+   without its own GTI file is skipped and recorded in the observation's skipped-inputs
+   report: borrowing another file's GTIs would silently apply the wrong ones.
+Event screening
+   ``FLAG == 0`` only, as ECPI's own imaging does. In the ObsID surveyed 16 % of events
+   were flagged, nearly all with bit 32 (energy below threshold or ``PHA`` > 1022); bit
+   16 marks a pixel disabled in that minute, bit 64 an energy out of range. An optional
+   ``eclairs_pi_band`` keeps ``PI`` channels ``[pimin, pimax]``.
+Archive GTIs (``archive_gti``)
+   ``TLM`` ∩ ``EGP`` ∩ (``NEO`` ∪ ``PEO``), clipped to the file's own ``TSTART``-``TSTOP``
+   and applied to that file's events before joining. The three occultation states split
+   the time, and the archive leaves out the extension of a state the file never was in
+   (``NEO`` was missing from 6 of 14 files), so a missing one means no time. ``TLM`` and
+   ``EGP`` were present in every file; if one is ever missing the file is skipped rather
+   than guessed about, and so is a file without a criterion asked for in
+   ``eclairs_gti_criteria`` (``NSA`` was missing from 4 of 14, and what that means is not
+   known). Stable attitude and the archive's SAA criterion are off by default.
+Joining (``join_events``)
+   The pass's files are joined, sorted by time (not every input file is sorted) and
+   rows identical in every column kept once. Burst (``CP``) files overlap the survey
+   (``GP``) file of the same pass; in the four overlaps surveyed the survey file had no
+   events inside the burst file's span, so nothing was duplicated, but two bursts may
+   share events, and an exact-row rule removes those without cutting anything else.
+Geometry (``geometry_cuts``)
+   The union of the files' archive GTIs is intersected, in this order, with the orbit
+   coverage, the source's visibility above the Earth's limb, the attitude coverage and
+   the off-axis cut (``eclairs_max_offaxis_deg``, default 40°), and, only if
+   ``eclairs_saa`` is ``"deep"`` or ``"ext"``, the SAA table; see `SVOM geometry
+   (svom_geometry.py)`_. Without a position only the orbit coverage applies. Both the
+   archive's occultation criterion (Earth in the *field of view*) and the computed
+   visibility (Earth in front of *the source*) are kept: the acceptance runs will show
+   whether either can go.
+Output
+   The events under the first file's headers, with the keywords that describe a single
+   input file dropped (``BURST_ID``, ``GTISTART``/``GTISTOP``, ``EARTH_FR`` and similar,
+   checksums), ``TSTART``/``TSTOP`` set by ``utils.update_time_bounds``, ``ONTIME`` the
+   GTI total and ``EXPOSURE`` that times ``DEADC``; and a ``GTI`` extension.
+Report
+   ``l2_files/<obsid>_ecl.ecsv``, one row per pass: files used; events read, flagged,
+   out of band, outside the file's archive GTI, duplicated, outside the final GTI, and
+   written; and the exposure after the archive GTIs and after each geometric cut. Its
+   metadata counts the orbit's ``ORIGIN`` and ``FLAG_PVT`` changes and position jumps.
+Barycentring (``barycentre_pass``)
+   With the ``barycenter`` package, at the searched position, on
+   ``barycenter_ephemeris`` (DE430 by default), passing it every orbit file of the
+   ObsID: it joins them itself, so no joined orbit file is written. There is no official
+   tool (``barycorr`` refuses ``TELESCOP = SVOM``), so ``barycenter_tool: official`` is
+   overridden with a warning. Without a position nothing is barycentred, as for XRISM.
+
+On a real pass (one file, 4.3 million events, 1174 s of archive good time) the
+reduction takes about a minute, most of it reading the day's orbit and attitude. 15.9 %
+of the events are flagged and none are duplicated. In that ObsID the Crab never came
+within 40° of the ECLAIRs axis, so the default off-axis cut left nothing: the pass is
+written and barycentred only with the cut off. Then the output is time-sorted, inside its
+GTI, with ``ONTIME`` equal to the GTI total, and the package's correction at mid-pass
+agrees with astropy's geocentric light-travel time plus TDB-TT to 7 ms, within the
+23 ms the satellite's distance from the Earth's centre can add.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 

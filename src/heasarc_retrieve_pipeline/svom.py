@@ -42,6 +42,7 @@ from astropy.table import Table, vstack
 from astropy.time import Time
 
 from .diagnostics import catalogue_row
+from .svom_eclairs import process_eclairs_obsid
 from .utils import get_logger
 
 #: The helper run inside the ECPI environment; see its docstring.
@@ -440,5 +441,12 @@ def svom_download(instrument, obsid, url, outdir, config, test=False):
 
 
 def process_svom_obsid(instrument, obsid, config=None, ra=None, dec=None, flags=None):
-    """Placeholder until the reductions land (steps S4 and S5 of the SVOM plan)."""
+    """
+    The ``"obsid_processing"`` hook: reduce one ObsID's files for ``instrument``.
+
+    ECLAIRs is :func:`heasarc_retrieve_pipeline.svom_eclairs.process_eclairs_obsid`; the
+    GRM reduction is not written yet.
+    """
+    if instrument == "eclairs":
+        return process_eclairs_obsid(obsid, config=config, flags=flags, ra=ra, dec=dec)
     raise NotImplementedError(f"The SVOM {instrument} reduction is not written yet.")
