@@ -379,9 +379,11 @@ reduction takes about a minute, most of it reading the day's orbit and attitude.
 of the events are flagged and none are duplicated. In that ObsID the Crab never came
 within 40° of the ECLAIRs axis, so the default off-axis cut left nothing: the pass is
 written and barycentred only with the cut off. Then the output is time-sorted, inside its
-GTI, with ``ONTIME`` equal to the GTI total, and the package's correction at mid-pass
-agrees with astropy's geocentric light-travel time plus TDB-TT to 7 ms, within the
-23 ms the satellite's distance from the Earth's centre can add.
+GTI, with ``ONTIME`` equal to the GTI total. Every one of its 3.6 million barycentred
+times equals, to 0.06 µs (one float64 step at these times), what the ``barycenter``
+package gives when run directly on the raw archive file, evaluated exactly at each event.
+The package itself is checked against ``barycorr`` to one step (see its documentation),
+so this ties the pipeline's output to ``barycorr`` at the same level.
 
 SVOM/GRM reduction (``svom_grm.py``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -437,8 +439,12 @@ rejected by the flags and a third fall outside 20-300 keV (20.9-296.7 keV once w
 channels are kept). The Earth leaves 38 400 s of the file's 55 900 s. Detectors 1 and 3
 keep all of it inside 60° and write about 47 million events each, with dead time 0.85 %
 of the live time. Detector 2 is never within 60° and writes nothing. The barycentred
-detector 3 agrees with astropy's geocentric light-travel time plus TDB-TT to 19 ms,
-within the 23 ms the satellite's distance from the Earth's centre can add.
+detector 3, compared on 940 000 events with the ``barycenter`` package run exactly on
+the raw file, agrees to 0.06 µs everywhere except one 42 s stretch, where it differs by up
+to 2.8 µs. There the orbit file's position jumps by 2.1 km and back 18 s later, with no
+flag set. The exact calculation follows that excursion and the package's default 5 s
+interpolation grid (used above 100 000 events) partly smooths it, so neither is right
+there. ``orbit_discontinuities`` lists such jumps.
 
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
