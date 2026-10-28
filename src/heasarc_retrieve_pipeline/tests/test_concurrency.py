@@ -750,9 +750,10 @@ class TestExposureCondition:
     def test_every_mission_drops_planned_but_unexecuted_observations(self):
         """A null or negative exposure is a plan, not an observation, for all of them.
 
-        Missions sliced by time (GBM days) have no exposure column, so they are skipped."""
+        Missions sliced by time (GBM days) and those with their own catalogue (SVOM) have
+        no exposure column, so they are skipped."""
         for mission in core.MISSION_CONFIG:
-            if core.is_time_sliced(mission):
+            if core.is_time_sliced(mission) or core.has_own_catalogue(mission):
                 continue
             assert core.exposure_condition(mission).endswith(("> 0", ">= 0"))
 

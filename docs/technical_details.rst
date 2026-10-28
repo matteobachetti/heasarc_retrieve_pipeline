@@ -208,6 +208,57 @@ stays the same:
    Replaces ``recursive_download``: ``download(obsid, url, outdir, config, test=False)``
    fills ``<outdir>/<obsid>``. ``download_filter`` does not apply to it.
 
+SVOM retrieval (``svom.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The missions ``svom_eclairs`` and ``svom_grm`` share one module and differ only in which
+event products they fetch (``ECL-EVT-CAL`` and ``ECL-GTI-CAL``, or ``GRM-EVT``) and in
+the default search radius (45 and 70 degrees around the ECLAIRs pointing: the GRM
+detectors point 30 degrees off that axis). Their reductions are not written yet, so a run
+stops after the download.
+
+The SVOM tools live in an environment of their own (Python 3.12), so they are never
+imported. They run as subprocesses, set up from three environment variables:
+
+``SVOM_ECPI_PYTHON``
+   The Python of the environment with ECPI and ``svom.messaging``. ``ecpi_find_files`` is
+   looked for beside it. Without it every SVOM call stops with an error saying so.
+``SVOM_ECPI_ENV``
+   A shell file setting the FSC credentials, default ``~/.ecpi``. It is sourced by
+   ``bash`` before each call; the package never reads it, and its name is passed to the
+   shell as an argument, not pasted into the script.
+``FSC_URL``
+   Defaults to production, ``https://fsc.svom.org``. Without it ECPI logs into its
+   integration server and fails.
+
+The steps:
+
+``catalogue``
+   ``ecpi_find_files`` searches ECLAIRs event files by pointing, dates or ObsID (it
+   knows no GRM product). Its answer has one row per file; ``group_by_obsid`` turns it
+   into one row per ObsID, with the span of all files, the mean pointing of those that
+   have one (averaged as unit vectors, so it wraps at RA 0/360) and the passes they came
+   in. GRM files share the ECLAIRs ObsIDs, so the same search serves both.
+``work_items``
+   One item per ObsID, with the label ``fsc:<obsid>`` as URL. Without a source position
+   the ObsID is barycentred at its pointing.
+``download``
+   ``download_plan`` asks the helper ``data/svom_fsc.py`` (run with the SVOM Python, in
+   isolated mode) for the event products with this ``OBS_ID``, keeps the highest
+   ``PROC_VER`` of each, then asks for every orbit (``SVO-ORB-CNV``) and attitude
+   (``SVO-ATT-CNV``) file overlapping the events' span widened by 600 s. These come one per
+   downlink pass, and an event file can start minutes before its own pass's orbit file,
+   so they are searched by time, not by pass. A GRM event file usually spans several
+   passes, and gets one orbit and one attitude file for each. Each file is then fetched by
+   the keywords that pick exactly its version, under the archive's own file name, and
+   skipped if already there. On an exFAT disk macOS adds a ``._<name>`` file beside each
+   download; the reductions must ignore them.
+
+``ecpi_find_files`` cannot search GRM products, so the helper uses ``svom.messaging``'s
+``SdbIo`` instead, asking for every page of the answer (the archive returns 100 products
+per page). The unit tests replace ``svom.run_ecpi`` with a fake archive; one test marked
+``remote_data`` runs against the FSC when ``SVOM_ECPI_PYTHON`` is set.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 

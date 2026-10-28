@@ -60,6 +60,8 @@ from .xrism import (
     xrism_download_filter,
     DEFAULT_CONFIG as XRISM_DEFAULT_CONFIG,
 )
+from functools import partial
+from . import svom
 
 from prefect import flow, task, get_run_logger
 from prefect.task_runners import ProcessPoolTaskRunner
@@ -1097,7 +1099,37 @@ MISSION_CONFIG = {
         "condition": "cat.tte_flag = 'Y'",
         "additional": "end_time, tte_flag",
     },
+    # Not at HEASARC: the catalogue, the work items and the download are SVOM's own, at
+    # the French Science Center; see svom.py. One work item per ObsID, which ECLAIRs and
+    # GRM share. The reductions are not written yet.
+    "svom_eclairs": {
+        "catalogue": partial(svom.svom_catalogue, "eclairs"),
+        "work_items": svom.svom_work_items,
+        "download": partial(svom.svom_download, "eclairs"),
+        "obsid_processing": partial(svom.process_svom_obsid, "eclairs"),
+        "default_config": svom.DEFAULT_CONFIG,
+    },
+    "svom_grm": {
+        "catalogue": partial(svom.svom_catalogue, "grm"),
+        "work_items": svom.svom_work_items,
+        "download": partial(svom.svom_download, "grm"),
+        "obsid_processing": partial(svom.process_svom_obsid, "grm"),
+        "default_config": svom.DEFAULT_CONFIG,
+    },
 }
+
+
+def has_own_catalogue(mission: str) -> bool:
+    """
+    Whether a mission brings its own catalogue instead of a HEASARC master table.
+
+    Examples
+    --------
+    >>> has_own_catalogue("nustar"), has_own_catalogue("svom_grm")
+    (False, True)
+    """
+    return "catalogue" in MISSION_CONFIG[mission]
+
 
 # A mission whose data are not at HEASARC (SVOM, at the French Science Center) declares
 # three more entries, and the HEASARC query, the datalink lookup and the HTTPS/S3 download

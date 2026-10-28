@@ -24,6 +24,9 @@ from heasarc_retrieve_pipeline.core import (
     s3_key_destination,
 )
 
+#: The missions searched in a HEASARC master catalogue; SVOM brings its own.
+HEASARC_MISSIONS = sorted(m for m in MISSION_CONFIG if not core.has_own_catalogue(m))
+
 BASE_URL = "https://heasarc.gsfc.nasa.gov/FTP/nustar/data/obs/00/8/80002092008/"
 
 # The real index page of 80002092008, captured verbatim. Apache writes the column-sort
@@ -740,13 +743,13 @@ class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
         # "day_id as obsid" asks the catalogue for day_id.
         return [column.split()[0] for column in selected.split(",") if column.strip()]
 
-    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    @pytest.mark.parametrize("mission", HEASARC_MISSIONS)
     def test_every_column_a_mission_asks_for_exists_in_its_catalogue(self, mission):
         table = MISSION_CONFIG[mission]["table"]
 
         assert set(self.selected_columns(mission)) <= CATALOGUE_COLUMNS[table]
 
-    @pytest.mark.parametrize("mission", sorted(MISSION_CONFIG))
+    @pytest.mark.parametrize("mission", HEASARC_MISSIONS)
     def test_a_mission_asks_for_no_column_twice(self, mission):
         """``rxte`` named ``cycle`` in "additional" while the query text named it too."""
         columns = self.selected_columns(mission)
@@ -755,7 +758,7 @@ class TestTheObsidQueryAsksEachCatalogueForItsOwnColumns:
 
     def test_a_new_mission_has_to_record_its_catalogue_schema(self):
         """Otherwise the guard above silently passes over it."""
-        tables = {config["table"] for config in MISSION_CONFIG.values()}
+        tables = {MISSION_CONFIG[mission]["table"] for mission in HEASARC_MISSIONS}
 
         assert tables <= set(CATALOGUE_COLUMNS)
 
