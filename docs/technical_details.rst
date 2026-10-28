@@ -390,6 +390,10 @@ Diagnostics (``svom_common.record_screening``)
    report. A pass that writes nothing is recorded as skipped, naming the cut that left no
    good time (or "no event left"). Barycentring leaves a ``barycenter`` record per pass:
    position, ephemeris, number of orbit files and output, or skipped with the reason.
+   The report page draws two figures from each screening record: "Good time"
+   (``report.screening_gti_figure``), one row of intervals per cut in the order applied,
+   the last one dark, which shows at a glance which cut cost what; and "Off-axis angle"
+   (``report.offaxis_figure``), the angle against time with the threshold dashed.
 Barycentring (``svom_common.barycentre_events``)
    With the ``barycenter`` package, at the searched position, on
    ``barycenter_ephemeris`` (DE430 by default), passing it every orbit file of the

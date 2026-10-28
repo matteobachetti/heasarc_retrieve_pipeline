@@ -94,6 +94,7 @@ STEP_TITLES = {
     "flare_filtering": "Flare filtering",
     "calculate_spectra": "Spectral extraction",
     "combine_modules": "Module combination",
+    "svom_screening": "Screening",
 }
 """Readable names for the steps, for the timeline and the section headings."""
 
@@ -517,6 +518,104 @@ def gti_figure(record, arrays):
             rows.append((f"FPM{fpm} merged (OR)", arrays[f"gti_{fpm}_out"], "#219ebc"))
     if "gti_combined" in arrays:
         rows.append((values.get("combined", "combined (AND)"), arrays["gti_combined"], "#023047"))
+    return _interval_rows_figure(rows)
+
+
+def screening_gti_figure(record, arrays):
+    """
+    The good time of one SVOM pass or detector after each cut, one row per cut in order.
+
+    Parameters
+    ----------
+    record : dict
+        An ``svom_screening`` record.
+    arrays : dict of numpy.ndarray
+        Its array payload.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if no intervals were recorded.
+    """
+    names = (record.get("values") or {}).get("cuts") or []
+    rows = [
+        (name if i == 0 else f"after {name}", arrays[f"gti_{name}"], "#8ecae6")
+        for i, name in enumerate(names)
+        if f"gti_{name}" in arrays
+    ]
+    if rows:
+        rows[-1] = (*rows[-1][:2], "#023047")
+    return _interval_rows_figure(rows)
+
+
+def offaxis_figure(record, arrays):
+    """
+    The angle between the source and the instrument axis, with the threshold.
+
+    Parameters
+    ----------
+    record : dict
+        An ``svom_screening`` record.
+    arrays : dict of numpy.ndarray
+        Its array payload: ``offaxis_time`` and ``offaxis_deg``.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` without a position, when no angle was recorded.
+    """
+    go, _ = _plotly()
+
+    if "offaxis_time" not in arrays or not len(arrays["offaxis_time"]):
+        return None
+    times = np.asarray(arrays["offaxis_time"], float)
+    fig = go.Figure(
+        go.Scatter(
+            x=np.round(times - times[0], 1).astype(np.float32),
+            y=np.asarray(arrays["offaxis_deg"], np.float32),
+            mode="lines",
+            line=dict(color="#219ebc"),
+            showlegend=False,
+            hovertemplate="%{y:.1f}°<extra></extra>",
+        )
+    )
+    threshold = (record.get("values") or {}).get("max_offaxis_deg")
+    if threshold is not None:
+        fig.update_layout(
+            shapes=[
+                dict(
+                    type="line",
+                    xref="x domain",
+                    x0=0,
+                    x1=1,
+                    y0=threshold,
+                    y1=threshold,
+                    line=dict(color="#e76f51", dash="dash"),
+                )
+            ]
+        )
+    fig.update_layout(
+        xaxis_title="seconds since the first attitude sample", yaxis_title="off-axis angle (°)"
+    )
+    fig.update_yaxes(range=[0, 180])
+    return _blank(fig, height=300)
+
+
+def _interval_rows_figure(rows):
+    """
+    One row of horizontal bars per list of intervals.
+
+    Parameters
+    ----------
+    rows : list of (str, numpy.ndarray, str)
+        Name, ``(N, 2)`` intervals and colour of each row, top to bottom.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure or None
+        ``None`` if no row has an interval.
+    """
+    go, _ = _plotly()
 
     rows = [(name, np.atleast_2d(gti), colour) for name, gti, colour in rows]
     rows = [row for row in rows if row[1].size]
@@ -1059,6 +1158,9 @@ def observation_body(summary, directory):
         # and the figure's own axes say which. The step title is generic for the same
         # reason.
         ("Flare filtering", "flare_filtering", flare_figure),
+        # SVOM: one record per pass (ECLAIRs) or detector (GRM).
+        ("Good time", "svom_screening", screening_gti_figure),
+        ("Off-axis angle", "svom_screening", offaxis_figure),
         ("Spectra", "calculate_spectra", spectrum_figure),
         # The same figure: a combined product is a spectrum like any other, and drawing it
         # on its own axes is what lets a reader see it sitting at the sum of the two

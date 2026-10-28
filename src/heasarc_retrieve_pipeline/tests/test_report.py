@@ -123,6 +123,19 @@ def a_join(tmp_path, obsid=OBSID):
         )
 
 
+def a_screening(tmp_path, obsid=OBSID):
+    """An ``svom_screening`` record: three steps of good time and an off-axis angle."""
+    with record_step(observation(tmp_path, obsid), obsid, "svom_screening", key="P1") as rec:
+        rec.value(cuts=["archive", "orbit", "offaxis"], max_offaxis_deg=40.0, written=10)
+        rec.array(
+            gti_archive=np.array([[0.0, 1000.0]]),
+            gti_orbit=np.array([[0.0, 900.0]]),
+            gti_offaxis=np.array([[100.0, 500.0]]),
+            offaxis_time=np.arange(0.0, 1000.0, 10.0),
+            offaxis_deg=np.linspace(60.0, 20.0, 100),
+        )
+
+
 def a_flare_filtering(tmp_path, obsid=OBSID, goes=True):
     """A ``flare_filtering`` record with both bands before and after."""
     time = np.arange(0, 1000, 100.0)
@@ -348,6 +361,18 @@ class TestWhatTheFiguresContain:
             "FPMB merged (OR)",
             f"nu{OBSID}_src1.evt",
         ]
+
+    def test_the_svom_screening_shows_the_good_time_after_each_cut_and_the_angle(self, tmp_path):
+        """One row per cut, in the order applied; the angle with its threshold drawn."""
+        a_screening(tmp_path)
+        record, arrays = self.records(tmp_path, "svom_screening")
+
+        rows = report.screening_gti_figure(record, arrays)
+        angle = report.offaxis_figure(record, arrays)
+
+        assert list(rows.layout.yaxis.ticktext) == ["archive", "after orbit", "after offaxis"]
+        assert len(angle.data[0].x) == 100
+        assert [shape.y0 for shape in angle.layout.shapes] == [40.0]
 
     def test_the_row_label_is_not_repeated_once_per_interval(self, tmp_path):
         """A real observation has ~1500 intervals per row. The name is 30 characters."""
