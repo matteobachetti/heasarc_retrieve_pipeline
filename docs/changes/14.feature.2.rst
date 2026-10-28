@@ -1,0 +1,1 @@
+New ``svom_geometry`` module: good time intervals for SVOM from the orbit, attitude and SAA files (orbit coverage, Earth occultation of the source, off-axis angle from any instrument axis, SAA), and a list of orbit discontinuities for the report.

@@ -265,6 +265,51 @@ The steps:
 per page). The unit tests replace ``svom.run_ecpi`` with a fake archive; one test marked
 ``remote_data`` runs against the FSC when ``SVOM_ECPI_PYTHON`` is set.
 
+SVOM geometry (``svom_geometry.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The good time intervals (GTIs) that both SVOM reductions build from the orbit, attitude
+and SAA files. Plain numpy and astropy, so it runs and is tested without ECPI. Each
+``*_gti`` function returns an ``(N, 2)`` array in the files' own time; the reductions
+intersect them with ``utils.intersect_intervals``. Edges between two 1-s samples are
+placed by linear interpolation of the quantity being cut on
+(``intervals_where_positive``).
+
+Joining (``read_aux_series``)
+   Orbit and attitude files of consecutive passes abut and share a few samples. They
+   are joined in time order, each sample time kept once from the earlier file, and the
+   repeated samples whose values differ are counted. In the real files checked, those
+   differ only in ``ORIGIN`` (which system gave the position), never in the position.
+   ``._*`` files are skipped.
+Orbit coverage (``orbit_coverage_gti``)
+   Time between orbit samples at most ``MAX_HOLE_S`` = 2 s apart. Samples flagged as
+   telemetry gaps (``FLAG_PVT`` bit ``0x08``) count as missing, and the orbit is never
+   extended past its ends: ``barycenter`` refuses to extrapolate it inside a GTI anyway.
+   Sample times are not whole seconds, so one missing sample leaves a hole of about
+   2.1 s, which is cut: 2 s lost, against a bridged interpolation error never checked.
+Discontinuities (``orbit_discontinuities``)
+   Changes of ``ORIGIN`` or ``FLAG_PVT``, and steps in position larger than
+   ``JUMP_M`` = 1 km beyond what the mean velocity of the two samples explains. Reported,
+   not cut: whether they matter for timing is for the acceptance runs to show. A day of
+   real orbit gave about a dozen ``ORIGIN`` changes and two steps of 1-2 km.
+Earth occultation (``visibility_gti``)
+   The source is hidden when it is within the angular radius of a sphere of radius
+   6378.137 km plus ``ATMOSPHERE_M`` = 100 km from the direction of the Earth's centre.
+   No margin is added at the limb. The test checks the analytic answer: in the plane of
+   a circular orbit of radius *r*, the source is hidden for a fraction ρ/π of each orbit,
+   with ρ = arcsin((R⊕ + 100 km)/*r*).
+Off-axis angle (``offaxis_gti``)
+   Where the source is within a given angle of an axis: ECLAIRs' (``POINTING``) or one
+   GRM detector's (``GRDX_1..3``), read with ``axis_columns``. The defaults for the
+   reductions are 40° for ECLAIRs (beyond it the year-long Crab study lost the pulsar)
+   and 60° for each GRM detector, both to be tuned on the Crab.
+SAA (``saa_gti``)
+   The complement of the entry/exit rows of the archive's weekly tables; rows with
+   missing times are dropped. In the data checked, ``SAA-DEEP-ECL`` removes about 14 % of
+   the time and ``SAA-EXT-ECL`` about 56 %. The proposed defaults are no SAA cut for
+   ECLAIRs (it costs exposure without improving the pulse per photon) and the deep
+   region for GRM, whose detectors cannot separate source from background.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 
