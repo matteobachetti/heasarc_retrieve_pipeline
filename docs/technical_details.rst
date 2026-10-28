@@ -348,7 +348,7 @@ Joining (``join_events``)
    (``GP``) file of the same pass; in the four overlaps surveyed the survey file had no
    events inside the burst file's span, so nothing was duplicated, but two bursts may
    share events, and an exact-row rule removes those without cutting anything else.
-Geometry (``geometry_cuts``)
+Geometry (``svom_common.geometry_cuts``)
    The union of the files' archive GTIs is intersected, in this order, with the orbit
    coverage, the source's visibility above the Earth's limb, the attitude coverage and
    the off-axis cut (``eclairs_max_offaxis_deg``, default 40°), and, only if
@@ -367,7 +367,7 @@ Report
    out of band, outside the file's archive GTI, duplicated, outside the final GTI, and
    written; and the exposure after the archive GTIs and after each geometric cut. Its
    metadata counts the orbit's ``ORIGIN`` and ``FLAG_PVT`` changes and position jumps.
-Barycentring (``barycentre_pass``)
+Barycentring (``svom_common.barycentre_events``)
    With the ``barycenter`` package, at the searched position, on
    ``barycenter_ephemeris`` (DE430 by default), passing it every orbit file of the
    ObsID: it joins them itself, so no joined orbit file is written. There is no official

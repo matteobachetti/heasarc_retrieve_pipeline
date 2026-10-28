@@ -57,7 +57,6 @@ Configuration keys:
     ``"deep"`` or ``"ext"``: also cut on that SAA table. Default: no SAA cut.
 """
 
-import glob
 import os
 from collections import defaultdict
 
@@ -67,13 +66,14 @@ from astropy.io import fits
 from astropy.table import Table, vstack
 from prefect import flow, task
 
-from . import svom_geometry as geo
-from .barycenter import (
-    OFFICIAL_TOOL,
-    barycenter_ephemeris,
-    barycenter_tool,
-    barycenter_with_package,
-    barycentered_file_name,
+from .svom_common import (
+    DEFAULT_CONFIG,
+    barycentre_events,
+    discontinuity_counts,
+    find_inputs,
+    geometry_cuts,
+    is_data_file,
+    total_time,
 )
 from .utils import (
     absolute_config,
@@ -106,9 +106,6 @@ GOOD_FLAG = 0
 #: Largest angle between the ECLAIRs axis and the source, in degrees. The coded field of
 #: view reaches about 45 degrees off axis at zero response.
 DEFAULT_MAX_OFFAXIS_DEG = 40.0
-
-#: The SAA table for each value of ``eclairs_saa``.
-SAA_EXTNAMES = {"deep": "SAA-DEEP-ECL", "ext": "SAA-EXT-ECL"}
 
 #: Header keywords of the input files that do not describe a joined pass, and are dropped.
 STALE_KEYWORDS = (
@@ -151,30 +148,9 @@ COUNTS = (
     "written",
 )
 
-DEFAULT_CONFIG = dict(out_data_path="./", input_data_path="./")
-
 
 class MissingCriterion(ValueError):
     """A GTI file lacks a criterion that has to be applied."""
-
-
-def _is_data_file(path):
-    name = os.path.basename(path)
-    return not name.startswith("._") and name.endswith((".fits", ".fits.gz"))
-
-
-def find_inputs(raw_data_dir):
-    """
-    The observation's files, by the name of their first extension.
-
-    ``ECL-EVT-CAL`` (events), ``ECL-GTI-CAL-GRP`` (GTIs), ``SVO-ORB-CNV``, ``SVO-ATT-CNV``,
-    ``SAA-DEEP-ECL`` and ``SAA-EXT-ECL``; each a sorted list, empty if there are none.
-    """
-    found = defaultdict(list)
-    for path in sorted(glob.glob(os.path.join(raw_data_dir, "*"))):
-        if os.path.isfile(path) and _is_data_file(path):
-            found[fits.getheader(path, 1).get("EXTNAME", "").strip()].append(path)
-    return found
 
 
 def file_identity(path):
@@ -200,7 +176,7 @@ def pair_event_and_gti_files(paths):
         ``(event_file, reason)`` for each event file without a GTI file of its own.
     """
     events, gtis = {}, {}
-    for path in filter(_is_data_file, paths):
+    for path in filter(is_data_file, paths):
         extname = fits.getheader(path, 1).get("EXTNAME", "").strip()
         kind = {EVENTS_EXTNAME: events, GTI_GROUP_EXTNAME: gtis}.get(extname)
         if kind is None:
@@ -219,11 +195,6 @@ def pair_event_and_gti_files(paths):
         else:
             unpaired.append((event_file, "no ECL-GTI-CAL file of the same burst and pass"))
     return dict(sorted(passes.items())), unpaired
-
-
-def _total(gti):
-    gti = np.asarray(gti, dtype=float).reshape(-1, 2)
-    return float(np.sum(gti[:, 1] - gti[:, 0]))
 
 
 def archive_gti(gti_file, extra_criteria=()):
@@ -341,7 +312,7 @@ def write_pass(table, gti, primary, header, outfile):
 
     hdul = fits.HDUList([fits.PrimaryHDU(header=_clean(primary)), events, gti_hdu])
     update_time_bounds(hdul, gti)
-    ontime = _total(gti)
+    ontime = total_time(gti)
     for hdu in hdul[:2]:
         if "ONTIME" in hdu.header:
             hdu.header["ONTIME"] = ontime
@@ -396,10 +367,10 @@ def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
         headers = headers or (primary, header)
 
     gti = merge_intervals(np.concatenate(gtis)) if gtis else np.zeros((0, 2))
-    summary["exposure_archive"] = _total(gti)
+    summary["exposure_archive"] = total_time(gti)
     for name, cut in cuts.items():
         gti = intersect_intervals(gti, cut)
-        summary[f"exposure_{name}"] = _total(gti)
+        summary[f"exposure_{name}"] = total_time(gti)
     if not tables:
         return None, summary
 
@@ -412,40 +383,6 @@ def reduce_pass(pairs, outfile, cuts=None, extra_criteria=(), pi_band=None):
         logger.warning(f"{os.path.basename(outfile)}: no event left")
         return None, summary
     return write_pass(table, gti, *headers, outfile), summary
-
-
-def geometry_cuts(inputs, source=None, max_offaxis_deg=DEFAULT_MAX_OFFAXIS_DEG, saa=None):
-    """
-    The geometric cuts of an observation, in the order they are applied.
-
-    ``orbit``, where the orbit is measured; with a ``source``, ``visible`` (above the
-    Earth's limb), ``attitude`` (where the attitude is known) and ``offaxis``; with
-    ``saa`` (``"deep"`` or ``"ext"``), ``saa``.
-
-    Parameters
-    ----------
-    inputs : dict
-        From :func:`find_inputs`.
-
-    Returns
-    -------
-    cuts : dict
-    orbit : astropy.table.Table
-        The joined orbit, for the report.
-    """
-    orbit, _ = geo.read_aux_series(inputs["SVO-ORB-CNV"])
-    times = np.asarray(orbit["TIME"], dtype=float)
-    cuts = dict(orbit=geo.orbit_coverage_gti(orbit))
-    if source is not None:
-        cuts["visible"] = geo.visibility_gti(orbit, source)
-        attitude, _ = geo.read_aux_series(inputs["SVO-ATT-CNV"])
-        cuts["attitude"] = geo.coverage_gti(attitude["TIME"])
-        ra, dec = geo.axis_columns(attitude, "POINTING")
-        cuts["offaxis"] = geo.offaxis_gti(attitude["TIME"], ra, dec, source, max_offaxis_deg)
-    if saa is not None:
-        table = geo.read_saa(inputs[SAA_EXTNAMES[saa]])
-        cuts["saa"] = geo.saa_gti(table, times[0], times[-1])
-    return cuts, orbit
 
 
 @task(name="reduce_eclairs_obsid")
@@ -475,11 +412,11 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
         cuts, orbit = geometry_cuts(
             inputs,
             source=source,
+            axis="POINTING",
             max_offaxis_deg=config.get("eclairs_max_offaxis_deg", DEFAULT_MAX_OFFAXIS_DEG),
             saa=config.get("eclairs_saa"),
         )
-        found = geo.orbit_discontinuities(orbit)
-        meta = {kind: int((found["kind"] == kind).sum()) for kind in ("ORIGIN", "FLAG_PVT", "jump")}
+        meta = discontinuity_counts(orbit)
     else:
         logger.warning(f"{obsid}: no orbit file; only the archive GTIs apply")
 
@@ -504,27 +441,6 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
     table.meta["orbit_discontinuities"] = meta
     table.write(os.path.join(l2_dir, f"{obsid}_ecl.ecsv"), overwrite=True)
     return written, orbit_files
-
-
-def barycentre_pass(infile, orbit_files, ra, dec, config=None):
-    """
-    Barycentre one pass with the ``barycenter`` package, from every orbit file given.
-
-    There is no official tool for SVOM (``barycorr`` refuses ``TELESCOP = SVOM``), so
-    ``barycenter_tool: official`` is overridden, with a warning.
-    """
-    config = config or {}
-    if barycenter_tool(config) == OFFICIAL_TOOL:
-        get_logger().warning("No official barycentring tool for SVOM: using the barycenter package")
-    outfile = barycentered_file_name(infile)
-    return barycenter_with_package(
-        infile,
-        list(orbit_files),
-        outfile,
-        ra=float(ra),
-        dec=float(dec),
-        ephem=barycenter_ephemeris(config),
-    )
 
 
 @flow
@@ -565,5 +481,5 @@ def process_eclairs_obsid(obsid: str, config=None, flags=None, ra: float = None,
         )
         return written
     return [
-        barycentre_pass(infile, orbit_files, ra, dec, config=current_config) for infile in written
+        barycentre_events(infile, orbit_files, ra, dec, config=current_config) for infile in written
     ]

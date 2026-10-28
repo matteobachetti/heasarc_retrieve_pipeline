@@ -11,6 +11,7 @@ import pytest
 from astropy.io import fits
 from astropy.table import Table
 
+from heasarc_retrieve_pipeline import svom_common
 from heasarc_retrieve_pipeline import svom_eclairs as ecl
 from heasarc_retrieve_pipeline.tests.test_svom_geometry import circular_orbit
 
@@ -190,7 +191,7 @@ def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, 
         calls.append(dict(orbit=sorted(os.path.basename(o) for o in orbit), ra=ra))
         return outfile
 
-    monkeypatch.setattr(ecl, "barycenter_with_package", fake_barycentre)
+    monkeypatch.setattr(svom_common, "barycenter_with_package", fake_barycentre)
     config = {"out_data_path": str(tmp_path)}
 
     unbarycentred = ecl.process_eclairs_obsid.fn(str(OBS_ID), config=config)
