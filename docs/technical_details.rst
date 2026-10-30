@@ -414,6 +414,20 @@ Barycentring (``svom_common.barycentre_events``)
    ObsID: it joins them itself, so no joined orbit file is written. There is no official
    tool (``barycorr`` refuses ``TELESCOP = SVOM``), so ``barycenter_tool: official`` is
    overridden with a warning. Without a position nothing is barycentred, as for XRISM.
+Readout sectors (``eclairs_sector``, ``split_by_sector``)
+   The detector plane (80 × 80 pixels, ``IDET`` and ``JDET`` from 0 to 79) is eight
+   sectors of 800 pixels, each with its own readout electronics. A timing problem in
+   one sector's electronics would be diluted by the other seven in the joined file, so
+   ``split_by_sector`` splits any written file, barycentred or not, into
+   ``<stem>_s<sector><ext>``, one per sector, each with a ``SECTOR`` keyword and the
+   input's GTI and exposure. The numbering is ECPI's (``array_convention.ijdet_to_dpix``,
+   after ECL-EIC-FITS-KEYWORDS, "DPIX frame"; eic-tools uses the same):
+   ``sector = (IDET // 20) * 2 + JDET // 40``, so sectors 0 and 1 share ``IDET`` 0-19
+   and even sectors have ``JDET`` < 40. Other numberings circulate (one counts along
+   ``IDET`` first), so name the convention when comparing sector numbers with anyone.
+   Each sector has about an eighth of the counts, so a pulsation's Z² is about an eighth
+   of the whole file's. On a real pass, 2.8 million events split in 6 s, 0.32-0.38
+   million per sector.
 
 On a real pass (one file, 4.3 million events, 1174 s of archive good time) the
 reduction takes about a minute, most of it reading the day's orbit and attitude. 15.9 %

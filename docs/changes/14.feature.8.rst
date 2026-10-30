@@ -1,0 +1,1 @@
+Add ``svom_eclairs.split_by_sector``, which splits a written ECLAIRs file into one file per readout sector (ECPI numbering, ``eclairs_sector``), to look for timing problems in one sector's electronics.

@@ -249,3 +249,45 @@ def test_without_a_position_the_observation_stops_before_barycentring(tmp_path, 
     assert {"gti_archive", "gti_offaxis"} <= set(arrays)
     assert np.allclose(np.diff(arrays["offaxis_time"]), 10.0)
     assert records()["barycenter", "P1"]["values"]["ephem"] == "DE430"
+
+
+def test_sectors_follow_ecpi_numbering():
+    """Sector numbers are ECPI's (``array_convention.ijdet_to_dpix``): 20 rows of IDET by
+    40 columns of JDET each, counted along JDET first."""
+    idet = np.array([0, 19, 0, 20, 39, 40, 60, 79])
+    jdet = np.array([0, 39, 40, 0, 79, 0, 40, 79])
+
+    assert ecl.eclairs_sector(idet.astype(np.uint8), jdet.astype(np.uint8)).tolist() == [
+        0,
+        0,
+        1,
+        2,
+        3,
+        4,
+        7,
+        7,
+    ]
+
+
+def test_a_file_splits_into_one_file_per_sector_with_its_events_only(tmp_path):
+    """Each sector's file keeps that sector's events, every other extension unchanged, and
+    a SECTOR keyword; a sector without events writes nothing, and ``sectors`` picks some."""
+    times = np.arange(0.5, 10.0)
+    infile = write_events(tmp_path / "e.fits", times, span=(0, 10))
+    with fits.open(infile, mode="update") as hdul:
+        data = hdul[ecl.EVENTS_EXTNAME].data
+        data["IDET"][:4], data["JDET"][:4] = 25, 45  # sector 3
+        data["IDET"][4:], data["JDET"][4:] = 79, 0  # sector 6
+        hdul.append(fits.BinTableHDU(Table(dict(START=[0.0], STOP=[10.0])), name="GTI"))
+
+    written = ecl.split_by_sector(infile)
+    only = ecl.split_by_sector(infile, sectors=[6])
+
+    assert {k: os.path.basename(v) for k, v in written.items()} == {3: "e_s3.fits", 6: "e_s6.fits"}
+    assert only == {6: written[6]}
+    for sector, expected in [(3, times[:4]), (6, times[4:])]:
+        with fits.open(written[sector]) as hdul:
+            assert hdul[ecl.EVENTS_EXTNAME].data["TIME"].tolist() == expected.tolist()
+            assert hdul[0].header["SECTOR"] == hdul[ecl.EVENTS_EXTNAME].header["SECTOR"] == sector
+            assert hdul["GTI"].data["STOP"].tolist() == [10.0]
+            assert hdul[ecl.EVENTS_EXTNAME].header["TSTOP"] == 10

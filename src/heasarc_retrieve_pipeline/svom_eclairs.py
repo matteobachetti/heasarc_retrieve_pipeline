@@ -55,6 +55,11 @@ Configuration keys:
     Default :data:`DEFAULT_MAX_OFFAXIS_DEG`.
 ``eclairs_saa``
     ``"deep"`` or ``"ext"``: also cut on that SAA table. Default: no SAA cut.
+
+The detector plane is 8 sectors of 800 pixels, each with its own readout electronics.
+:func:`split_by_sector` splits a written file, barycentred or not, into one file per
+sector, to tell an instrumental timing problem in one sector's electronics from one of
+the whole instrument.
 """
 
 import os
@@ -123,6 +128,9 @@ STALE_KEYWORDS = COMMON_STALE_KEYWORDS + (
     "EARTHMAX",
 )
 
+#: Pixels of one readout sector along ``IDET`` and along ``JDET``.
+SECTOR_SHAPE = (20, 40)
+
 #: The counts in a pass's summary, in the order they are taken.
 COUNTS = (
     "files",
@@ -138,6 +146,64 @@ COUNTS = (
 
 class MissingCriterion(ValueError):
     """A GTI file lacks a criterion that has to be applied."""
+
+
+def eclairs_sector(idet, jdet):
+    """
+    Readout sector, 0 to 7, of detector pixels, numbered as ECPI does.
+
+    ECPI's ``array_convention.ijdet_to_dpix`` (after ECL-EIC-FITS-KEYWORDS, DPIX frame):
+    sectors are :data:`SECTOR_SHAPE` pixels, two along ``JDET`` and four along ``IDET``,
+    counted along ``JDET`` first.
+
+    Examples
+    --------
+    >>> eclairs_sector([0, 0, 20, 79], [0, 40, 0, 79]).tolist()
+    [0, 1, 2, 7]
+    """
+    idet = np.asarray(idet, dtype=int)
+    jdet = np.asarray(jdet, dtype=int)
+    return (idet // SECTOR_SHAPE[0]) * (80 // SECTOR_SHAPE[1]) + jdet // SECTOR_SHAPE[1]
+
+
+def split_by_sector(event_file, sectors=None):
+    """
+    Write one event file per readout sector, ``<stem>_s<sector><ext>``, beside the input.
+
+    Each keeps that sector's events and every other extension (``GTI``) unchanged, and
+    gets a ``SECTOR`` keyword in its primary and event headers. The good time and exposure
+    are the input's: a pixel switched off is flagged and its events already gone, not cut
+    from the good time.
+
+    Parameters
+    ----------
+    event_file : str
+        A file from :func:`reduce_observation`, barycentred or not.
+    sectors : list of int, optional
+        Default: all eight. A sector without events is reported and not written.
+
+    Returns
+    -------
+    dict
+        ``{sector: file}``.
+    """
+    stem, ext = os.path.splitext(event_file)
+    written = {}
+    with fits.open(event_file) as hdul:
+        events = hdul[EVENTS_EXTNAME]
+        sector_of_event = eclairs_sector(events.data["IDET"], events.data["JDET"])
+        for sector in range(8) if sectors is None else sectors:
+            good = sector_of_event == sector
+            if not good.any():
+                get_logger().warning(f"{os.path.basename(event_file)}: no event in sector {sector}")
+                continue
+            out = fits.HDUList([hdu.copy() for hdu in hdul])
+            out[EVENTS_EXTNAME] = fits.BinTableHDU(events.data[good], header=events.header.copy())
+            for hdu in (out[0], out[EVENTS_EXTNAME]):
+                hdu.header["SECTOR"] = (sector, "ECLAIRs readout sector, ECPI numbering")
+            written[sector] = f"{stem}_s{sector}{ext}"
+            out.writeto(written[sector], overwrite=True)
+    return written
 
 
 def file_identity(path):
