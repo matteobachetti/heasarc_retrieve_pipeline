@@ -69,6 +69,16 @@ AUX_PRODUCTS = ("SVO-ORB-CNV", "SVO-ATT-CNV", "SAA-DEEP-ECL", "SAA-EXT-ECL")
 #: were seen starting up to 5 minutes before their pass's orbit file.
 AUX_MARGIN_S = 600.0
 
+#: GRM files found by time (not by ObsID) are fetched only if they cover more ECLAIRs time than
+#: this, beyond what the ObsID's own GRM files and the ones already chosen cover: most
+#: neighbours only touch the edges of the ECLAIRs files.
+MIN_GRM_GAIN_S = 60.0
+
+#: GRM files found by time claiming a longer span are ignored: some archive files have a
+#: broken ``TSTOP`` (around the year 2140), and would match every later search. The longest
+#: real ones last about a day.
+MAX_GRM_SPAN_S = 2 * 86400.0
+
 #: Default search radius around the ECLAIRs pointing, per instrument. The GRM detectors
 #: point 30 degrees off the ECLAIRs axis, and see far off their own axes.
 DEFAULT_RADIUS_DEG = {"eclairs": 45.0, "grm": 70.0}
@@ -383,8 +393,9 @@ def download_plan(instrument, obsid):
     SAA.
 
     GRM event files are those of this ObsID and, as GRM files are not always filed under
-    the ECLAIRs ObsID (long ECLAIRs ObsIDs span weeks of ordinary ones), every GRM file
-    overlapping one of this ObsID's ECLAIRs event files, whatever its own ObsID. The
+    the ECLAIRs ObsID (long ECLAIRs ObsIDs span weeks of ordinary ones), the GRM files of
+    any ObsID that add coverage of this ObsID's ECLAIRs event files
+    (:func:`grm_by_time`). The
     auxiliary files (:data:`AUX_PRODUCTS`) are those overlapping any event file, widened by
     :data:`AUX_MARGIN_S`, whatever their pass; nothing is fetched for the gaps between
     event files. An ObsID with no event products for this instrument gives an empty plan.
@@ -392,11 +403,13 @@ def download_plan(instrument, obsid):
     events = []
     for acronym in EVENT_PRODUCTS[instrument]:
         events += search_products(acronym, [f"OBS_ID={obsid}"])
+    events = latest_versions(events)
     if instrument == "grm":
         eclairs = latest_versions(search_products("ECL-EVT-CAL", [f"OBS_ID={obsid}"]))
+        found = []
         for tmin, tmax in aux_windows(eclairs, margin=0.0):
-            events += search_products("GRM-EVT", tmin=tmin, tmax=tmax)
-    events = latest_versions(events)
+            found += search_products("GRM-EVT", tmin=tmin, tmax=tmax)
+        events += grm_by_time(found, events, aux_windows(eclairs, margin=0.0))
     if not events:
         return []
     aux = []
@@ -404,6 +417,66 @@ def download_plan(instrument, obsid):
         for acronym in AUX_PRODUCTS:
             aux += search_products(acronym, tmin=tmin, tmax=tmax)
     return events + latest_versions(aux)
+
+
+def _span(product):
+    return float(product["header"]["TSTART"]), float(product["header"]["TSTOP"])
+
+
+def _subtract(intervals, start, stop):
+    """``intervals`` (disjoint) minus ``[start, stop]``."""
+    out = []
+    for a, b in intervals:
+        if stop <= a or start >= b:
+            out.append((a, b))
+            continue
+        if a < start:
+            out.append((a, start))
+        if stop < b:
+            out.append((stop, b))
+    return out
+
+
+def _overlap_s(intervals, start, stop):
+    return sum(max(0.0, min(b, stop) - max(a, start)) for a, b in intervals)
+
+
+def grm_by_time(found, own, windows):
+    """
+    The GRM files found by time worth fetching besides the ObsID's own ones (``own``).
+
+    Files claiming more than :data:`MAX_GRM_SPAN_S` are dropped. Then, greedily, the file
+    adding the most coverage of the ECLAIRs ``windows`` is taken, until none adds more than
+    :data:`MIN_GRM_GAIN_S`; taking them in time order would keep a file at an edge that the
+    next file covers anyway.
+
+    Examples
+    --------
+    >>> def grm(obsid, a, b):
+    ...     return dict(acronym="GRM-EVT", url=str(obsid), header=dict(OBS_ID=obsid, TSTART=a, TSTOP=b))
+    >>> chosen = grm_by_time([grm(8, 2990, 3500), grm(9, 3000, 5000), grm(10, 4000, 4e9)],
+    ...                      [grm(7, 1000, 3000)], [(1000.0, 5000.0)])
+    >>> [p["header"]["OBS_ID"] for p in chosen]
+    [9]
+    """
+    have = {p["url"] for p in own}
+    candidates = [
+        p
+        for p in latest_versions(found)
+        if p["url"] not in have and _span(p)[1] - _span(p)[0] <= MAX_GRM_SPAN_S
+    ]
+    uncovered = list(windows)
+    for p in own:
+        uncovered = _subtract(uncovered, *_span(p))
+    chosen = []
+    while candidates and uncovered:
+        gains = [_overlap_s(uncovered, *_span(p)) for p in candidates]
+        best = int(np.argmax(gains))
+        if gains[best] <= MIN_GRM_GAIN_S:
+            break
+        chosen.append(candidates.pop(best))
+        uncovered = _subtract(uncovered, *_span(chosen[-1]))
+    return chosen
 
 
 def aux_windows(events, margin=AUX_MARGIN_S):

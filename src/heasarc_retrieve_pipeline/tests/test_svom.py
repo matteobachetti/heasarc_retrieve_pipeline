@@ -204,6 +204,27 @@ class TestDownload:
 
         assert sorted(p["header"]["OBS_ID"] for p in plan if p["acronym"] == "GRM-EVT") == [8, 10]
 
+    def test_grm_files_found_by_time_must_add_eclairs_coverage(self, ecpi, monkeypatch):
+        """A neighbour touching the edge of an ECLAIRs file already covered by the ObsID's own GRM
+        file is not fetched; one filling an uncovered stretch is; one whose header claims a span
+        of a century (archive files with a broken TSTOP) is never fetched."""
+        fsc = FakeFSC(
+            {
+                "ECL-EVT-CAL": [product("ECL-EVT-CAL", 1000.0, 5000.0, obsid=7)],
+                "GRM-EVT": [
+                    product("GRM-EVT", 1000.0, 3000.0, obsid=7),
+                    product("GRM-EVT", 2990.0, 3500.0, obsid=8),
+                    product("GRM-EVT", 3000.0, 5000.0, obsid=9),
+                    product("GRM-EVT", 4000.0, 4e9, obsid=10),
+                ],
+            }
+        )
+        monkeypatch.setattr(svom, "run_ecpi", fsc)
+
+        plan = svom.download_plan("grm", 7)
+
+        assert sorted(p["header"]["OBS_ID"] for p in plan if p["acronym"] == "GRM-EVT") == [7, 9]
+
     def test_auxiliary_files_around_each_event_file_not_the_whole_span(self, ecpi, monkeypatch):
         """Two event files a day apart: orbit files are searched around each, so the one
         between them is not fetched."""

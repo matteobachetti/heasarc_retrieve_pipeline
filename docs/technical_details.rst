@@ -250,8 +250,14 @@ The steps:
    of the ObsID's ECLAIRs event files, whatever its own ObsID: a few ECLAIRs ObsIDs span
    weeks (one in the Crab history covers 39 days of autumn 2024), and the GRM files of
    those weeks carry the ordinary ObsIDs of their days, so a search by ObsID alone finds
-   none. The whole GRM file is kept, also where it runs beyond the ECLAIRs file, so a
-   stretch of GRM data can be reduced under two ObsIDs. It then asks for every orbit
+   none. Only files that add coverage are kept (``grm_by_time``): greedily, the file
+   covering the most ECLAIRs time not yet covered by the ObsID's own GRM files and those
+   already chosen, until none adds more than 60 s. Without this, three ObsIDs in four of
+   the Crab history picked up neighbours that only touch the edges of the ECLAIRs files
+   (987 extra files against 245, for no coverage). Files claiming a span over two days
+   are ignored: four GRM files of December 2025 carry a ``TSTOP`` near the year 2140 and
+   overlap every later search. A kept file is kept whole, also where it runs beyond the
+   ECLAIRs file, so a stretch of GRM data can be reduced under two ObsIDs. It then asks for every orbit
    (``SVO-ORB-CNV``), attitude (``SVO-ATT-CNV``) and SAA (``SAA-DEEP-ECL``,
    ``SAA-EXT-ECL``: South Atlantic Anomaly entry and exit times, one table per week, made
    for ECLAIRs and the only ones there are) file overlapping any event file widened by
