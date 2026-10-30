@@ -469,9 +469,20 @@ Event selection
 Joining
    The files in time order, rows identical in every column kept once (``join_events``,
    as for ECLAIRs); events outside the GTI dropped.
+Splitting
+   All of a detector's kept events are in memory at once, twice while joining: the file
+   surveyed (~100 million events per detector) peaked at ~7 GB. So when one detector's
+   files hold more than ``grm_max_events`` events (default 150 million, from the headers'
+   ``NAXIS2``), each file is reduced on its own (``pieces``) into
+   ``<obsid>_<file's OBS_ID>_grd<n>.evt``, keyed ``<file's OBS_ID>_grd<n>`` in the
+   diagnostics (``.2``, ``.3`` added if an ``OBS_ID`` repeats). Files go in ``TSTART``
+   order, and a first cut, ``overlap``, removes from each the time an earlier file covers,
+   so every event is in one piece only, as in the joined file. The case that needed it:
+   an ECLAIRs ObsID of 39 days, whose GRM, found by time, is 153 files over 27 days, over
+   a billion events per detector after the cuts.
 Output and report
    ``EBOUNDS`` is copied into the output. ``l2_files/<obsid>_grm.ecsv`` has one row per
-   detector: events read, rejected by the flags, out of band, outside the file's GTI,
+   detector (per piece and detector, with a ``piece`` column, when split): events read, rejected by the flags, out of band, outside the file's GTI,
    duplicated, outside the final GTI and written; the dead time and live time; the band
    actually kept; the exposure after each cut and the events each removed. The
    diagnostics are those of ECLAIRs, keyed ``grd<n>``, the off-axis angle that of the

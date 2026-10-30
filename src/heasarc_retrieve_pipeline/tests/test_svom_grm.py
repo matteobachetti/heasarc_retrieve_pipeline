@@ -170,3 +170,29 @@ def test_each_detector_gets_its_own_offaxis_cut_and_is_barycentred(tmp_path, mon
     assert empty["status"] == "skipped"
     assert empty["reason"] == "no good time left after the offaxis cut"
     assert empty["values"]["offaxis_min_deg"] == 180.0
+
+
+def test_above_the_event_limit_each_file_is_reduced_on_its_own(tmp_path):
+    """With more events than grm_max_events, each file gives its own output per detector,
+    named after the file's ObsID, and time an earlier file covers is cut from the later one:
+    the pieces hold every event once, as the joined file would."""
+    obsdir = tmp_path / str(OBS_ID)
+    obsdir.mkdir()
+    write_grm(obsdir / "a.fits", np.arange(0.5, 60.0), span=(0.0, 60.0))
+    other = dict(TIMING, OBS_ID=OBS_ID + 1)
+    path = write_grm(obsdir / "b.fits", np.arange(40.5, 100.0), span=(40.0, 100.0))
+    with fits.open(path, mode="update") as hdul:
+        for hdu in hdul:
+            hdu.header["OBS_ID"] = other["OBS_ID"]
+    config = {"out_data_path": str(tmp_path), "grm_max_events": 100}
+
+    written, _ = grm.reduce_observation(str(obsdir), str(OBS_ID), config)
+
+    assert sorted(written) == [f"{OBS_ID + d}_grd{n}" for d in (0, 1) for n in grm.DETECTORS]
+    first, second = (fits.getdata(written[f"{OBS_ID + d}_grd1"], "EVENTS") for d in (0, 1))
+    assert np.array_equal(first["TIME"], np.arange(0.5, 60.0))
+    assert np.array_equal(second["TIME"], np.arange(60.5, 100.0))
+    assert os.path.basename(written[f"{OBS_ID + 1}_grd1"]) == f"{OBS_ID}_{OBS_ID + 1}_grd1.evt"
+    summary = Table.read(obsdir / "l2_files" / f"{OBS_ID}_grm.ecsv")
+    assert summary["piece"].tolist() == [str(OBS_ID)] * 3 + [str(OBS_ID + 1)] * 3
+    assert summary["removed_overlap"].tolist() == [0] * 3 + [20] * 3

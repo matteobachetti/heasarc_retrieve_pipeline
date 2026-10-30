@@ -36,6 +36,10 @@ Configuration keys:
     ``[emin, emax]``. Default :data:`DEFAULT_ENERGY_BAND_KEV`.
 ``grm_max_offaxis_deg``
     Default :data:`DEFAULT_MAX_OFFAXIS_DEG`.
+``grm_max_events``
+    Above this many events in one detector's files, each file is reduced on its own into
+    ``<obsid>_<file's OBS_ID>_grd<n>.evt``, without the time an earlier file covers
+    (:func:`pieces`). Default :data:`MAX_EVENTS`.
 ``grm_saa``
     ``"deep"`` or ``"ext"``: also cut on that SAA table (made for ECLAIRs; there is none
     for GRM). Default: no SAA cut beyond the file's own GTI.
@@ -91,6 +95,11 @@ DEFAULT_ENERGY_BAND_KEV = (20.0, 300.0)
 #: Largest angle between a detector's axis and the source, in degrees.
 DEFAULT_MAX_OFFAXIS_DEG = 60.0
 
+#: Most events one detector's files may hold before each file is reduced on its own: the
+#: kept events are all in memory at once, twice while joining. A 22.7-hour file, ~100 million
+#: events per detector, peaked at ~7 GB; this keeps a reduction near 10 GB.
+MAX_EVENTS = 150_000_000
+
 #: Header keywords of the input files that do not describe a joined output.
 STALE_KEYWORDS = COMMON_STALE_KEYWORDS + ("INFILE01",)
 
@@ -137,6 +146,41 @@ def _file_gti(path, extname):
         span = np.array([[header["TSTART"], header["TSTOP"]]], dtype=float)
         gti = np.column_stack([hdul["GTI"].data["START"], hdul["GTI"].data["STOP"]])
     return intersect_intervals(gti, span), span
+
+
+def pieces(files, max_events=MAX_EVENTS):
+    """
+    How an ObsID's files are reduced: all together, or each on its own.
+
+    Together while no detector has more than ``max_events`` events in them (the ``NAXIS2``
+    of the headers). Otherwise each file, in ``TSTART`` order, is a piece named after its
+    ``OBS_ID`` (``.2``, ``.3`` added if one repeats), with an ``overlap`` cut leaving out
+    the time an earlier file covers, so that no event is in two pieces.
+
+    Returns
+    -------
+    list of (str or None, list of str, numpy.ndarray or None)
+        ``(name, files, overlap cut)``; a single ``(None, files, None)`` if not split.
+    """
+    headers = {path: fits.getheader(path, events_extname(DETECTORS[0])) for path in files}
+    files = sorted(files, key=lambda path: headers[path]["TSTART"])
+    events = [
+        sum(fits.getheader(path, events_extname(detector))["NAXIS2"] for path in files)
+        for detector in DETECTORS
+    ]
+    if max(events, default=0) <= max_events:
+        return [(None, files, None)]
+    out, covered, seen = [], np.zeros((0, 2)), {}
+    for path in files:
+        header = headers[path]
+        name = str(header["OBS_ID"])
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            name += f".{seen[name]}"
+        span = np.array([[header["TSTART"], header["TSTOP"]]], dtype=float)
+        out.append((name, [path], good_intervals(covered, *span[0])))
+        covered = merge_intervals(np.concatenate([covered, span]))
+    return out
 
 
 def reduce_detector(files, detector, outfile, cuts=None, band_kev=DEFAULT_ENERGY_BAND_KEV):
@@ -265,23 +309,29 @@ def reduce_observation(raw_data_dir: str, obsid: str, config: dict, source=None)
     l2_dir = os.path.join(raw_data_dir, "l2_files")
     os.makedirs(l2_dir, exist_ok=True)
     written, rows = {}, []
-    for detector, detector_cuts, detector_angles in zip(DETECTORS, cuts, angles):
-        key = f"grd{detector}"
-        with record_step(diagnostics_path(obsid, config), obsid, "svom_screening", key) as rec:
-            outfile, summary = reduce_detector(
-                files,
-                detector,
-                os.path.join(l2_dir, f"{obsid}_{key}.evt"),
-                cuts=detector_cuts,
-                band_kev=config.get("grm_energy_band_kev", DEFAULT_ENERGY_BAND_KEV),
+    for name, piece_files, overlap in pieces(files, config.get("grm_max_events", MAX_EVENTS)):
+        for detector, detector_cuts, detector_angles in zip(DETECTORS, cuts, angles):
+            key = f"grd{detector}" if name is None else f"{name}_grd{detector}"
+            if overlap is not None:
+                detector_cuts = dict(overlap=overlap, **detector_cuts)
+            with record_step(diagnostics_path(obsid, config), obsid, "svom_screening", key) as rec:
+                outfile, summary = reduce_detector(
+                    piece_files,
+                    detector,
+                    os.path.join(l2_dir, f"{obsid}_{key}.evt"),
+                    cuts=detector_cuts,
+                    band_kev=config.get("grm_energy_band_kev", DEFAULT_ENERGY_BAND_KEV),
+                )
+                steps = summary.pop("steps")
+                record_screening(rec, summary, steps, orbit, detector_angles, max_offaxis)
+            rows.append(
+                dict(summary, detector=detector, **({} if name is None else {"piece": name}))
             )
-            steps = summary.pop("steps")
-            record_screening(rec, summary, steps, orbit, detector_angles, max_offaxis)
-        rows.append(dict(summary, detector=detector))
-        if outfile is not None:
-            written[key] = outfile
+            if outfile is not None:
+                written[key] = outfile
     table = Table(rows=rows)
-    table = table[["detector"] + [name for name in table.colnames if name != "detector"]]
+    first = [name for name in ("piece", "detector") if name in table.colnames]
+    table = table[first + [name for name in table.colnames if name not in first]]
     table.meta["orbit_discontinuities"] = meta
     table.write(os.path.join(l2_dir, f"{obsid}_grm.ecsv"), overwrite=True)
     return written, orbit_files
