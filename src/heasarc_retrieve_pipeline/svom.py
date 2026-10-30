@@ -10,14 +10,16 @@ and are never imported here. This module drives them as subprocesses, the way
 
 Both instruments share the catalogue and the auxiliary files:
 
-* **One catalogue, by ObsID.** ECLAIRs and GRM files of the same pointing carry the same
-  ``OBS_ID``. ``ecpi_find_files`` searches ECLAIRs files by position (it knows no GRM
-  product), and its one-row-per-file answer is grouped into one row per ObsID.
+* **One catalogue, by ObsID.** ECLAIRs and GRM files of the same pointing usually carry the
+  same ``OBS_ID``. ``ecpi_find_files`` searches ECLAIRs files by position (it knows no GRM
+  product), and its one-row-per-file answer is grouped into one row per ObsID. GRM files
+  are also searched by time, over each of the ObsID's ECLAIRs files: an ECLAIRs ObsID can
+  span weeks, while the GRM files of those weeks carry the ordinary ObsIDs.
 * **Orbit, attitude and SAA by time.** ``SVO-ORB-CNV`` and ``SVO-ATT-CNV`` come one per
   downlink pass, the SAA tables (South Atlantic Anomaly entry and exit times) one per
   week. An event file can start minutes before its own pass's orbit file, inside
-  the previous one's, so every file overlapping the events (with :data:`AUX_MARGIN_S` on
-  either side) is fetched, whatever its pass.
+  the previous one's, so every file overlapping an event file (with :data:`AUX_MARGIN_S`
+  on either side) is fetched, whatever its pass.
 
 What the run needs from the environment, like ``HEADAS`` for HEASOFT:
 
@@ -380,37 +382,54 @@ def download_plan(instrument, obsid):
     Every file to download for one ObsID: its event products, then orbit, attitude and
     SAA.
 
-    The auxiliary files (:data:`AUX_PRODUCTS`) are all those overlapping the events' span, widened by
-    :data:`AUX_MARGIN_S`, whatever their pass. An ObsID with no event products for this
-    instrument gives an empty plan.
+    GRM event files are those of this ObsID and, as GRM files are not always filed under
+    the ECLAIRs ObsID (long ECLAIRs ObsIDs span weeks of ordinary ones), every GRM file
+    overlapping one of this ObsID's ECLAIRs event files, whatever its own ObsID. The
+    auxiliary files (:data:`AUX_PRODUCTS`) are those overlapping any event file, widened by
+    :data:`AUX_MARGIN_S`, whatever their pass; nothing is fetched for the gaps between
+    event files. An ObsID with no event products for this instrument gives an empty plan.
     """
     events = []
     for acronym in EVENT_PRODUCTS[instrument]:
         events += search_products(acronym, [f"OBS_ID={obsid}"])
+    if instrument == "grm":
+        eclairs = latest_versions(search_products("ECL-EVT-CAL", [f"OBS_ID={obsid}"]))
+        for tmin, tmax in aux_windows(eclairs, margin=0.0):
+            events += search_products("GRM-EVT", tmin=tmin, tmax=tmax)
     events = latest_versions(events)
     if not events:
         return []
-    tmin, tmax = aux_window(events)
     aux = []
-    for acronym in AUX_PRODUCTS:
-        aux += search_products(acronym, tmin=tmin, tmax=tmax)
+    for tmin, tmax in aux_windows(events):
+        for acronym in AUX_PRODUCTS:
+            aux += search_products(acronym, tmin=tmin, tmax=tmax)
     return events + latest_versions(aux)
 
 
-def aux_window(events, margin=AUX_MARGIN_S):
+def aux_windows(events, margin=AUX_MARGIN_S):
     """
-    The interval orbit and attitude files must cover: the events' span plus a margin.
+    The intervals orbit and attitude files must cover: each event file's span plus a
+    margin, overlapping ones merged, in time order.
 
     Examples
     --------
     >>> events = [dict(header=dict(TSTART=100.0, TSTOP=200.0)),
-    ...           dict(header=dict(TSTART=150.0, TSTOP=400.0))]
-    >>> aux_window(events, margin=10)
-    (90.0, 410.0)
+    ...           dict(header=dict(TSTART=150.0, TSTOP=400.0)),
+    ...           dict(header=dict(TSTART=5000.0, TSTOP=6000.0))]
+    >>> aux_windows(events, margin=10)
+    [(90.0, 410.0), (4990.0, 6010.0)]
     """
-    tstart = min(float(p["header"]["TSTART"]) for p in events)
-    tstop = max(float(p["header"]["TSTOP"]) for p in events)
-    return tstart - margin, tstop + margin
+    spans = sorted(
+        (float(p["header"]["TSTART"]) - margin, float(p["header"]["TSTOP"]) + margin)
+        for p in events
+    )
+    windows = []
+    for tstart, tstop in spans:
+        if windows and tstart <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], tstop))
+        else:
+            windows.append((tstart, tstop))
+    return windows
 
 
 def local_name(product):

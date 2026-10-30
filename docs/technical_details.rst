@@ -238,17 +238,25 @@ The steps:
    knows no GRM product). Its answer has one row per file; ``group_by_obsid`` turns it
    into one row per ObsID, with the span of all files, the mean pointing of those that
    have one (averaged as unit vectors, so it wraps at RA 0/360) and the passes they came
-   in. GRM files share the ECLAIRs ObsIDs, so the same search serves both.
+   in. GRM files usually share the ECLAIRs ObsIDs, so the same search serves both (but
+   see ``download`` for the exceptions).
 ``work_items``
    One item per ObsID, with the label ``fsc:<obsid>`` as URL. Without a source position
    the ObsID is barycentred at its pointing.
 ``download``
    ``download_plan`` asks the helper ``data/svom_fsc.py`` (run with the SVOM Python, in
    isolated mode) for the event products with this ``OBS_ID``, keeps the highest
-   ``PROC_VER`` of each, then asks for every orbit (``SVO-ORB-CNV``), attitude
-   (``SVO-ATT-CNV``) and SAA (``SAA-DEEP-ECL``, ``SAA-EXT-ECL``: South Atlantic Anomaly
-   entry and exit times, one table per week, made for ECLAIRs and the only ones there
-   are) file overlapping the events' span widened by 600 s. These come one per
+   ``PROC_VER`` of each. For GRM it also asks for every GRM event file overlapping one
+   of the ObsID's ECLAIRs event files, whatever its own ObsID: a few ECLAIRs ObsIDs span
+   weeks (one in the Crab history covers 39 days of autumn 2024), and the GRM files of
+   those weeks carry the ordinary ObsIDs of their days, so a search by ObsID alone finds
+   none. The whole GRM file is kept, also where it runs beyond the ECLAIRs file, so a
+   stretch of GRM data can be reduced under two ObsIDs. It then asks for every orbit
+   (``SVO-ORB-CNV``), attitude (``SVO-ATT-CNV``) and SAA (``SAA-DEEP-ECL``,
+   ``SAA-EXT-ECL``: South Atlantic Anomaly entry and exit times, one table per week, made
+   for ECLAIRs and the only ones there are) file overlapping any event file widened by
+   600 s, one search per group of overlapping event files: nothing for the gaps between
+   them, which in a weeks-long ObsID would be thousands of files. These come one per
    downlink pass, and an event file can start minutes before its own pass's orbit file,
    so they are searched by time, not by pass. A GRM event file usually spans several
    passes, and gets one orbit and one attitude file for each. Each file is then fetched by

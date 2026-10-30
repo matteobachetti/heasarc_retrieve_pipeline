@@ -38,8 +38,28 @@ def product(acronym, tstart, tstop, obsid=None, pass_id=None, burst=None, versio
     return dict(acronym=acronym, url=url, header=header)
 
 
+def matches(product, criteria):
+    """Whether a product passes ``search``'s ``KEY=VALUE`` and ``--tmin``/``--tmax`` criteria."""
+    header, i = product["header"], 0
+    while i < len(criteria):
+        if criteria[i] in ("--tmin", "--tmax"):
+            limit = float(criteria[i + 1])
+            if criteria[i] == "--tmin" and float(header["TSTOP"]) < limit:
+                return False
+            if criteria[i] == "--tmax" and float(header["TSTART"]) > limit:
+                return False
+            i += 2
+            continue
+        key, value = criteria[i].split("=", 1)
+        if str(header.get(key)) != value:
+            return False
+        i += 1
+    return True
+
+
 class FakeFSC:
-    """Answers the runner's calls from a dictionary of products, and records them."""
+    """Answers the runner's calls from a dictionary of products, filtered by the search's
+    criteria, and records them."""
 
     def __init__(self, products, find_table=FIND_FILES_TABLE):
         self.products = products
@@ -58,7 +78,8 @@ class FakeFSC:
             os.makedirs(outdir, exist_ok=True)
             open(os.path.join(outdir, name), "w").close()
             return json.dumps(dict(path=os.path.join(outdir, name)))
-        return json.dumps(self.products.get(acronym, []))
+        found = [p for p in self.products.get(acronym, []) if matches(p, argv[5:])]
+        return json.dumps(found)
 
     def searched(self, acronym):
         return [call for call in self.calls if call[3:5] == ["search", acronym]]
@@ -160,6 +181,52 @@ class TestDownload:
         assert plan[0]["header"]["PROC_VER"] == 2
         orbit_search = fsc.searched("SVO-ORB-CNV")[0]
         assert orbit_search[-4:] == ["--tmin", "400.0", "--tmax", "5600.0"]
+
+    def test_grm_files_of_other_obsids_that_overlap_the_eclairs_files(self, ecpi, monkeypatch):
+        """GRM files are filed under other ObsIDs during long ECLAIRs ObsIDs: those overlapping
+        one of this ObsID's ECLAIRs event files come too, not those in the gaps between them."""
+        fsc = FakeFSC(
+            {
+                "ECL-EVT-CAL": [
+                    product("ECL-EVT-CAL", 1000.0, 2000.0, obsid=7, pass_id="000001_HBX"),
+                    product("ECL-EVT-CAL", 1e5, 1.01e5, obsid=7, pass_id="000009_HBX"),
+                ],
+                "GRM-EVT": [
+                    product("GRM-EVT", 900.0, 1500.0, obsid=8),
+                    product("GRM-EVT", 5e4, 6e4, obsid=9),
+                    product("GRM-EVT", 9.9e4, 1.005e5, obsid=10),
+                ],
+            }
+        )
+        monkeypatch.setattr(svom, "run_ecpi", fsc)
+
+        plan = svom.download_plan("grm", 7)
+
+        assert sorted(p["header"]["OBS_ID"] for p in plan if p["acronym"] == "GRM-EVT") == [8, 10]
+
+    def test_auxiliary_files_around_each_event_file_not_the_whole_span(self, ecpi, monkeypatch):
+        """Two event files a day apart: orbit files are searched around each, so the one
+        between them is not fetched."""
+        fsc = FakeFSC(
+            {
+                "GRM-EVT": [
+                    product("GRM-EVT", 1000.0, 2000.0, obsid=7, pass_id="000001_HBX"),
+                    product("GRM-EVT", 1e5, 1.01e5, obsid=7, pass_id="000009_HBX"),
+                ],
+                "SVO-ORB-CNV": [
+                    product("SVO-ORB-CNV", 0.0, 3000.0, pass_id="000001_HBX"),
+                    product("SVO-ORB-CNV", 5e4, 6e4, pass_id="000005_HBX"),
+                    product("SVO-ORB-CNV", 9.9e4, 1.02e5, pass_id="000009_HBX"),
+                ],
+            }
+        )
+        monkeypatch.setattr(svom, "run_ecpi", fsc)
+
+        plan = svom.download_plan("grm", 7)
+
+        orbits = [p["header"]["PASS_ID"] for p in plan if p["acronym"] == "SVO-ORB-CNV"]
+        assert orbits == ["000001_HBX", "000009_HBX"]
+        assert len(fsc.searched("SVO-ORB-CNV")) == 2
 
     def test_an_obsid_without_events_downloads_nothing(self, ecpi, monkeypatch):
         """No GRM file for this pointing: no orbit or attitude search either."""
