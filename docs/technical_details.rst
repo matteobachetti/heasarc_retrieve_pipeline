@@ -713,6 +713,34 @@ and, one of each per observation, in ``<out_data_path>/<OBSID>/``::
     nu<OBSID>_goes.gti                     the flare-free intervals derived from it
     skipped_inputs.txt                     the inputs the reduction had to skip
 
+Decompressing the metrology file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``numetrology``, the first task of ``nupipeline``, reads ``hk/nu<OBSID>_met.fits.gz`` in
+blocks of 1000 rows and reopens the file for each block. CFITSIO decompresses a whole
+gzipped file every time it opens one, so the run time grows with the square of the
+observation length. ``nu_run_l2_pipeline`` therefore writes a plain copy next to the
+``.gz`` for the duration of the run, and removes it afterwards. ``nupipeline`` prefers the
+plain file when both are present.
+
+Measured on the 93.6 ks observation 90201037002 (M82), HEASOFT 6.37.1:
+
+============  ===========  ==========
+Input         numetrology  nupipeline
+============  ===========  ==========
+gzipped       241.3 s      399.9 s
+decompressed  3.4 s        160.4 s
+============  ===========  ==========
+
+The mast aspect and position-detector files are identical between the two runs. In the
+cleaned event files only ``DET1X/Y``, ``DET2X/Y``, ``X`` and ``Y`` differ, by under 2
+pixels rms with zero mean, because ``nucalcpos`` draws random sub-pixel positions from a
+new seed at each run (``initseed=no``).
+
+The step does nothing if ``metrologyfile`` is passed in ``flags``, and it leaves a plain
+file that was already there. If the copy cannot be written, for example on a full disk
+or a read-only archive, ``nupipeline`` runs on the ``.gz``, more slowly.
+
 Observing modes 01 and 06
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

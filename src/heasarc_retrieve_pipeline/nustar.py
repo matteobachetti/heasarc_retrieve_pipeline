@@ -34,8 +34,11 @@ See ``docs/technical_details.rst`` for the scientific rationale behind each step
 
 import os
 import re
+import gzip
+import shutil
 
 import glob
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 import numpy as np
 import astropy.units as u
@@ -824,6 +827,44 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
         return _run_l2_pipeline(obsid, config, flags, rec)
 
 
+@contextmanager
+def _decompressed_metrology(datadir, obsid):
+    """
+    Provide a plain copy of the gzipped metrology file for the duration of the block.
+
+    ``numetrology`` reopens its input for every 1000 rows and CFITSIO decompresses the
+    whole of a gzipped file at each opening, so its run time grows with the square of the
+    observation length. ``nupipeline`` prefers a plain ``_met.fits`` when one sits next to
+    the ``.gz``. The copy is removed afterwards. A plain file that was already there is
+    left alone, and a failure to decompress only means a slower run.
+
+    Parameters
+    ----------
+    datadir : str
+        The raw data directory of the observation.
+    obsid : str
+        Observation identifier.
+    """
+    plain = os.path.join(datadir, "hk", f"nu{obsid}_met.fits")
+    compressed = plain + ".gz"
+    created = False
+    if os.path.exists(compressed) and not os.path.exists(plain):
+        try:
+            with gzip.open(compressed, "rb") as source, open(plain, "wb") as target:
+                created = True
+                shutil.copyfileobj(source, target, length=1 << 20)
+        except OSError as error:
+            get_logger().warning(f"Keeping the gzipped metrology file: {error}")
+            if created:
+                os.remove(plain)
+            created = False
+    try:
+        yield
+    finally:
+        if created:
+            os.remove(plain)
+
+
 def _run_l2_pipeline(obsid, config, flags, rec):
     """The body of :func:`nu_run_l2_pipeline`, with its diagnostics record open."""
     pipe_done_file = nu_pipeline_done_file(obsid, config=config)
@@ -850,14 +891,17 @@ def _run_l2_pipeline(obsid, config, flags, rec):
         logger.info(f"Applying custom flags: {flags}")
         params.update(flags)
 
-    # No return-code check here: heasoft.run_task raises on a non-zero code, with the
-    # tool's own output in the message.
-    heasoft.run_task(
-        "nupipeline",
-        produces=ev_dir,
-        log_to=tool_log_file("nupipeline", obsid, config),
-        **params,
-    )
+    # A metrology file named in the flags is read from wherever it is, not from hk.
+    decompress = not (flags and "metrologyfile" in flags)
+    with _decompressed_metrology(datadir, obsid) if decompress else nullcontext():
+        # No return-code check here: heasoft.run_task raises on a non-zero code, with
+        # the tool's own output in the message.
+        heasoft.run_task(
+            "nupipeline",
+            produces=ev_dir,
+            log_to=tool_log_file("nupipeline", obsid, config),
+            **params,
+        )
 
     open(pipe_done_file, "a").close()
 

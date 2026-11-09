@@ -4,6 +4,7 @@ These need neither the network nor a HEASOFT installation: they exercise the pur
 file-selection helpers that decide which event files the pipeline works on.
 """
 
+import gzip
 import os
 import glob
 import numpy as np
@@ -2558,3 +2559,81 @@ class TestCombiningTheModules:
 
 def test_the_mode_06_fraction_of_nothing_is_zero():
     assert mode_06_exposure_fraction([], OBSID) == 0.0
+
+
+class TestMetrologyIsDecompressedForNupipeline:
+    """``numetrology`` is about 70 times faster on a plain metrology file than a gzipped one.
+
+    Only the call to ``nupipeline`` is replaced, because it needs HEASOFT: what these check
+    is which files it would find in ``hk`` while it runs, and what is left afterwards.
+    """
+
+    CONTENT = b"metrology rows"
+
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        """A raw observation with a gzipped metrology file; records what ``nupipeline`` sees."""
+        monkeypatch.setattr(nustar, "HAS_HEASOFT", True)
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        hk = os.path.join(nu_local_raw_data_path(OBSID, config), "hk")
+        os.makedirs(hk)
+        plain = os.path.join(hk, f"nu{OBSID}_met.fits")
+        with gzip.open(plain + ".gz", "wb") as f:
+            f.write(self.CONTENT)
+        seen = {}
+
+        def fake_run_task(name, **params):
+            seen["content"] = open(plain, "rb").read() if os.path.exists(plain) else None
+            seen["params"] = params
+
+        monkeypatch.setattr(nustar.heasoft, "run_task", fake_run_task)
+        return config, plain, seen
+
+    def test_nupipeline_reads_a_plain_file_that_is_removed_afterwards(self, setup):
+        """The plain copy exists only during the run, and the archive's ``.gz`` is untouched."""
+        config, plain, seen = setup
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert seen["content"] == self.CONTENT
+        assert not os.path.exists(plain)
+        assert os.path.exists(plain + ".gz")
+
+    def test_the_plain_copy_is_removed_when_nupipeline_fails(self, setup, monkeypatch):
+        """A failed run must not leave a 50 MB copy in the raw data."""
+        config, plain, _ = setup
+
+        def failing_run_task(name, **params):
+            raise RuntimeError("nupipeline failed")
+
+        monkeypatch.setattr(nustar.heasoft, "run_task", failing_run_task)
+        with pytest.raises(RuntimeError, match="nupipeline failed"):
+            nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert not os.path.exists(plain)
+
+    def test_a_plain_file_already_there_is_kept(self, setup):
+        """A file the user decompressed is theirs: neither overwritten nor deleted."""
+        config, plain, seen = setup
+        with open(plain, "wb") as f:
+            f.write(b"the user's own copy")
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert seen["content"] == b"the user's own copy"
+        assert os.path.exists(plain)
+
+    def test_a_metrology_file_given_in_flags_is_left_to_nupipeline(self, setup):
+        """With ``metrologyfile`` set, ``nupipeline`` does not look in ``hk`` at all."""
+        config, _, seen = setup
+        nustar.nu_run_l2_pipeline.fn(OBSID, config, flags=dict(metrologyfile="custom.fits"))
+        assert seen["content"] is None
+        assert seen["params"]["metrologyfile"] == "custom.fits"
+
+    def test_a_failed_decompression_only_costs_speed(self, setup, monkeypatch):
+        """With a full disk, ``nupipeline`` still runs on the ``.gz``, with no partial file."""
+        config, plain, seen = setup
+
+        def disk_full(source, target, *args, **kwargs):
+            target.write(b"partial")
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(nustar.shutil, "copyfileobj", disk_full)
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert seen["content"] is None
+        assert "params" in seen
