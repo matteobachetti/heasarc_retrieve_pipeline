@@ -2637,3 +2637,101 @@ class TestMetrologyIsDecompressedForNupipeline:
         nustar.nu_run_l2_pipeline.fn(OBSID, config)
         assert seen["content"] is None
         assert "params" in seen
+
+
+class TestDetectorsRunInParallel:
+    """The two detectors overlap when the machine can hold both, and their outputs are merged."""
+
+    GIB = 1024**3
+
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        """A raw observation with two small event files, on a machine with plenty of room."""
+        monkeypatch.setattr(nustar, "HAS_HEASOFT", True)
+        monkeypatch.setattr(nustar, "_usable_cpus", lambda: 10)
+        self.free = 30 * self.GIB
+        monkeypatch.setattr(
+            nustar.psutil,
+            "virtual_memory",
+            lambda: type("Memory", (), dict(available=self.free)),
+        )
+        config = dict(out_data_path=str(tmp_path), input_data_path=str(tmp_path))
+        datadir = nu_local_raw_data_path(OBSID, config)
+        os.makedirs(os.path.join(datadir, "event_uf"))
+        self.datadir = datadir
+        for fpm in "AB":
+            self.write_events(fpm, 1000)
+        return config
+
+    def write_events(self, fpm, n_events):
+        """Writes the Level-1 event file of one detector, gzipped like the archive's."""
+        hdu = fits.BinTableHDU.from_columns(
+            [fits.Column(name="TIME", format="D", array=np.zeros(n_events))], name="EVENTS"
+        )
+        path = os.path.join(self.datadir, "event_uf", f"nu{OBSID}{fpm}_uf.evt.gz")
+        fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
+
+    def can_overlap(self, config, flags=None):
+        return nustar._detectors_can_overlap(self.datadir, OBSID, config, flags)[0]
+
+    def test_enough_memory_and_cores_allow_it(self, setup):
+        """The ordinary case on a workstation."""
+        assert self.can_overlap(setup)
+
+    def test_not_enough_memory_for_the_estimate_stops_it(self, setup):
+        """About 1 GB per detector is the fixed cost measured for ``nuflagevt``."""
+        self.free = 2 * self.GIB
+        assert not self.can_overlap(setup)
+
+    def test_the_event_count_enters_the_estimate(self, setup, monkeypatch):
+        """Many events cost memory beyond the fixed part, because of ``nucalcsaa``'s table."""
+        self.free = 4 * self.GIB
+        assert self.can_overlap(setup)
+        monkeypatch.setattr(nustar, "_detector_event_counts", lambda *a: [50_000_000, 1000])
+        assert not self.can_overlap(setup)
+
+    def test_free_memory_is_shared_between_workers(self, setup):
+        """Workers decide at the same moment, so none may count on all the free memory."""
+        self.free = 12 * self.GIB
+        assert self.can_overlap(setup)
+        assert not self.can_overlap(dict(setup, n_workers=5))
+
+    def test_cores_must_cover_two_processes_per_worker(self, setup):
+        """Doubling the processes past the core count would only make them wait."""
+        assert self.can_overlap(dict(setup, n_workers=5))
+        assert not self.can_overlap(dict(setup, n_workers=6))
+
+    def test_a_single_detector_request_or_the_switch_keeps_it_serial(self, setup):
+        """An explicit ``instrument``, or the configuration switch, always wins."""
+        assert not self.can_overlap(setup, flags=dict(instrument="FPMA"))
+        assert not self.can_overlap(dict(setup, nustar_parallel_detectors=False))
+
+    def test_missing_event_files_keep_it_serial(self, setup):
+        """Without event counts there is no estimate, so it does not guess."""
+        os.remove(os.path.join(self.datadir, "event_uf", f"nu{OBSID}A_uf.evt.gz"))
+        assert not self.can_overlap(setup)
+
+    def test_outputs_land_in_event_pipe_and_shared_files_appear_once(self, setup, monkeypatch):
+        """``nupipeline`` runs once per detector, and the result looks like a serial run."""
+        calls = []
+
+        def fake_run_concurrently(name, jobs):
+            for job in jobs:
+                calls.append(job["params"])
+                fpm = job["params"]["instrument"][-1]
+                outdir = job["params"]["outdir"]
+                os.makedirs(outdir, exist_ok=True)
+                for filename in (f"nu{OBSID}{fpm}01_cl.evt", f"nu{OBSID}_mast.fits"):
+                    with open(os.path.join(outdir, filename), "w") as f:
+                        f.write(fpm)
+
+        monkeypatch.setattr(nustar.heasoft, "run_concurrently", fake_run_concurrently)
+        ev_dir = nustar.nu_run_l2_pipeline.fn(OBSID, setup)
+
+        assert sorted(c["instrument"] for c in calls) == ["FPMA", "FPMB"]
+        assert all(os.path.isabs(c["indir"]) and os.path.isabs(c["outdir"]) for c in calls)
+        assert sorted(glob.glob(os.path.join(ev_dir, "nu*"))) == sorted(
+            os.path.join(ev_dir, name)
+            for name in (f"nu{OBSID}A01_cl.evt", f"nu{OBSID}B01_cl.evt", f"nu{OBSID}_mast.fits")
+        )
+        assert not glob.glob(os.path.join(os.path.dirname(ev_dir), "fpm*"))

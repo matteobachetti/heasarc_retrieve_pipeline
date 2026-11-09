@@ -41,6 +41,7 @@ import glob
 from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 import numpy as np
+import psutil
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from prefect import flow, task, get_run_logger
@@ -865,6 +866,154 @@ def _decompressed_metrology(datadir, obsid):
             os.remove(plain)
 
 
+#: Fixed memory of one detector's ``nupipeline``: ``nuflagevt`` always takes 873 MB.
+FPM_BASE_MEMORY = 1024**3
+#: Memory per Level-1 event: ``nucalcsaa`` loads them all, measured at 38 bytes each.
+FPM_MEMORY_PER_EVENT = 40
+#: The share of a worker's free memory the two detectors together may be expected to use.
+FPM_MEMORY_MARGIN = 0.8
+
+
+def _usable_cpus():
+    """The number of processor cores this process may run on."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def _detector_event_counts(datadir, obsid):
+    """
+    The number of Level-1 events of each detector, read from the file headers.
+
+    Parameters
+    ----------
+    datadir : str
+        The raw data directory of the observation.
+    obsid : str
+        Observation identifier.
+
+    Returns
+    -------
+    list of int or None
+        The counts for FPMA and FPMB, or ``None`` if a detector has no readable file.
+    """
+    from astropy.io import fits
+
+    counts = []
+    for fpm in "AB":
+        files = glob.glob(os.path.join(datadir, "event_uf", f"nu{obsid}{fpm}_uf.evt*"))
+        if not files:
+            return None
+        try:
+            counts.append(sum(fits.getheader(path, "EVENTS")["NAXIS2"] for path in files))
+        except (OSError, KeyError):
+            return None
+    return counts
+
+
+def _detectors_can_overlap(datadir, obsid, config, flags):
+    """
+    Decide whether FPMA and FPMB can be reduced at the same time.
+
+    Workers make this decision independently and at about the same moment, so each one
+    counts only on its share of the free memory, and on two cores of its own. The estimate
+    is deliberately generous, because it adds up peaks that do not all happen at once:
+    see ``docs/technical_details.rst``.
+
+    Parameters
+    ----------
+    datadir : str
+        The raw data directory of the observation.
+    obsid : str
+        Observation identifier.
+    config : dict
+        ``n_workers`` says how many observations share the machine (default 1), and
+        ``nustar_parallel_detectors=False`` turns this off.
+    flags : dict or None
+        The extra ``nupipeline`` parameters. Choosing the detector or the output
+        directory by hand keeps the run serial.
+
+    Returns
+    -------
+    overlap : bool
+        Whether to run both detectors at once.
+    reason : str
+        Why, for the log.
+    """
+    if not config.get("nustar_parallel_detectors", True):
+        return False, "turned off in the configuration"
+    if flags and ("instrument" in flags or "outdir" in flags):
+        return False, "the flags choose the detector or the output directory"
+
+    n_workers = config.get("n_workers", 1)
+    cpus = _usable_cpus()
+    if 2 * n_workers > cpus:
+        return False, f"{n_workers} workers with 2 processes each need more than {cpus} cores"
+
+    events = _detector_event_counts(datadir, obsid)
+    if events is None:
+        return False, "the event counts could not be read"
+    needed = sum(FPM_BASE_MEMORY + FPM_MEMORY_PER_EVENT * count for count in events)
+    share = psutil.virtual_memory().available / n_workers
+    gib = 1024**3
+    summary = (
+        f"expected {needed / gib:.1f} GB, this worker's share of free memory {share / gib:.1f} GB"
+    )
+    if needed > FPM_MEMORY_MARGIN * share:
+        return False, f"not enough memory: {summary}"
+    return True, summary
+
+
+def _run_each_detector(params, obsid, ev_dir, config):
+    """
+    Run ``nupipeline`` once per detector at the same time, and merge the outputs.
+
+    Each detector works in a folder of its own beside ``event_pipe``. The name is shorter
+    than ``event_pipe``, so no file name gets closer to the length HEASOFT truncates at.
+    Five files are written identically by both runs, so one copy is kept.
+
+    Parameters
+    ----------
+    params : dict
+        The parameters of the serial run.
+    obsid : str
+        Observation identifier.
+    ev_dir : str
+        Where the outputs of a serial run would be, and where these end up.
+    config : dict
+        The pipeline configuration, for the log file names.
+    """
+    # The processes run elsewhere, so anything relative has to stop being relative.
+    common = {
+        key: os.path.abspath(value) if isinstance(value, str) and os.path.exists(value) else value
+        for key, value in params.items()
+    }
+    outdirs, jobs = [], []
+    for fpm in "AB":
+        outdir = os.path.join(os.path.dirname(os.path.abspath(ev_dir)), f"fpm{fpm}")
+        shutil.rmtree(outdir, ignore_errors=True)
+        os.makedirs(outdir)
+        outdirs.append(outdir)
+        jobs.append(
+            dict(
+                label=f"FPM{fpm}",
+                params=dict(common, instrument=f"FPM{fpm}", outdir=outdir),
+                produces=outdir,
+                log_to=tool_log_file(f"nupipeline_FPM{fpm}", obsid, config),
+            )
+        )
+
+    heasoft.run_concurrently("nupipeline", jobs)
+
+    placed = set()
+    for outdir in outdirs:
+        for name in os.listdir(outdir):
+            if name not in placed:
+                os.replace(os.path.join(outdir, name), os.path.join(ev_dir, name))
+                placed.add(name)
+        shutil.rmtree(outdir)
+
+
 def _run_l2_pipeline(obsid, config, flags, rec):
     """The body of :func:`nu_run_l2_pipeline`, with its diagnostics record open."""
     pipe_done_file = nu_pipeline_done_file(obsid, config=config)
@@ -893,20 +1042,26 @@ def _run_l2_pipeline(obsid, config, flags, rec):
 
     # A metrology file named in the flags is read from wherever it is, not from hk.
     decompress = not (flags and "metrologyfile" in flags)
+    overlap, reason = _detectors_can_overlap(datadir, obsid, config, flags)
+    logger.info(f"Running FPMA and FPMB {'together' if overlap else 'in turn'}: {reason}")
     with _decompressed_metrology(datadir, obsid) if decompress else nullcontext():
-        # No return-code check here: heasoft.run_task raises on a non-zero code, with
-        # the tool's own output in the message.
-        heasoft.run_task(
-            "nupipeline",
-            produces=ev_dir,
-            log_to=tool_log_file("nupipeline", obsid, config),
-            **params,
-        )
+        # No return-code check here: both raise on a non-zero code, with the tool's own
+        # output in the message.
+        if overlap:
+            _run_each_detector(params, obsid, ev_dir, config)
+        else:
+            heasoft.run_task(
+                "nupipeline",
+                produces=ev_dir,
+                log_to=tool_log_file("nupipeline", obsid, config),
+                **params,
+            )
 
     open(pipe_done_file, "a").close()
 
     rec.value(
         flags=flags or {},
+        detectors_in_parallel=overlap,
         cleaned_event_files=sorted(
             os.path.basename(f) for f in glob.glob(os.path.join(ev_dir, "*_cl.evt*"))
         ),

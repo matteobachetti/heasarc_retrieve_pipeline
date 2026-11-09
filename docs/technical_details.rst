@@ -741,6 +741,54 @@ The step does nothing if ``metrologyfile`` is passed in ``flags``, and it leaves
 file that was already there. If the copy cannot be written, for example on a full disk
 or a read-only archive, ``nupipeline`` runs on the ``.gz``, more slowly.
 
+Reducing the two detectors at the same time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nupipeline`` processes FPMA and FPMB one after the other, and almost all of its time is
+spent on one detector or the other. ``nu_run_l2_pipeline`` therefore starts one
+``nupipeline`` per detector when the machine can hold both, through
+``heasoft.run_concurrently``, because ``heasoftpy`` cannot overlap two tools in one
+process. Each run has private parameter files and a private working directory, and works
+in ``<OBSID>/fpmA`` or ``<OBSID>/fpmB``. The outputs are then moved to ``event_pipe``. The
+five files both runs write (``_att``, ``_mast``, ``_psd``, ``_psdcorr``, ``_obeb.hk``)
+hold identical data, so one copy is kept.
+
+Measured on 90201037002 (M82) with a decompressed metrology file. The run times are
+through ``nu_run_l2_pipeline``, and the memory comes from separate instrumented runs:
+
+=========  ========  =====================
+Detectors  Run time  Peak memory
+=========  ========  =====================
+in turn    162.5 s   873 MB (largest tool)
+together   92.0 s    2.2 GB, for 6 s
+=========  ========  =====================
+
+Every table holds the same rows and values as in a serial run, except position columns,
+which differ between any two runs because of the random numbers mentioned above.
+
+What sets the memory, measured at 0.55 to 0.86 million events per detector:
+
+* ``nuflagevt`` takes 873 MB in every run, for a table of fixed size.
+* ``nucalcsaa`` is the only tool found to load every event: about 38 bytes each.
+* ``ftstat``, ``ftcopy`` and ``nuattcorr`` grow with the length of the observation, to
+  between 124 and 161 MB for 93.6 ks.
+* The other tools that process events stay flat.
+
+The two detectors overlap only if all of these hold:
+
+* The expected memory, 1 GB plus 40 bytes per Level-1 event for each detector, is at most
+  80% of the free memory divided by ``n_workers``. Workers decide at about the same
+  moment, so none of them may count on all the free memory. The event counts come from
+  the file headers.
+* There are at least ``2 * n_workers`` usable cores.
+* ``flags`` does not set ``instrument`` or ``outdir``.
+* ``nustar_parallel_detectors`` is not ``False`` in the configuration.
+
+Otherwise the detectors are reduced in turn, and the log says why. The estimate has not
+been checked against an observation with many millions of events. It sees the memory of
+the machine, not a limit a batch system imposes on the job, so on such a system set
+``nustar_parallel_detectors=False`` if the job's limit is below the estimate.
+
 Observing modes 01 and 06
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -3564,7 +3612,8 @@ that were noisy -- ``nupipeline`` once per observation, ``nuproducts`` once per 
 stem in both ``nustar.py`` and ``segments.py`` -- pass
 ``utils.tool_log_file(name, obsid, config)``::
 
-    <out_data_path>/<OBSID>/logs/nupipeline.log
+    <out_data_path>/<OBSID>/logs/nupipeline.log        (nupipeline_FPMA.log and _FPMB.log
+                                                        when the detectors overlap)
     <out_data_path>/<OBSID>/logs/nuproducts.log
 
 One file per tool per observation: ``nuproducts`` runs a dozen times for one observation
@@ -4262,7 +4311,7 @@ Relevant environment:
     on ``PATH`` is enough. ``ciao.HAS_CIAO`` records whether both are present.
 
 Required at runtime, beyond the standard scientific stack: ``prefect``, ``astroquery``,
-``pyvo``, ``pySmartDL``, ``beautifulsoup4`` and ``pyyaml``. Everything else is an extra,
+``pyvo``, ``pySmartDL``, ``beautifulsoup4``, ``pyyaml`` and ``psutil``. Everything else is an extra,
 imported inside the function that needs it and declared in ``[project.optional-dependencies]``
 in ``pyproject.toml``: ``scikit-image``/``scipy``/``statsmodels`` (``imaging``),
 ``regions``, ``boto3`` (``s3``), ``plotly`` (``report``), ``sunpy`` (``solar``) and
