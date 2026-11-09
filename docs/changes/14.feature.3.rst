@@ -1,0 +1,1 @@
+Add the SVOM/ECLAIRs reduction (``svom_eclairs``): one event file per downlink pass, from each file's own archive GTIs, ``FLAG == 0`` events, duplicates removed, cut on orbit coverage, Earth occultation and off-axis angle, and barycentred with every orbit file of the ObsID; with a per-pass summary table of what each step removed.

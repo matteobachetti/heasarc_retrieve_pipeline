@@ -1,0 +1,1 @@
+Record each SVOM pass's and detector's screening (events removed per cut, off-axis angles, orbit discontinuities left in the good time) and barycentring in the observation's diagnostics.

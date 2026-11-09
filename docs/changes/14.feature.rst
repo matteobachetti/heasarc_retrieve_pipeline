@@ -1,0 +1,1 @@
+Missions outside HEASARC can declare their own ``catalogue``, ``work_items`` and ``download`` in ``MISSION_CONFIG``; ``radius_deg`` of the search by name now defaults to ``None`` (0.1 degrees for HEASARC catalogues).

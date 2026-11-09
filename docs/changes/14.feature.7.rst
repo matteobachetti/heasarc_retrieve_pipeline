@@ -1,0 +1,1 @@
+Show each SVOM pass's or detector's good time after every cut, and its off-axis angle against the threshold, on the observation's report page.

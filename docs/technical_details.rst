@@ -183,6 +183,338 @@ Nothing needs it: the URL of an observation's directory comes from the datalink 
 which is authoritative, while a hand-built path encodes a layout convention that can drift.
 The builders and their only caller were deleted with the legacy fallback path they served.
 
+Missions that are not at HEASARC
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SVOM's data are at the French Science Center, behind the instrument team's own query and
+download tools, so none of the HEASARC machinery applies: no master catalogue, no datalink
+service, no HTTPS or S3 directory to mirror. Such a mission declares three more entries in
+``MISSION_CONFIG``, and each replaces one HEASARC step while the rest of the run -- the
+worker processes, the per-observation record and page, the mission's own reduction --
+stays the same:
+
+``catalogue``
+   Replaces the cone search and the OBSID lookup. Called as
+   ``catalogue(position=, radius_deg=, mjd_start=, mjd_stop=)`` by
+   ``retrieve_heasarc_data_by_source_name`` and as ``catalogue(obsids=[...])`` by
+   ``retrieve_heasarc_data_by_obsid``; returns a table with at least ``obsid``, ``ra``
+   and ``dec``. Dates are accepted, not required, and ``radius_deg`` is passed as given:
+   its 0.1-degree default belongs to the HEASARC cone search, and a wide-field instrument
+   chooses its own.
+``work_items``
+   Replaces the datalink lookup: ``work_items(result_table, source_position)`` returns
+   the list of dictionaries ``observation_work_items`` would.
+``download``
+   Replaces ``recursive_download``: ``download(obsid, url, outdir, config, test=False)``
+   fills ``<outdir>/<obsid>``. ``download_filter`` does not apply to it.
+
+SVOM retrieval (``svom.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The missions ``svom_eclairs`` and ``svom_grm`` share one module and differ only in which
+event products they fetch (``ECL-EVT-CAL`` and ``ECL-GTI-CAL``, or ``GRM-EVT``) and in
+the default search radius (45 and 70 degrees around the ECLAIRs pointing: the GRM
+detectors point 30 degrees off that axis). Their reductions are not written yet, so a run
+stops after the download.
+
+The SVOM tools live in an environment of their own (Python 3.12), so they are never
+imported. They run as subprocesses, set up from three environment variables:
+
+``SVOM_ECPI_PYTHON``
+   The Python of the environment with ECPI and ``svom.messaging``. ``ecpi_find_files`` is
+   looked for beside it. Without it every SVOM call stops with an error saying so.
+``SVOM_ECPI_ENV``
+   A shell file setting the FSC credentials, default ``~/.ecpi``. It is sourced by
+   ``bash`` before each call; the package never reads it, and its name is passed to the
+   shell as an argument, not pasted into the script.
+``FSC_URL``
+   Defaults to production, ``https://fsc.svom.org``. Without it ECPI logs into its
+   integration server and fails.
+
+The steps:
+
+``catalogue``
+   ``ecpi_find_files`` searches ECLAIRs event files by pointing, dates or ObsID (it
+   knows no GRM product). Its answer has one row per file; ``group_by_obsid`` turns it
+   into one row per ObsID, with the span of all files, the mean pointing of those that
+   have one (averaged as unit vectors, so it wraps at RA 0/360) and the passes they came
+   in. GRM files usually share the ECLAIRs ObsIDs, so the same search serves both (but
+   see ``download`` for the exceptions).
+``work_items``
+   One item per ObsID, with the label ``fsc:<obsid>`` as URL. Without a source position
+   the ObsID is barycentred at its pointing.
+``download``
+   ``download_plan`` asks the helper ``data/svom_fsc.py`` (run with the SVOM Python, in
+   isolated mode) for the event products with this ``OBS_ID``, keeps the highest
+   ``PROC_VER`` of each. For GRM it also asks for every GRM event file overlapping one
+   of the ObsID's ECLAIRs event files, whatever its own ObsID: a few ECLAIRs ObsIDs span
+   weeks (one in the Crab history covers 39 days of autumn 2024), and the GRM files of
+   those weeks carry the ordinary ObsIDs of their days, so a search by ObsID alone finds
+   none. Only files that add coverage are kept (``grm_by_time``): greedily, the file
+   covering the most ECLAIRs time not yet covered by the ObsID's own GRM files and those
+   already chosen, until none adds more than 60 s. Without this, three ObsIDs in four of
+   the Crab history picked up neighbours that only touch the edges of the ECLAIRs files
+   (987 extra files against 245, for no coverage). Files claiming a span over two days
+   are ignored: four GRM files of December 2025 carry a ``TSTOP`` near the year 2140 and
+   overlap every later search. A kept file is kept whole, also where it runs beyond the
+   ECLAIRs file, so a stretch of GRM data can be reduced under two ObsIDs. It then asks for every orbit
+   (``SVO-ORB-CNV``), attitude (``SVO-ATT-CNV``) and SAA (``SAA-DEEP-ECL``,
+   ``SAA-EXT-ECL``: South Atlantic Anomaly entry and exit times, one table per week, made
+   for ECLAIRs and the only ones there are) file overlapping any event file widened by
+   600 s, one search per group of overlapping event files: nothing for the gaps between
+   them, which in a weeks-long ObsID would be thousands of files. These come one per
+   downlink pass, and an event file can start minutes before its own pass's orbit file,
+   so they are searched by time, not by pass. A GRM event file usually spans several
+   passes, and gets one orbit and one attitude file for each. Each file is then fetched by
+   the URL its search returned, under the archive's own file name, and skipped if already
+   there. Not by header keywords: an SAA table has no ObsID or pass, and the archive
+   answers a search that matches several products with its latest one, which can be
+   another week's table. ``svom.messaging`` downloads a URL only through a private
+   method, ``SdbIo._dump_remote_fits_file``; the helper stops with a clear error if a
+   new version drops it. On an exFAT disk macOS adds a ``._<name>`` file beside each
+   download; the reductions must ignore them.
+
+``ecpi_find_files`` cannot search GRM products, so the helper uses ``svom.messaging``'s
+``SdbIo`` instead, asking for every page of the answer (the archive returns 100 products
+per page). The unit tests replace ``svom.run_ecpi`` with a fake archive; one test marked
+``remote_data`` runs against the FSC when ``SVOM_ECPI_PYTHON`` is set.
+
+SVOM geometry (``svom_geometry.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The good time intervals (GTIs) that both SVOM reductions build from the orbit, attitude
+and SAA files. Plain numpy and astropy, so it runs and is tested without ECPI. Each
+``*_gti`` function returns an ``(N, 2)`` array in the files' own time; the reductions
+intersect them with ``utils.intersect_intervals``. Edges between two 1-s samples are
+placed by linear interpolation of the quantity being cut on
+(``intervals_where_positive``).
+
+Joining (``read_aux_series``)
+   Orbit and attitude files of consecutive passes abut and share a few samples. They
+   are joined in time order, each sample time kept once from the earlier file, and the
+   repeated samples whose values differ are counted. In the real files checked, those
+   differ only in ``ORIGIN`` (which system gave the position), never in the position.
+   ``._*`` files are skipped.
+Orbit coverage (``orbit_coverage_gti``)
+   Time between orbit samples at most ``MAX_HOLE_S`` = 2 s apart. Samples flagged as
+   telemetry gaps (``FLAG_PVT`` bit ``0x08``) count as missing, and the orbit is never
+   extended past its ends: ``barycenter`` refuses to extrapolate it inside a GTI anyway.
+   Sample times are not whole seconds, so one missing sample leaves a hole of about
+   2.1 s, which is cut: 2 s lost, against a bridged interpolation error never checked.
+Discontinuities (``orbit_discontinuities``)
+   Changes of ``ORIGIN`` or ``FLAG_PVT``, and steps in position larger than
+   ``JUMP_M`` = 1 km beyond what the mean velocity of the two samples explains. A day of
+   real orbit gave about a dozen ``ORIGIN`` changes and five jumps of 1-2 km, no flag
+   set, in two groups; one is an excursion out and back 18 s later. ``ORIGIN`` and
+   ``FLAG_PVT`` changes are only reported; the jumps are cut, see below.
+Orbit jumps (``orbit_jump_gti``)
+   One kilometre is up to 3.3 µs of light travel time, and at one such excursion the
+   barycentred times are off by up to 2.8 µs (see `SVOM/GRM reduction (svom_grm.py)`_),
+   so jumps are cut. Jumps less than ``JUMP_CLUSTER_S`` = 300 s apart are one excursion,
+   cut from the sample before the first to the last, ``JUMP_PAD_S`` = 20 s wider on each
+   side. The margin is set by the ``barycenter`` package, which interpolates the
+   correction with a cubic spline on a 5 s grid: a spline spreads an error at one knot to
+   its neighbours, about 3.7 times smaller per knot, and on the real excursion the error
+   was still 0.36 µs 5 s outside it and one float64 step (0.06 µs) only 15 s outside.
+   A lone jump loses the same margin around it. On a day of real orbit the cut costs
+   about 200 s.
+Earth occultation (``visibility_gti``)
+   The source is hidden when it is within the angular radius of a sphere of radius
+   6378.137 km plus ``ATMOSPHERE_M`` = 100 km from the direction of the Earth's centre.
+   No margin is added at the limb. The test checks the analytic answer: in the plane of
+   a circular orbit of radius *r*, the source is hidden for a fraction ρ/π of each orbit,
+   with ρ = arcsin((R⊕ + 100 km)/*r*).
+Off-axis angle (``offaxis_gti``)
+   Where the source is within a given angle of an axis: ECLAIRs' (``POINTING``) or one
+   GRM detector's (``GRDX_1..3``), read with ``axis_columns``. The defaults for the
+   reductions are 40° for ECLAIRs (beyond it the year-long Crab study lost the pulsar)
+   and 60° for each GRM detector, both to be tuned on the Crab.
+SAA (``saa_gti``)
+   The complement of the entry/exit rows of the archive's weekly tables; rows with
+   missing times are dropped. In the data checked, ``SAA-DEEP-ECL`` removes about 14 % of
+   the time and ``SAA-EXT-ECL`` about 56 %. The proposed defaults are no SAA cut for
+   ECLAIRs (it costs exposure without improving the pulse per photon) and the deep
+   region for GRM, whose detectors cannot separate source from background.
+
+SVOM/ECLAIRs reduction (``svom_eclairs.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_eclairs_obsid``, reached through ``svom.process_svom_obsid("eclairs", ...)``,
+writes one event file per downlink pass, ``l2_files/<obsid>_<pass>_ecl.evt``, and
+barycentres each. An ObsID is a day of survey and a few hundred million events (one
+surveyed ObsID had 273 million in 14 files); a pass is about a tenth of that, which fits
+in memory and is the unit the timing work is organised by.
+
+The archive gives each event file (``ECL-EVT-CAL``) a GTI file (``ECL-GTI-CAL``) of its
+own, with one extension per criterion (``GTICAL-STA``, ``-TLM``, ``-EGP``, ``-NSA``,
+``-NEO``, ``-PEO``, ``-TEO``: stable attitude, no telemetry gap, instrument good, outside
+the SAA, no, partial and total Earth occultation of the field of view). Per pass:
+
+Pairing (``pair_event_and_gti_files``)
+   By ``OBS_ID``, ``BURST_ID`` and ``PASS_ID`` from the primary headers. An event file
+   without its own GTI file is skipped and recorded in the observation's skipped-inputs
+   report: borrowing another file's GTIs would silently apply the wrong ones.
+Event screening
+   ``FLAG == 0`` only, as ECPI's own imaging does. In the ObsID surveyed 16 % of events
+   were flagged, nearly all with bit 32 (energy below threshold or ``PHA`` > 1022); bit
+   16 marks a pixel disabled in that minute, bit 64 an energy out of range. An optional
+   ``eclairs_pi_band`` keeps ``PI`` channels ``[pimin, pimax]``.
+Archive GTIs (``archive_gti``)
+   ``TLM`` ∩ ``EGP`` ∩ (``NEO`` ∪ ``PEO``), clipped to the file's own ``TSTART``-``TSTOP``
+   and applied to that file's events before joining. The three occultation states split
+   the time, and the archive leaves out the extension of a state the file never was in
+   (``NEO`` was missing from 6 of 14 files), so a missing one means no time. ``TLM`` and
+   ``EGP`` were present in every file; if one is ever missing the file is skipped rather
+   than guessed about, and so is a file without a criterion asked for in
+   ``eclairs_gti_criteria`` (``NSA`` was missing from 4 of 14, and what that means is not
+   known). Stable attitude and the archive's SAA criterion are off by default.
+Joining (``join_events``)
+   The pass's files are joined, sorted by time (not every input file is sorted) and
+   rows identical in every column kept once. Burst (``CP``) files overlap the survey
+   (``GP``) file of the same pass; in the four overlaps surveyed the survey file had no
+   events inside the burst file's span, so nothing was duplicated, but two bursts may
+   share events, and an exact-row rule removes those without cutting anything else.
+Geometry (``svom_common.geometry_cuts``)
+   The union of the files' archive GTIs is intersected, in this order, with the orbit
+   coverage, the orbit's span without its position jumps, the source's visibility above the Earth's limb, the attitude coverage and
+   the off-axis cut (``eclairs_max_offaxis_deg``, default 40°), and, only if
+   ``eclairs_saa`` is ``"deep"`` or ``"ext"``, the SAA table; see `SVOM geometry
+   (svom_geometry.py)`_. Without a position only the two orbit cuts apply. Both the
+   archive's occultation criterion (Earth in the *field of view*) and the computed
+   visibility (Earth in front of *the source*) are kept: the acceptance runs will show
+   whether either can go.
+Output
+   The events under the first file's headers, with the keywords that describe a single
+   input file dropped (``BURST_ID``, ``GTISTART``/``GTISTOP``, ``EARTH_FR`` and similar,
+   checksums), ``TSTART``/``TSTOP`` set by ``utils.update_time_bounds``, ``ONTIME`` the
+   GTI total and ``EXPOSURE`` that times ``DEADC``; and a ``GTI`` extension.
+Report
+   ``l2_files/<obsid>_ecl.ecsv``, one row per pass: files used; events read, flagged,
+   out of band, outside the file's archive GTI, duplicated, outside the final GTI, and
+   written; the exposure after the archive GTIs and after each geometric cut, and the
+   events each cut removed (``removed_<cut>``, charged to the first cut that leaves an
+   event out, summing to ``outside_gti``). Its metadata counts the orbit's ``ORIGIN`` and
+   ``FLAG_PVT`` changes and position jumps.
+Diagnostics (``svom_common.record_screening``)
+   Each pass leaves an ``svom_screening`` record keyed by the pass, with the same numbers;
+   the cut names in order and the good time after each (``gti_<cut>`` arrays); the orbit
+   discontinuities left inside the final good time; and the off-axis angle's minimum,
+   median and maximum over the good time *before* the off-axis cut, which is what a
+   different threshold would have to choose from, with the angle every 10 s for the
+   report. A pass that writes nothing is recorded as skipped, naming the cut that left no
+   good time (or "no event left"). Barycentring leaves a ``barycenter`` record per pass:
+   position, ephemeris, number of orbit files and output, or skipped with the reason.
+   The report page draws two figures from each screening record: "Good time"
+   (``report.screening_gti_figure``), one row of intervals per cut in the order applied,
+   the last one dark, which shows at a glance which cut cost what; and "Off-axis angle"
+   (``report.offaxis_figure``), the angle against time with the threshold dashed.
+Barycentring (``svom_common.barycentre_events``)
+   With the ``barycenter`` package, at the searched position, on
+   ``barycenter_ephemeris`` (DE430 by default), passing it every orbit file of the
+   ObsID: it joins them itself, so no joined orbit file is written. There is no official
+   tool (``barycorr`` refuses ``TELESCOP = SVOM``), so ``barycenter_tool: official`` is
+   overridden with a warning. Without a position nothing is barycentred, as for XRISM.
+Readout sectors (``eclairs_sector``, ``split_by_sector``)
+   The detector plane (80 × 80 pixels, ``IDET`` and ``JDET`` from 0 to 79) is eight
+   sectors of 800 pixels, each with its own readout electronics. A timing problem in
+   one sector's electronics would be diluted by the other seven in the joined file, so
+   ``split_by_sector`` splits any written file, barycentred or not, into
+   ``<stem>_s<sector><ext>``, one per sector, each with a ``SECTOR`` keyword and the
+   input's GTI and exposure. The numbering is ECPI's (``array_convention.ijdet_to_dpix``,
+   after ECL-EIC-FITS-KEYWORDS, "DPIX frame"; eic-tools uses the same):
+   ``sector = (IDET // 20) * 2 + JDET // 40``, so sectors 0 and 1 share ``IDET`` 0-19
+   and even sectors have ``JDET`` < 40. Other numberings circulate (one counts along
+   ``IDET`` first), so name the convention when comparing sector numbers with anyone.
+   Each sector has about an eighth of the counts, so a pulsation's Z² is about an eighth
+   of the whole file's. On a real pass, 2.8 million events split in 6 s, 0.32-0.38
+   million per sector.
+
+On a real pass (one file, 4.3 million events, 1174 s of archive good time) the
+reduction takes about a minute, most of it reading the day's orbit and attitude. 15.9 %
+of the events are flagged and none are duplicated. In that ObsID the Crab never came
+within 40° of the ECLAIRs axis, so the default off-axis cut left nothing: the pass is
+written and barycentred only with the cut off. Then the output is time-sorted, inside its
+GTI, with ``ONTIME`` equal to the GTI total. Every one of its 3.6 million barycentred
+times equals, to 0.06 µs (one float64 step at these times), what the ``barycenter``
+package gives when run directly on the raw archive file, evaluated exactly at each event.
+The package itself is checked against ``barycorr`` to one step (see its documentation),
+so this ties the pipeline's output to ``barycorr`` at the same level.
+
+SVOM/GRM reduction (``svom_grm.py``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``process_grm_obsid``, reached through ``svom.process_svom_obsid("grm", ...)``, writes
+one event file per detector (GRD, Gamma-Ray Detector), ``l2_files/<obsid>_grd<n>.evt``
+with the events in an extension called ``EVENTS``, and barycentres each. The three
+detectors point in different directions, so each has its own off-axis cut and GTI, and a
+delay in one detector's readout would show as an offset between files. What the two SVOM
+reductions share -- finding the files, the geometric cuts, joining, writing and
+barycentring -- is in ``svom_common.py``.
+
+A ``GRM-EVT`` file covers an ObsID, with one event table per detector (``EVENTS01..03``,
+``DETNAM = GRD_0n``), an ``EBOUNDS`` table (``PI`` is the channel, 0 to 258, 5 keV to
+20 MeV) and one ``GTI``. In the 22.7-hour file surveyed: 5.4 GB, about 100 million events
+per detector, time-sorted, no two at the same time; the ``GTI`` has 14 rows and its gaps
+are exactly the gaps in the data; it already leaves out the deep SAA (51 s of
+``SAA-DEEP-ECL`` fall inside it), while ``SAA-EXT-ECL`` would remove 7.6 of its 15.5
+hours. Per detector (``reduce_detector``):
+
+GTI
+   The files' own ``GTI``, each clipped to its ``TSTART``-``TSTOP``, intersected with
+   orbit coverage, the orbit jumps, the source's visibility above the Earth's limb,
+   attitude coverage and the angle between the source and *this detector's* axis
+   (``GRDX_n``) below
+   ``grm_max_offaxis_deg`` (default 60°). No SAA cut unless ``grm_saa`` is ``"deep"`` or
+   ``"ext"``: the file's GTI already does the deep one.
+Dead time
+   ``DEAD_TIME`` (µs) summed over *every* event inside the final GTI, those the selection
+   below removes included, since each kept the detector busy; where files overlap, the
+   earlier file's events count. ``LIVETIME`` = ``ONTIME`` minus that sum, ``EXPOSURE`` =
+   ``LIVETIME``, ``DEADC`` = their ratio. About 0.56 % of the time in the file surveyed.
+Event selection
+   ``FLAG``, ``EVT_TYPE`` and ``ANTI_COIN`` all 0, and ``PI`` in the channels lying
+   entirely inside ``grm_energy_band_kev`` (default 20-300 keV, a first guess to be tuned
+   on the Crab). The meaning of the flags is read from the energies they carry, not from
+   a description, and should be confirmed with the GRM team: ``EVT_TYPE = 1`` (1.5 % of
+   events) are all in the top channel, an overflow; ``ANTI_COIN = 1`` (0.7 %) only
+   between 24 and 62 keV, most likely the americium-241 calibration source (59.5 keV);
+   ``GAIN_TYPE = 1`` (6 %) are the events above ~1.3 MeV, which the band removes;
+   ``FLAG = 1`` is 0.01 %.
+Joining
+   The files in time order, rows identical in every column kept once (``join_events``,
+   as for ECLAIRs); events outside the GTI dropped.
+Splitting
+   All of a detector's kept events are in memory at once, twice while joining: the file
+   surveyed (~100 million events per detector) peaked at ~7 GB. So when one detector's
+   files hold more than ``grm_max_events`` events (default 150 million, from the headers'
+   ``NAXIS2``), each file is reduced on its own (``pieces``) into
+   ``<obsid>_<file's OBS_ID>_grd<n>.evt``, keyed ``<file's OBS_ID>_grd<n>`` in the
+   diagnostics (``.2``, ``.3`` added if an ``OBS_ID`` repeats). Files go in ``TSTART``
+   order, and a first cut, ``overlap``, removes from each the time an earlier file covers,
+   so every event is in one piece only, as in the joined file. The case that needed it:
+   an ECLAIRs ObsID of 39 days, whose GRM, found by time, is 153 files over 27 days, over
+   a billion events per detector after the cuts.
+Output and report
+   ``EBOUNDS`` is copied into the output. ``l2_files/<obsid>_grm.ecsv`` has one row per
+   detector (per piece and detector, with a ``piece`` column, when split): events read, rejected by the flags, out of band, outside the file's GTI,
+   duplicated, outside the final GTI and written; the dead time and live time; the band
+   actually kept; the exposure after each cut and the events each removed. The
+   diagnostics are those of ECLAIRs, keyed ``grd<n>``, the off-axis angle that of the
+   detector's own axis.
+
+On the real file at the Crab (default settings) the three detectors take 2.7 minutes in
+all, about 7 GB of memory at peak. Of each detector's ~100 million events, 2 % are
+rejected by the flags and a third fall outside 20-300 keV (20.9-296.7 keV once whole
+channels are kept). The Earth leaves 38 400 s of the file's 55 900 s. Detectors 1 and 3
+keep all of it inside 60° and write about 47 million events each, with dead time 0.85 %
+of the live time. Detector 2 is never within 60° and writes nothing. The barycentred
+detector 3, compared on 940 000 events with the ``barycenter`` package run exactly on
+the raw file, agrees to 0.06 µs everywhere except one 42 s stretch, where it differs by up
+to 2.8 µs. There the orbit file's position jumps by 2.1 km and back 18 s later, with no
+flag set. The exact calculation follows that excursion and the package's default 5 s
+interpolation grid (used above 100 000 events) partly smooths it, so neither is right
+there; that is why ``orbit_jump_gti`` now cuts such stretches.
+
 Catalogue queries
 ~~~~~~~~~~~~~~~~~
 
@@ -3907,7 +4239,7 @@ imported inside the function that needs it and declared in ``[project.optional-d
 in ``pyproject.toml``: ``scikit-image``/``scipy``/``statsmodels`` (``imaging``),
 ``regions``, ``boto3`` (``s3``), ``plotly`` (``report``), ``sunpy`` (``solar``) and
 ``nustar_gen`` (``snr``). The package imports, queries and downloads with none of them
-installed, which is what the ``py310-test`` job in CI checks.
+installed, which is what the ``py311-test`` job in CI checks.
 
 
 Testing
