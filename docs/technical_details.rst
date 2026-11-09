@@ -4239,7 +4239,7 @@ imported inside the function that needs it and declared in ``[project.optional-d
 in ``pyproject.toml``: ``scikit-image``/``scipy``/``statsmodels`` (``imaging``),
 ``regions``, ``boto3`` (``s3``), ``plotly`` (``report``), ``sunpy`` (``solar``) and
 ``nustar_gen`` (``snr``). The package imports, queries and downloads with none of them
-installed.
+installed, which is what the ``py311-test`` job in CI checks.
 
 
 Testing
