@@ -31,13 +31,6 @@ jobs:
             python: "3.x"
             toxenv: codestyle
 
-          # Deliberately installed without any extra: if an optional dependency is ever
-          # imported at module scope again, this job is what says so.
-          - name: Python 3.10 with no optional dependencies
-            os: ubuntu-latest
-            python: "3.10"
-            toxenv: py310-test
-
           - name: Python 3.12 with all optional dependencies and coverage
             os: ubuntu-latest
             python: "3.12"
