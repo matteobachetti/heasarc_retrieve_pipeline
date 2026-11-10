@@ -741,6 +741,38 @@ The step does nothing if ``metrologyfile`` is passed in ``flags``, and it leaves
 file that was already there. If the copy cannot be written, for example on a full disk
 or a read-only archive, ``nupipeline`` runs on the ``.gz``, more slowly.
 
+Decompressing the event files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``nupipeline`` Perl script itself holds a whole gzipped Level-1 event file in memory
+for its first seconds, about 286 bytes per event. The likely reason is that it opens the
+file through CFITSIO, which unpacks gzipped files in memory. ``nu_run_l2_pipeline``
+therefore writes plain copies of ``event_uf/nu<OBSID>[AB]_uf.evt.gz`` for the duration of
+the run, as for the metrology file. ``nupipeline`` reads the plain file when both exist.
+
+Measured with both detectors running at once on the Crab observation 10502001011 (5.5
+million events per detector, 1.5 GiB unpacked each), HEASOFT 6.37.1:
+
+================  =================  ===========
+Input event file  Peak memory        Run time
+================  =================  ===========
+gzipped           2946, 2869 MiB     374, 678 s
+plain             1823, 1820 MiB     566 s
+================  =================  ===========
+
+The memory is repeatable. The run times are not: other work on the machine moved two
+identical runs from 374 s to 678 s, so these runs cannot say whether the plain input is
+faster. Decompressing both files takes a few seconds. The cleaned event files have the
+same rows and the same values in every non-position column as a serial gzipped run.
+
+A plain copy is made only for a detector ``nupipeline`` will read from ``event_uf``, so not
+for one excluded by ``instrument`` or replaced by ``fpma_infile`` or ``fpmb_infile``. It
+also needs free disk of at least 4 times the unpacked size, divided by ``n_workers``: once
+for the copy and about 3 times for the working files of ``nupipeline``, measured at 7.7 GiB
+for 2.9 GiB of events. Otherwise the ``.gz`` files stay, and the memory estimate of the
+next section counts their unpacked size. The disk check looks at the disk of the raw
+data, which is cautious when the output directory is on another disk.
+
 Reducing the two detectors at the same time
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -773,19 +805,22 @@ What sets the memory, measured at 0.55 to 0.86 million events per detector:
 * ``ftstat``, ``ftcopy`` and ``nuattcorr`` grow with the length of the observation, to
   between 124 and 161 MB for 93.6 ks.
 * The other tools that process events stay flat.
+* A gzipped event file costs its whole unpacked size, as described above.
 
 The two detectors overlap only if all of these hold:
 
-* The expected memory, 1 GB plus 40 bytes per Level-1 event for each detector, is at most
-  80% of the free memory divided by ``n_workers``. Workers decide at about the same
-  moment, so none of them may count on all the free memory. The event counts come from
-  the file headers.
+* The expected memory is at most 80% of the free memory divided by ``n_workers``. Each
+  detector is expected to need 1 GB plus 40 bytes per Level-1 event, or, if its event file
+  stayed gzipped and that is larger, the unpacked size plus 64 MiB. Workers decide at
+  about the same moment, so none of them may count on all the free memory. The event
+  counts and row sizes come from the file headers.
 * There are at least ``2 * n_workers`` usable cores.
 * ``flags`` does not set ``instrument`` or ``outdir``.
 * ``nustar_parallel_detectors`` is not ``False`` in the configuration.
 
-Otherwise the detectors are reduced in turn, and the log says why. The estimate has not
-been checked against an observation with many millions of events. It sees the memory of
+Otherwise the detectors are reduced in turn, and the log says why. The estimate was
+checked up to 5.5 million events per detector, where it gave 2.4 GB against a measured 1.8
+GB with plain input. It sees the memory of
 the machine, not a limit a batch system imposes on the job, so on such a system set
 ``nustar_parallel_detectors=False`` if the job's limit is below the estimate.
 

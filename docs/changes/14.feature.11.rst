@@ -1,0 +1,1 @@
+``nu_run_l2_pipeline`` gives ``nupipeline`` plain copies of the gzipped event files when the disk has room, which removes a peak of memory as large as the unpacked files. The check that decides whether FPMA and FPMB can overlap now counts that peak when the files stay gzipped.

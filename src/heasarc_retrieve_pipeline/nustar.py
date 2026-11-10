@@ -38,7 +38,7 @@ import gzip
 import shutil
 
 import glob
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from datetime import timedelta
 import numpy as np
 import psutil
@@ -829,40 +829,39 @@ def nu_run_l2_pipeline(obsid, config, flags=None):
 
 
 @contextmanager
-def _decompressed_metrology(datadir, obsid):
+def _decompressed_files(plain_paths):
     """
-    Provide a plain copy of the gzipped metrology file for the duration of the block.
+    Provide plain copies of gzipped input files for the duration of the block.
 
-    ``numetrology`` reopens its input for every 1000 rows and CFITSIO decompresses the
-    whole of a gzipped file at each opening, so its run time grows with the square of the
-    observation length. ``nupipeline`` prefers a plain ``_met.fits`` when one sits next to
-    the ``.gz``. The copy is removed afterwards. A plain file that was already there is
-    left alone, and a failure to decompress only means a slower run.
+    ``nupipeline`` reads a plain file when one sits next to the ``.gz``, and that saves it
+    a lot: ``numetrology`` reopens its input for every 1000 rows and CFITSIO decompresses
+    the whole of a gzipped file at each opening, and the ``nupipeline`` script itself holds
+    a whole gzipped event file in memory. The copies are removed afterwards. A plain file
+    that was already there is left alone, and a failure to decompress only means that
+    ``nupipeline`` gets the ``.gz``.
 
     Parameters
     ----------
-    datadir : str
-        The raw data directory of the observation.
-    obsid : str
-        Observation identifier.
+    plain_paths : list of str
+        The files to provide, each named without the ``.gz``.
     """
-    plain = os.path.join(datadir, "hk", f"nu{obsid}_met.fits")
-    compressed = plain + ".gz"
-    created = False
-    if os.path.exists(compressed) and not os.path.exists(plain):
+    created = []
+    for plain in plain_paths:
+        compressed = plain + ".gz"
+        if os.path.exists(plain) or not os.path.exists(compressed):
+            continue
         try:
             with gzip.open(compressed, "rb") as source, open(plain, "wb") as target:
-                created = True
+                created.append(plain)
                 shutil.copyfileobj(source, target, length=1 << 20)
         except OSError as error:
-            get_logger().warning(f"Keeping the gzipped metrology file: {error}")
-            if created:
-                os.remove(plain)
-            created = False
+            get_logger().warning(f"Keeping {os.path.basename(compressed)} gzipped: {error}")
+            if created and created[-1] == plain:
+                os.remove(created.pop())
     try:
         yield
     finally:
-        if created:
+        for plain in created:
             os.remove(plain)
 
 
@@ -870,8 +869,13 @@ def _decompressed_metrology(datadir, obsid):
 FPM_BASE_MEMORY = 1024**3
 #: Memory per Level-1 event: ``nucalcsaa`` loads them all, measured at 38 bytes each.
 FPM_MEMORY_PER_EVENT = 40
+#: What the ``nupipeline`` script holds beyond a gzipped event file it unpacks: measured 28 MiB.
+FPM_UNPACK_OVERHEAD = 64 * 1024**2
 #: The share of a worker's free memory the two detectors together may be expected to use.
 FPM_MEMORY_MARGIN = 0.8
+#: Free disk wanted per byte of unpacked event file: 1 for the copy, and about 3 for the
+#: working files of ``nupipeline`` (7.7 GiB measured on 2.9 GiB of Crab events).
+FPM_DISK_FACTOR = 4
 
 
 def _usable_cpus():
@@ -881,9 +885,11 @@ def _usable_cpus():
     return os.cpu_count() or 1
 
 
-def _detector_event_counts(datadir, obsid):
+def _detector_event_tables(datadir, obsid, fpms="AB"):
     """
-    The number of Level-1 events of each detector, read from the file headers.
+    Describe the Level-1 event file ``nupipeline`` would read for each detector.
+
+    Like ``nupipeline``, this takes the plain file when a gzipped one sits beside it.
 
     Parameters
     ----------
@@ -891,24 +897,98 @@ def _detector_event_counts(datadir, obsid):
         The raw data directory of the observation.
     obsid : str
         Observation identifier.
+    fpms : str
+        The detectors to describe.
 
     Returns
     -------
-    list of int or None
-        The counts for FPMA and FPMB, or ``None`` if a detector has no readable file.
+    list of tuple or None
+        ``(events, bytes per event, whether the file is gzipped)`` per detector, or
+        ``None`` if a detector has no readable file.
     """
     from astropy.io import fits
 
-    counts = []
-    for fpm in "AB":
-        files = glob.glob(os.path.join(datadir, "event_uf", f"nu{obsid}{fpm}_uf.evt*"))
-        if not files:
-            return None
+    tables = []
+    for fpm in fpms:
+        plain = os.path.join(datadir, "event_uf", f"nu{obsid}{fpm}_uf.evt")
+        compressed = not os.path.exists(plain)
         try:
-            counts.append(sum(fits.getheader(path, "EVENTS")["NAXIS2"] for path in files))
+            header = fits.getheader(plain + ".gz" if compressed else plain, "EVENTS")
+            tables.append((header["NAXIS2"], header["NAXIS1"], compressed))
         except (OSError, KeyError):
             return None
-    return counts
+    return tables
+
+
+def _fpm_memory_needed(events, row_bytes, compressed):
+    """
+    Estimate the peak memory of one detector's ``nupipeline``, in bytes.
+
+    Parameters
+    ----------
+    events : int
+        The number of Level-1 events.
+    row_bytes : int
+        The size of one event in the unpacked file.
+    compressed : bool
+        Whether ``nupipeline`` will read a gzipped file, which it holds in memory whole.
+
+    Returns
+    -------
+    int
+        The estimate.
+    """
+    needed = FPM_BASE_MEMORY + FPM_MEMORY_PER_EVENT * events
+    if compressed:
+        needed = max(needed, row_bytes * events + FPM_UNPACK_OVERHEAD)
+    return needed
+
+
+def _event_files_to_decompress(datadir, obsid, config, flags):
+    """
+    Choose the gzipped event files that are worth, and have room for, a plain copy.
+
+    Workers make this decision at about the same moment, so each one counts only on its
+    share of the free disk.
+
+    Parameters
+    ----------
+    datadir : str
+        The raw data directory of the observation.
+    obsid : str
+        Observation identifier.
+    config : dict
+        ``n_workers`` says how many observations share the machine (default 1).
+    flags : dict or None
+        The extra ``nupipeline`` parameters. Only detectors that ``nupipeline`` will read
+        from ``event_uf`` are considered.
+
+    Returns
+    -------
+    list of str
+        The plain file names to create.
+    """
+    flags = flags or {}
+    wanted = str(flags.get("instrument", "ALL")).upper()
+    fpms = [
+        fpm
+        for fpm in "AB"
+        if wanted in ("ALL", f"FPM{fpm}") and f"fpm{fpm.lower()}_infile" not in flags
+    ]
+    plain, unpacked = [], 0
+    for fpm in fpms:
+        tables = _detector_event_tables(datadir, obsid, fpm)
+        if tables is not None and tables[0][2]:
+            plain.append(os.path.join(datadir, "event_uf", f"nu{obsid}{fpm}_uf.evt"))
+            unpacked += tables[0][0] * tables[0][1]
+    share = shutil.disk_usage(datadir).free / config.get("n_workers", 1)
+    if FPM_DISK_FACTOR * unpacked > share:
+        get_logger().warning(
+            f"Keeping the event files gzipped: {FPM_DISK_FACTOR * unpacked / 1024**3:.1f} GB "
+            f"of disk wanted, this worker's share is {share / 1024**3:.1f} GB"
+        )
+        return []
+    return plain
 
 
 def _detectors_can_overlap(datadir, obsid, config, flags):
@@ -950,10 +1030,10 @@ def _detectors_can_overlap(datadir, obsid, config, flags):
     if 2 * n_workers > cpus:
         return False, f"{n_workers} workers with 2 processes each need more than {cpus} cores"
 
-    events = _detector_event_counts(datadir, obsid)
-    if events is None:
+    tables = _detector_event_tables(datadir, obsid)
+    if tables is None:
         return False, "the event counts could not be read"
-    needed = sum(FPM_BASE_MEMORY + FPM_MEMORY_PER_EVENT * count for count in events)
+    needed = sum(_fpm_memory_needed(*table) for table in tables)
     share = psutil.virtual_memory().available / n_workers
     gib = 1024**3
     summary = (
@@ -1040,11 +1120,14 @@ def _run_l2_pipeline(obsid, config, flags, rec):
         logger.info(f"Applying custom flags: {flags}")
         params.update(flags)
 
+    plain_inputs = _event_files_to_decompress(datadir, obsid, config, flags)
     # A metrology file named in the flags is read from wherever it is, not from hk.
-    decompress = not (flags and "metrologyfile" in flags)
-    overlap, reason = _detectors_can_overlap(datadir, obsid, config, flags)
-    logger.info(f"Running FPMA and FPMB {'together' if overlap else 'in turn'}: {reason}")
-    with _decompressed_metrology(datadir, obsid) if decompress else nullcontext():
+    if not (flags and "metrologyfile" in flags):
+        plain_inputs.append(os.path.join(datadir, "hk", f"nu{obsid}_met.fits"))
+    with _decompressed_files(plain_inputs):
+        # Decided in here, because the memory needed depends on what got decompressed.
+        overlap, reason = _detectors_can_overlap(datadir, obsid, config, flags)
+        logger.info(f"Running FPMA and FPMB {'together' if overlap else 'in turn'}: {reason}")
         # No return-code check here: both raise on a non-zero code, with the tool's own
         # output in the message.
         if overlap:

@@ -2639,6 +2639,70 @@ class TestMetrologyIsDecompressedForNupipeline:
         assert "params" in seen
 
 
+class TestEventFilesAreDecompressedForNupipeline:
+    """``nupipeline`` holds a whole gzipped event file in memory, but not a plain one."""
+
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        """Gzipped 8000-byte event files; records which plain ones ``nupipeline`` would see."""
+        monkeypatch.setattr(nustar, "HAS_HEASOFT", True)
+        self.free = 1024**3
+        monkeypatch.setattr(
+            nustar.shutil, "disk_usage", lambda path: type("Usage", (), dict(free=self.free))
+        )
+        config = dict(
+            out_data_path=str(tmp_path),
+            input_data_path=str(tmp_path),
+            nustar_parallel_detectors=False,
+        )
+        event_uf = os.path.join(nu_local_raw_data_path(OBSID, config), "event_uf")
+        os.makedirs(event_uf)
+        hdu = fits.BinTableHDU.from_columns(
+            [fits.Column(name="TIME", format="D", array=np.zeros(1000))], name="EVENTS"
+        )
+        for fpm in "AB":
+            path = os.path.join(event_uf, f"nu{OBSID}{fpm}_uf.evt.gz")
+            fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path)
+        self.pattern = os.path.join(event_uf, "*_uf.evt")
+        seen = {}
+
+        def fake_run_task(name, **params):
+            seen["plain"] = sorted(os.path.basename(p)[-8] for p in glob.glob(self.pattern))
+
+        monkeypatch.setattr(nustar.heasoft, "run_task", fake_run_task)
+        return config, seen
+
+    def test_plain_copies_exist_only_during_the_run(self, setup):
+        """Both detectors get a plain file, and the raw data end up as they started."""
+        config, seen = setup
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert seen["plain"] == ["A", "B"]
+        assert glob.glob(self.pattern) == []
+
+    def test_too_little_disk_keeps_the_gzipped_files(self, setup):
+        """``nupipeline`` still runs, because a full disk would be worse than the memory."""
+        config, seen = setup
+        self.free = 63_999
+        nustar.nu_run_l2_pipeline.fn(OBSID, config)
+        assert seen["plain"] == []
+
+    def test_free_disk_is_shared_between_workers(self, setup):
+        """Workers decide at the same moment, so none may count on all the free disk."""
+        config, seen = setup
+        self.free = 100_000
+        nustar.nu_run_l2_pipeline.fn(OBSID, dict(config, n_workers=2))
+        assert seen["plain"] == []
+
+    def test_only_the_detectors_nupipeline_will_read_are_decompressed(self, setup):
+        """A single requested detector, or an input file named by hand, needs no plain copy."""
+        config, seen = setup
+        nustar.nu_run_l2_pipeline.fn(OBSID, config, flags=dict(instrument="FPMB"))
+        assert seen["plain"] == ["B"]
+        os.remove(nustar.nu_pipeline_done_file(OBSID, config=config))
+        nustar.nu_run_l2_pipeline.fn(OBSID, config, flags=dict(fpma_infile="my_a.evt"))
+        assert seen["plain"] == ["B"]
+
+
 class TestDetectorsRunInParallel:
     """The two detectors overlap when the machine can hold both, and their outputs are merged."""
 
@@ -2663,12 +2727,12 @@ class TestDetectorsRunInParallel:
             self.write_events(fpm, 1000)
         return config
 
-    def write_events(self, fpm, n_events):
+    def write_events(self, fpm, n_events, suffix=".gz"):
         """Writes the Level-1 event file of one detector, gzipped like the archive's."""
         hdu = fits.BinTableHDU.from_columns(
             [fits.Column(name="TIME", format="D", array=np.zeros(n_events))], name="EVENTS"
         )
-        path = os.path.join(self.datadir, "event_uf", f"nu{OBSID}{fpm}_uf.evt.gz")
+        path = os.path.join(self.datadir, "event_uf", f"nu{OBSID}{fpm}_uf.evt{suffix}")
         fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path, overwrite=True)
 
     def can_overlap(self, config, flags=None):
@@ -2687,8 +2751,25 @@ class TestDetectorsRunInParallel:
         """Many events cost memory beyond the fixed part, because of ``nucalcsaa``'s table."""
         self.free = 4 * self.GIB
         assert self.can_overlap(setup)
-        monkeypatch.setattr(nustar, "_detector_event_counts", lambda *a: [50_000_000, 1000])
+        tables = [(50_000_000, 286, False), (1000, 286, False)]
+        monkeypatch.setattr(nustar, "_detector_event_tables", lambda *a: tables)
         assert not self.can_overlap(setup)
+
+    def test_a_big_gzipped_file_costs_its_uncompressed_size(self):
+        """Measured on the Crab: the Perl script holds the whole unpacked file in memory."""
+        assert nustar._fpm_memory_needed(10_000_000, 286, True) > 2.6 * self.GIB
+        assert nustar._fpm_memory_needed(10_000_000, 286, False) < 1.5 * self.GIB
+
+    def test_a_small_gzipped_file_costs_only_the_usual_estimate(self):
+        """Below 1 GB unpacked, the peak of ``nuflagevt`` is the larger one."""
+        gzipped = nustar._fpm_memory_needed(100_000, 286, True)
+        assert gzipped == nustar._fpm_memory_needed(100_000, 286, False)
+
+    def test_a_plain_file_next_to_the_gzipped_one_is_the_one_counted(self, setup):
+        """``nupipeline`` reads the plain one, so the pair must not count twice."""
+        self.write_events("A", 1000, suffix="")
+        tables = nustar._detector_event_tables(self.datadir, OBSID)
+        assert tables == [(1000, 8, False), (1000, 8, True)]
 
     def test_free_memory_is_shared_between_workers(self, setup):
         """Workers decide at the same moment, so none may count on all the free memory."""
