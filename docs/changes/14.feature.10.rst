@@ -1,0 +1,1 @@
+``nu_run_l2_pipeline`` reduces FPMA and FPMB at the same time when there is enough free memory and enough cores for both, which makes ``nupipeline`` about 1.8 times faster. ``psutil`` is now required, and ``nustar_parallel_detectors=False`` in the configuration turns this off.

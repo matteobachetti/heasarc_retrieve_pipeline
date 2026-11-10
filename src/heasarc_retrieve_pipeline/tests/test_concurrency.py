@@ -610,12 +610,13 @@ class TestTheFlowUsesAShortWorkspace:
         assert (outdir / "a_result.txt").is_file()
 
     def test_the_caller_config_reaches_the_workers(self, tmp_path, monkeypatch):
+        """The workers get the caller's config, plus how many workers share the machine."""
         outdir = tmp_path / "out"
         outdir.mkdir()
 
-        seen = self.run(monkeypatch, outdir, config={"cameras": ["pn"]})
+        seen = self.run(monkeypatch, outdir, config={"cameras": ["pn"]}, n_workers=2)
 
-        assert seen["config"] == {"cameras": ["pn"]}
+        assert seen["config"] == {"cameras": ["pn"], "n_workers": 2}
 
 
 class TestTheFlowRefusesNamesHeasoftCannotHandle:
