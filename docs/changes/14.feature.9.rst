@@ -1,0 +1,1 @@
+``nu_run_l2_pipeline`` decompresses the metrology file for the duration of ``nupipeline``, which more than halves the run time of a long NuSTAR observation.

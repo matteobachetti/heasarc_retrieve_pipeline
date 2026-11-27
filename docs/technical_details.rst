@@ -713,6 +713,117 @@ and, one of each per observation, in ``<out_data_path>/<OBSID>/``::
     nu<OBSID>_goes.gti                     the flare-free intervals derived from it
     skipped_inputs.txt                     the inputs the reduction had to skip
 
+Decompressing the metrology file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``numetrology``, the first task of ``nupipeline``, reads ``hk/nu<OBSID>_met.fits.gz`` in
+blocks of 1000 rows and reopens the file for each block. CFITSIO decompresses a whole
+gzipped file every time it opens one, so the run time grows with the square of the
+observation length. ``nu_run_l2_pipeline`` therefore writes a plain copy next to the
+``.gz`` for the duration of the run, and removes it afterwards. ``nupipeline`` prefers the
+plain file when both are present.
+
+Measured on the 93.6 ks observation 90201037002 (M82), HEASOFT 6.37.1:
+
+============  ===========  ==========
+Input         numetrology  nupipeline
+============  ===========  ==========
+gzipped       241.3 s      399.9 s
+decompressed  3.4 s        160.4 s
+============  ===========  ==========
+
+The mast aspect and position-detector files are identical between the two runs. In the
+cleaned event files only ``DET1X/Y``, ``DET2X/Y``, ``X`` and ``Y`` differ, by under 2
+pixels rms with zero mean, because ``nucalcpos`` draws random sub-pixel positions from a
+new seed at each run (``initseed=no``).
+
+The step does nothing if ``metrologyfile`` is passed in ``flags``, and it leaves a plain
+file that was already there. If the copy cannot be written, for example on a full disk
+or a read-only archive, ``nupipeline`` runs on the ``.gz``, more slowly.
+
+Decompressing the event files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``nupipeline`` Perl script itself holds a whole gzipped Level-1 event file in memory
+for its first seconds, about 286 bytes per event. The likely reason is that it opens the
+file through CFITSIO, which unpacks gzipped files in memory. ``nu_run_l2_pipeline``
+therefore writes plain copies of ``event_uf/nu<OBSID>[AB]_uf.evt.gz`` for the duration of
+the run, as for the metrology file. ``nupipeline`` reads the plain file when both exist.
+
+Measured with both detectors running at once on the Crab observation 10502001011 (5.5
+million events per detector, 1.5 GiB unpacked each), HEASOFT 6.37.1:
+
+================  =================  ===========
+Input event file  Peak memory        Run time
+================  =================  ===========
+gzipped           2946, 2869 MiB     374, 678 s
+plain             1823, 1820 MiB     566 s
+================  =================  ===========
+
+The memory is repeatable. The run times are not: other work on the machine moved two
+identical runs from 374 s to 678 s, so these runs cannot say whether the plain input is
+faster. Decompressing both files takes a few seconds. The cleaned event files have the
+same rows and the same values in every non-position column as a serial gzipped run.
+
+A plain copy is made only for a detector ``nupipeline`` will read from ``event_uf``, so not
+for one excluded by ``instrument`` or replaced by ``fpma_infile`` or ``fpmb_infile``. It
+also needs free disk of at least 4 times the unpacked size, divided by ``n_workers``: once
+for the copy and about 3 times for the working files of ``nupipeline``, measured at 7.7 GiB
+for 2.9 GiB of events. Otherwise the ``.gz`` files stay, and the memory estimate of the
+next section counts their unpacked size. The disk check looks at the disk of the raw
+data, which is cautious when the output directory is on another disk.
+
+Reducing the two detectors at the same time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nupipeline`` processes FPMA and FPMB one after the other, and almost all of its time is
+spent on one detector or the other. ``nu_run_l2_pipeline`` therefore starts one
+``nupipeline`` per detector when the machine can hold both, through
+``heasoft.run_concurrently``, because ``heasoftpy`` cannot overlap two tools in one
+process. Each run has private parameter files and a private working directory, and works
+in ``<OBSID>/fpmA`` or ``<OBSID>/fpmB``. The outputs are then moved to ``event_pipe``. The
+five files both runs write (``_att``, ``_mast``, ``_psd``, ``_psdcorr``, ``_obeb.hk``)
+hold identical data, so one copy is kept.
+
+Measured on 90201037002 (M82) with a decompressed metrology file. The run times are
+through ``nu_run_l2_pipeline``, and the memory comes from separate instrumented runs:
+
+=========  ========  =====================
+Detectors  Run time  Peak memory
+=========  ========  =====================
+in turn    162.5 s   873 MB (largest tool)
+together   92.0 s    2.2 GB, for 6 s
+=========  ========  =====================
+
+Every table holds the same rows and values as in a serial run, except position columns,
+which differ between any two runs because of the random numbers mentioned above.
+
+What sets the memory, measured at 0.55 to 0.86 million events per detector:
+
+* ``nuflagevt`` takes 873 MB in every run, for a table of fixed size.
+* ``nucalcsaa`` is the only tool found to load every event: about 38 bytes each.
+* ``ftstat``, ``ftcopy`` and ``nuattcorr`` grow with the length of the observation, to
+  between 124 and 161 MB for 93.6 ks.
+* The other tools that process events stay flat.
+* A gzipped event file costs its whole unpacked size, as described above.
+
+The two detectors overlap only if all of these hold:
+
+* The expected memory is at most 80% of the free memory divided by ``n_workers``. Each
+  detector is expected to need 1 GB plus 40 bytes per Level-1 event, or, if its event file
+  stayed gzipped and that is larger, the unpacked size plus 64 MiB. Workers decide at
+  about the same moment, so none of them may count on all the free memory. The event
+  counts and row sizes come from the file headers.
+* There are at least ``2 * n_workers`` usable cores.
+* ``flags`` does not set ``instrument`` or ``outdir``.
+* ``nustar_parallel_detectors`` is not ``False`` in the configuration.
+
+Otherwise the detectors are reduced in turn, and the log says why. The estimate was
+checked up to 5.5 million events per detector, where it gave 2.4 GB against a measured 1.8
+GB with plain input. It sees the memory of
+the machine, not a limit a batch system imposes on the job, so on such a system set
+``nustar_parallel_detectors=False`` if the job's limit is below the estimate.
+
 Observing modes 01 and 06
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -3536,7 +3647,8 @@ that were noisy -- ``nupipeline`` once per observation, ``nuproducts`` once per 
 stem in both ``nustar.py`` and ``segments.py`` -- pass
 ``utils.tool_log_file(name, obsid, config)``::
 
-    <out_data_path>/<OBSID>/logs/nupipeline.log
+    <out_data_path>/<OBSID>/logs/nupipeline.log        (nupipeline_FPMA.log and _FPMB.log
+                                                        when the detectors overlap)
     <out_data_path>/<OBSID>/logs/nuproducts.log
 
 One file per tool per observation: ``nuproducts`` runs a dozen times for one observation
@@ -4234,7 +4346,7 @@ Relevant environment:
     on ``PATH`` is enough. ``ciao.HAS_CIAO`` records whether both are present.
 
 Required at runtime, beyond the standard scientific stack: ``prefect``, ``astroquery``,
-``pyvo``, ``pySmartDL``, ``beautifulsoup4`` and ``pyyaml``. Everything else is an extra,
+``pyvo``, ``pySmartDL``, ``beautifulsoup4``, ``pyyaml`` and ``psutil``. Everything else is an extra,
 imported inside the function that needs it and declared in ``[project.optional-dependencies]``
 in ``pyproject.toml``: ``scikit-image``/``scipy``/``statsmodels`` (``imaging``),
 ``regions``, ``boto3`` (``s3``), ``plotly`` (``report``), ``sunpy`` (``solar``) and

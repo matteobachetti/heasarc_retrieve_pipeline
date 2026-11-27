@@ -645,3 +645,62 @@ class TestToolOutputCanGoToAFile:
 
         assert seen["verbose"] == 20
         assert seen["logfile"] == str(path)
+
+
+class TestRunConcurrently:
+    """Tools that must overlap run as separate processes, each with its own parameter files."""
+
+    def fake_tool(self, tmp_path, monkeypatch, script):
+        """Installs ``script`` as a HEASOFT tool, run for real from ``$HEADAS/bin``."""
+        monkeypatch.setattr(heasoft, "HAS_HEASOFT", True)
+        monkeypatch.setenv("HEADAS", str(tmp_path / "headas"))
+        monkeypatch.chdir(tmp_path)
+        tool = tmp_path / "headas" / "bin" / "faketool"
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/bash\n" + script)
+        tool.chmod(0o755)
+
+    def job(self, tmp_path, label):
+        out = tmp_path / label
+        out.mkdir()
+        return dict(
+            label=label,
+            params=dict(out=str(out), flag=True, other=False, noprompt=True),
+            produces=str(out),
+            log_to=str(tmp_path / "logs" / f"{label}.log"),
+        )
+
+    def test_each_job_gets_private_state_and_plain_arguments(self, tmp_path, monkeypatch):
+        """Parameter files and working directories differ, booleans read as yes and no."""
+        script = 'for a in "$@"; do [[ $a == out=* ]] && o=${a#out=}; done\n'
+        script += 'echo "$PFILES" > $o/pfiles; pwd > $o/cwd; echo "$@" > $o/args\n'
+        self.fake_tool(tmp_path, monkeypatch, script)
+        heasoft.run_concurrently("faketool", [self.job(tmp_path, "A"), self.job(tmp_path, "B")])
+
+        def read(label, name):
+            return (tmp_path / label / name).read_text().strip()
+
+        assert read("A", "pfiles") != read("B", "pfiles")
+        assert read("A", "pfiles").endswith(f";{tmp_path}/headas/syspfiles")
+        assert read("A", "cwd") != read("B", "cwd")
+        assert read("A", "args") == f"out={tmp_path}/A flag=yes other=no"
+
+    def test_the_jobs_really_overlap(self, tmp_path, monkeypatch):
+        """Each job waits for the other's file, so running them in turn would never finish."""
+        script = 'for a in "$@"; do [[ $a == out=* ]] && o=${a#out=}; done\n'
+        script += "touch $o/started; other=A; [[ $o == */A ]] && other=B\n"
+        script += (
+            f"for i in $(seq 100); do [ -e {tmp_path}/$other/started ] && exit 0; sleep 0.1; done\n"
+        )
+        script += "exit 7\n"
+        self.fake_tool(tmp_path, monkeypatch, script)
+        heasoft.run_concurrently("faketool", [self.job(tmp_path, "A"), self.job(tmp_path, "B")])
+
+    def test_a_failed_job_is_named_with_its_output(self, tmp_path, monkeypatch):
+        """The error says which job failed, and shows what it printed."""
+        script = 'for a in "$@"; do [[ $a == out=* ]] && o=${a#out=}; done\n'
+        script += 'touch $o/x; [[ $o == */B ]] && { echo "the reason"; exit 3; }; exit 0\n'
+        self.fake_tool(tmp_path, monkeypatch, script)
+        jobs = [self.job(tmp_path, "A"), self.job(tmp_path, "B")]
+        with pytest.raises(RuntimeError, match=r"(?s)faketool \(B\).*code 3.*the reason"):
+            heasoft.run_concurrently("faketool", jobs)

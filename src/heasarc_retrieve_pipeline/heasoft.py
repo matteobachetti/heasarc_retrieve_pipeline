@@ -10,10 +10,12 @@ threads of one process, 19 of them failed with ``parameter file .../ftlist.par n
 ``PFILES`` is an environment variable, so it cannot be made per-thread: within a process
 the only fix is to let one tool run at a time. Across processes the fix is a private
 ``PFILES`` directory each, which :func:`heasarc_retrieve_pipeline.core.prepare_worker`
-sets up. Parallelism therefore lives between observations, not inside one.
+sets up. Parallelism therefore lives between observations, not inside one, with one
+exception: :func:`run_concurrently` starts plain subprocesses with a private environment
+each, for tools that take long enough to be worth overlapping.
 
 The lock costs nothing real: a HEASOFT tool is an external subprocess doing seconds to
-minutes of work, and two of them in one observation have nothing to gain from overlapping.
+minutes of work, and most of them have nothing to gain from overlapping.
 
 Every call here also has to say what it produces, and the file is checked before the call
 returns. A zero return code is not evidence that anything was written: ``ftmgtime`` handed
@@ -21,9 +23,11 @@ an empty list of input GTIs exits 0, writes nothing, and lets the next tool take
 """
 
 import os
+import subprocess
+import tempfile
 import threading
 
-from .utils import get_logger
+from .utils import _shortest_temporary_directory, get_logger
 
 try:
     import heasoftpy as hsp
@@ -424,3 +428,103 @@ def run_task(name, *, produces, log_to=None, **params):
         result = _checked(name, _calling(name, hsp.HSPTask(name), **params))
         _check_outputs(name, produces)
         return result
+
+
+def _command_line_value(value):
+    """
+    A parameter as HEASOFT reads it on the command line.
+
+    Examples
+    --------
+    >>> _command_line_value(True), _command_line_value(False), _command_line_value(3)
+    ('yes', 'no', '3')
+    """
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def run_concurrently(name, jobs):
+    """
+    Run several copies of one HEASOFT tool at the same time, and wait for all of them.
+
+    ``heasoftpy`` cannot do this from one process, as the module docstring explains, so
+    each copy is an ordinary subprocess with an environment of its own: private parameter
+    files on the shortest temporary disk, and a private working directory, because
+    ``xselect`` and others drop scratch files under fixed names. Every job runs to its end
+    even if another fails, so each one's log is complete.
+
+    Parameters
+    ----------
+    name : str
+        Tool name, for example ``"nupipeline"``.
+    jobs : list of dict
+        One per copy, with keys ``label`` (how the job is named in errors), ``params``
+        (tool parameters; ``noprompt`` is handled through the environment), ``produces``
+        (see :func:`_check_outputs`) and ``log_to`` (the file for the tool's output).
+
+    Raises
+    ------
+    ImportError
+        If ``heasoftpy`` is not installed.
+    RuntimeError
+        If any job exits non-zero or does not produce what it said it would, naming every
+        job that failed and showing the end of its log.
+    """
+    if not HAS_HEASOFT:
+        raise ImportError("heasoftpy not installed")
+    headas = os.environ["HEADAS"]
+    processes, logs, failures = [], [], []
+    with (
+        tempfile.TemporaryDirectory(prefix="hrp", dir=_shortest_temporary_directory()) as pfiles,
+        tempfile.TemporaryDirectory(prefix="job", dir=os.getcwd()) as work,
+        HEASOFT_LOCK,
+    ):
+        try:
+            for index, job in enumerate(jobs):
+                private_pfiles = os.path.join(pfiles, str(index))
+                cwd = os.path.join(work, str(index))
+                os.makedirs(private_pfiles)
+                os.makedirs(cwd)
+                env = dict(
+                    os.environ,
+                    PFILES=f"{private_pfiles};{os.path.join(headas, 'syspfiles')}",
+                    HEADASNOQUERY="1",
+                    HEADASPROMPT="/dev/null",
+                )
+                arguments = [
+                    f"{key}={_command_line_value(value)}"
+                    for key, value in job["params"].items()
+                    if key != "noprompt"
+                ]
+                log_path = _log_file(name, job["log_to"])["logfile"]
+                logs.append(log_path)
+                with open(log_path, "a") as log:
+                    processes.append(
+                        subprocess.Popen(
+                            [os.path.join(headas, "bin", name), *arguments],
+                            cwd=cwd,
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                        )
+                    )
+            codes = [process.wait() for process in processes]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    for job, code, log_path in zip(jobs, codes, logs):
+        try:
+            if code:
+                raise RuntimeError(f"returned code {code}")
+            _check_outputs(name, job["produces"])
+        except RuntimeError as error:
+            with open(log_path, errors="replace") as log:
+                tail = "".join(log.readlines()[-20:])
+            failures.append(f"{name} ({job['label']}) {error}:\n{tail}")
+    if failures:
+        raise RuntimeError("\n".join(failures).strip())

@@ -2348,7 +2348,7 @@ def retrieve_and_process_data(
             work_root=workspace.work,
             flags=flags,
             test=test,
-            config=config,
+            config=dict(config or {}, n_workers=n_workers),
         )
 
     return result_table
